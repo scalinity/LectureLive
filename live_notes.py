@@ -79,6 +79,53 @@ def hms(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
+def write_atomic(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def initial_state(old, notes_existed, transcript_path, slides):
+    data = transcript_path.read_bytes()
+    if "noted_through" in old:
+        # one-time migration from the old timestamp checkpoint
+        cut = old["noted_through"]
+        offset, pos = len(data), 0
+        for raw in data.splitlines(keepends=True):
+            m = LINE_RE.match(raw.decode(errors="replace").rstrip("\n"))
+            if m and m.group(1) >= cut:
+                offset = pos
+                break
+            pos += len(raw)
+        slide_index = max([s[1] for s in slides if s[0] < cut], default=0)
+    elif notes_existed:
+        offset, slide_index = len(data), max([s[1] for s in slides], default=0)
+    else:
+        offset, slide_index = 0, 0
+    return {"transcript_offset": offset, "slide_index": slide_index}
+
+
+def recover_commit(state, notes_path):
+    """Finish or undo a snapshot append that was interrupted by a crash."""
+    c = state.pop("commit", None)
+    if not c:
+        return
+    block = c["block"].encode()
+    data = notes_path.read_bytes()
+    before, tail = c["before"], data[c["before"]:]
+    if len(data) >= before and tail == block:
+        state["transcript_offset"], state["slide_index"] = c["transcript_offset"], c["slide_index"]
+        print("Recovered: last snapshot was fully written.", file=sys.stderr)
+    elif len(data) > before and block.startswith(tail):
+        os.truncate(notes_path, before)
+        print("Recovered: removed a partially written snapshot; its material is pending again.", file=sys.stderr)
+    elif len(data) != before:
+        print("Warning: notes changed during an interrupted snapshot; left as is, material is pending again.", file=sys.stderr)
+
+
 def load_env():
     values = {}
     env_file = HERE / ".env"
@@ -254,23 +301,27 @@ def main():
     title = f"# {course} — {lecture_dir.name} — {today:%Y-%m-%d}"
     client = httpx.Client()
 
-    if not notes_path.exists():
+    notes_existed = notes_path.exists()
+    if not notes_existed:
         notes_path.write_text(title + "\n")
-    if state_path.exists():
-        state = json.loads(state_path.read_text())
-    else:
-        # first run against an existing notes file: treat everything before now as already noted
-        state = {"noted_through": hms(time.time()) if transcript_path.exists() else "00:00:00"}
-    with open(transcript_path, "a") as tf:
-        tf.write(f"--- {'resumed' if transcript_path.stat().st_size else 'started'} {hms(time.time())} ---\n")
+    transcript_path.touch()
+    slides_now = existing_slides(slides_dir)
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if "transcript_offset" not in state:
+        state = initial_state(state, notes_existed, transcript_path, slides_now)
+    recover_commit(state, notes_path)
+    write_atomic(state_path, json.dumps(state))
 
     pending = []
-    pending_slides = []
-    for line in transcript_path.read_text().splitlines():
-        m = LINE_RE.match(line)
-        if m and m.group(1) >= state["noted_through"]:
-            pending.append((m.group(1), m.group(2)))
-    pending_slides += [s for s in existing_slides(slides_dir) if s[0] >= state["noted_through"]]
+    with open(transcript_path, "rb") as tf:
+        tf.seek(state["transcript_offset"])
+        for line in tf.read().decode(errors="replace").splitlines():
+            m = LINE_RE.match(line)
+            if m:
+                pending.append((m.group(1), m.group(2)))
+    pending_slides = [s for s in slides_now if s[1] > state["slide_index"]]
+    with open(transcript_path, "a") as tf:
+        tf.write(f"--- {'resumed' if transcript_path.stat().st_size else 'started'} {hms(time.time())} ---\n")
     if pending or pending_slides:
         print(f"Resumed: {len(pending)} transcript line(s), {len(pending_slides)} slide(s) not yet in notes.", file=sys.stderr)
 
@@ -283,7 +334,7 @@ def main():
     counters = {"slide": max([s[1] for s in existing_slides(slides_dir)], default=0) + 1}
 
     def save_state():
-        state_path.write_text(json.dumps(state))
+        write_atomic(state_path, json.dumps(state))
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -301,9 +352,10 @@ def main():
             if text:
                 line = f"[{hms(start)}] {text}"
                 print(line)
-                with open(transcript_path, "a") as tf:
-                    tf.write(line + "\n")
+                # file line and pending entry change together so a snapshot's offset matches its batch
                 with lock:
+                    with open(transcript_path, "a") as tf:
+                        tf.write(line + "\n")
                     pending.append((hms(start), text))
             chunk_q.task_done()
 
@@ -324,9 +376,11 @@ def main():
                 slides = sorted(pending_slides)
                 pending.clear()
                 pending_slides.clear()
+                offset = transcript_path.stat().st_size
             if not segments and not slides:
                 print("[snapshot] nothing new since the last snapshot", file=sys.stderr)
-                return
+                return True
+            slide_index = max([s[1] for s in slides], default=state["slide_index"])
             words = sum(len(s[1].split()) for s in segments)
             print(f"[snapshot] {words} words, {len(slides)} slide(s) -> {NOTES_MODEL} ...", file=sys.stderr)
             doc = notes_path.read_text()
@@ -337,20 +391,31 @@ def main():
                 with lock:
                     pending[:0] = segments
                     pending_slides[:0] = slides
-                return
+                return False
             for s in slides:
                 if embed_md(s, notes_path.parent) not in notes:
                     notes += f"\n\n{embed_md(s, notes_path.parent)}\n"
             block = f"\n<!-- {hms(t_enter)} -->\n{notes}\n"
+            state["commit"] = {
+                "before": notes_path.stat().st_size, "block": block,
+                "transcript_offset": offset, "slide_index": slide_index,
+            }
+            save_state()
             with open(notes_path, "a") as nf:
                 nf.write(block)
-            state["noted_through"] = hms(t_enter)
+                nf.flush()
+                os.fsync(nf.fileno())
+            del state["commit"]
+            state["transcript_offset"], state["slide_index"] = offset, slide_index
             save_state()
             print("\n" + "=" * 60 + block + "=" * 60 + "\n")
+            return True
 
     def polish():
         with snapshot_lock:
-            snapshot()
+            if not snapshot():
+                print("[polish] aborted: the snapshot before it failed, notes unchanged", file=sys.stderr)
+                return
             doc = notes_path.read_text()
             transcript = transcript_path.read_text()
             embeds = EMBED_RE.findall(doc)
@@ -365,7 +430,9 @@ def main():
                     new += f"\n\n{e}\n"
             backup = bookkeeping / f"{notes_path.stem}_{datetime.now():%H%M%S}.md"
             shutil.copy2(notes_path, backup)
-            notes_path.write_text(new.rstrip() + "\n")
+            with open(backup, "rb") as bf:
+                os.fsync(bf.fileno())
+            write_atomic(notes_path, new.rstrip() + "\n")
             print(f"[polish] done. Previous version: {backup}", file=sys.stderr)
 
     def stdin_worker():
