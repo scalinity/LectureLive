@@ -8,7 +8,7 @@ document afterwards.
 
 Current state: a Python command-line tool (`live_notes.py`) that works today.
 A native companion app (Tauri + Svelte, Rust pipeline) is proposed in
-`docs/superpowers/specs/2026-09-22-lecturelive-tauri-design.md`.
+`docs/spec.md`, with the build order in `docs/milestones.md`.
 
 ## Requirements
 
