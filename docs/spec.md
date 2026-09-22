@@ -450,9 +450,11 @@ meaning.
 
 ## 13. Dependencies
 
-Candidates, pinned in `Cargo.lock` and verified together at M0: `tauri 2`, `tokio 1`,
-`tokio-tungstenite` (rustls), `reqwest` (stream), `serde`/`serde_json`, `cpal 0.18.2`,
-`rubato 5.0.0` (needs Rust ≥ 1.87), `hound 3.5.1`, `xcap 0.9.8`, `image`,
+Pinned in `Cargo.lock`; the versions that build together are recorded in
+`milestones.md` at M0: `tauri 2`, `tokio 1`, `tokio-tungstenite` (rustls), `reqwest`
+(stream), `serde`/`serde_json`, `cpal` (0.18 line), `rubato` (fixed-ratio resampling
+from M0; the asynchronous resampler that mixed mode needs is adopted at M6),
+`hound 3.5`, `xcap` (0.9 line), `image`,
 `coreaudio-sys`, `sha2`, `uuid`, `fs2` (advisory lock), `keyring`, `anyhow`/`thiserror`,
 `tracing`. Frontend: `@tauri-apps/api` 2, `svelte` 5, `marked`, `dompurify 3.4.15`.
 Deployment target macOS 13; toolchain pinned in `rust-toolchain.toml`.
