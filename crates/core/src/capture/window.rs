@@ -5,6 +5,23 @@ use image::{imageops::FilterType, RgbaImage};
 
 pub const MAX_PX: u32 = 1600;
 
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+/// xcap only preflights: without the grant it silently drops other apps' windows, so a
+/// missing permission would read as "no windows". Requesting registers the app in
+/// System Settings and shows the prompt once.
+fn ensure_screen_access() -> Result<()> {
+    if unsafe { CGPreflightScreenCaptureAccess() } {
+        return Ok(());
+    }
+    unsafe { CGRequestScreenCaptureAccess() };
+    bail!("Screen Recording not granted (System Settings → Privacy & Security → Screen & System Audio Recording)")
+}
+
 pub struct WindowInfo {
     pub id: u32,
     pub app: String,
@@ -30,6 +47,7 @@ pub fn is_blank(img: &RgbaImage) -> bool {
 }
 
 pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    ensure_screen_access()?;
     let mut out = Vec::new();
     for w in xcap::Window::all().context("enumerate windows (Screen Recording permission?)")? {
         out.push(WindowInfo {
@@ -44,6 +62,7 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
 }
 
 pub fn capture_window(id: u32, out: &Path) -> Result<(u32, u32)> {
+    ensure_screen_access()?;
     let window = xcap::Window::all()?
         .into_iter()
         .find(|w| w.id().map(|i| i == id).unwrap_or(false))

@@ -84,12 +84,18 @@ fn run_check(args: &[String]) -> Result<String, String> {
     }
 }
 
-fn log_check(args: &[String], result: &Result<String, String>) -> std::io::Result<()> {
+/// Appends one line to checks.log. A "started" line precedes every check, so a check that
+/// is killed or aborts is visible as a start with no result.
+fn log_line(line: &str) -> std::io::Result<()> {
     let path = app_dir("canary").map_err(std::io::Error::other)?.join("checks.log");
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{} {line}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
+}
+
+fn log_check(args: &[String], result: &Result<String, String>) -> std::io::Result<()> {
     match result {
-        Ok(s) => writeln!(f, "{} ok\n{s}\n", args.join(" ")),
-        Err(e) => writeln!(f, "{} FAILED: {e}\n", args.join(" ")),
+        Ok(s) => log_line(&format!("{} ok\n{s}\n", args.join(" "))),
+        Err(e) => log_line(&format!("{} FAILED: {e}\n", args.join(" "))),
     }
 }
 
@@ -101,6 +107,7 @@ pub fn run() {
             if !check.is_empty() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
+                    let _ = log_line(&format!("{} started", check.join(" ")));
                     let _ = log_check(&check, &run_check(&check));
                     handle.exit(0);
                 });
