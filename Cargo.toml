@@ -1,7 +1,20 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.87"
+
+# Release profile of the Tauri app; cargo reads profiles only from the workspace root.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# With lto on, stripping host-side proc-macro dylibs leaves rustc unable to load them
+# (E0463 for ctor_proc_macro) on rustc 1.96.1 with Xcode 27.0 beta.
+[profile.release.build-override]
+strip = false
