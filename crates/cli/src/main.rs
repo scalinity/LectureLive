@@ -204,7 +204,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
         device.context("give --loopback or --device <UID> (`lecturelive inputs` lists them)")?
     };
 
-    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem }, Box::new(DeviceSource { uid }));
+    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, ..Default::default() }, Box::new(DeviceSource { uid }));
     let mut watch = use_loopback.then(|| SilenceWatch::new(-60.0, 10));
     let timer = async {
         match secs {
@@ -236,6 +236,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
                 ),
                 Some(Notification::DeviceBack { uid }) => println!("input {uid} is back at {}; recording continues in a new file", chrono::Local::now().format("%H:%M:%S")),
                 Some(Notification::Failed(msg)) => eprintln!("session failed: {msg}"),
+                Some(_) => {}
             },
             _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; handle.request_stop(); }
             _ = &mut timer, if !stopping => { stopping = true; handle.request_stop(); }
