@@ -73,6 +73,16 @@ pub fn prunable(sc: &Sidecar, retention: Retention, now: DateTime<Local>) -> Vec
         .collect()
 }
 
+/// The M0 canary can still make its own aggregate the system default. At launch, a route
+/// it left behind is undone (spec §4.3). Returns None when no route was saved, otherwise
+/// whether the default output was put back.
+pub fn restore_abandoned_route(state_path: &Path) -> Result<Option<bool>> {
+    if crate::audio::routing::load_state(state_path)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(crate::audio::routing::disable_loopback(state_path)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +191,12 @@ mod tests {
         sc.gaps.push(gap(old_resolved, true));
         assert_eq!(prunable(&sc, Retention::KeepDays(14), now()), vec![old_clean, old_resolved]);
         assert!(prunable(&sc, Retention::KeepAll, now()).is_empty());
+    }
+
+    #[test]
+    fn no_saved_route_means_nothing_to_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(restore_abandoned_route(&dir.path().join("route.json")).unwrap(), None);
     }
 
     #[test]

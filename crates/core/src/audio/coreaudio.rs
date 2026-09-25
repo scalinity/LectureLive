@@ -4,7 +4,7 @@ use std::mem::size_of;
 use std::ptr::null;
 
 use anyhow::{bail, Result};
-use core_foundation::array::CFArray;
+use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
@@ -119,4 +119,28 @@ pub fn destroy_aggregate(id: AudioObjectID) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     bail!("aggregate {uid} still present 2 s after destroy")
+}
+
+pub fn is_aggregate(id: AudioObjectID) -> Result<bool> {
+    let a = addr(kAudioDevicePropertyTransportType);
+    let mut t: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    check(
+        unsafe { AudioObjectGetPropertyData(id, &a, 0, null(), &mut size, &mut t as *mut _ as *mut c_void) },
+        "get transport type",
+    )?;
+    Ok(t == kAudioDeviceTransportTypeAggregate)
+}
+
+/// UIDs of an aggregate's subdevices, in order.
+pub fn aggregate_members(id: AudioObjectID) -> Result<Vec<String>> {
+    let a = addr(kAudioAggregateDevicePropertyFullSubDeviceList);
+    let mut list: CFArrayRef = std::ptr::null();
+    let mut size = size_of::<CFArrayRef>() as u32;
+    check(
+        unsafe { AudioObjectGetPropertyData(id, &a, 0, null(), &mut size, &mut list as *mut _ as *mut c_void) },
+        "get subdevice list",
+    )?;
+    let arr: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(list) };
+    Ok(arr.iter().map(|s| s.to_string()).collect())
 }

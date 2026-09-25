@@ -34,7 +34,7 @@ study document (`polish`).
 - G1 Live transcript with word-level fade-in, tentative words visibly distinct from committed ones.
 - G2 Snapshot → notes streamed token-by-token into the document pane; the file changes only by a verified, recoverable commit.
 - G3 Auto-capture of a selected region of the Zoom window on slide change, including small builds; manual capture always available.
-- G4 System audio via BlackHole loopback with automatic, crash-safe output routing; any physical input; mixed mode opt-in once it passes the drift gate (§4.2).
+- G4 System audio via BlackHole loopback through an app-owned Multi-Output device that only Zoom plays into; any physical input; mixed mode opt-in once it passes the drift gate (§4.2).
 - G5 Human-readable files compatible with the CLI's (Markdown notes, transcript, `slides/`), with exact resume.
 - G6 Captured audio is durable to within the last one-second checkpoint after a crash, and every interval without durable audio or without committed transcript is reported as a gap.
 - G7 `polish` and hint input as in the CLI.
@@ -164,7 +164,7 @@ Low-rate status goes over Tauri events: `SessionState`, `AudioLevel` (10/s),
 ### 4.1 Sources and permissions
 
 - **Input**: any CoreAudio input, persisted by device UID. The stream opens at a configuration the device supports (negotiated through cpal), not at a forced 16 kHz.
-- **Loopback**: the "BlackHole 2ch" input.
+- **Loopback**: the "BlackHole 2ch" input, fed by the app-owned "LectureLive Loopback" device that Zoom's Speaker is set to (§4.3).
 - **Mixed** (opt-in after the drift gate): input + loopback. Documented setup is headphones, so the room mic does not re-capture lecture audio already present in loopback. Per-source gain before summing; clamping is only a final safety limit.
 
 States per source: permission denied, device unavailable, stream started, signal
@@ -188,18 +188,34 @@ source is adjusted slowly to hold the FIFO level (independent clocks drift: 100 
 over two hours is 0.72 s). Mixed mode stays disabled until it passes a two-hour
 alignment test. On stop, the resampler tail and the final partial frame are drained.
 
-### 4.3 Output routing (macOS)
+### 4.3 Loopback device (macOS)
 
-Loopback needs Zoom's output to reach both the speakers/headphones and BlackHole:
+Zoom's output has to reach both the headphones or speakers and BlackHole. The app owns one
+Multi-Output device for this, Zoom's Speaker is set to it by name, and the system output is
+never changed:
 
-1. Before changing anything, persist the current default output UID in app state.
-2. Find the app-owned Multi-Output aggregate by its owner UID, or create it with `AudioHardwareCreateAggregateDevice` as a stacked (mirroring) device: subdevices = current output UID + BlackHole UID, clock source = the physical output, drift correction on BlackHole.
-3. Set it as default output. Preflight: ask the user to play Zoom audio and confirm signal on the BlackHole input while they can hear it. If Zoom is pinned to a specific speaker rather than "Same as System", the preflight fails and says so.
-4. On stop, restore the saved output only if the default output is still the app-owned aggregate; a later user change is respected.
-5. On launch, an abandoned app-owned route (saved state present, aggregate still default) triggers a restore offer. A pre-existing user aggregate is never modified or deleted.
-
-Known trade-off: a Multi-Output device has no global volume key control; volume is set
-per device or in Zoom.
+1. The device is a stacked (mirroring) aggregate with a fixed UID (`com.lecturelive.loopback`)
+   and the name "LectureLive Loopback". Its members are BlackHole 2ch, which is the clock
+   (it never disconnects, so taking off a pair of headphones cannot remove the clock), and one
+   physical output, with drift correction on the physical output.
+2. Setup creates the device, or rebuilds it under the same UID and name when the physical
+   output changes, so Zoom's choice stays valid. The physical output is the current system
+   output unless that is itself a multi-output device, in which case it is named explicitly.
+   Setup runs on request only, never during a recording: rebuilding the device under a
+   running meeting would move Zoom to another speaker.
+3. In Zoom → Settings → Audio, Speaker is set to "LectureLive Loopback" once. The system
+   output stays on a device that does not include BlackHole (the headphones or speakers), so
+   only Zoom reaches the transcript. Volume is set on the headphones or in Zoom; Zoom's
+   speaker slider also lowers the level that is transcribed.
+4. Preflight: play Zoom's Test Speaker and require a signal on the BlackHole input (loudest
+   second above −60 dBFS). During a loopback recording, ten consecutive seconds below
+   −60 dBFS raise a warning that names Zoom's Speaker setting. These are the only guards
+   against Zoom's Speaker drifting to a physical device, which captures nothing.
+5. A crash leaves nothing to undo: the device persists and the system output was never
+   changed. The M0 canary can still make its own aggregate the system default; at launch, a
+   route it left behind (saved state present) is undone, restoring the saved output only if
+   the canary's aggregate is still the default. A user-made aggregate is never modified or
+   deleted.
 
 ### 4.4 Recording
 
@@ -496,12 +512,12 @@ carry meaning.
 | Crash mid-commit | Journal recovery on launch (§6.2) |
 | Microphone or Screen Recording denied | Affected feature disabled with fix-it button; the rest works |
 | BlackHole missing | Loopback disabled with install hint (`brew install blackhole-2ch`) |
-| Routing preflight fails | Loopback not started; reason shown (e.g. Zoom pinned to a speaker) |
+| Loopback preflight fails | Reason shown: Zoom's Speaker is not "LectureLive Loopback"; ten silent seconds during a loopback recording raise the same warning |
 | Device disappears | Mixed: surviving source continues, gap marked. Single: source stops, fallback offered |
 | Sample-rate change | Stream rebuilt, new timing segment, gap marked |
 | Disk write error | Session stops cleanly, path surfaced |
 | Spend ledger write fails | Warning in the status; the request's result is kept and recording continues |
-| App crash | Recording valid to last checkpoint; route restore offered; journal recovery; unclosed utterance becomes a gap |
+| App crash | Recording valid to last checkpoint and repaired at launch; system output untouched; journal recovery; unclosed utterance becomes a gap |
 | External edit of notes | Accepted as new revision |
 
 ## 11. Testing
@@ -517,7 +533,7 @@ carry meaning.
 | M | Deliverable | Gate |
 |---|-------------|------|
 | M0 | Contract fixtures + packaged native canary | A packaged `.app` gets mic and Screen Recording permission, captures real Zoom audio through BlackHole with routing preflight, writes a playable WAV that survives `kill -9`, captures one correct window image, restores routing; STT protocol fixture recorded (finalize spelling, timestamp origin) |
-| M1 | Recording + loopback foundation (core + CLI) | 16/44.1/48 kHz inputs; interrupted WAV repaired; route restore after crash; no unexplained captured-audio gaps over 30 min |
+| M1 | Recording + loopback foundation (core + CLI) | 16/44.1/48 kHz inputs; interrupted WAV repaired; a crash leaves the system output untouched; loopback preflight through the app-owned device; no unexplained captured-audio gaps over 30 min |
 | M2 | Streaming + recovery (core + CLI) | Exact outputs on protocol fixtures; disconnect suite with no duplicate or missing committed intervals; REST recovery exercised |
 | M3 | Notes/session parity (core + CLI) | Golden prompts/formats; empty/truncated SSE; fault injection at every commit step; legacy migration; Python CLI refuses v2 folders; a fixture lecture distils to a study page within its budget |
 | M4 | Desktop app: transcript + notes panes | Hydration after reload, hint/cancel/polish, burst and two-hour fixtures within budget, sanitised rendering with scoped images |

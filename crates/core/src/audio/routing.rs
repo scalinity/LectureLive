@@ -62,7 +62,9 @@ pub fn disable_loopback(state_path: &Path) -> Result<bool> {
     let current = coreaudio::device_uid(coreaudio::default_output_device()?)?;
     let mut restored = false;
     if let Some(prev) = restore_target(&state, &current) {
-        let id = coreaudio::device_for_uid(&prev)?.with_context(|| format!("previous output {prev} is gone"))?;
+        let id = coreaudio::device_for_uid(&prev)?.with_context(|| {
+            format!("previous output {prev} is gone: choose an output in System Settings → Sound → Output, then run `route off` again")
+        })?;
         coreaudio::set_default_output(id)?;
         restored = true;
     }

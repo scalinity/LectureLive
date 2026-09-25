@@ -16,7 +16,7 @@ kickoff prompt carries this rule.
 | M | Name | Status | Depends on | Destroys anything | Plan |
 |---|------|--------|-----------|-------------------|------|
 | M0 | Contract fixtures + packaged native canary | done | — | Changes the system default output (restored by the canary) | [m0-native-canary](superpowers/plans/2026-09-22-m0-native-canary.md) |
-| M1 | Recording + loopback foundation | not started | M0 | Same as M0 | written at M1 start |
+| M1 | Recording + loopback foundation | in progress | M0 | Creates the "LectureLive Loopback" device; changes the system output only in the canary-route restore check, which restores it | [m1-recording-loopback](superpowers/plans/2026-09-25-m1-recording-loopback.md) |
 | M2 | Streaming + recovery | not started | M1 | No | written at M2 start |
 | M3 | Notes/session parity | not started | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | written at M3 start |
 | M4 | Desktop app: transcript + notes panes | not started | M3 | No | written at M4 start |
@@ -163,14 +163,22 @@ Tasks:
 2. Lock-free capture path: callback writes into a preallocated SPSC ring (`rtrb`); overflow counted as a recording gap (§3.4)
 3. Device identity by CoreAudio UID; property listeners for disappearance and sample-rate change; stream rebuild with new timing segment (§4.1)
 4. Session coordinator skeleton owning recorder and route state; bounded channels to workers (§3.2)
-5. Routing: preflight flow, conditional restore, abandoned-route detection on launch (§4.3)
+5. Loopback device: app-owned Multi-Output with BlackHole as clock, preflight and silence warning, abandoned canary route undone at launch (§4.3)
 6. Recorder retention rule and header repair on launch (§4.4)
 7. CLI `record` command on the coordinator
 
-**Gate:** 16/44.1/48 kHz inputs framed correctly (unit); interrupted WAV repaired on
-launch; route restored after `kill -9`; a 30-minute Zoom recording with no unexplained
-captured-audio gaps; unplugging the wireless receiver produces a marked gap and no
-automatic source switch.
+**Gate** (checked without a live lecture where the mechanism allows; plan Task 8):
+
+- [ ] 16/44.1/48 kHz inputs framed correctly (unit)
+- [ ] Interrupted WAV repaired on launch
+- [ ] `kill -9` during a loopback recording leaves the system output and "LectureLive Loopback" unchanged, and a canary route left behind is undone at the next launch
+- [ ] Loopback preflight passes with Zoom's Test Speaker played through "LectureLive Loopback"
+- [ ] Unplugging the wireless receiver produces a marked gap and no automatic source switch
+
+**At the first Zoom lecture after M1** (nothing else waits on it):
+
+- [ ] A 30-minute Zoom recording with no unexplained captured-audio gaps
+- [ ] M0's deferred check (the line under "At the first Zoom lecture after M0" above): the packaged `.app` captures the Zoom meeting window with a shared slide, and the image shows the slide
 
 ## M2 — Streaming + recovery
 
