@@ -17,6 +17,7 @@ use crate::audio::recorder::Recorder;
 use crate::audio::source::{Source, SourceEvent};
 use crate::session::segments::{NewSegment, Segment, SegmentLog, SegmentSource};
 use crate::session::sidecar::{sidecar_path, Gap, GapKind, RecState, RecordingEntry, Sidecar};
+use crate::session::spend::{Spend, SpendKind, BATCH_USD_PER_SECOND, STREAM_USD_PER_SECOND};
 use crate::stt::rest::{RecoverEvent, RecoverJob, RecoveryLink};
 use crate::stt::stream::{SttEvent, SttInput, SttLink};
 
@@ -33,6 +34,8 @@ pub struct SessionConfig {
     pub stt: Option<SttLink>,
     /// REST recovery of transcript gaps (spec §5.4).
     pub recovery: Option<RecoveryLink>,
+    /// The ledger speech-to-text costs are written to (spec §8).
+    pub spend: Option<Spend>,
 }
 
 #[derive(Debug)]
@@ -51,6 +54,8 @@ pub enum Notification {
     /// Recovery committed a transcript gap's whole interval.
     Recovered(Gap),
     RecoveryFailed(String),
+    /// The spend ledger could not be written (spec §10: a warning; nothing else stops).
+    SpendFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +187,7 @@ struct Coordinator {
     forwarded_to: u64,
     cutoffs: HashMap<u64, oneshot::Sender<CutoffResult>>,
     next_cutoff: u64,
+    spend: Option<Spend>,
 }
 
 impl Coordinator {
@@ -330,6 +336,15 @@ impl Coordinator {
         self.save().await
     }
 
+    /// A computed speech-to-text cost (spec §8); a ledger that cannot be written is a warning, never a stop (§10).
+    fn spend_audio(&self, samples: u64, usd_per_second: f64) {
+        let Some(spend) = &self.spend else { return };
+        let secs = samples as f64 / crate::audio::recorder::SAMPLE_RATE as f64;
+        if let Err(e) = spend.add(SpendKind::Transcribe, secs * usd_per_second, false, Some(secs)) {
+            self.notify(Notification::SpendFailed(format!("{e:#}")));
+        }
+    }
+
     fn add_gap(&mut self, g: Gap) -> Gap {
         self.sidecar.gaps.push(g.clone());
         self.notify(Notification::Gap(g.clone()));
@@ -390,6 +405,7 @@ impl Coordinator {
                     let _ = reply.send(CutoffResult { confirmed, segments: self.segment_count() });
                 }
             }
+            SttEvent::Streamed { samples, .. } => self.spend_audio(samples, STREAM_USD_PER_SECOND),
             SttEvent::Retrying { after, reason } => self.notify(Notification::Stt(SttStatus::Retrying { after, reason })),
             SttEvent::ServerError(m) => self.notify(Notification::Stt(SttStatus::ServerError(m))),
             SttEvent::Refused(m) => self.notify(Notification::Stt(SttStatus::Refused(m))),
@@ -400,6 +416,7 @@ impl Coordinator {
     async fn on_recovery(&mut self, ev: RecoverEvent) -> Result<()> {
         match ev {
             RecoverEvent::Piece { recording_id, start_sample, end_sample, text, words, .. } => {
+                self.spend_audio(end_sample - start_sample, BATCH_USD_PER_SECOND);
                 if !text.is_empty() {
                     self.commit(NewSegment { recording_id, start_sample, end_sample, text, words, source: SegmentSource::Recovered }).await?;
                 }
@@ -499,6 +516,7 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
         forwarded_to: 0,
         cutoffs: HashMap::new(),
         next_cutoff: 0,
+        spend: cfg.spend,
     };
     // Transcript gaps an earlier session left (a crash, recovery cut short) are recovered first.
     let pending: Vec<Gap> = c.sidecar.gaps.iter().filter(|g| g.kind.is_transcript() && !g.resolved).cloned().collect();
@@ -1056,5 +1074,33 @@ mod tests {
             vec![Gap::new(a, 0, Some(32_000), GapKind::SttInterrupted), Gap::new(b, 0, Some(len_b), GapKind::SttInterrupted)],
             "both recordings' audio waits for recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_and_recovered_audio_are_written_to_the_ledger() {
+        use crate::session::spend::{self, Spend};
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("spend.jsonl");
+        let spend = Spend::open(&ledger, "Machine Learning", "Week 01", chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap()).unwrap();
+        let a = Uuid::new_v4();
+        let stt = scripted_stt(move |i| match i {
+            SttInput::End { samples, .. } => vec![
+                SttEvent::Streamed { recording_id: a, samples: 16_000 },
+                SttEvent::Ended { recording_id: a, gap: Some(Gap::new(a, 8_000, Some(samples), GapKind::SttOffline)) },
+            ],
+            _ => vec![],
+        });
+        let recovery = scripted_recovery(|j| {
+            vec![
+                RecoverEvent::Piece { recording_id: j.recording_id, gap_start: j.gap_start, start_sample: j.from, end_sample: j.end, text: "recovered".into(), words: vec![] },
+                RecoverEvent::Done { recording_id: j.recording_id, gap_start: j.gap_start },
+            ]
+        });
+        let cfg = SessionConfig { stt: Some(stt), recovery: Some(recovery), spend: Some(spend), ..cfg(dir.path()) };
+        run_with(cfg, Script(recording(a, 10))).await.0.unwrap();
+        let entries = spend::read(&ledger).unwrap();
+        let got: Vec<(&str, f64, bool, Option<f64>)> = entries.iter().map(|e| (e.what.as_str(), e.usd, e.billed, e.audio_s)).collect();
+        assert_eq!(got, vec![("transcribe", 0.000056, false, Some(1.0)), ("transcribe", 0.000014, false, Some(0.5))]);
+        assert!(entries.iter().all(|e| e.course == "Machine Learning" && e.lecture == "Week 01"));
     }
 }

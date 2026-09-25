@@ -233,7 +233,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
         device.context("give --loopback or --device <UID> (`lecturelive inputs` lists them)")?
     };
 
-    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, stt: stt_link, recovery }, Box::new(DeviceSource { uid }));
+    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, stt: stt_link, recovery, ..Default::default() }, Box::new(DeviceSource { uid }));
     let mut watch = use_loopback.then(|| SilenceWatch::new(-60.0, 10));
     let timer = async {
         match secs_limit {
@@ -284,6 +284,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
                     g.recording_id
                 ),
                 Some(Notification::RecoveryFailed(m)) => eprintln!("recovery: {m}"),
+                Some(Notification::SpendFailed(m)) => eprintln!("warning: {m}"),
             },
             _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; handle.request_stop(); }
             _ = &mut timer, if !stopping => { stopping = true; handle.request_stop(); }

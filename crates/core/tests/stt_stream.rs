@@ -414,3 +414,15 @@ async fn a_disconnect_during_the_flush_leaves_the_cutoff_pending() {
     assert!(ev.iter().any(|e| matches!(e, SttEvent::Retrying { .. })));
     assert_partition(&ev, 100 * 1600);
 }
+
+#[tokio::test]
+async fn the_audio_a_recording_streamed_is_reported_before_it_ends() {
+    let fake = fake_stt::start(Config::default()).await;
+    let mut link = spawn(cfg(&fake)).unwrap();
+    let id = begin(&link).await;
+    fake.state.wait_accepted(1).await;
+    feed(&link, &fake, (0..30).map(|k| speech_frame(id, k))).await;
+    end(&link, id, 48_000).await;
+    let ev = until_ended(&mut link).await;
+    assert_eq!(ev[ev.len() - 2], SttEvent::Streamed { recording_id: id, samples: 48_000 }, "for the spend ledger (spec §8)");
+}

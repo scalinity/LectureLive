@@ -102,6 +102,8 @@ pub enum SttEvent {
     Open { recording_id: Uuid, stable: String, tentative: String },
     /// A closed utterance with text: commit it.
     Utterance { recording_id: Uuid, utterance: Utterance },
+    /// The audio this recording's connections carried, for the spend ledger (spec §8); sent just before `Ended`.
+    Streamed { recording_id: Uuid, samples: u64 },
     /// The recording's live transcript is finished; `gap` is its tail that no connection transcribed.
     Ended { recording_id: Uuid, gap: Option<Gap> },
     /// The cutoff is settled: confirmed when the recording's transcript is committed through it.
@@ -159,6 +161,8 @@ struct Rec {
     held: VecDeque<Frame>,
     /// Why the audio after `settled` may lack a transcript: the kind of the gap that reports it.
     cause: Option<GapKind>,
+    /// Audio sent on this recording's connections.
+    streamed: u64,
 }
 
 struct Worker {
@@ -212,7 +216,7 @@ impl Worker {
         match i {
             SttInput::Begin { recording_id } => {
                 let cause = self.refused.then_some(GapKind::SttRefused);
-                self.rec = Some(Rec { id: recording_id, settled: 0, next: 0, received_to: 0, held: VecDeque::new(), cause });
+                self.rec = Some(Rec { id: recording_id, settled: 0, next: 0, received_to: 0, held: VecDeque::new(), cause, streamed: 0 });
                 self.failures = 0;
                 self.connect();
             }
@@ -318,6 +322,7 @@ impl Worker {
         let sent = tokio::time::timeout(self.cfg.send_timeout, epoch.ws.send(Message::Binary(bytes.into()))).await;
         if matches!(sent, Ok(Ok(()))) {
             epoch.sent_to = f.sample_offset + f.valid_samples as u64;
+            rec.streamed += f.valid_samples as u64;
         }
         if let Some(e) = started {
             self.emit(e).await;
@@ -452,6 +457,9 @@ impl Worker {
             }
         }
         let Some(rec) = self.rec.take() else { return };
+        if rec.streamed > 0 {
+            self.emit(SttEvent::Streamed { recording_id, samples: rec.streamed }).await;
+        }
         let cause = rec.cause.unwrap_or(if samples > rec.received_to { GapKind::SttOverflow } else { GapKind::SttOffline });
         let gap = (samples > rec.settled + SERVER_RESOLUTION).then(|| Gap::new(recording_id, rec.settled, Some(samples), cause));
         self.emit(SttEvent::Ended { recording_id, gap }).await;
