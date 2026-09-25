@@ -12,6 +12,7 @@ use super::recorder::Recorder;
 
 pub struct InputInfo {
     pub name: String,
+    pub uid: String,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -27,9 +28,14 @@ pub fn list_inputs() -> Result<Vec<InputInfo>> {
     let mut out = Vec::new();
     for d in host.input_devices()? {
         let cfg = d.default_input_config()?;
-        out.push(InputInfo { name: d.description()?.name().to_string(), sample_rate: cfg.sample_rate(), channels: cfg.channels() });
+        out.push(InputInfo { name: d.description()?.name().to_string(), uid: d.id()?.id().to_string(), sample_rate: cfg.sample_rate(), channels: cfg.channels() });
     }
     Ok(out)
+}
+
+/// Inputs are identified by CoreAudio device UID (spec §4.1); cpal's device id is that UID.
+pub fn find_input(uid: &str) -> Result<Option<cpal::Device>> {
+    Ok(cpal::default_host().input_devices()?.find(|d| d.id().map(|i| i.id() == uid).unwrap_or(false)))
 }
 
 /// Records `device_name` for `duration` into `dir` as 16 kHz mono PCM16.

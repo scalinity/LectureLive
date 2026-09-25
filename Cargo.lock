@@ -2533,6 +2533,7 @@ dependencies = [
  "futures-util",
  "hound",
  "image",
+ "objc2-av-foundation",
  "rtrb",
  "rubato",
  "rustls",

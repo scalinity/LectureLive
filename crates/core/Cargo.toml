@@ -16,6 +16,7 @@ cpal = "0.18.2"
 futures-util = "0.3.34"
 hound = "3.5"
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat"] }
 rtrb = "0.4.0"
 rubato = "5.0.0"
 rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
