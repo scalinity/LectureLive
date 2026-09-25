@@ -3,8 +3,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lecturelive_core::audio::{input, recorder, routing};
+use lecturelive_core::audio::level::{self, SilenceWatch};
+use lecturelive_core::audio::permission::{self, MicPermission};
+use lecturelive_core::audio::source::DeviceSource;
+use lecturelive_core::audio::{input, loopback, recorder, routing};
 use lecturelive_core::capture::window;
+use lecturelive_core::session::coordinator::{self, Notification, SessionConfig};
+use lecturelive_core::session::launch::{self, Retention};
+use lecturelive_core::session::lock::FolderLock;
 use lecturelive_core::stt::probe;
 
 #[derive(Parser)]
@@ -16,8 +22,45 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// List inputs with their CoreAudio UIDs
+    Inputs,
+    /// List outputs with their CoreAudio UIDs
+    Outputs,
+    #[command(subcommand)]
+    Loopback(Loopback),
+    /// Record an input (or Zoom through BlackHole) into a lecture folder until Ctrl-C
+    Record {
+        #[arg(long, conflicts_with = "device")]
+        loopback: bool,
+        /// Input device UID (see `inputs`)
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Stop after this many seconds
+        #[arg(long)]
+        secs: Option<u64>,
+        /// Delete closed recordings older than this many days that have no unresolved gap
+        #[arg(long)]
+        keep_days: Option<u32>,
+    },
     #[command(subcommand)]
     Canary(Canary),
+}
+
+#[derive(Subcommand)]
+enum Loopback {
+    /// Create or rebuild "LectureLive Loopback" (BlackHole + one physical output)
+    Setup {
+        #[arg(long)]
+        output: Option<String>,
+    },
+    Status,
+    /// Measure BlackHole while Zoom's Test Speaker plays
+    Check {
+        #[arg(long, default_value_t = 15)]
+        secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,20 +99,155 @@ enum Canary {
         #[arg(long)]
         log: PathBuf,
     },
+    /// Play a tone on one output device (no system output change)
+    Tone {
+        #[arg(long)]
+        output: String,
+        #[arg(long, default_value_t = 5.0)]
+        secs: f32,
+        #[arg(long, default_value_t = 0.1)]
+        amp: f32,
+    },
 }
 
-fn route_state_path() -> Result<PathBuf> {
+fn data_dir() -> Result<PathBuf> {
     let dir = dirs::data_dir().context("no Application Support dir")?.join("LectureLive");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("route.json"))
+    Ok(dir)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Cmd::Canary(c) = Cli::parse().cmd;
+    match Cli::parse().cmd {
+        Cmd::Inputs => {
+            for i in input::list_inputs()? {
+                println!("{:<32} {:<40} {} Hz  {} ch", i.name, i.uid, i.sample_rate, i.channels);
+            }
+        }
+        Cmd::Outputs => {
+            for o in loopback::list_outputs()? {
+                println!("{:<32} {:<40} {}", o.name, o.uid, if o.is_aggregate { "multi-output" } else { "" });
+            }
+        }
+        Cmd::Loopback(l) => loopback_cmd(l)?,
+        Cmd::Record { loopback, device, dir, secs, keep_days } => record(loopback, device, dir, secs, keep_days).await?,
+        Cmd::Canary(c) => canary(c).await?,
+    }
+    Ok(())
+}
+
+fn loopback_cmd(l: Loopback) -> Result<()> {
+    match l {
+        Loopback::Setup { output } => {
+            let (action, physical) = loopback::setup(output.as_deref())?;
+            println!("{}: {action:?} with BlackHole 2ch (clock) + {physical}", loopback::LOOPBACK_NAME);
+            println!("Zoom → Settings → Audio → Speaker: choose \"{}\". Keep the system output on a device without BlackHole.", loopback::LOOPBACK_NAME);
+        }
+        Loopback::Status => println!("{:#?}", loopback::status()?),
+        Loopback::Check { secs } => {
+            println!("Play Zoom's Test Speaker (Zoom → Settings → Audio) now; measuring BlackHole for {secs} s…");
+            let dir = data_dir()?.join("checks");
+            let mut loudest = 0f32;
+            let r = input::record_for("BlackHole 2ch", Duration::from_secs(secs), &dir, |l| {
+                println!("  {:>6.1} dBFS", level::dbfs(l));
+                loudest = loudest.max(l);
+            })?;
+            let db = level::dbfs(loudest);
+            anyhow::ensure!(db > -60.0, "no signal on BlackHole (loudest {db:.1} dBFS): Zoom's Speaker must be \"{}\"", loopback::LOOPBACK_NAME);
+            println!("pass: loudest {db:.1} dBFS ({})", r.path.display());
+        }
+    }
+    Ok(())
+}
+
+async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>, secs: Option<u64>, keep_days: Option<u32>) -> Result<()> {
+    match permission::microphone() {
+        MicPermission::Denied | MicPermission::Restricted => {
+            anyhow::bail!("microphone access is denied for this terminal: System Settings → Privacy & Security → Microphone")
+        }
+        p => println!("microphone permission: {p:?}"),
+    }
+    let dir = match dir {
+        Some(d) => d,
+        None => data_dir()?.join("record"),
+    };
+    std::fs::create_dir_all(&dir)?;
+    let _lock = FolderLock::acquire(&dir)?;
+    if let Some(restored) = launch::restore_abandoned_route(&data_dir()?.join("route.json"))? {
+        println!("undid a canary route left behind; default output restored: {restored}");
+    }
+    let stem = format!("lecture_notes_{}", chrono::Local::now().format("%Y%m%d"));
+    let retention = keep_days.map_or(Retention::KeepAll, Retention::KeepDays);
+    let report = launch::recover(&dir, &stem, retention, chrono::Local::now())?;
+    for (p, n) in &report.repaired {
+        println!("repaired {} ({:.1} s)", p.display(), *n as f64 / 16_000.0);
+    }
+    for p in &report.missing {
+        println!("missing {} (marked as a gap)", p.display());
+    }
+    for p in &report.pruned {
+        println!("deleted {} (retention)", p.display());
+    }
+    let uid = if use_loopback {
+        let s = loopback::status()?;
+        anyhow::ensure!(s.blackhole_present, "BlackHole 2ch is not installed (brew install blackhole-2ch)");
+        if !s.present {
+            println!("warning: {} is not set up (`lecturelive loopback setup`); recording BlackHole anyway", loopback::LOOPBACK_NAME);
+        }
+        loopback::BLACKHOLE_UID.to_string()
+    } else {
+        device.context("give --loopback or --device <UID> (`lecturelive inputs` lists them)")?
+    };
+
+    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem }, Box::new(DeviceSource { uid }));
+    let mut watch = use_loopback.then(|| SilenceWatch::new(-60.0, 10));
+    let timer = async {
+        match secs {
+            Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(timer);
+    let mut stopping = false;
+    let mut seconds = 0u64;
+    loop {
+        tokio::select! {
+            n = notes.recv() => match n {
+                None => break,
+                Some(Notification::Recording { path }) => println!("recording to {}", path.display()),
+                Some(Notification::Level(l)) => {
+                    seconds += 1;
+                    if seconds % 10 == 0 {
+                        println!("{:>6} s  {:>6.1} dBFS", seconds, level::dbfs(l));
+                    }
+                    if watch.as_mut().is_some_and(|w| w.observe(l)) {
+                        println!("warning: 10 s of silence on BlackHole — is Zoom's Speaker \"{}\"?", loopback::LOOPBACK_NAME);
+                    }
+                }
+                Some(Notification::Gap(g)) => println!("gap: {:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id),
+                Some(Notification::DeviceGone { uid }) => println!(
+                    "input {uid} disappeared at {}; waiting for it to return (no other input is used). Ctrl-C stops.",
+                    chrono::Local::now().format("%H:%M:%S")
+                ),
+                Some(Notification::DeviceBack { uid }) => println!("input {uid} is back at {}; recording continues in a new file", chrono::Local::now().format("%H:%M:%S")),
+                Some(Notification::Failed(msg)) => eprintln!("session failed: {msg}"),
+            },
+            _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; handle.request_stop(); }
+            _ = &mut timer, if !stopping => { stopping = true; handle.request_stop(); }
+        }
+    }
+    let report = handle.finish().await?;
+    for (p, n) in &report.recordings {
+        println!("{} — {:.1} s", p.display(), *n as f64 / 16_000.0);
+    }
+    println!("gaps in the sidecar: {}, stream errors: {}", report.gaps, report.stream_errors);
+    Ok(())
+}
+
+async fn canary(c: Canary) -> Result<()> {
     match c {
         Canary::Route { action } => {
-            let p = route_state_path()?;
+            let p = data_dir()?.join("route.json");
             match action.as_str() {
                 "on" => println!("routed; saved previous output {:?}", routing::enable_loopback(&p)?.previous_output_uid),
                 "off" => println!("restored default output: {}", routing::disable_loopback(&p)?),
@@ -116,6 +294,7 @@ async fn main() -> Result<()> {
             .await?;
             println!("{s:#?}");
         }
+        Canary::Tone { output, secs, amp } => lecturelive_core::audio::tone::play_tone(&output, secs, amp)?,
     }
     Ok(())
 }
