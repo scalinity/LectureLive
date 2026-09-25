@@ -60,14 +60,15 @@ pub async fn probe(opts: ProbeOptions) -> Result<ProbeSummary> {
         }
     }
 
+    // Shared so that messages received before a timeout still reach the log.
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = received.clone();
     let reader = tokio::spawn(async move {
-        let mut lines = Vec::new();
         while let Some(Ok(msg)) = rx.next().await {
             if let Message::Text(t) = msg {
-                lines.push((Instant::now(), t.to_string()));
+                sink.lock().unwrap().push((Instant::now(), t.to_string()));
             }
         }
-        lines
     });
 
     for (i, frame) in opts.pcm.chunks(1600).enumerate() {
@@ -82,10 +83,12 @@ pub async fn probe(opts: ProbeOptions) -> Result<ProbeSummary> {
             tokio::time::sleep(opts.pace).await;
         }
     }
-    tx.send(Message::Text("audio.done".into())).await?;
-    write_line(&mut log, started, "out", Value::String("audio.done".into())).await?;
+    const AUDIO_DONE: &str = r#"{"type":"audio.done"}"#; // bare `audio.done` is rejected as invalid JSON
+    tx.send(Message::Text(AUDIO_DONE.into())).await?;
+    write_line(&mut log, started, "out", Value::String(AUDIO_DONE.into())).await?;
 
-    let received = tokio::time::timeout(Duration::from_secs(30), reader).await.context("waiting for transcript.done")??;
+    let finished = tokio::time::timeout(Duration::from_secs(30), reader).await;
+    let received = std::mem::take(&mut *received.lock().unwrap());
     for (at, t) in received {
         let v: Value = serde_json::from_str(&t).unwrap_or(Value::String(t));
         summary.messages += 1;
@@ -94,5 +97,6 @@ pub async fn probe(opts: ProbeOptions) -> Result<ProbeSummary> {
         log.write_all(format!("{line}\n").as_bytes()).await?;
     }
     log.flush().await?;
+    finished.context("waiting for transcript.done")??;
     Ok(summary)
 }

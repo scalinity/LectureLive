@@ -32,7 +32,7 @@ async fn probe_sends_paced_pcm_frames_and_logs_every_message() {
                 Message::Text(t) => {
                     let t = t.to_string();
                     texts.push(t.clone());
-                    if t == "audio.done" {
+                    if t == r#"{"type":"audio.done"}"# {
                         ws.send(Message::Text(r#"{"type":"transcript.done","transcript":"hi","words":[]}"#.into())).await.unwrap();
                         ws.close(None).await.ok();
                         break;
@@ -61,7 +61,7 @@ async fn probe_sends_paced_pcm_frames_and_logs_every_message() {
     let (auth, sizes, texts) = server.await.unwrap();
     assert_eq!(auth.as_deref(), Some("Bearer test-key"));
     assert_eq!(sizes, vec![3200, 3200, 3200, 200]); // little-endian PCM16, last frame partial
-    assert_eq!(texts, vec![r#"{"type":"finalize"}"#.to_string(), "audio.done".to_string()]);
+    assert_eq!(texts, vec![r#"{"type":"finalize"}"#.to_string(), r#"{"type":"audio.done"}"#.to_string()]);
     assert!(summary.saw_created && summary.saw_done);
     assert_eq!(summary.frames_sent, 4);
     let lines = std::fs::read_to_string(&log).unwrap();
