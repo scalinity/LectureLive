@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -25,12 +25,50 @@ pub struct Sidecar {
     /// rate change the next recording opens while the last is still being flushed, hence a list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_utterances: Vec<OpenUtterance>,
+    /// The day the lecture's files were created; it does not change across midnight (spec §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lecture_date: Option<NaiveDate>,
+    /// What the notes document holds (spec §6.2, §8).
+    #[serde(default, skip_serializing_if = "NotesState::is_empty")]
+    pub notes: NotesState,
+    /// Registered slides, in registration order (spec §7.3, §8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slides: Vec<SlideEntry>,
 }
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new() }
+        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new() }
     }
+}
+
+/// The notes document's committed state: its revision and fingerprint, and the cursors of what it holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotesState {
+    /// Advances with every commit, polish and accepted external edit.
+    pub revision: u64,
+    /// Length and SHA-256 (hex) of the notes file at this revision.
+    pub len: u64,
+    pub sha256: String,
+    /// Segment-log positions below this are in the notes.
+    pub segment_cursor: u64,
+    /// Slides with an index up to this are in the notes.
+    pub slide_index: u32,
+}
+
+impl NotesState {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlideEntry {
+    pub index: u32,
+    /// Relative to the lecture folder (absolute when the slides folder is elsewhere).
+    pub file: String,
+    /// When it was first on screen; for an imported image, its file time.
+    pub shown_at: DateTime<Local>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,5 +296,21 @@ mod tests {
     fn wall_time_is_the_anchor_plus_samples() {
         let anchor = Local.with_ymd_and_hms(2026, 9, 25, 10, 0, 0).unwrap();
         assert_eq!(wall_time_at(anchor, 66_288), anchor + chrono::Duration::milliseconds(4_143));
+    }
+
+    #[test]
+    fn notes_state_and_slides_round_trip_and_an_m2_sidecar_is_written_back_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sidecar_path(dir.path(), "x");
+        let mut s = Sidecar { lecture_date: chrono::NaiveDate::from_ymd_opt(2026, 9, 25), ..Sidecar::default() };
+        s.notes = NotesState { revision: 3, len: 120, sha256: "ab".repeat(32), segment_cursor: 7, slide_index: 2 };
+        s.slides.push(SlideEntry { index: 1, file: "slides/slide_01_100512.png".into(), shown_at: Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 12).unwrap() });
+        s.save(&path).unwrap();
+        assert_eq!(Sidecar::load(&path).unwrap().unwrap(), s);
+
+        let m2 = r#"{"version":2,"recordings":[],"gaps":[]}"#;
+        let old: Sidecar = serde_json::from_str(m2).unwrap();
+        assert_eq!((old.lecture_date, old.notes.clone(), old.slides.len()), (None, NotesState::default(), 0));
+        assert_eq!(serde_json::to_string(&old).unwrap(), m2, "fields M3 did not set are not written");
     }
 }

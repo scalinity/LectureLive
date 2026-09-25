@@ -16,6 +16,8 @@ use crate::stt::transcript::Word;
 pub enum SegmentSource {
     Live,
     Recovered,
+    /// A line imported from the Python CLI's transcript: second resolution, no words (spec §8).
+    Imported,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
