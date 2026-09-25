@@ -6,6 +6,11 @@ gate holds. Each milestone gets its own step-by-step plan when it begins, becaus
 previous milestone's findings (routing behaviour, crate versions, protocol details)
 change it. Plans live in `docs/superpowers/plans/`.
 
+Any task that creates or changes UI — the desktop app's views, the study page template
+(`notes_template.html`), or any other page a person looks at — invokes
+`/frontend-design:frontend-design` before any markup is written (spec §9.4). Every plan and
+kickoff prompt carries this rule.
+
 ## Status
 
 | M | Name | Status | Depends on | Destroys anything | Plan |
@@ -211,8 +216,9 @@ its cached parts without requests.
 
 ## M4 — Desktop app: transcript + notes panes
 
-Spec: §3.6, §9. Visual design produced with the frontend-design skill at the start of
-this milestone.
+Spec: §3.6, §9. Visual design produced with `/frontend-design:frontend-design` at the
+start of this milestone, before any pane is built; tasks 3–5 and 7 invoke it again for
+their own views.
 
 Tasks:
 
@@ -230,7 +236,8 @@ frame work under 16.7 ms; rendered Markdown cannot run script or load remote con
 
 ## M5 — Slide automation
 
-Spec: §7.
+Spec: §7. The region picker and the slides strip are UI: both invoke
+`/frontend-design:frontend-design` before any markup is written.
 
 Tasks:
 

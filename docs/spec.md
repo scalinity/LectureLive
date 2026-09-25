@@ -359,7 +359,7 @@ each section's slides and flagged points, a switch on every redraw back to its
 screenshot, self-test mode (definitions, takeaways, example steps and formulas hidden
 until clicked), glossary definitions on the first use of each term per section, a formula
 sheet, questions with folded answers, and the All slides gallery. It works in light and dark, at phone width and
-in print. Math (KaTeX) and fonts load from the web with pinned versions and integrity
+in print. Changes to the template's design go through `/frontend-design:frontend-design` (§9.4). Math (KaTeX) and fonts load from the web with pinned versions and integrity
 hashes; offline the page stays readable with math shown as TeX.
 
 ## 7. Slide capture
@@ -478,9 +478,12 @@ the lecture's `slides/`. CSP forbids remote loads.
 
 ### 9.4 Visual design
 
-Produced at build time with the frontend-design skill: readable at arm's length, light
-and dark, a large-type toggle, no decorative motion beyond the fade-ins that carry
-meaning.
+All UI work invokes `/frontend-design:frontend-design` before any markup is written:
+the desktop app (`apps/desktop/src/`), the study page template (`notes_template.html`,
+§6.4), and any other page or view a person looks at. That includes changes to an
+existing view, not only new ones. The design is readable at arm's length, light and
+dark, has a large-type toggle, and has no decorative motion beyond the fade-ins that
+carry meaning.
 
 ## 10. Errors and robustness
 
