@@ -18,7 +18,7 @@ kickoff prompt carries this rule.
 | M0 | Contract fixtures + packaged native canary | done | — | Changes the system default output (restored by the canary) | [m0-native-canary](superpowers/plans/2026-09-22-m0-native-canary.md) |
 | M1 | Recording + loopback foundation | done | M0 | Creates the "LectureLive Loopback" device; changes the system output only in the canary-route restore check, which restores it | [m1-recording-loopback](superpowers/plans/2026-09-25-m1-recording-loopback.md) |
 | M2 | Streaming + recovery | done | M1 | No | [m2-streaming-recovery](superpowers/plans/2026-09-25-m2-streaming-recovery.md) |
-| M3 | Notes/session parity | not started | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | written at M3 start |
+| M3 | Notes/session parity | done | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | [m3-notes-session-parity](superpowers/plans/2026-09-25-m3-notes-session-parity.md) |
 | M4 | Desktop app: transcript + notes panes | not started | M3 | No | written at M4 start |
 | M5 | Slide automation | not started | M4 | No | written at M5 start |
 | M6 | Full-lecture acceptance; mixed mode; Python retired | not started | M5 | Removes `live_notes.py` | written at M6 start |
@@ -408,7 +408,7 @@ Tasks:
 
 1. Prompts carried over from `live_notes.py` with golden tests
 2. Batch builder and timeline (tie rule, slide-boundary splitting) (§6.1)
-3. Context budget and revision-keyed prefix summary (§6.1)
+3. Context budget with a local outline of the omitted prefix (§6.1)
 4. SSE client with strict success criteria (§6.2)
 5. Embed validation and repair (§6.2)
 6. Commit journal and launch recovery with fault injection at every step (§6.2)
@@ -418,11 +418,120 @@ Tasks:
 10. Spend ledger: one line per paid request, billed or computed, CLI format; takes over the CLI's ledger (§8)
 11. Study page: one distillation request over the whole notes and slides within a word budget, revision on overshoot, section re-cut, fragment stripping, page cache keyed to prompt and notes, single-pass template fill with `notes_template.html` embedded (§6.4)
 
-**Gate:** golden prompts and file formats (including the spend ledger) match `live_notes.py`; empty and truncated SSE
-leave the document untouched; fault injection between every commit step recovers
-correctly; a legacy folder migrates; the Rust CLI runs a full lecture headless; a
-fixture lecture distils to a complete study page within its budget, and an unchanged one re-renders from
-its cached parts without requests.
+**Gate** (checked in `cargo test` against fakes, plus live checks on synthetic lectures; plan Task 15):
+
+- [x] Golden prompts and file formats (including the spend ledger) match `live_notes.py`
+- [x] Empty and truncated SSE leave the document untouched
+- [x] Fault injection between every commit step recovers correctly
+- [x] A legacy folder migrates (and the Python CLI refuses a v2 folder)
+- [x] The Rust CLI runs a full lecture headless
+- [x] A fixture lecture distils to a complete study page within its budget, and an unchanged one re-renders from its cached parts without requests
+
+**Findings** (acceptance run 2026-09-25; live runs in `~/Library/Application Support/LectureLive/m3-*`, outside the repository):
+
+*Suite.* `cargo test -p lecturelive-core`: 229 passed, 0 failed, 9 ignored (M1's four hardware tests, M2's three live tests, M3's two live tests). The gate files are `lecture_gate` (5 tests, five consecutive runs green, about 2.2 s), `notes_chat` (10), `notes_page` (2), and the `notesfile`, `folder`, `spend`, `timeline`, `embeds`, `page`, `prompts` and `pyjson` unit tests.
+
+*New crates* (`Cargo.lock`): `regex 1.13.1`, `sha2 0.11.0`, `base64 0.23.1`; `reqwest 0.13.5` gains `stream`; `serde_json 1.0.151` gains `preserve_order`, so Python-format JSON keeps insertion order. Map equality stays order-insensitive, and every M0–M2 test passed unchanged with it.
+
+*SSE protocol recorded while planning* (`crates/core/tests/fixtures/notes/*.sse`; spec §6.2 now states it; about $0.005):
+- A streamed chat response reports its cost only when asked with `stream_options: {"include_usage": true}`, and then only once: a chunk with `choices: []` and `usage.cost_in_usd_ticks` after the finish chunk, then `data: [DONE]`. Without the option, no cost appears at all.
+- Reasoning deltas (`delta.reasoning_content`) come before content deltas; the first carries `role`.
+- A `max_tokens` cut ends with `finish_reason: "length"` and is still billed.
+- Refusals are HTTP 400 before any stream, with the STT endpoint's `{"code","error"}` body.
+- `grok-4.7` reports a 500,000-token context and a 200,000-token `long_context_threshold`, above which every token is billed at twice the rate. The §6.1 budget is that threshold, so §14.2 did not have to be measured to set it.
+
+*What the fake SSE endpoint encodes* (`crates/core/tests/support/fake_sse.rs`): replays of the recorded streams in pieces of any size (7 bytes up to 1 KB); synthetic answers in api.x.ai's order (reasoning, word-sized content deltas, finish, usage chunk, `[DONE]`); a stall after the headers; refusals by status with the real body. It records every request body.
+
+*Golden comparisons.*
+- **Prompts.** The four system prompts are compared with `live_notes.py`'s f-strings evaluated from its source by the test, for two courses (one non-ASCII) and several budgets and slide counts. The user messages have hand goldens, and every fixed fragment of them is checked to appear in the source.
+- **Spend ledger.** Byte-identical to the CLI's real ledger line (read with `od -c`): Python `json.dumps` defaults, `—` for the em dash, `repr` floats, `usd` rounded to 6 decimals and `audio_s` to 1. Live check: the CLI ledger's one line, imported into the app ledger by take-over, compares byte-identical with `cmp`. The spend view is golden-compared with `show_spend`'s layout.
+- **Other formats.** Transcript lines `[HH:MM:SS] text` and `--- started|resumed HH:MM:SS ---`, the notes block `\n<!-- HH:MM:SS -->\n…\n`, the title line, and the timeline lines (`>>> Slide N shown (embed: …)`) are compared with the formats `live_notes.py` writes in code. The study page cache is the CLI's own file (`{"source", "fills", "words", "budget"}`, keyed to the SHA-256 of prompt and notes), so either tool re-renders the other's cache.
+- **Not done.** No fresh Python CLI run was made to byte-compare notes and transcript output on the same fixtures. Those formats are compared with the code that writes them.
+
+*Fault injection per commit step* (`notesfile::tests::a_crash_at_every_commit_step_recovers_to_the_block_exactly_once`). Each case crashes at one point, reloads the sidecar from disk, recovers, and checks that the block lands exactly once:
+
+| Crash point | Recovery | Outcome |
+|---|---|---|
+| Journal's temp file only | Nothing | Material pending, then committed once |
+| After the journal | Not appended | Committed once on retry |
+| Mid-append (20 bytes written) | Truncated | Committed once on retry |
+| After the append | Completed | Cursors advanced |
+| After the cursors | Completed | Idempotent, no second advance |
+| After the clear | Nothing | — |
+
+Recovery stops and changes nothing in three further cases: the notes no longer begin with the recorded "before"; they grew past the block; or (after review) the tail is text typed by hand rather than the block's start. After review, a commit that finds an earlier commit's journal in the same session repairs it first, and refuses a stale batch when that earlier block had completed.
+
+*Legacy migration* (`folder::tests`, `lecture_gate::a_legacy_folder_migrates…`), on synthetic folders in the Python CLI's exact formats. No real lecture folder was touched.
+- `transcript_offset` and the older `noted_through` checkpoints both migrate; lines before the checkpoint count as noted.
+- The CLI's half-written snapshot (a `commit` entry) is finished or undone as `recover_commit` does, in its own words.
+- Imported lines roll to the next day past midnight.
+- Notes without state, and a corrupt sidecar with `--rebuild`, are rebuilt from the last `<!-- -->` marker; the corrupt file is kept beside.
+- The next snapshot sends exactly the pending legacy lines.
+- `live_notes.py page` in a folder holding `.live_notes/*.v2.json` prints "This folder is kept by the LectureLive app now (.live_notes/*.v2.json). Run `lecturelive lecture` here instead." and exits 1. In a plain folder it behaves as before and touches nothing.
+
+*The headless lecture.*
+- **Fakes** (`lecture_gate::a_whole_lecture_runs_headless_from_first_word_to_study_page`): speech into the fake STT, a slide dropped into `slides/`, a snapshot, a hinted snapshot, polish and page, then stop. The notes are polished with the embed exactly once, the backup holds the raw snapshots, the last snapshot takes every logged segment, no journal is left, the ledger has transcribe, notes, polish and page lines, and the hint reached the request.
+- **Live**, `lecturelive lecture --loopback --secs 600`, with `say -a "BlackHole 2ch"` into a synthetic folder and scripted input:
+  - The notes were created and the dropped slide was registered as `slide_01_185408.png` and placed.
+  - Snapshots cost $0.02 (41 words, 1 slide), $0.01 (hinted, 34 words) and $0.01 (the one polish takes first, 16 words); the polish cost $0.01, with its backup written.
+  - The page was `Optimisation.html`, 530 of 600 words, $0.09. The last snapshot found nothing new, and the command exited 0.
+  - The sidecar ended with cursor 6 for 6 segments, slide index 1, 0 gaps and no journal. The default output was "MacBook Pro Speakers" before and after.
+  - The ten-second silence warning fired after the scripted speech ended, as it should.
+
+*Study page.*
+- **Fake:** the 2,006-word fixture lecture (budget 600) drew a first draft half again over budget, then one revision without images, ending within budget and complete. It re-rendered from the cache with no request, and after a template change still with no request; changed notes typeset again.
+- **Live:** 570 of 600 words, all parts present, one request with no revision, $0.2727. The re-render was cached and the ledger unchanged.
+- The live page request took about 530 s at medium effort for 2,000 words of notes and three slides.
+- The template is embedded unchanged. No visual change was made, so `/frontend-design:frontend-design` was not needed.
+
+*Live spend:* about $0.44 of the $2 cap. Research about $0.005; the live snapshot check $0.003432; the live page $0.2727; the headless lecture $0.162046 (notes $0.028986, polish $0.011396 and page $0.088336, all billed; transcribe $0.033328 computed for 599.9 s).
+
+*Settled while planning* (the plan's header has the reasons):
+- A snapshot does not wait for pending recovery.
+- A cutoff while a recording's transcript is still flushing is not confirmed (M2's deferred minor).
+- The prefix summary is an outline derived locally, with no request and no cache.
+- The ledger lives in the app's data directory with incremental take-over.
+- Streamed speech-to-text is one computed line per recording; recovery is one per REST piece.
+- Notes without state are rebuilt from the last marker.
+- Other days' transcript gaps are recovered at launch.
+- A transcript line lost between the two syncs is put back.
+
+*M2 deferred minors taken:*
+- The cutoff between a recording's end and its flush.
+- A second Ctrl-C stops a draining stop, in the coordinator and the CLI.
+- The refusal's double period, in `record` and `lecture`.
+
+Not taken, because their code was not touched: any REST 4xx ends recovery; the backoff resets on each handshake; recovery retries a failing piece without limit.
+
+*Rulings during execution:*
+- `cargo test` takes one filter before `--`.
+- The Write tool decodes `\uXXXX` escapes, so files containing them are written with quoted heredocs.
+- A raw string in the plan's chat test needed `r###`.
+- The page fixture is named `fixture_lecture.md`, because `lecture_notes_*.md` is git-ignored to keep real notes out of this public repository.
+- The fixture has 2,006 words (budget 600).
+- The fake answers in 1 KB pieces.
+- The plan's store test waited for samples the recorder had not yet synced; it now waits for the sidecar to list the recording.
+- **Durable store updates.** The plan's `Store::update` answered before the coordinator had saved. It now answers only after the save, caught by its own test.
+
+*Review* (a fresh reviewer on the most capable model, over the whole branch): no Critical, four Important, twelve Minor. All four Important were fixed test-first:
+1. Journal recovery could delete notes typed by hand after a crash. The journal now keeps the block, and a tail is truncated only when it is the block's start. Spec §6.2 was amended.
+2. A commit that failed mid-session left a fragment the next commit built on. A commit now repairs an existing journal first.
+3. There was no way out while stopping, and a second stop sent while the audio was ending was swallowed. The coordinator now counts stops in both phases, a second stop also skips queued operations, and a third Ctrl-C quits at once.
+4. A deleted slide failed every later snapshot. It is now skipped with a warning, and the cursor moves past it.
+
+*Failed lines:* none. No spec §14.1 fallback applies (§14.1 covers loopback only).
+
+*Open threads.*
+- **Owner M4:**
+  - Deferred review minors: other days' gap recovery runs before today's recording without a progress line; ledger warnings from polish and page are not shown; removing an inline embed from `- ![Slide N](…)` leaves a lone `-`.
+  - `coordinator::tests::a_stuck_stt_worker_loses_frames_not_control_messages` flakes about 1 run in 10 under parallel load. It was reproduced at the M2 tip, so it predates M3. Pacing its source, as M2 did for the fixture source, would fix it with its assertions unchanged.
+- **Owner M6:**
+  - Deferred review minors: relaunching after midnight starts the next day's files; migration and rebuild date slide files and markers after midnight on the start day; `course` is derived from a relative `--dir` before it is made absolute; the session marker can glue onto a torn transcript line; the last snapshot is skipped when the session ends in failure; the page retries a billed `length` or empty answer once; `lecture page` runs without journal recovery; an `"error": null` key reads as an error.
+  - A Python CLI already running in a folder when the Rust CLI starts there would share it, because the Python CLI takes no lock. The v2 check covers only a Python CLI started later.
+  - The M2 minors listed above as not taken.
+  - §14.2's latency (a page took about nine minutes for 2,000 words) is measured over a real lecture.
+  - Before `live_notes.py` is removed, its golden tests (which read its source) are frozen into fixtures.
+- **Optional, needing the person:** a Python CLI run on a synthetic folder, to byte-compare its notes and transcript output with the Rust CLI's (no step of M3 depends on it).
 
 ## M4 — Desktop app: transcript + notes panes
 
