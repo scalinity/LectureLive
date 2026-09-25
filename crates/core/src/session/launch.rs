@@ -5,7 +5,8 @@ use chrono::{DateTime, Local};
 use uuid::Uuid;
 
 use crate::audio::recorder::repair_header;
-use crate::session::sidecar::{Gap, GapKind, RecState, Sidecar};
+use crate::session::segments::{self, segments_path};
+use crate::session::sidecar::{Gap, GapKind, OpenUtterance, RecState, Sidecar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
@@ -18,6 +19,8 @@ pub struct LaunchReport {
     pub repaired: Vec<(PathBuf, u64)>,
     pub missing: Vec<PathBuf>,
     pub pruned: Vec<PathBuf>,
+    /// Audio a crash left without a committed transcript (spec §5.2).
+    pub untranscribed: Vec<Gap>,
 }
 
 /// Runs before a session starts in `dir` (caller holds the folder lock): for every sidecar in
@@ -44,7 +47,7 @@ pub fn recover(dir: &Path, retention: Retention, now: DateTime<Local>) -> Result
 
 fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Local>, report: &mut LaunchReport) -> Result<()> {
     let Some(mut sc) = Sidecar::load(path)? else { return Ok(()) };
-    let before = (report.repaired.len(), report.missing.len(), report.pruned.len());
+    let before = sc.clone();
     let mut gaps = Vec::new();
     for r in sc.recordings.iter_mut().filter(|r| r.state == RecState::Open) {
         let wav = dir.join(&r.file);
@@ -62,6 +65,12 @@ fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Loca
         gaps.push(Gap::new(r.id, start_sample, None, GapKind::Interrupted));
     }
     sc.gaps.extend(gaps);
+    if let Some(open) = sc.open_utterance.take() {
+        if let Some(g) = untranscribed(dir, path, &sc, open)? {
+            report.untranscribed.push(g.clone());
+            sc.gaps.push(g);
+        }
+    }
     for id in prunable(&sc, retention, now) {
         let r = sc.recording_mut(id).expect("prunable ids come from the sidecar");
         let wav = dir.join(&r.file);
@@ -73,10 +82,20 @@ fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Loca
         r.state = RecState::Deleted;
         report.pruned.push(wav);
     }
-    if before != (report.repaired.len(), report.missing.len(), report.pruned.len()) {
+    if sc != before {
         sc.save(path)?;
     }
     Ok(())
+}
+
+/// The crashed live epoch's audio after its last logged segment (spec §5.2): a gap for recovery.
+fn untranscribed(dir: &Path, sidecar: &Path, sc: &Sidecar, open: OpenUtterance) -> Result<Option<Gap>> {
+    let recording = sc.recordings.iter().find(|r| r.id == open.recording_id && r.state != RecState::Missing);
+    let Some(len) = recording.and_then(|r| r.samples) else { return Ok(None) };
+    let stem = sidecar.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".v2.json")).context("a sidecar is named <stem>.v2.json")?;
+    let logged = segments::read(&segments_path(dir, stem))?.iter().filter(|s| s.recording_id == open.recording_id).map(|s| s.end_sample).max().unwrap_or(0);
+    let from = open.from_sample.max(logged);
+    Ok((len > from).then(|| Gap::new(open.recording_id, from, Some(len), GapKind::SttInterrupted)))
 }
 
 /// Closed recordings older than the retention window with no unresolved gap (spec §4.4).
@@ -106,7 +125,8 @@ pub fn restore_abandoned_route(state_path: &Path) -> Result<Option<bool>> {
 mod tests {
     use super::*;
     use crate::audio::recorder::Recorder;
-    use crate::session::sidecar::{sidecar_path, Gap, GapKind, RecordingEntry, Sidecar};
+    use crate::session::segments::{NewSegment, SegmentLog, SegmentSource};
+    use crate::session::sidecar::{sidecar_path, Gap, GapKind, OpenUtterance, RecordingEntry, Sidecar};
     use chrono::TimeZone;
 
     const STEM: &str = "lecture_notes_20260925";
@@ -269,5 +289,61 @@ mod tests {
         sc.gaps.push(Gap::new(audio_only, 0, Some(1_600), GapKind::CaptureOverflow));
         sc.gaps.push(Gap::new(pending, 0, Some(16_000), GapKind::SttOffline));
         assert_eq!(prunable(&sc, Retention::KeepDays(14), now()), vec![audio_only]);
+    }
+
+    fn log_segment(dir: &Path, rec: Uuid, start: u64, end: u64) {
+        let mut log = SegmentLog::open(dir, STEM).unwrap();
+        let s = NewSegment { recording_id: rec, start_sample: start, end_sample: end, text: "x".into(), words: vec![], source: SegmentSource::Live };
+        log.append(s, now()).unwrap();
+    }
+
+    #[test]
+    fn a_crash_turns_the_open_utterance_after_the_last_segment_into_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crashed_recording(dir.path());
+        let id = Uuid::new_v4();
+        let mut sc = Sidecar::default();
+        sc.recordings.push(RecordingEntry { samples: None, ..entry(id, &file, 0, RecState::Open) });
+        sc.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 0 });
+        let path = sidecar_path(dir.path(), STEM);
+        sc.save(&path).unwrap();
+        log_segment(dir.path(), id, 16, 12_000);
+
+        let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
+        let len = report.repaired[0].1;
+        let gap = Gap::new(id, 12_000, Some(len), GapKind::SttInterrupted);
+        assert_eq!(report.untranscribed, vec![gap.clone()]);
+        let sc = Sidecar::load(&path).unwrap().unwrap();
+        assert_eq!(sc.gaps, vec![Gap::new(id, len, None, GapKind::Interrupted), gap]);
+        assert_eq!(sc.open_utterance, None);
+        assert!(recover(dir.path(), Retention::KeepAll, now()).unwrap().untranscribed.is_empty(), "a second launch adds nothing");
+    }
+
+    #[test]
+    fn an_open_utterance_on_a_finalized_recording_gets_its_tail_from_the_later_of_marker_and_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut sc = Sidecar::default();
+        sc.recordings.push(RecordingEntry { samples: Some(160_000), ..entry(id, "recordings/r.wav", 0, RecState::Finalized) });
+        sc.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 96_000 });
+        sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
+        log_segment(dir.path(), id, 16, 90_000);
+        let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
+        assert_eq!(report.untranscribed, vec![Gap::new(id, 96_000, Some(160_000), GapKind::SttInterrupted)]);
+    }
+
+    #[test]
+    fn an_open_utterance_on_a_missing_recording_leaves_no_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut sc = Sidecar::default();
+        sc.recordings.push(entry(id, "recordings/gone.wav", 0, RecState::Open));
+        sc.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 0 });
+        sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
+        let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
+        assert!(report.untranscribed.is_empty());
+        let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
+        assert_eq!(sc.open_utterance, None);
+        assert_eq!(sc.gaps.len(), 1, "only the missing recording's interrupted gap");
     }
 }
