@@ -224,3 +224,66 @@ async fn a_legacy_folder_migrates_and_its_pending_lines_reach_the_next_snapshot(
     assert!(sent.contains("## Intro\n- one, two"), "the notes so far go with it");
     assert_eq!(Sidecar::load(&f.sidecar()).unwrap().unwrap().notes.segment_cursor, 3);
 }
+
+/// Final review, Important 4: a slide whose file was deleted after it was registered is skipped with
+/// a warning; the snapshot commits and moves past it instead of failing for the rest of the lecture.
+#[tokio::test]
+async fn a_registered_slide_whose_file_is_gone_is_skipped_with_a_warning() {
+    use lecturelive_core::session::sidecar::SlideEntry;
+    let dir = tempfile::tempdir().unwrap();
+    let (f, _) = offline_folder(dir.path());
+    support::slides::png(&f.slides.join("slide_01_100001.png"));
+    let at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 25, 10, 0, 1).unwrap();
+    let mut sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    sc.slides = vec![
+        SlideEntry { index: 1, file: "slides/slide_01_100001.png".into(), shown_at: at },
+        SlideEntry { index: 2, file: "slides/slide_02_100002.png".into(), shown_at: at }, // deleted by hand
+    ];
+    sc.save(&f.sidecar()).unwrap();
+    let sse = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    lec.snapshot(&Store::offline(sc, f.sidecar()), "", &ev_tx).await.expect("a missing slide file does not stop the notes");
+    drop(ev_tx);
+    let mut warned = false;
+    while let Some(e) = ev.recv().await {
+        warned |= matches!(&e, Event::Warning(m) if m.contains("slide_02_100002.png"));
+    }
+    assert!(warned, "the person is told which slide was skipped");
+    let sent = &sse.state.bodies()[0];
+    assert_eq!(sent["messages"][1]["content"].as_array().unwrap().len(), 2, "the text and the one slide that exists");
+    assert!(!user_text(sent).contains("slide_02_"), "the missing slide is not offered to the model");
+    let notes = std::fs::read_to_string(&f.notes).unwrap();
+    assert!(notes.contains("![Slide 1](slides/slide_01_100001.png)") && !notes.contains("Slide 2"));
+    assert_eq!(Sidecar::load(&f.sidecar()).unwrap().unwrap().notes.slide_index, 2, "the cursor moves past the missing slide");
+}
+
+/// Final review, Important 3: a second stop also drops the operations still queued behind the one in
+/// flight, so a person who asked for a polish and then wants out is not held for minutes.
+#[tokio::test]
+async fn a_second_stop_skips_queued_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let sse = fake_sse::start(|_| Reply::Stall).await; // every request hangs until the idle timeout
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let spend = Spend::open(&ledger, "Machine Learning", NAME, f.date).unwrap();
+    let chat = ChatClient::new(ChatConfig { url: sse.url.clone(), idle_timeout: ms(1_000), ..ChatConfig::new("test-key".into()) }, Some(spend.clone())).unwrap();
+    let lec = Arc::new(Lecture { files: f.clone(), course: "Machine Learning".into(), name: NAME.into(), title: TITLE.into(), chat, spend });
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, cmd_rx, ev_tx));
+    segments_seen(&mut ev, 1).await;
+    cmd.send(Command::Op(Op::Snapshot(String::new()))).unwrap();
+    until(&mut ev, "the snapshot in flight", |e| matches!(e, Event::Busy(m) if m.starts_with("snapshot"))).await;
+    cmd.send(Command::Op(Op::Polish)).unwrap();
+    cmd.send(Command::Stop).unwrap();
+    cmd.send(Command::Stop).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), run).await.expect("the lecture ends").unwrap().unwrap();
+    let systems: Vec<String> = sse.state.bodies().iter().map(|b| b["messages"][0]["content"].as_str().unwrap_or_default().chars().take(22).collect()).collect();
+    assert_eq!(systems.iter().filter(|s| s.starts_with("You are the note-taker")).count(), 2, "the snapshot in flight and the last one: {systems:?}");
+    assert!(!systems.iter().any(|s| s.starts_with("You turn raw")), "the queued polish was skipped");
+}

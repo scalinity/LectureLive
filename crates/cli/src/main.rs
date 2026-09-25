@@ -669,10 +669,15 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         let mut presses = 0;
         while tokio::signal::ctrl_c().await.is_ok() {
             presses += 1;
-            if presses == 1 {
-                say(p, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)");
-            } else {
-                say(p, "warn", "stopping", "no longer waiting for recovery; its gaps wait for the next session");
+            match presses {
+                1 => say(p, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)"),
+                2 => say(p, "warn", "stopping", "no longer waiting for recovery or queued requests; its gaps wait for the next session (Ctrl-C again quits at once)"),
+                _ => {
+                    // The recording is durable to its last second and gaps and journals are on disk: the next
+                    // session in this folder repairs, recovers and notes what is left.
+                    say(p, "warn", "quit", "stopped at once; the next session in this folder picks up what was left");
+                    std::process::exit(130);
+                }
             }
             if stop_tx.send(LectureCommand::Stop).is_err() {
                 return;

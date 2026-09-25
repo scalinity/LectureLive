@@ -91,7 +91,23 @@ impl Lecture {
             Some(c) => c.segments,
             None => segments::read(&log).map_err(text)?.len() as u64,
         };
-        let batch = Batch::take(&log, &sc, upto, hint).map_err(text)?;
+        let mut batch = Batch::take(&log, &sc, upto, hint).map_err(text)?;
+        // A slide whose file was deleted after it was registered is skipped, and the cursor still
+        // moves past it: one missing file must not stop the notes for the rest of the lecture.
+        let slide_to = batch.slide_to(sc.notes.slide_index);
+        let (present, missing): (Vec<_>, Vec<_>) = std::mem::take(&mut batch.slides).into_iter().partition(|s| self.files.dir.join(&s.file).exists());
+        batch.slides = present;
+        for s in &missing {
+            let _ = events.send(Event::Warning(format!("slide {} ({}) is no longer on disk; left out of the notes", s.index, s.file)));
+        }
+        if batch.is_empty() && !missing.is_empty() {
+            store.update(move |sc| {
+                sc.notes.slide_index = sc.notes.slide_index.max(slide_to);
+                Ok(())
+            })
+            .await
+            .map_err(text)?;
+        }
         if batch.is_empty() {
             let _ = events.send(Event::NothingNew);
             return Ok(());
@@ -113,7 +129,7 @@ impl Lecture {
         }
         let repaired = repair(&clean_output(&answer.text, true), &embeds);
         let block = notesfile::block(at, &repaired.text);
-        let (files, b, to, slide_to) = (self.files.clone(), block.clone(), batch.positions.end, batch.slide_to(sc.notes.slide_index));
+        let (files, b, to) = (self.files.clone(), block.clone(), batch.positions.end);
         store.update(move |sc| notesfile::commit(&files, sc, &b, to, slide_to)).await.map_err(text)?;
         let _ = events.send(Event::Committed { words: batch.words(), slides: batch.slides.len(), block, usd: answer.usd.unwrap_or(0.0), confirmed: cut.is_none_or(|c| c.confirmed), removed: repaired.removed, missing: repaired.missing.len() });
         Ok(())
@@ -174,8 +190,11 @@ impl Lecture {
     }
 }
 
-async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceiver<Op>, events: UnboundedSender<Event>, pages: Arc<Mutex<Vec<JoinHandle<()>>>>) {
+async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceiver<Op>, events: UnboundedSender<Event>, pages: Arc<Mutex<Vec<JoinHandle<()>>>>, hurry: Arc<AtomicBool>) {
     while let Some(op) = ops.recv().await {
+        if hurry.load(Ordering::Relaxed) {
+            continue; // a second stop: what was still queued is dropped; the last snapshot takes its material
+        }
         match op {
             Op::Snapshot(hint) => {
                 if let Err(e) = lec.snapshot(&store, &hint, &events).await {
@@ -286,7 +305,8 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
     let (handle, mut notes, store) = coordinator::spawn_with_store(cfg, source);
     let pages = Arc::new(Mutex::new(Vec::new()));
     let (op_tx, op_rx) = mpsc::unbounded_channel();
-    let worker = tokio::spawn(notes_worker(lec.clone(), store.clone(), op_rx, events.clone(), pages.clone()));
+    let hurry = Arc::new(AtomicBool::new(false));
+    let worker = tokio::spawn(notes_worker(lec.clone(), store.clone(), op_rx, events.clone(), pages.clone(), hurry.clone()));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let watcher = tokio::spawn(slide_watcher(lec.clone(), store.clone(), watch, stop_rx, events.clone()));
     drop(store);
@@ -316,7 +336,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                     handle.request_stop();
                     begin_stop(&mut op_tx);
                     if stops >= 2 {
-                        commands_open = false;
+                        hurry.store(true, Ordering::Relaxed);
                     }
                 }
                 None => commands_open = false, // input closed: the lecture runs until it is stopped or its audio ends

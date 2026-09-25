@@ -265,6 +265,8 @@ struct Coordinator {
     cutoffs: HashMap<u64, oneshot::Sender<CutoffResult>>,
     next_cutoff: u64,
     spend: Option<Spend>,
+    /// Stop requests so far, whichever phase they arrived in: the second stops waiting for recovery.
+    stops: u32,
 }
 
 impl Coordinator {
@@ -621,6 +623,7 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
         cutoffs: HashMap::new(),
         next_cutoff: 0,
         spend: cfg.spend,
+        stops: 0,
     };
     // Transcript gaps an earlier session left (a crash, recovery cut short) are recovered first.
     let pending: Vec<Gap> = c.sidecar.gaps.iter().filter(|g| g.kind.is_transcript() && !g.resolved).cloned().collect();
@@ -636,7 +639,10 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
-                Command::Stop => stop.store(true, Ordering::Relaxed),
+                Command::Stop => {
+                    c.stops += 1;
+                    stop.store(true, Ordering::Relaxed);
+                }
                 Command::Cutoff(reply) => c.cutoff(reply),
             },
             ev = src_rx.recv() => match ev {
@@ -671,6 +677,12 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
         if c.stt_events.is_none() {
             c.recovery = None;
         }
+        // A second stop, whichever phase it arrived in: stop waiting for recovery; its gaps wait for the next session.
+        if c.stops >= 2 && c.recovery_events.take().is_some() {
+            c.recovery = None;
+            c.notify(Notification::RecoveryFailed("recovery stopped by a second stop; its gaps wait for the next session".into()));
+            continue; // the loop's condition may now be false
+        }
         tokio::select! {
             ev = rev_rx.recv(), if recorder_open => match ev {
                 Some(ev) => if let Err(e) = c.on_recorder(ev).await { failure.get_or_insert(e); },
@@ -689,13 +701,7 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
                 None => store_rx = None,
             },
             Some(cmd) = cmd_rx.recv() => match cmd {
-                // A stop while draining: stop waiting for recovery; its gaps wait for the next session.
-                Command::Stop => {
-                    if c.recovery_events.take().is_some() {
-                        c.recovery = None;
-                        c.notify(Notification::RecoveryFailed("recovery stopped by a second stop; its gaps wait for the next session".into()));
-                    }
-                }
+                Command::Stop => c.stops += 1, // acted on at the top of the loop
                 Command::Cutoff(reply) => c.cutoff(reply),
             },
         }
@@ -1353,5 +1359,32 @@ mod tests {
         let report = tokio::time::timeout(Duration::from_secs(5), handle.finish()).await.expect("the second stop ends the wait").unwrap();
         assert_eq!(report.unresolved, 1, "the gap waits for the next session");
         assert_eq!(report.recordings.len(), 1, "this session's recording is intact");
+    }
+
+    /// Final review, Important 3: a second stop that arrives while the audio is still ending (the
+    /// coordinator's main phase) still abandons recovery, instead of being swallowed.
+    #[tokio::test]
+    async fn two_stops_in_quick_succession_still_abandon_pending_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Uuid::new_v4();
+        let anchor = Local.with_ymd_and_hms(2026, 9, 25, 9, 0, 0).unwrap();
+        let mut sc = Sidecar::default();
+        sc.recordings.push(RecordingEntry { id: old, file: "recordings/old.wav".into(), anchor, source_uid: "X".into(), input_rate: 48_000, samples: Some(16_000), state: RecState::Finalized });
+        sc.gaps.push(Gap::new(old, 0, Some(16_000), GapKind::SttOffline));
+        sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
+        let (jobs, mut jobs_rx) = mpsc::unbounded_channel::<RecoverJob>();
+        let (events_tx, events) = mpsc::channel::<RecoverEvent>(8);
+        tokio::spawn(async move {
+            let _hold = events_tx;
+            while jobs_rx.recv().await.is_some() {
+                std::future::pending::<()>().await;
+            }
+        });
+        let (handle, _notes) = spawn(SessionConfig { recovery: Some(RecoveryLink { jobs, events }), ..cfg(dir.path()) }, Box::new(Endless));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handle.request_stop();
+        handle.request_stop();
+        let report = tokio::time::timeout(Duration::from_secs(5), handle.finish()).await.expect("the second stop is not swallowed").unwrap();
+        assert_eq!(report.unresolved, 1);
     }
 }
