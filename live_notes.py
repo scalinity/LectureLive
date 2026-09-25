@@ -817,6 +817,8 @@ def main():
     args = ap.parse_args()
     if args.command == "spend":
         return show_spend()
+    if any((Path.cwd() / ".live_notes").glob("*.v2.json")):
+        sys.exit("This folder is kept by the LectureLive app now (.live_notes/*.v2.json). Run `lecturelive lecture` here instead.")
 
     env = load_env()
     key = env["GROK_API_KEY"]

@@ -335,3 +335,10 @@ mod tests {
         assert!((28_800..=36_800).contains(samples), "about 2 s: {samples}");
     }
 }
+
+/// A source with no audio: a session that only finishes what an earlier one left (recovery).
+pub struct NoAudio;
+
+impl Source for NoAudio {
+    fn run(self: Box<Self>, _out: Sender<SourceEvent>, _stop: Arc<AtomicBool>) {}
+}

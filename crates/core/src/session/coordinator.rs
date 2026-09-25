@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::audio::frame::{Frame, FRAME_SAMPLES};
 use crate::audio::recorder::Recorder;
 use crate::audio::source::{Source, SourceEvent};
-use crate::session::segments::{NewSegment, Segment, SegmentLog, SegmentSource};
+use crate::session::segments::{transcript_path, NewSegment, Segment, SegmentLog, SegmentSource};
 use crate::session::sidecar::{sidecar_path, Gap, GapKind, RecState, RecordingEntry, Sidecar};
 use crate::session::spend::{Spend, SpendKind, BATCH_USD_PER_SECOND, STREAM_USD_PER_SECOND};
 use crate::stt::rest::{RecoverEvent, RecoverJob, RecoveryLink};
@@ -36,6 +36,8 @@ pub struct SessionConfig {
     pub recovery: Option<RecoveryLink>,
     /// The ledger speech-to-text costs are written to (spec §8).
     pub spend: Option<Spend>,
+    /// The transcript file; None is the standard name (`lecture_transcript_YYYYMMDD.txt`).
+    pub transcript: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -481,7 +483,8 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
     let sidecar = Sidecar::load(&sidecar_path)?.unwrap_or_default();
     let segments = if cfg.stt.is_some() || cfg.recovery.is_some() {
         let (dir, stem) = (cfg.dir.clone(), cfg.stem.clone());
-        Some(tokio::task::spawn_blocking(move || SegmentLog::open(&dir, &stem)).await??)
+        let transcript = cfg.transcript.clone().unwrap_or_else(|| transcript_path(&dir, &stem));
+        Some(tokio::task::spawn_blocking(move || SegmentLog::open_at(&dir, &stem, &transcript)).await??)
     } else {
         None
     };

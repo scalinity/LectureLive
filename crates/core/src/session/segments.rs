@@ -66,8 +66,14 @@ pub struct SegmentLog {
 }
 
 impl SegmentLog {
-    /// Opens the log and the transcript for appending, creating both. A last line cut short by a crash is removed.
+    /// Opens the log and the standard transcript for appending, creating both.
     pub fn open(dir: &Path, stem: &str) -> Result<Self> {
+        Self::open_at(dir, stem, &transcript_path(dir, stem))
+    }
+
+    /// Opens the log and `transcript` for appending, creating both. A last line cut short by a crash
+    /// is removed, and the transcript line a crash kept from the transcript is put back.
+    pub fn open_at(dir: &Path, stem: &str, tpath: &Path) -> Result<Self> {
         let path = segments_path(dir, stem);
         std::fs::create_dir_all(path.parent().expect("the log lives in .live_notes"))?;
         let (segments, torn_at) = read_complete(&path)?;
@@ -75,8 +81,10 @@ impl SegmentLog {
         if let Some(len) = torn_at {
             log.set_len(len).with_context(|| format!("trim {}", path.display()))?;
         }
-        let tpath = transcript_path(dir, stem);
-        let transcript = OpenOptions::new().create(true).append(true).open(&tpath).with_context(|| format!("open {}", tpath.display()))?;
+        if let Some(last) = segments.last() {
+            repair_transcript(tpath, last)?;
+        }
+        let transcript = OpenOptions::new().create(true).append(true).open(tpath).with_context(|| format!("open {}", tpath.display()))?;
         Ok(Self { log, transcript, intervals: segments.iter().map(|s| (s.recording_id, s.start_sample, s.end_sample)).collect() })
     }
 
@@ -121,6 +129,57 @@ impl SegmentLog {
     pub fn committed_within(&self, recording: Uuid, from: u64, to: u64) -> Option<u64> {
         self.intervals.iter().filter(|(r, s, _)| *r == recording && (from..to).contains(s)).map(|(_, _, e)| *e).max()
     }
+}
+
+/// A crash between the segment log's sync and the transcript's (spec §8) leaves the last segment's
+/// line missing or cut short: it is put back. Session marker lines after it do not count.
+fn repair_transcript(path: &Path, last: &Segment) -> Result<()> {
+    let line = transcript_line(last);
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let torn = &bytes[keep..];
+    let complete = String::from_utf8_lossy(&bytes[..keep]).into_owned();
+    let mut last_text = complete.lines().rev().find(|l| !l.starts_with("--- ")).map(str::to_string);
+    let mut f = OpenOptions::new().create(true).append(true).open(path).with_context(|| format!("open {}", path.display()))?;
+    if !torn.is_empty() {
+        if line.as_bytes().starts_with(torn) {
+            f.set_len(keep as u64)?;
+        } else {
+            f.write_all(b"\n")?; // someone else's cut-off text: kept, as a line of its own
+            last_text = Some(String::from_utf8_lossy(torn).into_owned());
+        }
+    }
+    if last_text.as_deref() != Some(line.trim_end_matches('\n')) {
+        f.write_all(line.as_bytes())?;
+    }
+    f.sync_data()?;
+    Ok(())
+}
+
+/// The CLI's session line: `--- started HH:MM:SS ---` in an empty transcript, `--- resumed …` otherwise.
+pub fn session_marker(transcript: &Path, at: DateTime<Local>) -> Result<()> {
+    let resumed = std::fs::metadata(transcript).is_ok_and(|m| m.len() > 0);
+    let mut f = OpenOptions::new().create(true).append(true).open(transcript).with_context(|| format!("open {}", transcript.display()))?;
+    f.write_all(format!("--- {} {} ---\n", if resumed { "resumed" } else { "started" }, at.format("%H:%M:%S")).as_bytes())?;
+    f.sync_data()?;
+    Ok(())
+}
+
+/// Writes a whole segment log at once (migration), replacing any earlier attempt.
+pub fn write_all(path: &Path, segments: &[Segment]) -> Result<()> {
+    let mut out = Vec::new();
+    for s in segments {
+        out.extend(serde_json::to_vec(s)?);
+        out.push(b'\n');
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::fsutil::write_atomic(path, &out)
 }
 
 /// Every complete segment of the log; a last line without its newline (a crash mid-write) is skipped.
@@ -229,5 +288,44 @@ mod tests {
         let dir = Path::new("/lecture");
         assert_eq!(transcript_path(dir, STEM), Path::new("/lecture/lecture_transcript_20260925.txt"));
         assert_eq!(segments_path(dir, STEM), Path::new("/lecture/.live_notes/lecture_notes_20260925.segments.jsonl"));
+    }
+
+    #[test]
+    fn a_transcript_line_lost_between_the_two_syncs_is_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Uuid::new_v4();
+        let mut log = SegmentLog::open(dir.path(), STEM).unwrap();
+        log.append(seg(rec, 0, 16_000, "one", vec![], SegmentSource::Live), anchor()).unwrap();
+        log.append(seg(rec, 16_000, 32_000, "two", vec![], SegmentSource::Live), anchor()).unwrap();
+        drop(log);
+        let t = transcript_path(dir.path(), STEM);
+        std::fs::write(&t, "[10:00:00] one\n").unwrap(); // the crash came after the log's sync
+        SegmentLog::open(dir.path(), STEM).unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "[10:00:00] one\n[10:00:01] two\n");
+        std::fs::write(&t, "[10:00:00] one\n[10:00:0").unwrap(); // or mid-line
+        SegmentLog::open(dir.path(), STEM).unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "[10:00:00] one\n[10:00:01] two\n");
+        session_marker(&t, anchor() + chrono::Duration::minutes(5)).unwrap();
+        SegmentLog::open(dir.path(), STEM).unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "[10:00:00] one\n[10:00:01] two\n--- resumed 10:05:00 ---\n", "a marker after the last line hides nothing");
+    }
+
+    #[test]
+    fn session_markers_are_the_clis() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("lecture_transcript_20260925.txt");
+        session_marker(&t, anchor()).unwrap();
+        session_marker(&t, anchor() + chrono::Duration::seconds(90)).unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "--- started 10:00:00 ---\n--- resumed 10:01:30 ---\n");
+    }
+
+    #[test]
+    fn a_custom_transcript_path_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("mine.txt");
+        let mut log = SegmentLog::open_at(dir.path(), STEM, &t).unwrap();
+        log.append(seg(Uuid::new_v4(), 0, 16_000, "one", vec![], SegmentSource::Live), anchor()).unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "[10:00:00] one\n");
+        assert!(!transcript_path(dir.path(), STEM).exists());
     }
 }
