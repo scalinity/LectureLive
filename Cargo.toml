@@ -4,7 +4,7 @@ members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.89"
 
 # Release profile of the Tauri app; cargo reads profiles only from the workspace root.
 [profile.release]

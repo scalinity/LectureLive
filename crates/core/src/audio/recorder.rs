@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
 
+use crate::audio::frame::{Frame, FRAME_SAMPLES};
+
 pub const SAMPLE_RATE: u32 = 16_000;
 const CHECKPOINT_SAMPLES: u32 = SAMPLE_RATE;
 const HEADER_LEN: u64 = 44;
@@ -18,6 +20,7 @@ pub struct Recorder {
     sync_handle: File,
     path: PathBuf,
     since_checkpoint: u32,
+    samples: u64,
 }
 
 impl Recorder {
@@ -35,7 +38,32 @@ impl Recorder {
         };
         let sync_handle = file.try_clone()?;
         let writer = WavWriter::new(BufWriter::new(file), spec())?;
-        Ok(Self { writer, sync_handle, path, since_checkpoint: 0 })
+        let mut r = Self { writer, sync_handle, path, since_checkpoint: 0, samples: 0 };
+        r.checkpoint()?; // the header reaches disk before any audio, so a crash leaves a repairable file
+        Ok(r)
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Writes a frame at its own offset; missing offsets before it become silence, so the
+    /// file's timeline stays linear in wall-clock time (the gap itself is recorded by the caller).
+    pub fn write_frame(&mut self, frame: &Frame) -> Result<()> {
+        ensure!(
+            frame.sample_offset >= self.samples,
+            "frame at sample {} overlaps audio already written up to {}",
+            frame.sample_offset,
+            self.samples
+        );
+        const SILENCE: [i16; FRAME_SAMPLES] = [0; FRAME_SAMPLES];
+        let mut pad = frame.sample_offset - self.samples;
+        while pad > 0 {
+            let n = pad.min(FRAME_SAMPLES as u64) as usize;
+            self.write(&SILENCE[..n])?;
+            pad -= n as u64;
+        }
+        self.write(frame.pcm())
     }
 
     pub fn path(&self) -> &Path {
@@ -47,6 +75,7 @@ impl Recorder {
             self.writer.write_sample(s)?;
         }
         self.since_checkpoint += pcm.len() as u32;
+        self.samples += pcm.len() as u64;
         if self.since_checkpoint >= CHECKPOINT_SAMPLES {
             self.checkpoint()?;
         }
@@ -127,6 +156,42 @@ mod tests {
         let repaired = repair_header(&path).unwrap();
         assert!(repaired >= 32_000);
         assert_eq!(hound::WavReader::open(&path).unwrap().len(), repaired);
+    }
+
+    fn frame(offset: u64, value: i16) -> crate::audio::frame::Frame {
+        crate::audio::frame::Frame { recording_id: uuid::Uuid::nil(), sample_offset: offset, valid_samples: 1600, pcm16: [value; 1600] }
+    }
+
+    #[test]
+    fn header_is_on_disk_before_any_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Recorder::create(dir.path(), "session").unwrap();
+        let path = r.path().to_path_buf();
+        std::mem::forget(r); // crash straight after creation
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 44);
+        assert_eq!(repair_header(&path).unwrap(), 0);
+        assert_eq!(hound::WavReader::open(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_frame_fills_skipped_offsets_with_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recorder::create(dir.path(), "session").unwrap();
+        r.write_frame(&frame(0, 100)).unwrap();
+        r.write_frame(&frame(3200, 300)).unwrap(); // 1600..3200 never arrived
+        assert_eq!(r.samples(), 4800);
+        let path = r.finalize().unwrap();
+        let s: Vec<i16> = hound::WavReader::open(&path).unwrap().samples::<i16>().map(|x| x.unwrap()).collect();
+        assert_eq!(s.len(), 4800);
+        assert_eq!((s[0], s[1600], s[3199], s[3200]), (100, 0, 0, 300));
+    }
+
+    #[test]
+    fn write_frame_rejects_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recorder::create(dir.path(), "session").unwrap();
+        r.write_frame(&frame(0, 1)).unwrap();
+        assert!(r.write_frame(&frame(800, 1)).is_err());
     }
 
     #[test]
