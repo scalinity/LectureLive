@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,8 +11,15 @@ use lecturelive_core::audio::{input, loopback, recorder, routing};
 use lecturelive_core::capture::window;
 use lecturelive_core::session::coordinator::{self, Notification, SessionConfig, SttStatus};
 use lecturelive_core::session::launch::{self, Retention};
+use lecturelive_core::notes::chat::{self, ChatClient, ChatConfig};
+use lecturelive_core::notes::prompts;
+use lecturelive_core::session::files::LectureFiles;
+use lecturelive_core::session::folder::{self, How};
+use lecturelive_core::session::lecture::{self, Command as LectureCommand, Event, Lecture, Op, SlideWatch};
 use lecturelive_core::session::lock::FolderLock;
-use lecturelive_core::session::segments::SegmentSource;
+use lecturelive_core::session::notesfile::Recovered;
+use lecturelive_core::session::segments::{self, SegmentSource};
+use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::stt::{probe, rest, stream};
 
 #[derive(Parser)]
@@ -51,8 +59,52 @@ enum Cmd {
         #[arg(long = "keyterm", requires = "stt")]
         keyterms: Vec<String>,
     },
+    /// A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter
+    /// adds a focus hint, polish then Enter polishes and typesets the page, Ctrl-C stops (twice: stop
+    /// waiting for recovery)
+    Lecture(LectureArgs),
     #[command(subcommand)]
     Canary(Canary),
+}
+
+#[derive(clap::Args)]
+struct LectureArgs {
+    /// page: typeset the study page from the notes; spend: what the tool has cost. Leave out to record.
+    #[arg(value_parser = ["page", "spend"])]
+    command: Option<String>,
+    /// The lecture folder (default: the current directory)
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Course name (default: the folder above Weeks/, else LECTURE_COURSE)
+    #[arg(long)]
+    course: Option<String>,
+    /// Record BlackHole: Zoom through "LectureLive Loopback"
+    #[arg(long, conflicts_with = "device")]
+    loopback: bool,
+    /// Audio input: its UID or part of its name (default: LECTURE_DEVICE)
+    #[arg(long)]
+    device: Option<String>,
+    /// A term to bias recognition toward (repeatable; up to 100, each at most 50 characters)
+    #[arg(long = "keyterm")]
+    keyterms: Vec<String>,
+    /// Notes file (default: lecture_notes_<today>.md)
+    #[arg(long)]
+    notes: Option<PathBuf>,
+    /// Transcript file (default: lecture_transcript_<today>.txt)
+    #[arg(long)]
+    transcript: Option<PathBuf>,
+    /// Where captured slides go (default: slides)
+    #[arg(long = "slides-dir")]
+    slides_dir: Option<PathBuf>,
+    /// Stop after this many seconds
+    #[arg(long)]
+    secs: Option<u64>,
+    /// Delete closed recordings older than this many days that have no unresolved gap
+    #[arg(long)]
+    keep_days: Option<u32>,
+    /// Rebuild a corrupt sidecar from the notes, transcript and slides
+    #[arg(long)]
+    rebuild: bool,
 }
 
 #[derive(Subcommand)]
@@ -143,6 +195,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Loopback(l) => loopback_cmd(l)?,
         Cmd::Record { loopback, device, dir, secs, keep_days, stt, keyterms } => record(loopback, device, dir, secs, keep_days, stt, keyterms).await?,
+        Cmd::Lecture(args) => lecture_cmd(args).await?,
         Cmd::Canary(c) => canary(c).await?,
     }
     Ok(())
@@ -268,7 +321,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
                 Some(Notification::Stt(s)) => match s {
                     SttStatus::Connected => println!("transcribing"),
                     SttStatus::Retrying { after, reason } => println!("transcription interrupted ({reason}); reconnecting in {} s", after.as_secs()),
-                    SttStatus::Refused(m) => eprintln!("transcription refused: {m}. Recording continues without it."),
+                    SttStatus::Refused(m) => eprintln!("transcription refused: {}. Recording continues without it.", sentence(&m)),
                     SttStatus::ServerError(m) => eprintln!("transcription server: {m}"),
                     SttStatus::Stopped(m) => eprintln!("transcription stopped: {m}"),
                 },
@@ -354,5 +407,303 @@ async fn canary(c: Canary) -> Result<()> {
         }
         Canary::Tone { output, secs, amp } => lecturelive_core::audio::tone::play_tone(&output, secs, amp)?,
     }
+    Ok(())
+}
+
+const REPO_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env");
+/// The Python CLI's ledger, taken over by the app's (spec §8).
+const CLI_LEDGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spend.jsonl");
+
+/// The environment, a .env here or above, then the repository's .env.
+fn env_value(name: &str) -> Option<String> {
+    let _ = dotenvy::dotenv();
+    std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| dotenvy::from_path_iter(REPO_ENV).ok()?.flatten().find(|(k, _)| k == name).map(|(_, v)| v))
+}
+
+/// The folder above `Weeks/` in `<course>/Weeks/<lecture>`, so each course names itself.
+fn course_from_path(dir: &Path) -> Option<String> {
+    let parts: Vec<String> = dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    (1..parts.len()).rev().find(|&i| parts[i] == "Weeks").map(|i| parts[i - 1].clone())
+}
+
+/// A message's own final period dropped before the sentence that follows it.
+fn sentence(m: &str) -> &str {
+    m.trim_end().trim_end_matches('.')
+}
+
+fn paint() -> spend::Paint {
+    use std::io::IsTerminal;
+    spend::Paint { color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(), truecolor: matches!(std::env::var("COLORTERM").as_deref(), Ok("truecolor" | "24bit")) }
+}
+
+/// The CLI's `say`: one event line, its mark, what it is, what happened.
+fn say(p: spend::Paint, kind: &str, label: &str, detail: &str) {
+    let (mark, colour) = match kind {
+        "slide" => ("▣", "teal"),
+        "notes" => ("◆", "teal"),
+        "page" => ("✦", "teal"),
+        "done" => ("✓", "teal"),
+        _ => ("▲", "red"),
+    };
+    println!("{}", format!("  {} {}  {detail}", p.paint(mark, &[colour]), p.paint(label, &["bold"])).trim_end());
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Where macOS saves screenshots (`defaults read com.apple.screencapture location`), else the Desktop.
+fn screenshot_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let out = std::process::Command::new("defaults").args(["read", "com.apple.screencapture", "location"]).output().ok();
+    let found = out.filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).map(|raw| raw.strip_prefix("~/").map_or_else(|| PathBuf::from(&raw), |r| home.join(r)));
+    Some(found.filter(|p| p.is_dir()).unwrap_or_else(|| home.join("Desktop")))
+}
+
+/// An input by UID, or by part of its name; checked before the folder is touched.
+fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, String)> {
+    if loopback {
+        return Ok((loopback::BLACKHOLE_UID.to_string(), "BlackHole 2ch".to_string()));
+    }
+    let want = device.context("give --loopback or --device <UID or part of its name> (or LECTURE_DEVICE in .env); `lecturelive inputs` lists them")?;
+    let inputs = input::list_inputs()?;
+    inputs
+        .iter()
+        .find(|i| i.uid == want)
+        .or_else(|| inputs.iter().find(|i| i.name.to_lowercase().contains(&want.to_lowercase())))
+        .map(|i| (i.uid.clone(), i.name.clone()))
+        .with_context(|| format!("No audio input matches {want:?}. Inputs now: {}.", inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")))
+}
+
+/// Prints the lecture's events in the CLI's lines; the loopback silence warning as `record` gives it.
+fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
+    match e {
+        Event::Session(n) => match n {
+            Notification::Segment(s) => {
+                let tag = if s.source == SegmentSource::Recovered { p.paint("  (recovered)", &["dim"]) } else { String::new() };
+                println!("  {}  {}{tag}", p.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), s.text);
+            }
+            Notification::Level(l) => {
+                if watch.as_mut().is_some_and(|w| w.observe(*l)) {
+                    say(p, "warn", "no signal", &format!("10 s of silence on BlackHole: is Zoom's Speaker \"{}\"?", loopback::LOOPBACK_NAME));
+                }
+            }
+            Notification::Recording { path } => println!("{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])),
+            Notification::Gap(g) => say(p, "warn", "gap", &format!("{:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id)),
+            Notification::DeviceGone { uid } => say(p, "warn", "input gone", &format!("{uid}; waiting for it to return (no other input is used). Ctrl-C stops.")),
+            Notification::DeviceBack { uid } => say(p, "done", "input back", &format!("{uid}; recording continues in a new file")),
+            Notification::Failed(m) => say(p, "warn", "session failed", m),
+            Notification::Stt(s) => match s {
+                SttStatus::Connected => println!("{}", p.paint("  transcribing", &["dim"])),
+                SttStatus::Retrying { after, reason } => say(p, "warn", "transcription interrupted", &format!("{reason}; reconnecting in {} s", after.as_secs())),
+                SttStatus::Refused(m) => say(p, "warn", "transcription refused", &format!("{}. Recording continues without it.", sentence(m))),
+                SttStatus::ServerError(m) => say(p, "warn", "transcription server", m),
+                SttStatus::Stopped(m) => say(p, "warn", "transcription stopped", m),
+            },
+            Notification::Open { .. } | Notification::SourceEnded => {}
+            Notification::Recovered(g) => say(p, "done", "recovered", &format!("the transcript of {:.1}–{:.1} s of recording {}", secs(g.start_sample), g.end_sample.map_or(0.0, secs), g.recording_id)),
+            Notification::RecoveryFailed(m) => say(p, "warn", "recovery", m),
+            Notification::SpendFailed(m) => say(p, "warn", "spend", m),
+        },
+        Event::Busy(m) => println!("{}", p.paint(&format!("  … {m}"), &["dim"])),
+        Event::Preview(_) => {} // the committed block is printed instead, as the CLI does
+        Event::NothingNew => say(p, "notes", "snapshot", "nothing new since the last one"),
+        Event::Committed { words, slides, block, usd, confirmed, missing, .. } => {
+            for line in block.trim().lines().filter(|l| !l.starts_with("<!-- ")) {
+                println!("  {} {}", p.paint("│", &["teal"]), p.paint(line, &["dim"]));
+            }
+            let mut detail = format!("{} and {} folded in  {}", plural(*words, "word"), plural(*slides, "slide"), p.paint(&spend::money(*usd), &["dim"]));
+            if *missing > 0 {
+                detail += &format!("  ({} not placed by the model, listed at the end)", plural(*missing, "slide"));
+            }
+            if !confirmed {
+                detail += "  (transcription still catching up; the rest goes into the next snapshot)";
+            }
+            say(p, "notes", "notes", &detail);
+        }
+        Event::SnapshotFailed(m) => say(p, "warn", "snapshot failed", m),
+        Event::Polished { backup, usd } => {
+            let name = backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            say(p, "done", "polished", &format!("previous version in .live_notes/{name}  {}", p.paint(&spend::money(*usd), &["dim"])));
+        }
+        Event::PolishStopped(m) => say(p, "warn", "polish stopped", m),
+        Event::PolishFailed(m) => say(p, "warn", "polish failed", m),
+        Event::Page { outcome, usd } => {
+            let name = outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let length = p.paint(&format!("{} words of {} allowed", outcome.words, outcome.budget), &[if outcome.words > outcome.budget as usize { "red" } else { "dim" }]);
+            let mut detail = format!("{name}  {length}  {}", p.paint(&spend::money(*usd), &["dim"]));
+            if outcome.cached {
+                detail += "  (notes unchanged since they were typeset: only the design reapplied, free)";
+            }
+            if !outcome.missing.is_empty() {
+                detail += &format!("  (missing: {})", outcome.missing.join(", "));
+            }
+            say(p, "done", "page", &detail);
+        }
+        Event::PageFailed(m) => say(p, "warn", "page failed", m),
+        Event::Slide { index, file } => say(p, "slide", &format!("slide {index}"), &format!("{}, into the next snapshot", Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+        Event::Warning(m) => say(p, "warn", "warning", m),
+    }
+}
+
+async fn lecture_cmd(a: LectureArgs) -> Result<()> {
+    let p = paint();
+    let app_ledger = data_dir()?.join("spend.jsonl");
+    spend::take_over(&app_ledger, Path::new(CLI_LEDGER))?;
+    if a.command.as_deref() == Some("spend") {
+        let columns = std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80);
+        print!("{}", spend::render(&spend::read(&app_ledger)?, columns, p, &app_ledger));
+        return Ok(());
+    }
+    let dir = match a.dir {
+        Some(d) => d,
+        None => std::env::current_dir()?,
+    };
+    let key = env_value("GROK_API_KEY").context("GROK_API_KEY is not set (the environment, a .env here or above, or the repository's .env)")?;
+    let course = a.course.or_else(|| course_from_path(&dir)).or_else(|| env_value("LECTURE_COURSE")).unwrap_or_else(|| "Lecture".into());
+    let recording = a.command.is_none();
+    // Checked before any file is created, so a missing device leaves the folder untouched.
+    let input = if recording { Some(resolve_input(a.loopback, a.device.or_else(|| env_value("LECTURE_DEVICE")))?) } else { None };
+    std::fs::create_dir_all(&dir)?;
+    let dir = dir.canonicalize()?;
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let today = chrono::Local::now().date_naive();
+    let resolve = |f: Option<PathBuf>| f.map(|f| if f.is_absolute() { f } else { dir.join(f) });
+    let files = LectureFiles::custom(&dir, today, resolve(a.notes), resolve(a.transcript), resolve(a.slides_dir));
+    let spend = Spend::open(&app_ledger, &course, &name, today)?;
+    let chat = ChatClient::new(ChatConfig::new(key.clone()), Some(spend.clone()))?;
+    let title = prompts::title(&course, &name, today);
+    let lec = Arc::new(Lecture { files: files.clone(), course: course.clone(), name: name.clone(), title: title.clone(), chat, spend: spend.clone() });
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let Some((uid, input_name)) = input else {
+        // `lecture page`: the page from the notes as they are, without recording or polishing.
+        anyhow::ensure!(files.notes.exists(), "No notes to typeset: {} is not in this folder.", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let _lock = FolderLock::acquire(&dir)?;
+        say(p, "page", "page", &format!("distilling {} with {}, a few minutes", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), chat::MODEL));
+        let printer = tokio::spawn(async move {
+            let mut none = None;
+            while let Some(e) = ev_rx.recv().await {
+                show(p, &e, &mut none);
+            }
+        });
+        let _ = lec.page(&ev_tx).await;
+        drop(ev_tx);
+        printer.await?;
+        return Ok(());
+    };
+
+    match permission::microphone() {
+        MicPermission::Denied | MicPermission::Restricted => anyhow::bail!("microphone access is denied for this terminal: System Settings → Privacy & Security → Microphone"),
+        _ => {}
+    }
+    let stt_link = stream::spawn(stream::SttConfig::new(key.clone(), a.keyterms.clone()))?;
+    let keyterms = a.keyterms.clone();
+    let recovery = || -> Result<rest::RecoveryLink> { Ok(rest::spawn_recovery(rest::RestClient::new(rest::RestConfig::new(key.clone(), keyterms.clone()))?)) };
+    let _lock = FolderLock::acquire(&dir)?;
+    if let Some(restored) = launch::restore_abandoned_route(&data_dir()?.join("route.json"))? {
+        println!("  undid a canary route left behind; default output restored: {restored}");
+    }
+    let report = launch::recover(&dir, a.keep_days.map_or(Retention::KeepAll, Retention::KeepDays), chrono::Local::now())?;
+    for (path, n) in &report.repaired {
+        say(p, "done", "repaired", &format!("{} ({:.1} s)", path.display(), secs(*n)));
+    }
+    for path in &report.missing {
+        say(p, "warn", "missing", &format!("{} (marked as a gap)", path.display()));
+    }
+    for path in &report.pruned {
+        say(p, "done", "deleted", &format!("{} (retention)", path.display()));
+    }
+    let (_, init) = folder::open(&files, &title, a.rebuild)?;
+    match init.how {
+        How::Created => say(p, "notes", "notes", &format!("{} created", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+        How::Migrated => say(p, "notes", "migrated", "this folder's Python CLI state is now the app's (the Python CLI no longer writes here)"),
+        How::Rebuilt => say(p, "warn", "rebuilt", "the state was rebuilt from the notes: everything after the last <!-- --> marker is pending"),
+        How::Resumed => {}
+    }
+    if let Some(m) = init.legacy_commit {
+        say(p, "warn", "recovered", m);
+    }
+    if let Some(kept) = &init.corrupt_kept {
+        say(p, "warn", "rebuilt", &format!("the corrupt state is kept as {}", kept.display()));
+    }
+    match init.journal {
+        Recovered::Completed => say(p, "done", "recovered", "the last snapshot was fully written"),
+        Recovered::Truncated => say(p, "warn", "recovered", "removed a half-written snapshot; its material is queued again"),
+        Recovered::NotAppended => say(p, "warn", "recovered", "an interrupted snapshot never reached the notes; its material is queued again"),
+        Recovered::Nothing => {}
+    }
+    if init.external_edit {
+        say(p, "notes", "notes", "edited outside the app since the last session; kept as they are");
+    }
+    for (stem, r) in folder::recover_other_days(&dir, &files.stem, &recovery, Some(spend.clone())).await? {
+        say(p, "done", "recovered", &format!("{stem}'s transcript gaps{}", if r.unresolved > 0 { format!(", {} still waiting", r.unresolved) } else { String::new() }));
+    }
+    segments::session_marker(&files.transcript, chrono::Local::now())?;
+
+    println!();
+    println!("  {}  {}  {name}", p.paint(&course, &["bold"]), p.paint("›", &["dim"]));
+    let waiting = if init.pending_segments > 0 || init.pending_slides > 0 {
+        format!(", resumed with {} and {} for the next snapshot", plural(init.pending_segments as usize, "line"), plural(init.pending_slides, "slide"))
+    } else {
+        String::new()
+    };
+    println!("{}", p.paint(&format!("  listening on {input_name}{waiting}"), &["dim"]));
+    println!("{}", p.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop", &["dim"]));
+    println!();
+
+    let session = SessionConfig { dir: dir.clone(), stem: files.stem.clone(), stt: Some(stt_link), recovery: Some(recovery()?), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stdin_tx = cmd_tx.clone();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines().map_while(Result::ok) {
+            let text = line.trim().to_string();
+            let op = if text.eq_ignore_ascii_case("polish") { Op::Polish } else { Op::Snapshot(text) };
+            if stdin_tx.send(LectureCommand::Op(op)).is_err() {
+                return;
+            }
+        }
+    });
+    let stop_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        let mut presses = 0;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            presses += 1;
+            if presses == 1 {
+                say(p, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)");
+            } else {
+                say(p, "warn", "stopping", "no longer waiting for recovery; its gaps wait for the next session");
+            }
+            if stop_tx.send(LectureCommand::Stop).is_err() {
+                return;
+            }
+        }
+    });
+    if let Some(limit) = a.secs {
+        let timer_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(limit)).await;
+            let _ = timer_tx.send(LectureCommand::Stop);
+        });
+    }
+    drop(cmd_tx);
+    let mut watch = (uid == loopback::BLACKHOLE_UID).then(|| SilenceWatch::new(-60.0, 10));
+    let printer = tokio::spawn(async move {
+        while let Some(e) = ev_rx.recv().await {
+            show(p, &e, &mut watch);
+        }
+    });
+    let watch_slides = SlideWatch { screenshots: screenshot_dir(), poll: Duration::from_secs(1) };
+    let result = lecture::run(lec, session, Box::new(DeviceSource { uid }), watch_slides, cmd_rx, ev_tx).await;
+    printer.await?;
+    let report = result?;
+    let file_name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    println!();
+    println!("  {} {}  {}  {}", p.paint("✓", &["teal"]), p.paint("saved", &["bold"]), file_name(&files.notes), file_name(&files.transcript));
+    if report.unresolved > 0 {
+        println!("{}", p.paint(&format!("    {} still to recover; the next session in this folder does it", plural(report.unresolved, "transcript gap")), &["dim"]));
+    }
+    println!("{}", p.paint(&format!("    {} spent on this lecture today; `lecture spend` has the rest", spend::money(spend.lecture_total())), &["dim"]));
+    println!();
     Ok(())
 }
