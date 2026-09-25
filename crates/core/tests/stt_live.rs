@@ -94,3 +94,17 @@ async fn live_refusal_of_a_bad_key_stops_stt() {
     let ev = until_ended(&mut link).await;
     assert_eq!(ev.last(), Some(&SttEvent::Ended { recording_id: id, gap: Some(Gap::new(id, 0, Some(1600), GapKind::SttRefused)) }));
 }
+
+#[tokio::test]
+#[ignore]
+async fn live_rest_transcribes_a_recorded_interval_with_word_times() {
+    use lecturelive_core::stt::rest::{RestClient, RestConfig, RestError};
+    let pcm = speech_wav();
+    let t = RestClient::new(RestConfig::new(api_key(), vec![])).unwrap().transcribe(&pcm[48_000..]).await.unwrap();
+    println!("{t:#?}");
+    assert!(t.text.to_lowercase().contains("gradient descent"), "{}", t.text);
+    assert!(!t.words.is_empty() && t.words.iter().all(|w| w.start <= w.end && w.end <= t.duration + 0.01));
+    let refused = RestClient::new(RestConfig::new("xai-not-a-real-key".into(), vec![])).unwrap().transcribe(&pcm[..16_000]).await.unwrap_err();
+    println!("{refused:?}");
+    assert!(matches!(refused, RestError::Refused(ref m) if m.contains("Incorrect API key")));
+}

@@ -1,4 +1,5 @@
 pub mod probe;
 pub mod protocol;
+pub mod rest;
 pub mod stream;
 pub mod transcript;

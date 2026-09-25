@@ -9,7 +9,7 @@ use crate::audio::frame::{Frame, FRAME_SAMPLES};
 
 pub const SAMPLE_RATE: u32 = 16_000;
 const CHECKPOINT_SAMPLES: u32 = SAMPLE_RATE;
-const HEADER_LEN: u64 = 44;
+pub const HEADER_LEN: u64 = 44;
 
 fn spec() -> WavSpec {
     WavSpec { channels: 1, sample_rate: SAMPLE_RATE, bits_per_sample: 16, sample_format: SampleFormat::Int }
