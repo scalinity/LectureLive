@@ -42,15 +42,23 @@ Tasks (detailed in the M0 plan):
 7. Packaged Tauri canary app (permissions, entitlements, buttons for each check)
 8. Acceptance run on the real machine; findings recorded below
 
-**Gate:**
+**Gate** (checked without a live lecture: the session runs every check it can alone, and
+a person gives the two permission grants and one Zoom click in a single sitting of about
+three minutes, with no meeting; plan Task 8):
 
 - [ ] Packaged `.app` obtains microphone permission and records from BlackHole
-- [ ] Routing preflight: Zoom audio audible and signal present on BlackHole while routed; default output restored on stop
+- [ ] Routing: signal from system audio present on BlackHole while routed; default output restored on stop
+- [ ] Zoom's own output (Settings → Audio → Test Speaker) audible and present on BlackHole, with Zoom's speaker setting recorded
 - [ ] Route restore offered and working after `kill -9` of the app while routed
 - [ ] WAV recorded by the app is playable up to the last one-second checkpoint after `kill -9` (after `canary repair`)
-- [ ] Packaged `.app` obtains Screen Recording permission and saves one correct Zoom window image
+- [ ] Packaged `.app` obtains Screen Recording permission and saves correct images of a known window and a Zoom window
 - [ ] STT protocol fixtures recorded for both finalize spellings; accepted spelling, timestamp origin and `speech_final` behaviour written below
 - [ ] Crate versions that build together recorded below
+
+**At the first Zoom lecture after M0** (holds before M1's gate is checked; that gate needs a
+Zoom lecture anyway):
+
+- [ ] The packaged `.app` captures the Zoom meeting window with a shared slide, and the image shows the slide
 
 **Findings:** _(filled in by M0 task 8)_
 

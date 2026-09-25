@@ -620,10 +620,10 @@ pub fn route_status(state_path: &Path) -> Result<RouteStatus> {
 Run: `cargo test -p lecturelive-core -- fsutil routing`
 Expected: 4 passed, 1 ignored.
 
-- [ ] **Step 8: Run the hardware test by hand** (BlackHole installed; audio will switch briefly)
+- [ ] **Step 8: Run the hardware test** (BlackHole installed; the default output switches for about a second, and the test asserts it comes back)
 
 Run: `cargo test -p lecturelive-core routing -- --ignored`
-Expected: PASS; System Settings → Sound shows the original output afterwards. If `BlackHole2ch_UID` is wrong, `route_status` reports `blackhole_present: false`; list device UIDs with Audio MIDI Setup and correct the constant.
+Expected: PASS. Before running it, note the default output's name (`system_profiler SPAudioDataType`, the device marked `Default Output Device: Yes`): if the test fails partway, sound still plays, because the aggregate includes the original output, and that name is what to select in System Settings → Sound → Output. If `BlackHole2ch_UID` is wrong, `route_status` reports `blackhole_present: false`; list device UIDs with Audio MIDI Setup and correct the constant.
 
 - [ ] **Step 9: Commit**
 
@@ -1486,7 +1486,7 @@ exercised from the terminal before the packaged app exists."
 
 **Interfaces:**
 - Consumes: `routing::{enable_loopback, disable_loopback, route_status}`, `input::{list_inputs, record_for}`, `window::{list_windows, capture_window}`.
-- Produces: Tauri commands `route(action: String) -> Result<String, String>`, `inputs() -> Result<Vec<String>, String>`, `record(device: String, secs: u64) -> Result<String, String>`, `windows() -> Result<Vec<(u32, String)>, String>`, `capture(id: u32) -> Result<String, String>`. Outputs go to `~/Library/Application Support/LectureLive/canary/`.
+- Produces: Tauri commands `route(action: String) -> Result<String, String>`, `inputs() -> Result<Vec<String>, String>`, `record(device: String, secs: u64) -> Result<String, String>`, `windows() -> Result<Vec<(u32, String)>, String>`, `capture(id: u32) -> Result<String, String>`. The same checks run without the UI when the app is launched with `--check <route on|off|status | record DEVICE SECS | windows | capture ID>`: the result is appended to `checks.log` and the app quits, so Task 8 can drive the packaged app from a terminal. Outputs go to `~/Library/Application Support/LectureLive/canary/`.
 
 - [ ] **Step 1: Scaffold**
 
@@ -1545,6 +1545,7 @@ Ad-hoc signing (`"-"`) means macOS may ask for permissions again after each rebu
 - [ ] **Step 3: Commands** — replace the template's `lib.rs` body:
 
 ```rust
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1561,18 +1562,39 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+fn route_sync(action: &str) -> Result<String, String> {
+    let p = app_dir("")?.join("route.json");
+    match action {
+        "on" => routing::enable_loopback(&p).map(|s| format!("routed; previous output {}", s.previous_output_uid)).map_err(err),
+        "off" => routing::disable_loopback(&p).map(|r| format!("restored: {r}")).map_err(err),
+        _ => routing::route_status(&p).map(|s| format!("{s:#?}")).map_err(err),
+    }
+}
+
+fn record_sync(device: &str, secs: u64) -> Result<String, String> {
+    let mut loudest = 0f32;
+    let r = input::record_for(device, Duration::from_secs(secs), &app_dir("canary")?, |l| loudest = loudest.max(l)).map_err(err)?;
+    Ok(format!(
+        "{} — {:.1} s, dropped {}, loudest second {:.1} dBFS",
+        r.path.display(),
+        r.samples as f64 / 16_000.0,
+        r.dropped_callbacks,
+        20.0 * loudest.max(1e-6).log10()
+    ))
+}
+
+fn windows_sync() -> Result<Vec<(u32, String)>, String> {
+    window::list_windows().map(|v| v.into_iter().map(|w| (w.id, format!("{} — {}", w.app, w.title))).collect()).map_err(err)
+}
+
+fn capture_sync(id: u32) -> Result<String, String> {
+    let out = app_dir("canary")?.join(format!("window_{id}.png"));
+    window::capture_window(id, &out).map(|(w, h)| format!("{} {w}x{h}", out.display())).map_err(err)
+}
+
 #[tauri::command]
 async fn route(action: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let p = app_dir("")?.join("route.json");
-        match action.as_str() {
-            "on" => routing::enable_loopback(&p).map(|s| format!("routed; previous output {}", s.previous_output_uid)).map_err(err),
-            "off" => routing::disable_loopback(&p).map(|r| format!("restored: {r}")).map_err(err),
-            _ => routing::route_status(&p).map(|s| format!("{s:#?}")).map_err(err),
-        }
-    })
-    .await
-    .map_err(err)?
+    tauri::async_runtime::spawn_blocking(move || route_sync(&action)).await.map_err(err)?
 }
 
 #[tauri::command]
@@ -1584,36 +1606,54 @@ async fn inputs() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 async fn record(device: String, secs: u64) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let r = input::record_for(&device, Duration::from_secs(secs), &app_dir("canary")?, |_| {}).map_err(err)?;
-        Ok(format!("{} — {:.1} s, dropped {}", r.path.display(), r.samples as f64 / 16_000.0, r.dropped_callbacks))
-    })
-    .await
-    .map_err(err)?
+    tauri::async_runtime::spawn_blocking(move || record_sync(&device, secs)).await.map_err(err)?
 }
 
 #[tauri::command]
 async fn windows() -> Result<Vec<(u32, String)>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        window::list_windows().map(|v| v.into_iter().map(|w| (w.id, format!("{} — {}", w.app, w.title))).collect()).map_err(err)
-    })
-    .await
-    .map_err(err)?
+    tauri::async_runtime::spawn_blocking(windows_sync).await.map_err(err)?
 }
 
 #[tauri::command]
 async fn capture(id: u32) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let out = app_dir("canary")?.join(format!("window_{id}.png"));
-        window::capture_window(id, &out).map(|(w, h)| format!("{} {w}x{h}", out.display())).map_err(err)
-    })
-    .await
-    .map_err(err)?
+    tauri::async_runtime::spawn_blocking(move || capture_sync(id)).await.map_err(err)?
+}
+
+/// One check without the UI: `--check route on|off|status`, `--check record DEVICE SECS`,
+/// `--check windows`, `--check capture ID`.
+fn run_check(args: &[String]) -> Result<String, String> {
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["route", action] => route_sync(action),
+        ["record", device, secs] => record_sync(device, secs.parse().map_err(err)?),
+        ["windows"] => windows_sync().map(|v| v.iter().map(|(id, l)| format!("{id} {l}")).collect::<Vec<_>>().join("\n")),
+        ["capture", id] => capture_sync(id.parse().map_err(err)?),
+        other => Err(format!("unknown check {other:?}")),
+    }
+}
+
+fn log_check(args: &[String], result: &Result<String, String>) -> std::io::Result<()> {
+    let path = app_dir("canary").map_err(std::io::Error::other)?.join("checks.log");
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    match result {
+        Ok(s) => writeln!(f, "{} ok\n{s}\n", args.join(" ")),
+        Err(e) => writeln!(f, "{} FAILED: {e}\n", args.join(" ")),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let check: Vec<String> = std::env::args().skip_while(|a| a.as_str() != "--check").skip(1).collect();
     tauri::Builder::default()
+        .setup(move |app| {
+            if !check.is_empty() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let _ = log_check(&check, &run_check(&check));
+                    handle.exit(0);
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![route, inputs, record, windows, capture])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1621,6 +1661,8 @@ pub fn run() {
 ```
 
 Remove any template plugins/commands no longer referenced.
+
+Launch checks through `open` (`open -W -n "<path>/LectureLive Canary.app" --args --check …`), never by running `Contents/MacOS/` from a shell: macOS attributes a process started from a terminal to that terminal for Microphone and Screen Recording, so the check would use the terminal's permissions — the very thing this app exists to rule out. `-W` returns when the check has finished and the app has quit; `-n` starts a fresh instance each time.
 
 - [ ] **Step 4: Page** — replace the template's main Svelte page with:
 
@@ -1676,7 +1718,9 @@ Remove any template plugins/commands no longer referenced.
 - [ ] **Step 5: Build the packaged app**
 
 Run: `cd apps/desktop && npm run tauri build -- --bundles app`
-Expected: `target/release/bundle/macos/LectureLive Canary.app`. Verify entitlements: `codesign -d --entitlements - "target/release/bundle/macos/LectureLive Canary.app"` lists `com.apple.security.device.audio-input`.
+Expected: `target/release/bundle/macos/LectureLive Canary.app` at the workspace root. Verify entitlements: `codesign -d --entitlements - "target/release/bundle/macos/LectureLive Canary.app"` lists `com.apple.security.device.audio-input`. Then `open -W -n "$PWD/target/release/bundle/macos/LectureLive Canary.app" --args --check route status` appends a route status to `~/Library/Application Support/LectureLive/canary/checks.log`.
+
+This is the build Task 8 grants permissions to. An ad-hoc-signed rebuild changes the app's code signature and macOS may ask for both permissions again, so any change after the permission sitting means another sitting.
 
 - [ ] **Step 6: Commit**
 
@@ -1686,7 +1730,9 @@ git commit -m "Add a packaged canary app that exercises each native capability
 
 The app asks for microphone and Screen Recording permission as a signed
 bundle with the audio-input entitlement, so the permissions M0 checks are the
-app's own, not inherited from Terminal."
+app's own, not inherited from Terminal. Launched with --check, it runs one
+check without the UI and logs the result, so the acceptance run can drive the
+packaged app from a terminal."
 ```
 
 ---
@@ -1696,6 +1742,16 @@ app's own, not inherited from Terminal."
 **Files:**
 - Create: `crates/core/tests/fixtures/stt/finalize_json.jsonl`, `crates/core/tests/fixtures/stt/finalize_text.jsonl`, `crates/core/tests/fixtures/stt/speech.wav`
 - Modify: `docs/milestones.md` (M0 gate checkboxes, Findings, Status)
+
+Nothing here waits for a live lecture. The session runs every check it can alone (Steps 1, 2, 4 and 5); a person gives the two permission grants and one Zoom click in a single sitting of about three minutes, with no meeting (Step 3); the one check that needs a Zoom meeting is left in `docs/milestones.md` for the first Zoom lecture after M0. macOS grants Microphone and Screen Recording only through a person's click — no program can write that permission — so the sitting is the part that cannot be automated, and it comes after the last build (Task 7 Step 5).
+
+The packaged app is driven with `--check` (Task 7). Define these in every shell that runs checks, from the repository root:
+
+```bash
+APP="$PWD/target/release/bundle/macos/LectureLive Canary.app"
+LOG="$HOME/Library/Application Support/LectureLive/canary/checks.log"
+check() { open -W -n "$APP" --args --check "$@"; tail -n 25 "$LOG"; }
+```
 
 - [ ] **Step 1: STT fixtures from synthesised speech** (no lecture audio in the repository)
 
@@ -1709,24 +1765,73 @@ cargo run -p lecturelive-cli -- canary stt-probe crates/core/tests/fixtures/stt/
 
 Record in Findings: which finalize spelling produced a `speech_final: true` shortly after it (or an `error`); whether word `start` times are relative to connection start; whether `transcript.done` repeats the whole text.
 
-- [ ] **Step 2: Packaged-app checks** (Zoom running with audio; open the `.app` from Finder)
+- [ ] **Step 2: Routing from the terminal** (no permission involved)
 
-1. Route status → `blackhole_present: true`.
-2. Route on → play Zoom audio: audible on speakers/headphones. If not, check Zoom → Settings → Audio → Speaker is "Same as System"; record the result.
-3. List inputs → Record `BlackHole 2ch` 20 s while Zoom plays → accept the microphone prompt → `afinfo <wav>` shows ~20 s; `afplay <wav>` plays Zoom audio.
-4. Route off → default output restored (System Settings → Sound).
-5. Crash test: Route on, Record 120 s, after ~30 s run `pkill -9 -f "LectureLive Canary"`. Relaunch → Route status shows `abandoned: true` → Route off restores output. Run `cargo run -p lecturelive-cli -- canary repair <wav>` → `afinfo` duration ≥ time recorded before the kill minus 1 s; `afplay` plays it.
-6. List windows → accept Screen Recording prompt (relaunch if macOS requires) → Capture the Zoom window → open the PNG: it shows the shared slide.
+```bash
+cargo run -p lecturelive-cli -- canary route status   # blackhole_present: true; note default_output_uid, the output that must come back
+cargo run -p lecturelive-cli -- canary route on
+cargo run -p lecturelive-cli -- canary route status   # abandoned: true, the state a crash while routed leaves behind
+cargo run -p lecturelive-cli -- canary route off      # restored default output: true
+cargo run -p lecturelive-cli -- canary route status   # default_output_uid as noted, saved: None
+```
 
-- [ ] **Step 3: Record versions**
+While routed, the aggregate plays through the original output as well as BlackHole, so sound is never lost; if a restore fails, name the noted device for System Settings → Sound → Output.
 
-`cargo tree -p lecturelive-core --depth 1` → copy the resolved versions of `cpal`, `rubato`, `hound`, `xcap`, `tokio-tungstenite`, `coreaudio-sys`, `core-foundation`, and `tauri` into Findings together with `rustc --version` and `sw_vers -productVersion`.
+- [ ] **Step 3: Permission sitting** (a person at the Mac, about three minutes, no Zoom meeting)
 
-- [ ] **Step 4: Update `docs/milestones.md`**
+Ask for the sitting once, listing all three actions up front, and run each command when the person says they are ready.
 
-Tick each gate line that held; for any that failed, write what was observed and which spec §14.1 fallback it points to. Set M0 status to `done` only if every gate line holds.
+1. `check record "BlackHole 2ch" 5` → macOS asks to let LectureLive Canary use the microphone → the person clicks Allow.
+2. `check windows` → macOS asks for Screen Recording → the person turns on LectureLive Canary in System Settings → Privacy & Security → Screen & System Audio Recording. Run `check windows` again: the log lists windows with their titles.
+3. Zoom's own audio, without a meeting: the person opens Zoom → Settings → Audio and reads out the Speaker setting ("Same as System" or a named device). Run `check route on`; tell the person to click Test Speaker and at once run `check record "BlackHole 2ch" 15`; then `check route off`. The person says whether they heard the ringtone; a loudest second above −60 dBFS in the log (digital silence reads −120) means Zoom's output reached BlackHole.
 
-- [ ] **Step 5: Commit**
+Record the Zoom speaker setting in Findings. With "Same as System", the signal came through the app's route (spec §4.3). With a named device, it came through that device, and §4.3's route did not carry Zoom at all.
+
+- [ ] **Step 4: Loopback and crash through the packaged app** (no person needed; the synthesised speech plays aloud while routed)
+
+```bash
+check route status                                      # note default_output_uid
+check route on
+(for i in $(seq 12); do afplay crates/core/tests/fixtures/stt/speech.wav; done) &   # ~2 min of speech, ends by itself; run in the background
+check record "BlackHole 2ch" 20                         # ~20 s, dropped 0, loudest second above −60 dBFS
+open -n "$APP" --args --check record "BlackHole 2ch" 120
+```
+
+About 30 s into that recording run `pkill -9 -f "LectureLive Canary"`, noting how long it recorded. Then:
+
+```bash
+check route status                                      # abandoned: true
+check route off                                         # restored: true
+check route status                                      # default_output_uid as noted
+WAV=$(ls -t "$HOME/Library/Application Support/LectureLive/canary"/session_*.wav | head -1)
+cargo run -p lecturelive-cli -- canary repair "$WAV"
+afinfo "$WAV"                                           # duration ≥ seconds recorded before the kill − 1
+afplay -t 2 "$WAV"                                      # exits 0
+```
+
+- [ ] **Step 5: Window capture through the packaged app** (no person needed)
+
+```bash
+open -a TextEdit README.md
+open -a zoom.us
+check windows                                           # note the ids of the TextEdit README.md window and a zoom.us window
+check capture <TextEdit id>
+check capture <zoom.us id>
+```
+
+Look at each PNG: the TextEdit image shows README.md's text, the Zoom image shows Zoom's window, and neither side exceeds 1600 px. If Zoom opens no window, record that.
+
+- [ ] **Step 6: Record versions**
+
+`cargo tree -p lecturelive-core --depth 1` → copy the resolved versions of `cpal`, `rubato`, `hound`, `xcap`, `tokio-tungstenite`, `coreaudio-sys` and `core-foundation`, and `tauri` from the app crate's `cargo tree --depth 1`, into Findings together with `rustc --version`, `sw_vers -productVersion` and `xcodebuild -version`.
+
+- [ ] **Step 7: Update `docs/milestones.md`**
+
+Tick each gate line that held; for any that failed, write what was observed and which spec §14.1 fallback it points to. Set M0 status to `done` only if every line under **Gate** holds; the line under **At the first Zoom lecture after M0** stays open until that lecture.
+
+Findings also compare spec §4.3 with README.md's "Zoom lectures on headphones" setup, which is how Zoom is recorded in class today. There, Zoom's speaker is pinned by name to a Multi-Output device the user made, with BlackHole as its primary (clock) device because headphones disconnect and take the clock with them, and the system output stays on the headphones so other sounds are not transcribed. §4.3 instead makes an app-owned aggregate the system default, with the physical output as the clock. Record what Step 3 showed and which arrangement the evidence favours; the choice is made when M1's plan is written.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/core/tests/fixtures docs/milestones.md
