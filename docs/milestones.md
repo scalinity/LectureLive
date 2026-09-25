@@ -16,7 +16,7 @@ kickoff prompt carries this rule.
 | M | Name | Status | Depends on | Destroys anything | Plan |
 |---|------|--------|-----------|-------------------|------|
 | M0 | Contract fixtures + packaged native canary | done | — | Changes the system default output (restored by the canary) | [m0-native-canary](superpowers/plans/2026-09-22-m0-native-canary.md) |
-| M1 | Recording + loopback foundation | in progress | M0 | Creates the "LectureLive Loopback" device; changes the system output only in the canary-route restore check, which restores it | [m1-recording-loopback](superpowers/plans/2026-09-25-m1-recording-loopback.md) |
+| M1 | Recording + loopback foundation | done | M0 | Creates the "LectureLive Loopback" device; changes the system output only in the canary-route restore check, which restores it | [m1-recording-loopback](superpowers/plans/2026-09-25-m1-recording-loopback.md) |
 | M2 | Streaming + recovery | not started | M1 | No | written at M2 start |
 | M3 | Notes/session parity | not started | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | written at M3 start |
 | M4 | Desktop app: transcript + notes panes | not started | M3 | No | written at M4 start |
@@ -169,16 +169,76 @@ Tasks:
 
 **Gate** (checked without a live lecture where the mechanism allows; plan Task 8):
 
-- [ ] 16/44.1/48 kHz inputs framed correctly (unit)
-- [ ] Interrupted WAV repaired on launch
-- [ ] `kill -9` during a loopback recording leaves the system output and "LectureLive Loopback" unchanged, and a canary route left behind is undone at the next launch
-- [ ] Loopback preflight passes with Zoom's Test Speaker played through "LectureLive Loopback"
-- [ ] Unplugging the wireless receiver produces a marked gap and no automatic source switch
+- [x] 16/44.1/48 kHz inputs framed correctly (unit)
+- [x] Interrupted WAV repaired on launch
+- [x] `kill -9` during a loopback recording leaves the system output and "LectureLive Loopback" unchanged, and a canary route left behind is undone at the next launch
+- [x] Loopback preflight passes with Zoom's Test Speaker played through "LectureLive Loopback"
+- [x] Unplugging the wireless receiver produces a marked gap and no automatic source switch
 
 **At the first Zoom lecture after M1** (nothing else waits on it):
 
 - [ ] A 30-minute Zoom recording with no unexplained captured-audio gaps
 - [ ] M0's deferred check (the line under "At the first Zoom lecture after M0" above): the packaged `.app` captures the Zoom meeting window with a shared slide, and the image shows the slide
+
+Commands for that lecture (Zoom's Speaker on "LectureLive Loopback", system output on the plain
+speakers or headphones):
+
+```bash
+L=$HOME/Documents/Tools/LectureLive/target/debug/lecturelive
+$L loopback check --secs 15          # while Zoom plays; pass above −60 dBFS
+$L record --loopback --secs 1800 --dir "$HOME/Library/Application Support/LectureLive/m1-zoom"
+cat "$HOME/Library/Application Support/LectureLive/m1-zoom/.live_notes/lecture_notes_$(date +%Y%m%d).v2.json"   # "gaps": []
+APP="$HOME/Documents/Tools/LectureLive/target/release/bundle/macos/LectureLive Canary.app"
+open -W -n "$APP" --args --check windows; tail -n 40 "$HOME/Library/Application Support/LectureLive/canary/checks.log"
+open -W -n "$APP" --args --check capture <ID of the zoom.us meeting window>
+```
+
+**Findings** (acceptance run 2026-09-25; recordings and check files in
+`~/Library/Application Support/LectureLive/`, outside the repository):
+
+*Routing decision.* The README arrangement, built by the app: "LectureLive Loopback"
+(`com.lecturelive.loopback`), a stacked Multi-Output with BlackHole as clock and one physical
+output with drift correction, never the system default (spec §4.3). Chosen over spec §4.3's
+default-output aggregate because both carried Zoom in M0 (−41.6 and −40.4 dBFS), and this
+one changes nothing system-wide, so a crash leaves nothing to undo and other apps stay out of
+the transcript.
+
+*New crates* (`Cargo.lock`): `rtrb 0.4.0`, `uuid 1.26.1` (v4, serde), `objc2-av-foundation 0.3.2`
+(no default features; `std`, `AVCaptureDevice`, `AVMediaFormat`); `chrono 0.4.45` gains `serde`.
+Workspace `rust-version` is 1.89 (`std::fs::File::try_lock` for the folder lock). cpal 0.18
+already installs `kAudioDevicePropertyDeviceIsAlive` and `kAudioDevicePropertyNominalSampleRate`
+listeners on every input stream and reports them as `DeviceNotAvailable` and
+`StreamInvalidated`; `Device::id()` is the CoreAudio UID. rubato 5's `Fft::output_delay()` is the
+exact delay to trim (an impulse at 1 s lands within ±2 samples of 16,000 at 16, 44.1 and 48 kHz).
+
+*Loopback.* Setup from a speaker default created the device and left the system output
+unchanged. A tone through the device read −53.1 dBFS on BlackHole; the same tone straight to the
+speakers read −120.0 (negative control). The device adds no loss: a tone read −47.0 dBFS both
+straight into BlackHole and through the device. The ~24 dB below nominal was BlackHole's own
+output volume (about 60% in Audio MIDI Setup).
+Zoom's Test Speaker through the device, first run: pass at −40.5 dBFS, but barely audible and the
+volume keys did nothing — the system output was the user-made Multi-Output "Macbook + Notes",
+which macOS gives no volume control (`output volume: missing value`), with its speaker member
+at about 10%. With the system output on MacBook Pro Speakers and BlackHole's volume at maximum:
+pass at −15.7 to −24.7 dBFS, the level following the ringtone regardless of listening volume,
+and the volume keys changed Zoom's loudness. Spec §4.3 step 3 now says so.
+
+*Crash and repair.* `record --loopback` killed with `kill -9` 20 s in: system output and the
+device unchanged; the next launch repaired the WAV to 19.8 s, marked an `interrupted` gap and
+`afplay` played it. A canary route left as the system default was undone at the next launch
+(`restored: true`). After review, launch repair and retention cover every sidecar in the folder,
+not only the current day's.
+
+*Receiver.* DJI "Wireless Mic Rx", UID `AppleUSBAudioEngine:DJI Technology Co.,
+Ltd.:Wireless Mic Rx:XSP12345678B:3` (48 kHz, 2 ch; the UID carries the serial number). Unplugged
+20.1 s in: the recording closed, a `device_gone` gap was marked, no other input was opened;
+replugged 21 s later: a new recording on the same UID. After review, a device that is listed but
+cannot open yet (after a replug or a rate change) is waited for instead of ending the session.
+
+*Soak* (evidence for the deferred 30-minute line, not a substitute): `record --loopback` for
+1,800 s with a tone straight into BlackHole: one recording of 1,800.0 s, 0 gaps, 0 stream errors.
+
+*Failed lines:* none. No spec §14.1 fallback is indicated by M1.
 
 ## M2 — Streaming + recovery
 

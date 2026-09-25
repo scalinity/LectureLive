@@ -204,9 +204,13 @@ never changed:
    Setup runs on request only, never during a recording: rebuilding the device under a
    running meeting would move Zoom to another speaker.
 3. In Zoom → Settings → Audio, Speaker is set to "LectureLive Loopback" once. The system
-   output stays on a device that does not include BlackHole (the headphones or speakers), so
-   only Zoom reaches the transcript. Volume is set on the headphones or in Zoom; Zoom's
-   speaker slider also lowers the level that is transcribed.
+   output is the plain physical device (the headphones or speakers), never a multi-output
+   device: macOS gives a multi-output device no volume control, and one that includes
+   BlackHole sends every app's sound into the transcript. Because the system output is the
+   same physical device that plays Zoom inside "LectureLive Loopback", the volume keys set
+   Zoom's listening volume without changing what is transcribed. BlackHole's own output
+   volume (Audio MIDI Setup) stays at maximum, because it sets the transcribed level; Zoom's
+   speaker slider lowers that level too.
 4. Preflight: play Zoom's Test Speaker and require a signal on the BlackHole input (loudest
    second above −60 dBFS). During a loopback recording, ten consecutive seconds below
    −60 dBFS raise a warning that names Zoom's Speaker setting. These are the only guards
