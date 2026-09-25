@@ -105,11 +105,15 @@ Tasks:
 6. Commit journal and launch recovery with fault injection at every step (§6.2)
 7. Polish with abort, backup, atomic replace (§6.3)
 8. Sidecar v2, folder lock, initialisation table, legacy migration; Python CLI exits on v2 folders (§8)
-9. CLI `run` command: full session (record, stream, snapshot, polish) headless
+9. CLI `lecture` command: full session (record, stream, snapshot, polish) headless, with `page` and `spend` as in the Python CLI
+10. Spend ledger: one line per paid request, billed or computed, CLI format; takes over the CLI's ledger (§8)
+11. Study page: one distillation request over the whole notes and slides within a word budget, revision on overshoot, section re-cut, fragment stripping, page cache keyed to prompt and notes, single-pass template fill with `notes_template.html` embedded (§6.4)
 
-**Gate:** golden prompts and file formats match `live_notes.py`; empty and truncated SSE
+**Gate:** golden prompts and file formats (including the spend ledger) match `live_notes.py`; empty and truncated SSE
 leave the document untouched; fault injection between every commit step recovers
-correctly; a legacy folder migrates; the Rust CLI runs a full lecture headless.
+correctly; a legacy folder migrates; the Rust CLI runs a full lecture headless; a
+fixture lecture distils to a complete study page within its budget, and an unchanged one re-renders from
+its cached parts without requests.
 
 ## M4 — Desktop app: transcript + notes panes
 
@@ -122,8 +126,9 @@ Tasks:
 2. Svelte rune store: awaited listener setup, hydration, sequence checks, bounded preview
 3. Transcript pane: word IDs, fade-in, collapse of closed utterances, pin-to-bottom
 4. Notes pane: frozen committed render, throttled preview parse, DOMPurify, scoped slide assets, CSP
-5. Control bar: source picker with meter and route status, start/stop, hint + snapshot, polish, status
+5. Control bar: source picker with meter and route status, start/stop, hint + snapshot, polish, open study page, status with this lecture's spend
 6. Keychain storage of the API key
+7. Spend view from the ledger (§9.1)
 
 **Gate:** reload and hidden-window rehydration restore the full view; hint, cancel and
 polish behave as in the CLI; 500-delta/s burst and two-hour transcript fixtures keep p95
@@ -153,7 +158,7 @@ Tasks:
 1. Mixed mode: timestamp-aligned FIFOs with adaptive resampling; two-hour drift test
 2. Error table (§10) verified item by item
 3. Two-hour real lecture with forced restart, receiver removal, permission denial, disk-full and network loss
-4. Remove `live_notes.py` and `pyproject.toml`; README switches to the app and Rust CLI
+4. Remove `live_notes.py` and `pyproject.toml` (`notes_template.html` stays; core embeds it); README switches to the app and Rust CLI
 
 **Gate:** zero unexplained missing or duplicate audio intervals over the two-hour run;
 every §10 row observed; mixed mode passes the drift test or ships disabled.

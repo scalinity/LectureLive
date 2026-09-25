@@ -38,6 +38,7 @@ study document (`polish`).
 - G5 Human-readable files compatible with the CLI's (Markdown notes, transcript, `slides/`), with exact resume.
 - G6 Captured audio is durable to within the last one-second checkpoint after a crash, and every interval without durable audio or without committed transcript is reported as a gap.
 - G7 `polish` and hint input as in the CLI.
+- G8 A study page per lecture: polish also typesets the notes as one interactive HTML page, each slide redrawn as formulas, tables and diagrams and switchable back to its screenshot.
 
 ### 1.4 Non-goals (v1)
 
@@ -56,6 +57,7 @@ slides, a past-lectures browser, cloud sync, accounts, telemetry, Windows/Linux.
 | Source of truth | Markdown, transcript and slides on disk; a versioned sidecar records exactly what is committed | Human-readable and tool-independent; the sidecar makes resume exact |
 | Target | macOS 13+, Apple Silicon, one user | |
 | Credentials | API key in the macOS Keychain for the app; `.env` or environment for the CLI; never in frontend state or lecture files | |
+| Study page | One fixed template (`notes_template.html`) filled with model-typeset fragments in a small component vocabulary; parts cached against the notes | The design lives in one file while content varies per lecture; a template change reaches every lecture from its cached parts, at no cost |
 
 ## 3. Architecture
 
@@ -68,14 +70,15 @@ LectureLive/
     core/                    library: the whole pipeline, no UI
       src/audio/             sources, conversion, alignment, mixer, framer, recorder, routing
       src/stt/               websocket client, transcript state machine, REST recovery
-      src/notes/             batch builder, prompts, SSE client, embed validation, polish
+      src/notes/             batch builder, prompts, SSE client, embed validation, polish, study page
       src/capture/           window enumeration, capture worker, change detector
-      src/session/           coordinator, lecture folder, sidecar, commit journal, lock
+      src/session/           coordinator, lecture folder, sidecar, commit journal, spend ledger, lock
       src/events.rs          notifications to adapters
-    cli/                     headless binary on core (replaces live_notes.py at M6)
+    cli/                     headless binary on core, the `lecture` command (replaces live_notes.py at M6)
   apps/desktop/
     src-tauri/               commands → coordinator handle; notifications → events/channels
     src/                     Svelte 5
+  notes_template.html        the study page design, read by live_notes.py and embedded in core at build time
   live_notes.py, pyproject.toml   retired at the final acceptance gate (M6)
   docs/
 ```
@@ -305,6 +308,60 @@ polish aborts. The previous document is copied to a uniquely named backup and fs
 the result is validated (every embed exactly once), written to a temp file and
 atomically renamed over the notes file, and the revision advances.
 
+### 6.4 Study page
+
+A successful polish distils the polished notes into an HTML study page beside them, named
+after the lecture: the lecture folder's title without its week prefix (`Week 06 —
+Statistical Analysis Methods` gives `Statistical Analysis Methods.html`), with the date
+added only when the folder holds more than one day's notes. The same step runs on its own
+from the notes (`lecture page`, or the app's Open study page when the page is missing or
+stale), without polishing again.
+
+The page is a condensation, not a copy: the notes stay the complete record, and the page
+holds what a student needs to revise. One chat request carries the whole notes and every
+slide image, at medium reasoning effort (at the default, high, one request over a
+two-hour lecture ran past ten minutes), so what earns space is decided across the whole lecture: flagged and
+examinable points first, then the formulas and decision rules needed to solve problems,
+then at most one worked example per method cut to its essential steps, then terms new in
+this lecture. Reviews of earlier weeks, digressions, logistics, repetition and software
+walkthroughs are cut. The budget is 30% of the notes' words, between 600 and 2,500, split
+about 65% topics, 15% glossary and takeaways, 20% questions. Visible words are counted
+from the output (drawings excluded); a draft more than 10% over budget gets one revision
+request, without images, that cuts the lowest-yield material, and the final count is
+reported with the page. At most 30% of the slides (2–8) are redrawn, only where a figure,
+table, diagram or formula block teaches faster than words and only the part that
+matters; every slide stays reachable in a collapsed All slides gallery. Prompts are
+`live_notes.py`'s `page_system` and `revise_system`, carried over with golden tests.
+
+The output runs keystone (the lecture's governing formula or idea, set large at the top),
+a two-to-three-sentence lede, 4–7 topic sections, a glossary of at most 12 terms, at most
+5 key takeaways, and 4–5 check-yourself questions with brief worked answers. It is written
+in a fixed vocabulary the template styles: TeX math in `\( \)` and `\[ \]`; `formula`
+(named, collected into the formula sheet), `flag` (examinable, at most 4), `example` with
+numbered `steps`, `map` (situation → method), `takeaways`, `glossary`, and
+`figure.redraw[data-slide=N]` holding display math, a table (highlighted groups as cells
+`a`/`b`) or an inline SVG drawn only with the template's classes. Sections are re-cut at
+every `<h2>`, so the page's structure never depends on the model's own wrappers;
+`<script>`, `<style>`, event and style attributes are stripped.
+
+Each request gets one retry; if it still fails, no page is written and the notes are
+untouched. The typeset page is stored in `.live_notes/<stem>.page.json` keyed by the
+SHA-256 of the prompt and the notes: a change to either typesets again, while a change to
+the template alone re-renders every lecture without requests. The page is filled in one
+pass (generated text is never read as a placeholder) and written atomically. Slide
+screenshots are embedded as JPEG data URIs (quality 80, subscripts still legible), read
+fresh from `slides/` at each fill while the cache keeps only their paths: the page is one
+self-contained file, because a browser handed only the page may not read the folder
+around it.
+
+The template owns all styling and behaviour: a contents rail in lecture order marking
+each section's slides and flagged points, a switch on every redraw back to its
+screenshot, self-test mode (definitions, takeaways, example steps and formulas hidden
+until clicked), glossary definitions on the first use of each term per section, a formula
+sheet, questions with folded answers, and the All slides gallery. It works in light and dark, at phone width and
+in print. Math (KaTeX) and fonts load from the web with pinned versions and integrity
+hashes; offline the page stays readable with math shown as TeX.
+
 ## 7. Slide capture
 
 ### 7.1 Window and region
@@ -348,6 +405,7 @@ until a real capture succeeds.
 ```
 <lecture folder>/
   lecture_notes_YYYYMMDD.md           append-only during class; <!-- HH:MM:SS --> markers
+  <lecture title>.html                the study page, named after the lecture (§6.4)
   lecture_transcript_YYYYMMDD.txt     [HH:MM:SS] text, append-only, in commit order
   slides/slide_NN_HHMMSS.png|jpg
   recordings/session_YYYYMMDD_HHMMSS.wav
@@ -357,6 +415,7 @@ until a real capture succeeds.
   .live_notes/<stem>.segments.jsonl   segment log: id, recording, samples, wall times, text, words
   .live_notes/<stem>.journal.json     pending commit, present only mid-commit
   .live_notes/<stem>_HHMMSS.md        polish backups
+  .live_notes/<stem>.page.json        typeset study page parts, keyed by the notes' SHA-256
   .live_notes/lock                    exclusive advisory lock (GUI and CLI)
 ```
 
@@ -378,6 +437,17 @@ Initialisation cases:
 Legacy writer: from M3 the Python CLI exits when a v2 sidecar exists, so the two
 writers never share a folder.
 
+Spend ledger: every paid request appends one JSON line to `spend.jsonl` in the app's data
+directory, written by the coordinator and fsynced: time, course, lecture folder, kind
+(`transcribe`, `notes`, `polish`, `page`), USD, `billed`, and for transcription the audio seconds.
+`billed` is true when the cost is the response's own `usage.cost_in_usd_ticks` (10^10
+ticks per dollar; for a streamed chat response, the running total on its final chunk) and
+false when it is computed from the published rates, as for speech-to-text, whose
+responses carry no cost ($0.20 per hour of audio streamed, $0.10 per hour batch). A failed
+request records nothing; a cancelled stream records the last cost it reported. The format
+is the CLI's, and on first launch the app takes over the CLI's ledger so the history is
+continuous. A last line cut short by a crash is skipped on read.
+
 ## 9. UI (Svelte 5, Tauri 2)
 
 ### 9.1 Layout
@@ -385,7 +455,8 @@ writers never share a folder.
 - **Transcript** (left): utterances as paragraphs with times; stable words full opacity, tentative tail reduced; newly stable words fade in (~180 ms). Closed utterances collapse to plain paragraph text. Auto-scroll pins to bottom until the user scrolls up; "jump to live" returns.
 - **Notes** (centre): committed document rendered once per revision and frozen; the streaming preview renders below it with the same fade-in and is replaced by the committed block.
 - **Slides** (right strip): thumbnails with time and auto/manual/uncertain badges; window and region picker on top.
-- **Control bar**: source picker with level meter and route status, Start/Stop, hint field + Snapshot, Polish, capture Auto/Manual and Capture-now, status (STT, capture, gaps, elapsed, cost estimate).
+- **Control bar**: source picker with level meter and route status, Start/Stop, hint field + Snapshot, Polish, Open study page (in the default browser; typesets first when the page is missing or stale, §6.4), capture Auto/Manual and Capture-now, status (STT, capture, gaps, elapsed, this lecture's spend today from the ledger, §8).
+- **Spend** (menu): totals by month and course, recent lectures broken down by kind, and the share of the total that is computed rather than billed.
 
 ### 9.2 State and lifecycle
 
@@ -418,6 +489,7 @@ meaning.
 | Network down / websocket error | Live-first reconnect with backoff; gap recorded; REST recovery when online; recording continues |
 | STT 4xx | Stop STT, surface message, keep recording |
 | Notes call fails, truncates or is cancelled | Document untouched; batch pending |
+| Study page part fails after its retry | No page written; notes untouched; typesetting can run again from the notes without polishing |
 | Crash mid-commit | Journal recovery on launch (§6.2) |
 | Microphone or Screen Recording denied | Affected feature disabled with fix-it button; the rest works |
 | BlackHole missing | Loopback disabled with install hint (`brew install blackhole-2ch`) |
@@ -425,16 +497,17 @@ meaning.
 | Device disappears | Mixed: surviving source continues, gap marked. Single: source stops, fallback offered |
 | Sample-rate change | Stream rebuilt, new timing segment, gap marked |
 | Disk write error | Session stops cleanly, path surfaced |
+| Spend ledger write fails | Warning in the status; the request's result is kept and recording continues |
 | App crash | Recording valid to last checkpoint; route restore offered; journal recovery; unclosed utterance becomes a gap |
 | External edit of notes | Accepted as new revision |
 
 ## 11. Testing
 
-- **Unit (core)**: framer across 16/44.1/48 kHz; drift alignment over simulated clocks; mixer gain/headroom; transcript state machine on recorded protocol logs incl. duplicate and late finals, empty hypotheses, continuous speech; finalize cutoff cases (no open utterance, final in flight, timeout, disconnect during flush); detector on recorded Zoom frames with annotated builds and animations; batch/cursor logic; journal recovery with fault injection after every commit step; embed validation; SSE parser on split/partial/truncated streams; character-safe slicing; midnight; external edits; legacy migration.
+- **Unit (core)**: framer across 16/44.1/48 kHz; drift alignment over simulated clocks; mixer gain/headroom; transcript state machine on recorded protocol logs incl. duplicate and late finals, empty hypotheses, continuous speech; finalize cutoff cases (no open utterance, final in flight, timeout, disconnect during flush); detector on recorded Zoom frames with annotated builds and animations; batch/cursor logic; journal recovery with fault injection after every commit step; embed validation; SSE parser on split/partial/truncated streams; character-safe slicing; midnight; external edits; legacy migration; spend ledger (billed and computed costs, a crash-truncated last line); study page (budget from the notes, word count excluding drawings, revision on overshoot, section re-cut, fragment stripping, cache hit and miss on prompt and notes, single-pass template fill).
 - **Integration**: fake STT websocket replaying captured sessions with disconnects of 3, 15, 45 and 300 s; fake REST STT; fake SSE endpoint; all in `cargo test` without network.
 - **Golden**: prompts and file formats byte-compared with `live_notes.py` output on fixtures.
 - **UI**: 500-delta/s burst and a two-hour transcript fixture with p95 frame work < 16.7 ms; reload and hidden-window rehydration.
-- **Manual**: packaged app with real Zoom for every source, permission flows, routing restore after kill, a full lecture with forced restart.
+- **Manual**: packaged app with real Zoom for every source, permission flows, routing restore after kill, a full lecture with forced restart; the study page of that lecture checked in light and dark, at phone width, and against each slide's screenshot.
 
 ## 12. Milestones
 
@@ -443,7 +516,7 @@ meaning.
 | M0 | Contract fixtures + packaged native canary | A packaged `.app` gets mic and Screen Recording permission, captures real Zoom audio through BlackHole with routing preflight, writes a playable WAV that survives `kill -9`, captures one correct window image, restores routing; STT protocol fixture recorded (finalize spelling, timestamp origin) |
 | M1 | Recording + loopback foundation (core + CLI) | 16/44.1/48 kHz inputs; interrupted WAV repaired; route restore after crash; no unexplained captured-audio gaps over 30 min |
 | M2 | Streaming + recovery (core + CLI) | Exact outputs on protocol fixtures; disconnect suite with no duplicate or missing committed intervals; REST recovery exercised |
-| M3 | Notes/session parity (core + CLI) | Golden prompts/formats; empty/truncated SSE; fault injection at every commit step; legacy migration; Python CLI refuses v2 folders |
+| M3 | Notes/session parity (core + CLI) | Golden prompts/formats; empty/truncated SSE; fault injection at every commit step; legacy migration; Python CLI refuses v2 folders; a fixture lecture distils to a study page within its budget |
 | M4 | Desktop app: transcript + notes panes | Hydration after reload, hint/cancel/polish, burst and two-hour fixtures within budget, sanitised rendering with scoped images |
 | M5 | Slide automation | Recorded Zoom fixtures: ≥95% recall of annotated stable states visible ≥3 s, ≤1 false capture per 10 min |
 | M6 | Full-lecture acceptance; mixed mode; Python retired | Two-hour real lecture with restart, device removal, permission denial, disk and network failure all accounted for; zero unexplained missing or duplicate audio intervals; mixed mode passes the two-hour drift test or stays disabled; `live_notes.py` removed |
@@ -457,6 +530,8 @@ from M0; the asynchronous resampler that mixed mode needs is adopted at M6),
 `hound 3.5`, `xcap` (0.9 line), `image`,
 `coreaudio-sys`, `sha2`, `uuid`, `fs2` (advisory lock), `keyring`, `anyhow`/`thiserror`,
 `tracing`. Frontend: `@tauri-apps/api` 2, `svelte` 5, `marked`, `dompurify 3.4.15`.
+Study page, loaded by the page rather than built: KaTeX 0.18.9 from jsDelivr with SRI
+hashes, Atkinson Hyperlegible Next and Mono from Google Fonts.
 Deployment target macOS 13; toolchain pinned in `rust-toolchain.toml`.
 
 ## 14. Open questions
