@@ -5,7 +5,7 @@ use chrono::{DateTime, Local};
 use uuid::Uuid;
 
 use crate::audio::recorder::repair_header;
-use crate::session::sidecar::{sidecar_path, Gap, GapKind, RecState, Sidecar};
+use crate::session::sidecar::{Gap, GapKind, RecState, Sidecar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
@@ -20,12 +20,31 @@ pub struct LaunchReport {
     pub pruned: Vec<PathBuf>,
 }
 
-/// Runs before a session starts in `dir` (caller holds the folder lock): repairs recordings a
-/// crash left open, marks their lost tails as gaps, then applies retention (spec §4.4).
-pub fn recover(dir: &Path, stem: &str, retention: Retention, now: DateTime<Local>) -> Result<LaunchReport> {
-    let path = sidecar_path(dir, stem);
-    let Some(mut sc) = Sidecar::load(&path)? else { return Ok(LaunchReport::default()) };
+/// Runs before a session starts in `dir` (caller holds the folder lock): for every sidecar in
+/// the folder, whatever day it belongs to, repairs recordings a crash left open, marks their
+/// lost tails as gaps, then applies retention (spec §4.4).
+pub fn recover(dir: &Path, retention: Retention, now: DateTime<Local>) -> Result<LaunchReport> {
     let mut report = LaunchReport::default();
+    let state_dir = dir.join(".live_notes");
+    let entries = match std::fs::read_dir(&state_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(e).with_context(|| format!("read {}", state_dir.display())),
+    };
+    let mut sidecars: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".v2.json")))
+        .collect();
+    sidecars.sort();
+    for path in sidecars {
+        recover_one(dir, &path, retention, now, &mut report)?;
+    }
+    Ok(report)
+}
+
+fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Local>, report: &mut LaunchReport) -> Result<()> {
+    let Some(mut sc) = Sidecar::load(path)? else { return Ok(()) };
+    let before = (report.repaired.len(), report.missing.len(), report.pruned.len());
     let mut gaps = Vec::new();
     for r in sc.recordings.iter_mut().filter(|r| r.state == RecState::Open) {
         let wav = dir.join(&r.file);
@@ -54,10 +73,10 @@ pub fn recover(dir: &Path, stem: &str, retention: Retention, now: DateTime<Local
         r.state = RecState::Deleted;
         report.pruned.push(wav);
     }
-    if !(report.repaired.is_empty() && report.missing.is_empty() && report.pruned.is_empty()) {
-        sc.save(&path)?;
+    if before != (report.repaired.len(), report.missing.len(), report.pruned.len()) {
+        sc.save(path)?;
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Closed recordings older than the retention window with no unresolved gap (spec §4.4).
@@ -87,7 +106,7 @@ pub fn restore_abandoned_route(state_path: &Path) -> Result<Option<bool>> {
 mod tests {
     use super::*;
     use crate::audio::recorder::Recorder;
-    use crate::session::sidecar::{Gap, GapKind, RecordingEntry, Sidecar};
+    use crate::session::sidecar::{sidecar_path, Gap, GapKind, RecordingEntry, Sidecar};
     use chrono::TimeZone;
 
     const STEM: &str = "lecture_notes_20260925";
@@ -129,7 +148,7 @@ mod tests {
         let path = sidecar_path(dir.path(), STEM);
         sc.save(&path).unwrap();
 
-        let report = recover(dir.path(), STEM, Retention::KeepAll, now()).unwrap();
+        let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
         assert_eq!(report.repaired.len(), 1);
         assert!(report.repaired[0].1 >= 32_000);
 
@@ -140,7 +159,7 @@ mod tests {
         assert_eq!(sc.gaps, vec![Gap { recording_id: id, start_sample: report.repaired[0].1, end_sample: None, kind: GapKind::Interrupted, resolved: false }]);
         assert_eq!(hound::WavReader::open(dir.path().join(&file)).unwrap().len() as u64, report.repaired[0].1);
 
-        let again = recover(dir.path(), STEM, Retention::KeepAll, now()).unwrap();
+        let again = recover(dir.path(), Retention::KeepAll, now()).unwrap();
         assert!(again.repaired.is_empty(), "a second launch repairs nothing");
     }
 
@@ -151,7 +170,7 @@ mod tests {
         let mut sc = Sidecar::default();
         sc.recordings.push(entry(id, "recordings/gone.wav", 0, RecState::Open));
         sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
-        let report = recover(dir.path(), STEM, Retention::KeepAll, now()).unwrap();
+        let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
         assert_eq!(report.missing.len(), 1);
         let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
         assert_eq!(sc.recordings[0].state, RecState::Missing);
@@ -164,7 +183,7 @@ mod tests {
         let path = sidecar_path(dir.path(), STEM);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{\"version\":2,\"recordings\":[").unwrap();
-        let err = recover(dir.path(), STEM, Retention::KeepAll, now()).unwrap_err();
+        let err = recover(dir.path(), Retention::KeepAll, now()).unwrap_err();
         assert!(format!("{err:#}").contains("corrupt sidecar"), "{err:#}");
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"version\":2,\"recordings\":[");
     }
@@ -172,7 +191,7 @@ mod tests {
     #[test]
     fn no_sidecar_is_a_fresh_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let report = recover(dir.path(), STEM, Retention::KeepDays(1), now()).unwrap();
+        let report = recover(dir.path(), Retention::KeepDays(1), now()).unwrap();
         assert!(report.repaired.is_empty() && report.pruned.is_empty() && report.missing.is_empty());
         assert!(!sidecar_path(dir.path(), STEM).exists());
     }
@@ -193,6 +212,30 @@ mod tests {
         assert!(prunable(&sc, Retention::KeepAll, now()).is_empty());
     }
 
+    /// A crash during an evening recording, relaunched the next day: the folder's other
+    /// sidecars are repaired and pruned too, not only today's.
+    #[test]
+    fn an_earlier_days_sidecar_is_repaired_and_pruned_at_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crashed_recording(dir.path());
+        std::fs::write(dir.path().join("recordings/old.wav"), b"x").unwrap();
+        let (open, old) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut yesterday = Sidecar::default();
+        yesterday.recordings.push(RecordingEntry { samples: None, ..entry(open, &file, 1, RecState::Open) });
+        yesterday.save(&sidecar_path(dir.path(), "lecture_notes_20260924")).unwrap();
+        let mut last_month = Sidecar::default();
+        last_month.recordings.push(entry(old, "recordings/old.wav", 30, RecState::Finalized));
+        last_month.save(&sidecar_path(dir.path(), "lecture_notes_20260826")).unwrap();
+
+        let report = recover(dir.path(), Retention::KeepDays(14), now()).unwrap();
+        assert_eq!(report.repaired.len(), 1);
+        assert_eq!(report.pruned, vec![dir.path().join("recordings/old.wav")]);
+        let y = Sidecar::load(&sidecar_path(dir.path(), "lecture_notes_20260924")).unwrap().unwrap();
+        assert_eq!(y.recordings[0].state, RecState::Repaired);
+        let m = Sidecar::load(&sidecar_path(dir.path(), "lecture_notes_20260826")).unwrap().unwrap();
+        assert_eq!(m.recordings[0].state, RecState::Deleted);
+    }
+
     #[test]
     fn no_saved_route_means_nothing_to_restore() {
         let dir = tempfile::tempdir().unwrap();
@@ -208,7 +251,7 @@ mod tests {
         let mut sc = Sidecar::default();
         sc.recordings.push(entry(id, "recordings/old.wav", 30, RecState::Finalized));
         sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
-        let report = recover(dir.path(), STEM, Retention::KeepDays(14), now()).unwrap();
+        let report = recover(dir.path(), Retention::KeepDays(14), now()).unwrap();
         assert_eq!(report.pruned, vec![dir.path().join("recordings/old.wav")]);
         assert!(!dir.path().join("recordings/old.wav").exists());
         let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();

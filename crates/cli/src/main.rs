@@ -178,7 +178,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
     }
     let stem = format!("lecture_notes_{}", chrono::Local::now().format("%Y%m%d"));
     let retention = keep_days.map_or(Retention::KeepAll, Retention::KeepDays);
-    let report = launch::recover(&dir, &stem, retention, chrono::Local::now())?;
+    let report = launch::recover(&dir, retention, chrono::Local::now())?;
     for (p, n) in &report.repaired {
         println!("repaired {} ({:.1} s)", p.display(), *n as f64 / 16_000.0);
     }
