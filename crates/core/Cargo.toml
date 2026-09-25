@@ -9,19 +9,21 @@ name = "lecturelive_core"
 
 [dependencies]
 anyhow = "1"
-chrono = "0.4.45"
+chrono = { version = "0.4.45", features = ["serde"] }
 core-foundation = "0.10.1"
 coreaudio-sys = "0.2.18"
 cpal = "0.18.2"
 futures-util = "0.3.34"
 hound = "3.5"
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+rtrb = "0.4.0"
 rubato = "5.0.0"
 rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "fs", "io-util"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
 xcap = "0.9.8"
 
 [dev-dependencies]

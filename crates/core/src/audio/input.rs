@@ -106,6 +106,10 @@ pub fn record_for(device_name: &str, duration: Duration, dir: &Path, mut on_leve
             samples += frame.len() as u64;
         }
     }
+    for frame in framer.push(&resampler.finish()?) {
+        recorder.write(&frame)?;
+        samples += frame.len() as u64;
+    }
     let tail = framer.finish();
     recorder.write(&tail)?;
     samples += tail.len() as u64;
