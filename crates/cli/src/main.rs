@@ -98,6 +98,11 @@ enum Canary {
         finalize_message: String,
         #[arg(long)]
         log: PathBuf,
+        #[arg(long, default_value = "wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&encoding=pcm&sample_rate=16000&interim_results=true&language=en")]
+        url: String,
+        /// Milliseconds between frames (0 sends as fast as the socket takes them)
+        #[arg(long, default_value_t = 100)]
+        pace_ms: u64,
     },
     /// Play a tone on one output device (no system output change)
     Tone {
@@ -275,7 +280,7 @@ async fn canary(c: Canary) -> Result<()> {
             let (w, h) = window::capture_window(id, &out)?;
             println!("{} {w}x{h}", out.display());
         }
-        Canary::SttProbe { wav, finalize_after_secs, finalize_message, log } => {
+        Canary::SttProbe { wav, finalize_after_secs, finalize_message, log, url, pace_ms } => {
             dotenvy::dotenv().ok();
             let api_key = std::env::var("GROK_API_KEY").context("GROK_API_KEY not set")?;
             let mut reader = hound::WavReader::open(&wav)?;
@@ -283,10 +288,10 @@ async fn canary(c: Canary) -> Result<()> {
             anyhow::ensure!(spec.sample_rate == 16_000 && spec.channels == 1 && spec.bits_per_sample == 16, "need 16 kHz mono PCM16");
             let pcm: Vec<i16> = reader.samples::<i16>().collect::<Result<_, _>>()?;
             let s = probe::probe(probe::ProbeOptions {
-                url: "wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&encoding=pcm&sample_rate=16000&interim_results=true&language=en".into(),
+                url,
                 api_key,
                 pcm,
-                pace: Duration::from_millis(100),
+                pace: Duration::from_millis(pace_ms),
                 finalize_after_frames: finalize_after_secs.map(|s| (s * 10.0) as usize),
                 finalize_message,
                 log_path: log,

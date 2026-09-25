@@ -1,0 +1,120 @@
+{"dir":"in","msg":{"id":"9a576fc4-e211-4807-8f45-fe8b89563c73","type":"transcript.created"},"t_ms":2}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":104}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":207}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":308}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":411}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":513}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":616}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":718}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":820}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":922}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1023}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1126}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1228}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1330}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1433}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1535}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1638}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1740}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1844}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1946}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2049}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2152}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2254}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2357}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2459}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2561}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2664}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2766}
+{"dir":"out","msg":"{\"type\":\"finalize\"}","t_ms":2766}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2868}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2971}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3073}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3175}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3276}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3379}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3480}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3582}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3685}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3788}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3890}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3992}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4095}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4197}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4300}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4403}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4505}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4608}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4710}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4813}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4915}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5017}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5119}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5221}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5324}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5426}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5528}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5630}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5732}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5833}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5936}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6038}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6140}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6242}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6346}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6447}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6550}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6652}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6755}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6858}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6961}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7063}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7164}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7266}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7369}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7471}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7573}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7675}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7777}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7880}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7982}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8084}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8186}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8288}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8389}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8491}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8594}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8697}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8799}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8901}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9003}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9106}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9209}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9313}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9415}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9517}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9619}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9721}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9824}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":9926}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":10028}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":10130}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":10232}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":10334}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":10435}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":10537}
+{"dir":"out","msg":{"binary_bytes":2430},"t_ms":10640}
+{"dir":"out","msg":"{\"type\":\"audio.done\"}","t_ms":10743}
+{"dir":"in","msg":{"duration":0.899,"is_final":false,"language":"en","speech_final":false,"start":0.001,"text":"Gradient descent.","type":"transcript.partial","words":[]},"t_ms":1082}
+{"dir":"in","msg":{"duration":1.899,"is_final":false,"language":"en","speech_final":false,"start":0.001,"text":"Gradient descent updates the weights.","type":"transcript.partial","words":[]},"t_ms":2099}
+{"dir":"in","msg":{"duration":2.479,"is_final":true,"language":"en","speech_final":false,"start":0.001,"text":"Gradient descent updates the weights.","type":"transcript.partial","words":[{"end":0.444,"start":0.001,"text":"Gradient"},{"end":0.867,"start":0.484,"text":"descent"},{"end":1.311,"start":0.908,"text":"updates"},{"end":1.432,"start":1.351,"text":"the"},{"end":1.895,"start":1.472,"text":"weights."}]},"t_ms":2792}
+{"dir":"in","msg":{"duration":2.799,"is_final":true,"language":"en","speech_final":true,"start":0.001,"text":"Gradient descent updates the weights.","type":"transcript.partial","words":[{"end":0.444,"start":0.001,"text":"Gradient"},{"end":0.867,"start":0.484,"text":"descent"},{"end":1.311,"start":0.908,"text":"updates"},{"end":1.432,"start":1.351,"text":"the"},{"end":1.895,"start":1.472,"text":"weights."}]},"t_ms":2974}
+{"dir":"in","msg":{"duration":1.08,"is_final":false,"language":"en","speech_final":false,"start":3.72,"text":"The learning rate","type":"transcript.partial","words":[]},"t_ms":5073}
+{"dir":"in","msg":{"duration":2.08,"is_final":false,"language":"en","speech_final":false,"start":3.72,"text":"The learning rate controls the step.","type":"transcript.partial","words":[]},"t_ms":6095}
+{"dir":"in","msg":{"duration":3.04,"is_final":true,"language":"en","speech_final":false,"start":3.72,"text":"The learning rate controls the step size.","type":"transcript.partial","words":[{"end":4.223,"start":4.143,"text":"The"},{"end":4.566,"start":4.284,"text":"learning"},{"end":4.807,"start":4.626,"text":"rate"},{"end":5.331,"start":4.827,"text":"controls"},{"end":5.472,"start":5.391,"text":"the"},{"end":5.774,"start":5.532,"text":"step"},{"end":6.257,"start":5.854,"text":"size."}]},"t_ms":7080}
+{"dir":"in","msg":{"duration":3.64,"is_final":true,"language":"en","speech_final":true,"start":3.72,"text":"The learning rate controls the step size.","type":"transcript.partial","words":[{"end":4.223,"start":4.143,"text":"The"},{"end":4.566,"start":4.284,"text":"learning"},{"end":4.807,"start":4.626,"text":"rate"},{"end":5.331,"start":4.827,"text":"controls"},{"end":5.472,"start":5.391,"text":"the"},{"end":5.774,"start":5.532,"text":"step"},{"end":6.257,"start":5.854,"text":"size."}]},"t_ms":7586}
+{"dir":"in","msg":{"duration":1.66,"is_final":false,"language":"en","speech_final":false,"start":8.04,"text":"Momentum smooths the","type":"transcript.partial","words":[]},"t_ms":10061}
+{"dir":"in","msg":{"duration":2.436,"is_final":true,"language":"en","speech_final":false,"start":8.04,"text":"Momentum smooths the updates.","type":"transcript.partial","words":[{"end":9.006,"start":8.503,"text":"Momentum"},{"end":9.449,"start":9.107,"text":"smooths"},{"end":9.59,"start":9.49,"text":"the"},{"end":10.234,"start":9.671,"text":"updates."}]},"t_ms":10964}
+{"dir":"in","msg":{"duration":2.436,"is_final":true,"language":"en","speech_final":true,"start":8.04,"text":"Momentum smooths the updates.","type":"transcript.partial","words":[{"end":9.006,"start":8.503,"text":"Momentum"},{"end":9.449,"start":9.107,"text":"smooths"},{"end":9.59,"start":9.49,"text":"the"},{"end":10.234,"start":9.671,"text":"updates."}]},"t_ms":10964}
+{"dir":"in","msg":{"duration":10.476,"text":"","type":"transcript.done","words":[]},"t_ms":10964}
