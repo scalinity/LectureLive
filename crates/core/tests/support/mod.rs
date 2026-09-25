@@ -5,3 +5,4 @@ pub mod fake_rest;
 pub mod fake_stt;
 pub mod fixtures;
 pub mod speech;
+pub mod sources;
