@@ -3,7 +3,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -169,6 +169,26 @@ pub fn recover(files: &LectureFiles, sc: &mut Sidecar) -> Result<Recovered> {
     Ok(outcome)
 }
 
+/// Polish's replace (spec §6.3). `based_on` is the SHA-256 of the notes the polish was made from:
+/// if they have changed since, nothing is written. Returns the backup's path.
+pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on: &str, at: DateTime<Local>) -> Result<std::path::PathBuf> {
+    let current = std::fs::read(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
+    if sha256_hex(&current) != based_on {
+        bail!("the notes changed while they were being polished, so the polished version was not written; {} is as it was left", files.notes.display());
+    }
+    accept_external_edit(files, sc)?;
+    let base = format!("{}_{}", files.stem, at.format("%H%M%S"));
+    let backup = (1..).map(|n| files.state_dir().join(if n == 1 { format!("{base}.md") } else { format!("{base}_{n}.md") })).find(|p| !p.exists()).expect("an unused name");
+    std::fs::write(&backup, &current).and_then(|()| std::fs::File::open(&backup)?.sync_all()).with_context(|| format!("back up the notes to {}", backup.display()))?;
+    write_atomic(&files.notes, format!("{}\n", polished.trim_end()).as_bytes()).with_context(|| format!("write {}", files.notes.display()))?;
+    let (len, sha) = fingerprint(files)?;
+    sc.notes.revision += 1;
+    sc.notes.len = len;
+    sc.notes.sha256 = sha;
+    sc.save(&files.sidecar())?;
+    Ok(backup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +300,32 @@ mod tests {
     fn a_block_is_the_clis_marker_and_text() {
         let at = chrono::Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 0).unwrap();
         assert_eq!(block(at, "## A\n- b"), "\n<!-- 10:05:00 -->\n## A\n- b\n");
+    }
+
+    #[test]
+    fn polish_replaces_the_notes_atomically_after_a_backup() {
+        let (_dir, files, mut sc) = folder();
+        let old = std::fs::read(&files.notes).unwrap();
+        let at = chrono::Local.with_ymd_and_hms(2026, 9, 25, 10, 15, 0).unwrap();
+        let backup = replace(&files, &mut sc, "# Title\n\nA summary.\n\n", &sha256_hex(&old), at).unwrap();
+        assert_eq!(backup, files.state_dir().join("lecture_notes_20260925_101500.md"));
+        assert_eq!(std::fs::read(&backup).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), "# Title\n\nA summary.\n");
+        assert_eq!(sc.notes.revision, 2);
+        assert_eq!(Sidecar::load(&files.sidecar()).unwrap().unwrap(), sc);
+        let again = replace(&files, &mut sc, "# Title\n\nShorter.\n", &sha256_hex(&std::fs::read(&files.notes).unwrap()), at).unwrap();
+        assert_eq!(again, files.state_dir().join("lecture_notes_20260925_101500_2.md"), "a backup never overwrites another");
+    }
+
+    #[test]
+    fn a_polish_over_notes_edited_meanwhile_is_not_written() {
+        let (_dir, files, mut sc) = folder();
+        let polished_from = sha256_hex(&std::fs::read(&files.notes).unwrap());
+        std::fs::OpenOptions::new().append(true).open(&files.notes).unwrap().write_all(b"- typed while the polish ran\n").unwrap();
+        let edited = std::fs::read(&files.notes).unwrap();
+        let err = replace(&files, &mut sc, "# Polished\n", &polished_from, chrono::Local::now()).unwrap_err();
+        assert!(format!("{err:#}").contains("changed while"), "{err:#}");
+        assert_eq!(std::fs::read(&files.notes).unwrap(), edited);
+        assert_eq!(std::fs::read_dir(files.state_dir()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".md")).count(), 0, "no backup either");
     }
 }
