@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}} — {{course}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Mono:wght@400..600&family=Atkinson+Hyperlegible+Next:ital,wght@0,400..800;1,400..800&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.9/dist/katex.min.css" integrity="sha256-uc4OjOk/DBjEmG/h8cPCadkhtWpp5sl/g6UHkWs4qrU=" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.9/dist/katex.min.js" integrity="sha256-FV9sLWc8WRLjtI9F2IMOqtGK4ZU5FZOc62SOqLnD5+I=" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.9/dist/contrib/auto-render.min.js" integrity="sha256-5TctGZvNrotN5x0PfOunKkuhJ3SifGCm8fd9A7MijuQ=" crossorigin="anonymous"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+:root {
+  --paper: #F4F6F8;
+  --ink: #14213D;
+  --graphite: #5A6478;
+  --rule: #D6DCE4;
+  --plate: #E7ECF1;
+  --signal: #B3261E;
+  --signal-soft: #F3DEDC;
+  --teal: #1D6B72;
+  --teal-soft: #D9EAEB;
+  --scrim: rgb(20 33 61 / 0.35);
+  --rail-w: 17.5rem;
+  --measure: 40rem;
+  --text: "Atkinson Hyperlegible Next", system-ui, sans-serif;
+  --mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #0E1522;
+    --ink: #E3E8F0;
+    --graphite: #98A3B5;
+    --rule: #263247;
+    --plate: #172235;
+    --signal: #F2766B;
+    --signal-soft: #3A1F24;
+    --teal: #5DB8C0;
+    --teal-soft: #16333A;
+    --scrim: rgb(0 0 0 / 0.5);
+  }
+}
+
+html { scroll-padding-top: 1.5rem; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 1.125rem/1.62 var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 2px; }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.skip { position: absolute; left: -999px; top: 0; }
+.skip:focus { left: 1rem; top: 1rem; z-index: 100; background: var(--ink); color: var(--paper); padding: 0.5rem 0.75rem; border-radius: 4px; }
+
+/* Rail: the lecture in order, with each section's slides and flagged points */
+.rail {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: var(--rail-w);
+  display: flex;
+  flex-direction: column;
+  padding: 2rem 1.25rem 1.25rem 1.5rem;
+  border-right: 1px solid var(--rule);
+  background: var(--paper);
+  z-index: 20;
+}
+.rail-head { padding-bottom: 1.1rem; margin-bottom: 1rem; border-bottom: 1px solid var(--rule); }
+.rail-week { margin: 0; color: var(--graphite); font-size: 0.9rem; }
+.rail-title { margin: 0.15rem 0 0; font-size: 1.05rem; font-weight: 750; line-height: 1.3; }
+.rail nav { position: relative; flex: 1; overflow-y: auto; margin: 0 -0.5rem; padding: 0 0.5rem; scrollbar-width: thin; }
+#map { position: relative; list-style: none; margin: 0; padding: 0 0 0 1rem; }
+#map::before, #map::after {
+  content: "";
+  position: absolute;
+  left: 0.25rem;
+  top: 0.75rem;
+  width: 2px;
+  border-radius: 1px;
+}
+#map::before { bottom: 0.75rem; background: var(--rule); }
+#map::after { height: calc((100% - 1.5rem) * var(--p, 0)); background: var(--ink); }
+#map li { position: relative; }
+#map a {
+  display: block;
+  padding: 0.32rem 0.5rem 0.32rem 0.7rem;
+  border-radius: 4px;
+  color: var(--graphite);
+  font-size: 0.95rem;
+  line-height: 1.35;
+  text-decoration: none;
+}
+#map a::before {
+  content: "";
+  position: absolute;
+  left: -15px;
+  top: 0.72rem;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 2px solid var(--rule);
+  background: var(--paper);
+  z-index: 1;
+}
+#map a:hover { color: var(--ink); }
+#map li.passed > a::before { border-color: var(--ink); }
+#map li[aria-current] > a { color: var(--ink); font-weight: 700; background: var(--plate); }
+#map li[aria-current] > a::before { border-color: var(--ink); background: var(--ink); }
+.marks { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 0.3rem; }
+.marks i { display: block; }
+.m-slide { width: 12px; height: 7px; border-radius: 1px; box-shadow: inset 0 0 0 1.5px var(--graphite); }
+.m-flag { width: 7px; height: 7px; border-radius: 50%; background: var(--signal); }
+.rail-tools { display: grid; gap: 0.5rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--rule); }
+.tool {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: 600 0.95rem/1.2 var(--text);
+  cursor: pointer;
+}
+.tool:hover { border-color: var(--graphite); }
+.switch { position: relative; flex: none; width: 2.1rem; height: 1.2rem; border-radius: 999px; background: var(--rule); transition: background 0.15s; }
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(1.2rem - 4px);
+  height: calc(1.2rem - 4px);
+  border-radius: 50%;
+  background: var(--paper);
+  transition: transform 0.15s;
+}
+.tool[aria-pressed="true"] .switch { background: var(--teal); }
+.tool[aria-pressed="true"] .switch::after { transform: translateX(0.9rem); }
+.count { color: var(--graphite); font-weight: 400; font-variant-numeric: tabular-nums; }
+
+.topbar { display: none; }
+
+/* Reading column */
+main { margin-left: var(--rail-w); padding: 4.5rem clamp(1.5rem, 5vw, 5rem) 6rem; }
+.title-page { max-width: 52rem; margin-bottom: 4.5rem; }
+.keystone {
+  margin: 0 0 2.75rem;
+  font-size: clamp(1.5rem, 3.6vw, 2.6rem);
+  line-height: 1.2;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.keystone .katex-display { margin: 0; text-align: left; }
+.keystone .katex-display > .katex { text-align: left; }
+.keystone p { margin: 0; max-width: 26ch; font-weight: 750; letter-spacing: -0.02em; }
+h1 { max-width: 18ch; margin: 0 0 1rem; font-size: clamp(2.3rem, 4.8vw, 3.5rem); font-weight: 800; line-height: 1.05; letter-spacing: -0.025em; }
+.meta { margin: 0 0 2rem; color: var(--graphite); font-size: 1rem; line-height: 1.5; }
+.summary { max-width: var(--measure); font-size: 1.25rem; line-height: 1.55; }
+.summary p { margin: 0 0 1rem; }
+
+.part { margin: 0 0 4.5rem; }
+.part > * { max-width: var(--measure); }
+.part > figure, .part > .table-wide { max-width: 48rem; }
+h2 { margin: 0 0 1.1rem; padding-top: 0.5rem; font-size: 1.85rem; font-weight: 780; line-height: 1.15; letter-spacing: -0.015em; }
+h3 { margin: 2.4rem 0 0.6rem; font-size: 1.28rem; font-weight: 720; line-height: 1.25; }
+h4 { margin: 0 0 0.5rem; font-size: 1.06rem; font-weight: 720; }
+p, ul, ol, dl, table, pre { margin: 0 0 1.1rem; }
+ul, ol { padding-left: 1.35rem; }
+li { margin: 0.3rem 0; }
+li::marker { color: var(--graphite); }
+strong { font-weight: 720; }
+a { color: var(--teal); }
+code { padding: 0.1em 0.3em; border-radius: 3px; background: var(--plate); font: 500 0.88em/1 var(--mono); }
+pre { overflow-x: auto; padding: 0.2rem 0 0.2rem 1rem; border-left: 3px solid var(--teal); font: 400 0.92rem/1.55 var(--mono); tab-size: 2; }
+pre code { padding: 0; background: none; font: inherit; }
+pre.output { border-left-color: var(--rule); color: var(--graphite); }
+.katex { font-size: 1.08em; }
+.katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.25rem 0; }
+.katex.wide { display: inline-block; max-width: 100%; overflow-x: auto; overflow-y: hidden; vertical-align: bottom; }
+code { overflow-wrap: anywhere; }
+
+/* Components the notes are written in */
+.formula { margin: 1.5rem 0; padding: 0.2rem 0 0.2rem 1.1rem; border-left: 3px solid var(--ink); }
+.formula::before { content: attr(data-name); display: block; color: var(--graphite); font-size: 0.88rem; font-weight: 650; }
+.formula .katex-display { margin: 0.35rem 0; text-align: left; }
+.formula .katex-display > .katex { text-align: left; }
+.flag { margin: 1.5rem 0; padding: 0.1rem 0 0.1rem 1.1rem; border-left: 3px solid var(--signal); }
+.flag::before { content: "Flagged in lecture"; display: block; margin-bottom: 0.15rem; color: var(--signal); font-size: 0.88rem; font-weight: 700; }
+.flag > :last-child { margin-bottom: 0; }
+.example { margin: 2.2rem 0; padding-top: 1.1rem; border-top: 2px solid var(--ink); }
+.steps { list-style: none; padding: 0; counter-reset: step; }
+.steps > li { position: relative; margin: 0.6rem 0; padding-left: 2.3rem; counter-increment: step; }
+.steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0.12rem;
+  display: grid;
+  place-items: center;
+  width: 1.55rem;
+  height: 1.55rem;
+  border: 1.5px solid var(--ink);
+  border-radius: 50%;
+  font-size: 0.8rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.steps > li:last-child::before { background: var(--ink); color: var(--paper); }
+.terms, .glossary { display: grid; grid-template-columns: minmax(8rem, max-content) 1fr; gap: 0.6rem 1.5rem; }
+dt { font-weight: 720; }
+dd { margin: 0; }
+.map { display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem 1.25rem; align-items: baseline; }
+.map dt { font-weight: 600; }
+.map dd { position: relative; padding-left: 1.5rem; }
+.map dd::before { content: ""; position: absolute; left: 0; top: 0.8em; width: 0.95rem; height: 1.5px; background: var(--graphite); }
+table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 1rem; font-variant-numeric: tabular-nums; }
+th, td { padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+thead th { border-bottom: 1.5px solid var(--ink); font-weight: 700; }
+td.a, th.a { background: var(--signal-soft); font-weight: 650; }
+td.b, th.b { background: var(--teal-soft); font-weight: 650; }
+
+/* Plates: only figures redrawn from a slide sit on one */
+figure { margin: 2.2rem 0; }
+.redraw, .slide-image { padding: 1.4rem 1.5rem 0; border-radius: 3px; background: var(--plate); }
+.slide-image { padding-bottom: 1rem; }
+.slide-image img, .redraw img.orig { display: block; width: 100%; height: auto; border-radius: 2px; }
+.slide-image figcaption { margin-top: 0.75rem; }
+.face > :last-child { margin-bottom: 0; }
+.face, .orig { transition: opacity 0.16s ease; }
+.redraw.fading .face, .redraw.fading .orig { opacity: 0; }
+.divider .face p { margin: 0; font-size: 1.35rem; font-weight: 750; letter-spacing: -0.01em; }
+.divider .face p + p { margin-top: 0.3rem; color: var(--graphite); font-size: 1.05rem; font-weight: 400; font-style: italic; letter-spacing: 0; }
+.plate-foot { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-top: 1.1rem; padding: 0.9rem 0 1rem; border-top: 1px solid var(--rule); }
+figcaption { color: var(--graphite); font-size: 0.95rem; line-height: 1.45; }
+.flip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.32rem 0.65rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 600 0.88rem/1.2 var(--text);
+  cursor: pointer;
+}
+.flip:hover { border-color: var(--graphite); }
+.flip svg { width: 1rem; height: 1rem; }
+/* .drawing marks the redrawn SVGs, so KaTeX's own SVG (radicals, arrows) keeps its styling */
+svg.drawing { display: block; width: 100%; height: auto; max-height: 26rem; overflow: visible; font-family: var(--text); }
+.drawing :is(line, path, polyline, polygon, rect, circle, ellipse) { fill: none; stroke: var(--ink); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.drawing text { fill: var(--ink); stroke: none; }
+.drawing .muted { stroke: var(--graphite); stroke-width: 1; }
+.drawing text.muted { fill: var(--graphite); stroke: none; }
+.drawing .a { stroke: var(--signal); }
+.drawing text.a { fill: var(--signal); stroke: none; }
+.drawing .b { stroke: var(--teal); }
+.drawing text.b { fill: var(--teal); stroke: none; }
+.drawing .thick { stroke-width: 2.6; }
+.drawing .dash { stroke-dasharray: 5 4; }
+.drawing .area-a { fill: var(--signal); fill-opacity: 0.2; stroke: none; }
+.drawing .area-b { fill: var(--teal); fill-opacity: 0.2; stroke: none; }
+.drawing .dot { fill: var(--ink); stroke: none; }
+.drawing .dot.a { fill: var(--signal); }
+.drawing .dot.b { fill: var(--teal); }
+
+.part > .gallery { max-width: 60rem; }
+.gallery summary { color: var(--teal); font-weight: 650; cursor: pointer; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: 1rem; margin-top: 1.1rem; }
+.grid figure { margin: 0; cursor: zoom-in; }
+.grid figure.wide { grid-column: 1 / -1; cursor: zoom-out; }
+.grid img { display: block; width: 100%; height: auto; border: 1px solid var(--rule); border-radius: 3px; }
+.grid figcaption { margin-top: 0.3rem; font-size: 0.85rem; }
+
+/* Check yourself, self-test, glossary, formula sheet */
+.quiz { list-style: none; padding: 0; counter-reset: q; }
+.quiz > li { margin: 0; padding: 1.1rem 0; border-top: 1px solid var(--rule); counter-increment: q; }
+.quiz .q { margin-bottom: 0.5rem; font-weight: 650; }
+.quiz .q::before { content: counter(q) ". "; color: var(--graphite); }
+.reveal { padding: 0.2rem 0; border: 0; background: none; color: var(--teal); font: 600 0.95rem/1.3 var(--text); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.answer { margin-top: 0.75rem; padding-left: 1.1rem; border-left: 3px solid var(--teal); }
+.answer > :last-child { margin-bottom: 0; }
+.selftest [data-recall]:not(.shown) { filter: blur(7px); cursor: pointer; user-select: none; transition: filter 0.2s; }
+.selftest [data-recall]:not(.shown):hover { filter: blur(5px); }
+.term { text-decoration: underline dotted var(--teal); text-decoration-thickness: 2px; text-underline-offset: 4px; cursor: help; }
+.tip {
+  position: fixed;
+  z-index: 50;
+  max-width: min(24rem, calc(100vw - 2rem));
+  padding: 0.8rem 1rem;
+  border-radius: 6px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 0.95rem;
+  line-height: 1.45;
+  pointer-events: none;
+}
+.tip strong { display: block; margin-bottom: 0.2rem; }
+.tip > :last-child { margin-bottom: 0; }
+dialog.sheet {
+  width: min(34rem, 100vw);
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+}
+dialog.sheet::backdrop { background: var(--scrim); }
+.sheet-head { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; padding: 1.2rem 1.5rem; border-bottom: 1px solid var(--rule); background: var(--paper); z-index: 1; }
+.sheet-head h2 { margin: 0; padding: 0; font-size: 1.3rem; }
+#sheet-list { list-style: none; margin: 0; padding: 0.25rem 1.5rem 2rem; }
+#sheet-list li { margin: 0; border-bottom: 1px solid var(--rule); }
+.sheet-item { display: block; width: 100%; padding: 1rem 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.sheet-item .name { display: block; margin-bottom: 0.2rem; color: var(--graphite); font-size: 0.92rem; font-weight: 700; }
+.sheet-item .katex-display { margin: 0.2rem 0; text-align: left; }
+.sheet-item .katex-display > .katex { text-align: left; }
+.sheet-item:hover .name { color: var(--teal); }
+.bar-btn { flex: none; padding: 0.4rem 0.6rem; border: 1px solid var(--rule); border-radius: 6px; background: transparent; color: var(--ink); font: 600 0.85rem/1.2 var(--text); cursor: pointer; }
+.bar-btn[aria-pressed="true"] { border-color: var(--teal); background: var(--teal); color: var(--paper); }
+@media (prefers-reduced-motion: no-preference) {
+  .pinged { animation: ping 1.8s ease; }
+  @keyframes ping { from { background: var(--teal-soft); } to { background: transparent; } }
+}
+
+@media (max-width: 1000px) {
+  html { scroll-padding-top: 4.5rem; }
+  .rail { width: min(19rem, 86vw); transform: translateX(-100%); visibility: hidden; transition: transform 0.2s ease, visibility 0s linear 0.2s; }
+  .map-open .rail { transform: none; visibility: visible; box-shadow: 0 0 0 100vmax var(--scrim); transition: transform 0.2s ease; }
+  .topbar { position: sticky; top: 0; z-index: 15; display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--rule); background: var(--paper); }
+  .topbar .t { flex: 1; min-width: 0; overflow: hidden; font-size: 0.95rem; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+  main { margin-left: 0; padding: 2.25rem 1rem 5rem; }
+}
+@media (max-width: 640px) {
+  body { font-size: 1.0625rem; }
+  .terms, .glossary { grid-template-columns: 1fr; gap: 0.15rem; }
+  .terms dd, .glossary dd { margin-bottom: 0.7rem; }
+  .map { grid-template-columns: 1fr; gap: 0.1rem; }
+  .map dd { margin-bottom: 0.6rem; }
+  .redraw, .slide-image { padding: 1rem 1rem 0; }
+  .plate-foot { flex-direction: column; gap: 0.6rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+@media print {
+  .rail, .topbar, .flip, .reveal, .tool, dialog, .tip, .skip { display: none !important; }
+  body { background: #fff; color: #000; font-size: 11pt; }
+  main { margin: 0; padding: 0; }
+  .answer[hidden] { display: block !important; }
+  [data-recall] { filter: none !important; }
+  figure, .example, .formula, table, .quiz > li { break-inside: avoid; }
+  h2, h3, h4 { break-after: avoid; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#notes">Skip to the notes</a>
+
+<aside class="rail" id="rail" aria-label="Lecture">
+  <div class="rail-head">
+    <p class="rail-week">{{week}}</p>
+    <p class="rail-title">{{title}}</p>
+  </div>
+  <nav aria-label="Sections in lecture order"><ol id="map"></ol></nav>
+  <div class="rail-tools">
+    <button type="button" class="tool js-selftest" aria-pressed="false"><span>Self-test</span><span class="switch" aria-hidden="true"></span></button>
+    <button type="button" class="tool js-sheet"><span>Formula sheet</span><span class="count"></span></button>
+  </div>
+</aside>
+
+<header class="topbar">
+  <button type="button" class="bar-btn js-map" aria-controls="rail" aria-expanded="false">Contents</button>
+  <span class="t">{{title}}</span>
+  <button type="button" class="bar-btn js-selftest" aria-pressed="false">Self-test</button>
+  <button type="button" class="bar-btn js-sheet">Formulas</button>
+</header>
+
+<main id="notes">
+  <header class="title-page">
+    <div class="keystone-wrap">{{keystone}}</div>
+    <h1>{{title}}</h1>
+    <p class="meta">{{course}}<br>{{date}}</p>
+    <div class="summary">{{summary}}</div>
+  </header>
+{{content}}
+</main>
+
+<dialog class="sheet" id="sheet" aria-labelledby="sheet-title">
+  <div class="sheet-head">
+    <h2 id="sheet-title">Formula sheet</h2>
+    <button type="button" class="bar-btn" id="sheet-close">Close</button>
+  </div>
+  <ol id="sheet-list"></ol>
+</dialog>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+
+<script type="application/json" id="slides">{{slides}}</script>
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const main = $("main");
+  const body = document.body;
+
+  // Typeset first: the rail, the formula sheet and the glossary copy the rendered math.
+  if (window.renderMathInElement) {
+    renderMathInElement(main, {
+      delimiters: [
+        { left: "\\[", right: "\\]", display: true },
+        { left: "\\(", right: "\\)", display: false },
+      ],
+      throwOnError: false,
+    });
+  }
+
+  // Inline math that cannot fit its line scrolls sideways instead of widening the page.
+  // Only those get it: an inline-block with overflow sits on its bottom edge, not the text baseline.
+  const inline = $$(".katex", main).filter((k) => !k.closest(".katex-display"));
+  const fitMath = () => {
+    inline.forEach((k) => k.classList.remove("wide"));
+    inline.forEach((k) => k.classList.toggle("wide", k.getBoundingClientRect().right > k.parentElement.getBoundingClientRect().right + 1));
+  };
+  // measured once the web fonts and the plates below have settled
+  document.fonts.ready.then(fitMath);
+  let fitTimer;
+  addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fitMath, 150); });
+
+  const visibleHTML = (el) => {
+    const c = el.cloneNode(true);
+    c.querySelectorAll(".katex-mathml").forEach((n) => n.remove());
+    return c.innerHTML;
+  };
+  const taken = new Set();
+  const idFor = (el, fallback) => {
+    if (el.id) return el.id;
+    const c = el.cloneNode(true);
+    c.querySelectorAll(".katex").forEach((n) => n.remove());
+    const base = c.textContent.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || fallback;
+    let id = base;
+    for (let i = 2; taken.has(id) || document.getElementById(id); i++) id = `${base}-${i}`;
+    taken.add(id);
+    el.id = id;
+    return id;
+  };
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  // Plates: each redraw can flip to the slide it was drawn from.
+  const slides = JSON.parse($("#slides").textContent || "{}");
+  const flipIcon = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 5h9.5L9 2.5M14 11H4.5L7 13.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  $$("figure.redraw").forEach((fig) => {
+    const n = fig.dataset.slide;
+    const src = slides[n];
+    const cap = $(":scope > figcaption", fig);
+    const face = document.createElement("div");
+    face.className = "face";
+    face.append(...[...fig.childNodes].filter((node) => node !== cap));
+    $$("svg", face).filter((s) => !s.closest(".katex")).forEach((s) => s.classList.add("drawing"));
+    const foot = document.createElement("div");
+    foot.className = "plate-foot";
+    if (cap) foot.append(cap);
+    fig.append(face, foot);
+    if (!src) return;
+    const img = document.createElement("img");
+    Object.assign(img, { src, alt: `Slide ${n} as shown in the lecture`, loading: "lazy", className: "orig", hidden: true });
+    face.after(img);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "flip";
+    btn.innerHTML = `${flipIcon}<span>Show slide ${n}</span>`;
+    btn.addEventListener("click", () => {
+      const toSlide = !face.hidden;
+      const swap = () => {
+        face.hidden = toSlide;
+        img.hidden = !toSlide;
+        btn.lastChild.textContent = toSlide ? "Show redraw" : `Show slide ${n}`;
+      };
+      if (reduce) return swap();
+      fig.classList.add("fading");
+      setTimeout(() => {
+        swap();
+        requestAnimationFrame(() => requestAnimationFrame(() => fig.classList.remove("fading")));
+      }, 160);
+    });
+    foot.append(btn);
+  });
+
+  // All slides: the page redraws only the few that teach best; every slide stays one click away.
+  const shots = Object.entries(slides).sort((a, b) => a[0] - b[0]);
+  if (shots.length) {
+    const sec = document.createElement("section");
+    sec.className = "part";
+    sec.innerHTML = `<h2>All slides</h2><details class="gallery"><summary>Show all ${shots.length} slides from the lecture</summary><div class="grid"></div></details>`;
+    const grid = $(".grid", sec);
+    shots.forEach(([n, src]) => {
+      const f = document.createElement("figure");
+      f.id = `slide-${n}`;
+      const img = Object.assign(document.createElement("img"), { src, alt: `Slide ${n}`, loading: "lazy" });
+      const cap = Object.assign(document.createElement("figcaption"), { textContent: `Slide ${n}` });
+      f.append(img, cap);
+      // a click widens a slide to the full row, and another shrinks it back
+      f.addEventListener("click", () => f.classList.toggle("wide"));
+      grid.append(f);
+    });
+    main.append(sec);
+  }
+
+  // Rail: sections in lecture order, marked with their slides and flagged points.
+  const map = $("#map");
+  const nav = map.parentElement;
+  const entries = $$("main > section.part").filter((s) => $(":scope > h2", s)).map((sec) => {
+    const h = $(":scope > h2", sec);
+    const li = document.createElement("li");
+    const a = document.createElement("a");
+    a.href = `#${idFor(h, "section")}`;
+    a.innerHTML = visibleHTML(h);
+    const shots = $$("figure[data-slide]", sec).length;
+    const flags = $$(".flag", sec).length;
+    if (shots || flags) {
+      const marks = document.createElement("span");
+      marks.className = "marks";
+      marks.setAttribute("aria-hidden", "true");
+      for (let i = 0; i < shots; i++) marks.append(Object.assign(document.createElement("i"), { className: "m-slide" }));
+      for (let i = 0; i < flags; i++) marks.append(Object.assign(document.createElement("i"), { className: "m-flag" }));
+      const said = document.createElement("span");
+      said.className = "vh";
+      said.textContent = [shots && plural(shots, "slide"), flags && plural(flags, "flagged point")].filter(Boolean).join(", ");
+      a.append(marks, said);
+    }
+    li.append(a);
+    map.append(li);
+    return { sec, li };
+  });
+  let ticking = false;
+  const track = () => {
+    ticking = false;
+    const line = innerHeight * 0.3;
+    let at = 0;
+    entries.forEach((e, i) => { if (e.sec.getBoundingClientRect().top <= line) at = i; });
+    entries.forEach((e, i) => {
+      e.li.classList.toggle("passed", i < at);
+      if (i === at) e.li.setAttribute("aria-current", "true");
+      else e.li.removeAttribute("aria-current");
+    });
+    const max = document.documentElement.scrollHeight - innerHeight;
+    map.style.setProperty("--p", max > 0 ? Math.min(1, scrollY / max) : 0);
+    const cur = entries[at]?.li;
+    if (cur && (cur.offsetTop < nav.scrollTop || cur.offsetTop + cur.offsetHeight > nav.scrollTop + nav.clientHeight)) {
+      nav.scrollTop = cur.offsetTop - nav.clientHeight / 3;
+    }
+  };
+  addEventListener("scroll", () => { if (!ticking) { ticking = true; requestAnimationFrame(track); } }, { passive: true });
+  track();
+
+  const setMap = (open) => {
+    body.classList.toggle("map-open", open);
+    $$(".js-map").forEach((b) => b.setAttribute("aria-expanded", String(open)));
+  };
+  $$(".js-map").forEach((b) => b.addEventListener("click", () => setMap(!body.classList.contains("map-open"))));
+  map.addEventListener("click", (e) => { if (e.target.closest("a")) setMap(false); });
+  main.addEventListener("click", () => { if (body.classList.contains("map-open")) setMap(false); });
+
+  // Check yourself: answers stay folded until asked for.
+  $$(".quiz > li").forEach((li, i) => {
+    const ans = $(":scope > .answer", li);
+    if (!ans) return;
+    ans.id ||= `answer-${i + 1}`;
+    ans.hidden = true;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "reveal";
+    b.textContent = "Show answer";
+    b.setAttribute("aria-expanded", "false");
+    b.setAttribute("aria-controls", ans.id);
+    b.addEventListener("click", () => {
+      const open = ans.hidden;
+      ans.hidden = !open;
+      b.setAttribute("aria-expanded", String(open));
+      b.textContent = open ? "Hide answer" : "Show answer";
+    });
+    ans.before(b);
+  });
+
+  // Self-test: definitions, takeaways, example steps and formulas blur until clicked.
+  const recall = $$(".terms dd, .glossary dd, .takeaways > li, .example .steps > li, main .formula");
+  recall.forEach((el) => { el.dataset.recall = ""; });
+  const reveal = (el) => {
+    el.classList.add("shown");
+    ["tabindex", "role", "aria-label"].forEach((a) => el.removeAttribute(a));
+  };
+  const setSelftest = (on) => {
+    body.classList.toggle("selftest", on);
+    $$(".js-selftest").forEach((b) => b.setAttribute("aria-pressed", String(on)));
+    recall.forEach((el) => {
+      if (!on) return reveal(el);
+      el.classList.remove("shown");
+      el.tabIndex = 0;
+      el.setAttribute("role", "button");
+      el.setAttribute("aria-label", "Hidden for self-test, press to reveal");
+    });
+  };
+  $$(".js-selftest").forEach((b) => b.addEventListener("click", () => setSelftest(!body.classList.contains("selftest"))));
+  main.addEventListener("click", (e) => {
+    const el = body.classList.contains("selftest") && e.target.closest("[data-recall]:not(.shown)");
+    if (el) { e.preventDefault(); reveal(el); }
+  });
+  main.addEventListener("keydown", (e) => {
+    if ((e.key === "Enter" || e.key === " ") && e.target.matches?.("[data-recall]:not(.shown)")) { e.preventDefault(); reveal(e.target); }
+  });
+
+  // Glossary: the first use of each term in a section shows its definition.
+  const terms = new Map();
+  $$(".glossary dt").forEach((dt) => {
+    const dd = dt.nextElementSibling;
+    const name = dt.textContent.trim();
+    if (dd?.tagName === "DD" && name.length > 2 && !$(".katex", dt)) terms.set(name, dd);
+  });
+  const tip = $("#tip");
+  let tipFor = null;
+  let touch = false;
+  const hideTip = () => {
+    tip.hidden = true;
+    tipFor?.removeAttribute("aria-describedby");
+    tipFor = null;
+  };
+  const showTip = (span) => {
+    const dd = terms.get(span.dataset.term);
+    if (!dd || body.classList.contains("selftest")) return;
+    hideTip();
+    tip.innerHTML = `<strong></strong>${visibleHTML(dd)}`;
+    tip.firstChild.textContent = span.dataset.term;
+    tip.hidden = false;
+    const r = span.getBoundingClientRect();
+    const w = tip.offsetWidth;
+    const h = tip.offsetHeight;
+    tip.style.left = `${Math.max(12, Math.min(r.left, innerWidth - w - 12))}px`;
+    tip.style.top = `${r.bottom + 8 + h > innerHeight ? r.top - h - 8 : r.bottom + 8}px`;
+    span.setAttribute("aria-describedby", "tip");
+    tipFor = span;
+  };
+  if (terms.size) {
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[-–—]/g, "[-–—]").replace(/\s+/g, "\\s+");
+    const skip = "h1, h2, h3, h4, dt, a, button, code, pre, svg, figcaption, .katex, .term, .glossary, .formula";
+    const names = [...terms.keys()].sort((a, b) => b.length - a.length);
+    for (const sec of $$("main > section.part")) {
+      for (const name of names) {
+        const re = new RegExp(`(^|[^\\p{L}\\p{N}])(${esc(name)}(?:e?s)?)(?![\\p{L}\\p{N}])`, "iu");
+        const walker = document.createTreeWalker(sec, NodeFilter.SHOW_TEXT, {
+          acceptNode: (n) => (n.parentElement.closest(skip) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+        });
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          const m = re.exec(node.data);
+          if (!m) continue;
+          const hit = node.splitText(m.index + m[1].length);
+          hit.splitText(m[2].length);
+          const span = document.createElement("span");
+          span.className = "term";
+          span.tabIndex = 0;
+          span.dataset.term = name;
+          hit.replaceWith(span);
+          span.append(hit);
+          break;
+        }
+      }
+    }
+    document.addEventListener("pointerdown", (e) => { touch = e.pointerType !== "mouse"; });
+    main.addEventListener("mouseover", (e) => { const t = e.target.closest(".term"); if (t && t !== tipFor) showTip(t); });
+    main.addEventListener("mouseout", (e) => { const t = e.target.closest(".term"); if (t && !t.contains(e.relatedTarget)) hideTip(); });
+    main.addEventListener("focusin", (e) => { if (e.target.classList.contains("term")) showTip(e.target); });
+    main.addEventListener("focusout", (e) => { if (e.target.classList.contains("term")) hideTip(); });
+    document.addEventListener("click", (e) => {
+      const t = e.target.closest?.(".term");
+      if (t && touch) t === tipFor ? hideTip() : showTip(t);
+      else if (!t && tipFor) hideTip();
+    });
+    addEventListener("scroll", hideTip, { passive: true });
+  }
+
+  // Formula sheet: every key formula in one place, each linked back to where it is explained.
+  const sheet = $("#sheet");
+  const list = $("#sheet-list");
+  const formulas = $$("main .formula");
+  formulas.forEach((f) => { if (f.dataset.name) f.dataset.name = f.dataset.name[0].toUpperCase() + f.dataset.name.slice(1); });
+  formulas.forEach((f, i) => {
+    f.id ||= `formula-${i + 1}`;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "sheet-item";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = f.dataset.name || `Formula ${i + 1}`;
+    const math = document.createElement("span");
+    math.innerHTML = visibleHTML(f);
+    b.append(name, math);
+    b.addEventListener("click", () => {
+      sheet.close();
+      f.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      f.classList.remove("pinged");
+      void f.offsetWidth;
+      f.classList.add("pinged");
+    });
+    const li = document.createElement("li");
+    li.append(b);
+    list.append(li);
+  });
+  $$(".js-sheet").forEach((b) => {
+    if (!formulas.length) { b.hidden = true; return; }
+    const count = $(".count", b);
+    if (count) count.textContent = formulas.length;
+    b.addEventListener("click", () => { setMap(false); sheet.showModal(); });
+  });
+  $("#sheet-close").addEventListener("click", () => sheet.close());
+  sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    hideTip();
+    setMap(false);
+  });
+});
+</script>
+</body>
+</html>

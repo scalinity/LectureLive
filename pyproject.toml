@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-live-notes = "live_notes:main"
+lecture = "live_notes:main"
 
 [build-system]
 requires = ["hatchling"]

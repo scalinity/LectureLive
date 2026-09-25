@@ -6,3 +6,6 @@ lecture_notes_*.md
 lecture_transcript_*.txt
 __pycache__/
 .DS_Store
+/*.html
+!/notes_template.html
+spend.jsonl
