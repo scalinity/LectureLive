@@ -71,11 +71,32 @@ pub fn is_refusal(status: u16) -> bool {
 }
 
 /// The `error` field of a JSON refusal, or the body as sent (plain text for a bad parameter).
+/// The server sends refusals chunked, and the websocket handshake hands the body over raw.
 pub fn refusal_message(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
+    let body = dechunk(body).unwrap_or_else(|| body.to_string());
+    serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v["error"].as_str().map(str::to_string))
         .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// The payload of a chunked body, or None when `body` is not chunked. A body cut short keeps what arrived.
+fn dechunk(body: &str) -> Option<String> {
+    let mut rest = body;
+    let mut out = String::new();
+    loop {
+        let (size, after) = rest.split_once("\r\n")?;
+        let size = usize::from_str_radix(size.trim(), 16).ok()?;
+        if size == 0 {
+            return Some(out);
+        }
+        let chunk = after.get(..size).unwrap_or(after);
+        out.push_str(chunk);
+        match after.get(size..).and_then(|r| r.strip_prefix("\r\n")) {
+            Some(next) => rest = next,
+            None => return Some(out),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +175,18 @@ mod tests {
             refusal_message("Failed to deserialize query string: sample_rate: invalid digit found in string\n"),
             "Failed to deserialize query string: sample_rate: invalid digit found in string"
         );
+    }
+
+    /// The live server sends refusal bodies chunked, and the websocket handshake hands them over raw.
+    #[test]
+    fn a_chunked_refusal_body_is_read_through_its_framing() {
+        let json = r#"{"code":"Client specified an invalid argument","error":"Incorrect API key provided. You can obtain an API key from https://console.x.ai."}"#;
+        let chunked = format!("{:x}\r\n{json}\r\n0\r\n\r\n", json.len());
+        assert!(chunked.starts_with("8a\r\n"), "the recorded framing");
+        assert_eq!(refusal_message(&chunked), "Incorrect API key provided. You can obtain an API key from https://console.x.ai.");
+        let text = "Failed to deserialize query string: sample_rate: invalid digit found in string";
+        assert_eq!(refusal_message(&format!("{:x}\r\n{text}\r\n0\r\n\r\n", text.len())), text);
+        assert_eq!(refusal_message(&format!("{:x}\r\n{text}", text.len())), text, "a tail cut short keeps what arrived");
     }
 
     #[test]
