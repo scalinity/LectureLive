@@ -8,10 +8,11 @@ use lecturelive_core::audio::permission::{self, MicPermission};
 use lecturelive_core::audio::source::DeviceSource;
 use lecturelive_core::audio::{input, loopback, recorder, routing};
 use lecturelive_core::capture::window;
-use lecturelive_core::session::coordinator::{self, Notification, SessionConfig};
+use lecturelive_core::session::coordinator::{self, Notification, SessionConfig, SttStatus};
 use lecturelive_core::session::launch::{self, Retention};
 use lecturelive_core::session::lock::FolderLock;
-use lecturelive_core::stt::probe;
+use lecturelive_core::session::segments::SegmentSource;
+use lecturelive_core::stt::{probe, rest, stream};
 
 #[derive(Parser)]
 #[command(name = "lecturelive")]
@@ -43,6 +44,12 @@ enum Cmd {
         /// Delete closed recordings older than this many days that have no unresolved gap
         #[arg(long)]
         keep_days: Option<u32>,
+        /// Stream to Grok speech-to-text and write the transcript (GROK_API_KEY from the repository's .env or the environment)
+        #[arg(long)]
+        stt: bool,
+        /// A term to bias recognition toward (repeatable; up to 100, each at most 50 characters)
+        #[arg(long = "keyterm", requires = "stt")]
+        keyterms: Vec<String>,
     },
     #[command(subcommand)]
     Canary(Canary),
@@ -135,7 +142,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Loopback(l) => loopback_cmd(l)?,
-        Cmd::Record { loopback, device, dir, secs, keep_days } => record(loopback, device, dir, secs, keep_days).await?,
+        Cmd::Record { loopback, device, dir, secs, keep_days, stt, keyterms } => record(loopback, device, dir, secs, keep_days, stt, keyterms).await?,
         Cmd::Canary(c) => canary(c).await?,
     }
     Ok(())
@@ -165,13 +172,27 @@ fn loopback_cmd(l: Loopback) -> Result<()> {
     Ok(())
 }
 
-async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>, secs: Option<u64>, keep_days: Option<u32>) -> Result<()> {
+fn secs(samples: u64) -> f64 {
+    samples as f64 / 16_000.0
+}
+
+async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>, secs_limit: Option<u64>, keep_days: Option<u32>, stt: bool, keyterms: Vec<String>) -> Result<()> {
     match permission::microphone() {
         MicPermission::Denied | MicPermission::Restricted => {
             anyhow::bail!("microphone access is denied for this terminal: System Settings → Privacy & Security → Microphone")
         }
         p => println!("microphone permission: {p:?}"),
     }
+    // A missing key or a bad keyterm stops the command before the folder is touched.
+    let (stt_link, recovery) = if stt {
+        dotenvy::dotenv().ok();
+        let key = std::env::var("GROK_API_KEY").context("GROK_API_KEY is not set (the repository's .env, or the environment)")?;
+        let link = stream::spawn(stream::SttConfig::new(key.clone(), keyterms.clone()))?;
+        let client = rest::RestClient::new(rest::RestConfig::new(key, keyterms))?;
+        (Some(link), Some(rest::spawn_recovery(client)))
+    } else {
+        (None, None)
+    };
     let dir = match dir {
         Some(d) => d,
         None => data_dir()?.join("record"),
@@ -193,6 +214,14 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
     for p in &report.pruned {
         println!("deleted {} (retention)", p.display());
     }
+    for g in &report.untranscribed {
+        println!(
+            "transcript to recover: {:.1}–{:.1} s of recording {} (recovered by the next --stt session of that day)",
+            secs(g.start_sample),
+            g.end_sample.map_or(0.0, secs),
+            g.recording_id
+        );
+    }
     let uid = if use_loopback {
         let s = loopback::status()?;
         anyhow::ensure!(s.blackhole_present, "BlackHole 2ch is not installed (brew install blackhole-2ch)");
@@ -204,10 +233,10 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
         device.context("give --loopback or --device <UID> (`lecturelive inputs` lists them)")?
     };
 
-    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, ..Default::default() }, Box::new(DeviceSource { uid }));
+    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, stt: stt_link, recovery }, Box::new(DeviceSource { uid }));
     let mut watch = use_loopback.then(|| SilenceWatch::new(-60.0, 10));
     let timer = async {
-        match secs {
+        match secs_limit {
             Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
             None => std::future::pending().await,
         }
@@ -236,7 +265,25 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
                 ),
                 Some(Notification::DeviceBack { uid }) => println!("input {uid} is back at {}; recording continues in a new file", chrono::Local::now().format("%H:%M:%S")),
                 Some(Notification::Failed(msg)) => eprintln!("session failed: {msg}"),
-                Some(_) => {}
+                Some(Notification::Stt(s)) => match s {
+                    SttStatus::Connected => println!("transcribing"),
+                    SttStatus::Retrying { after, reason } => println!("transcription interrupted ({reason}); reconnecting in {} s", after.as_secs()),
+                    SttStatus::Refused(m) => eprintln!("transcription refused: {m}. Recording continues without it."),
+                    SttStatus::ServerError(m) => eprintln!("transcription server: {m}"),
+                    SttStatus::Stopped(m) => eprintln!("transcription stopped: {m}"),
+                },
+                Some(Notification::Open { .. }) => {} // the terminal shows closed utterances only
+                Some(Notification::Segment(s)) => {
+                    let tag = if s.source == SegmentSource::Recovered { "   (recovered)" } else { "" };
+                    println!("[{}] {}{tag}", s.said_at.format("%H:%M:%S"), s.text);
+                }
+                Some(Notification::Recovered(g)) => println!(
+                    "recovered the transcript of {:.1}–{:.1} s of recording {}",
+                    secs(g.start_sample),
+                    g.end_sample.map_or(0.0, secs),
+                    g.recording_id
+                ),
+                Some(Notification::RecoveryFailed(m)) => eprintln!("recovery: {m}"),
             },
             _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; handle.request_stop(); }
             _ = &mut timer, if !stopping => { stopping = true; handle.request_stop(); }
@@ -247,6 +294,9 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
         println!("{} — {:.1} s", p.display(), *n as f64 / 16_000.0);
     }
     println!("gaps in the sidecar: {}, stream errors: {}", report.gaps, report.stream_errors);
+    if stt {
+        println!("segments: {}, transcript gaps still to recover: {}", report.segments, report.unresolved);
+    }
     Ok(())
 }
 
