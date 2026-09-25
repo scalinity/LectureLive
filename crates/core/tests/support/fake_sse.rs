@@ -77,10 +77,10 @@ pub fn events(content: &[&str], finish: Option<&str>, ticks: Option<u64>) -> Vec
     out.into_bytes()
 }
 
-/// A successful answer, its text in word-sized deltas, sent in 64-byte pieces.
+/// A successful answer, its text in word-sized deltas, sent in 1 KB pieces.
 pub fn answer(text: &str, ticks: u64) -> Reply {
     let deltas: Vec<&str> = text.split_inclusive(' ').collect();
-    Reply::Stream(pieces(events(&deltas, Some("stop"), Some(ticks)), 64))
+    Reply::Stream(pieces(events(&deltas, Some("stop"), Some(ticks)), 1024))
 }
 
 pub fn fixture(name: &str) -> Vec<u8> {
@@ -139,4 +139,16 @@ async fn handle(mut tcp: TcpStream, respond: &Respond, st: &SseState) {
         }
     }
     let _ = tcp.shutdown().await;
+}
+
+/// A complete study page in the prompt's vocabulary with exactly `words` visible words.
+pub fn study_page(words: usize) -> String {
+    let page = |filler: &str| {
+        format!(
+            "<div class=\"keystone\">\\[ \\theta \\leftarrow \\theta - \\eta \\nabla L \\]</div>\n<p class=\"lede\">Gradient descent and its variants.</p>\n<section class=\"part\"><h2>Descent</h2><p>{filler}</p><div class=\"formula\" data-name=\"update\">\\[ \\theta_{{t+1}} = \\theta_t - \\eta g_t \\]</div></section>\n<section class=\"part\"><h2>Glossary</h2><dl class=\"glossary\"><dt>Step</dt><dd>One update.</dd></dl></section>\n<section class=\"part\"><h2>Key takeaways</h2><ul class=\"takeaways\"><li>Scale the rate.</li></ul></section>\n<ol class=\"quiz\"><li><p class=\"q\">Why decay the rate?</p><div class=\"answer\">To settle.</div></li></ol>"
+        )
+    };
+    let base = lecturelive_core::notes::page::visible_words(&page(""));
+    let filler: Vec<String> = (0..words.saturating_sub(base)).map(|i| format!("w{i}")).collect();
+    page(&filler.join(" "))
 }

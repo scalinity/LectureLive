@@ -5,3 +5,4 @@ pub mod context;
 pub mod chat;
 pub mod embeds;
 pub mod polish;
+pub mod page;
