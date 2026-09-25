@@ -6,3 +6,4 @@ pub mod fake_stt;
 pub mod fixtures;
 pub mod speech;
 pub mod sources;
+pub mod fake_sse;

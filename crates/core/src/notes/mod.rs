@@ -2,3 +2,4 @@
 pub mod prompts;
 pub mod timeline;
 pub mod context;
+pub mod chat;
