@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use lecturelive_core::audio::frame::Frame;
 use lecturelive_core::session::sidecar::{Gap, GapKind};
+use lecturelive_core::stt::protocol::{AUDIO_DONE, FINALIZE};
 use lecturelive_core::stt::stream::{spawn, SttConfig, SttEvent, SttInput, SttLink};
 use lecturelive_core::stt::transcript::Utterance;
 use support::fake_stt::{self, Config, FakeStt, Mode, Outage, Refusal};
@@ -271,4 +272,145 @@ async fn a_missing_transcript_done_leaves_the_unclosed_tail_as_a_gap() {
     let ev = until_ended(&mut link).await;
     assert_eq!(gaps(&ev), vec![Gap::new(id, speech::endpoint(0), Some(96_000), GapKind::SttOffline)]);
     assert_partition(&ev, 96_000);
+}
+
+async fn until_cutoff(link: &mut SttLink, id: u64) -> (Vec<SttEvent>, bool) {
+    let mut seen = Vec::new();
+    loop {
+        let e = next_event(link).await;
+        if let SttEvent::Cutoff { id: got, confirmed } = e {
+            if got == id {
+                return (seen, confirmed);
+            }
+        }
+        seen.push(e);
+    }
+}
+
+async fn cutoff(link: &SttLink, id: Uuid, cut: u64, sample: u64) {
+    link.input.send(SttInput::Cutoff { id: cut, recording_id: id, sample }).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cutoff_finalizes_after_its_frame_and_the_covering_final_confirms_it() {
+    let fake = fake_stt::start(Config { mode: Mode::Replay(fixtures::load("finalize_json")), ..Default::default() }).await;
+    let mut link = spawn(SttConfig { finalize_wait: ms(2_000), ..cfg(&fake) }).unwrap();
+    let id = begin(&link).await;
+    fake.state.wait_accepted(1).await;
+    let frames = silent_frames(id, 137_838);
+    feed(&link, &fake, frames[..30].to_vec()).await;
+    cutoff(&link, id, 7, 48_000).await;
+    feed(&link, &fake, frames[30..].to_vec()).await; // the recorded final came while these went out
+    end(&link, id, 137_838).await;
+    let ev = until_ended(&mut link).await;
+    assert_eq!(
+        spans(&ev),
+        vec![
+            (16, 48_000, "Transfer learning reuses pre-trained weights. The".to_string()),
+            (48_000, 137_840, "losses cross entropy over the vocabulary, gradient descent updates the weights after every batch.".to_string()),
+        ]
+    );
+    let at = |want: &dyn Fn(&SttEvent) -> bool| ev.iter().position(|e| want(e)).unwrap();
+    let first = at(&|e| matches!(e, SttEvent::Utterance { utterance, .. } if utterance.end_sample == 48_000));
+    let confirmed = at(&|e| *e == SttEvent::Cutoff { id: 7, confirmed: true });
+    let second = at(&|e| matches!(e, SttEvent::Utterance { utterance, .. } if utterance.end_sample == 137_840));
+    assert!(first < confirmed && confirmed < second, "{ev:?}");
+    assert_eq!(fake.state.texts(), vec![FINALIZE.to_string(), AUDIO_DONE.to_string()]);
+    assert_eq!(ev.last(), Some(&SttEvent::Ended { recording_id: id, gap: None }));
+}
+
+#[tokio::test]
+async fn a_cutoff_without_a_covering_final_times_out_and_stays_pending() {
+    let fake = fake_stt::start(Config { mode: Mode::Replay(fixtures::load("finalize_text")), ..Default::default() }).await;
+    let mut link = spawn(SttConfig { finalize_wait: ms(300), ..cfg(&fake) }).unwrap();
+    let id = begin(&link).await;
+    fake.state.wait_accepted(1).await;
+    let frames = silent_frames(id, 137_838);
+    feed(&link, &fake, frames[..30].to_vec()).await;
+    cutoff(&link, id, 1, 48_000).await;
+    let (_, confirmed) = until_cutoff(&mut link, 1).await;
+    assert!(!confirmed, "the recorded server never finalized: the cutoff times out");
+    feed(&link, &fake, frames[30..].to_vec()).await;
+    end(&link, id, 137_838).await;
+    let ev = until_ended(&mut link).await;
+    assert_eq!(
+        spans(&ev),
+        vec![(16, 137_840, "Transfer learning reuses pre-trained weights; the losses cross entropy over the vocabulary, gradient descent updates the weights after every batch.".to_string())]
+    );
+    assert!(ev.contains(&SttEvent::ServerError("Invalid message: expected ident at line 1 column 2".into())));
+}
+
+#[tokio::test]
+async fn a_finalize_between_the_final_pair_is_confirmed_at_the_cutoff() {
+    let fake = fake_stt::start(Config { mode: Mode::Replay(fixtures::load("finalize_between_pair")), ..Default::default() }).await;
+    let mut link = spawn(SttConfig { finalize_wait: ms(2_000), ..cfg(&fake) }).unwrap();
+    let id = begin(&link).await;
+    fake.state.wait_accepted(1).await;
+    let frames = silent_frames(id, 167_615);
+    feed(&link, &fake, frames[..28].to_vec()).await;
+    cutoff(&link, id, 2, 44_800).await;
+    feed(&link, &fake, frames[28..].to_vec()).await;
+    end(&link, id, 167_615).await;
+    let ev = until_ended(&mut link).await;
+    assert!(ev.contains(&SttEvent::Cutoff { id: 2, confirmed: true }));
+    assert_eq!(spans(&ev)[0], (16, 44_800, "Gradient descent updates the weights.".to_string()));
+    assert_eq!(spans(&ev).len(), 3);
+}
+
+#[tokio::test]
+async fn a_cutoff_in_silence_is_confirmed_by_an_empty_final() {
+    let fake = fake_stt::start(Config { mode: Mode::Replay(fixtures::load("finalize_silence")), ..Default::default() }).await;
+    let mut link = spawn(SttConfig { finalize_wait: ms(2_000), ..cfg(&fake) }).unwrap();
+    let id = begin(&link).await;
+    fake.state.wait_accepted(1).await;
+    let frames = silent_frames(id, 49_598);
+    feed(&link, &fake, frames[..15].to_vec()).await;
+    cutoff(&link, id, 3, 24_000).await;
+    feed(&link, &fake, frames[15..].to_vec()).await;
+    end(&link, id, 49_598).await;
+    let ev = until_ended(&mut link).await;
+    assert!(ev.contains(&SttEvent::Cutoff { id: 3, confirmed: true }));
+    assert!(utterances(&ev).is_empty(), "an empty final commits nothing");
+    assert_eq!(ev.last(), Some(&SttEvent::Ended { recording_id: id, gap: None }));
+}
+
+#[tokio::test]
+async fn a_cutoff_already_settled_is_confirmed_without_a_finalize() {
+    let fake = fake_stt::start(Config::default()).await;
+    let mut link = spawn(cfg(&fake)).unwrap();
+    let id = begin(&link).await;
+    feed(&link, &fake, (0..50).map(|k| speech_frame(id, k))).await;
+    while !matches!(next_event(&mut link).await, SttEvent::Utterance { .. }) {}
+    cutoff(&link, id, 4, 64_000).await; // utterance 0 closed at 65_600
+    let (_, confirmed) = until_cutoff(&mut link, 4).await;
+    assert!(confirmed);
+    assert!(fake.state.texts().is_empty(), "no finalize was needed");
+}
+
+#[tokio::test]
+async fn a_cutoff_while_offline_stays_pending() {
+    let fake = fake_stt::start(Config { refuse_all: Some(Refusal::TcpClose), ..Default::default() }).await;
+    let mut link = spawn(cfg(&fake)).unwrap();
+    let id = begin(&link).await;
+    feed(&link, &fake, (0..10).map(|k| speech_frame(id, k))).await;
+    cutoff(&link, id, 5, 16_000).await;
+    let (_, confirmed) = until_cutoff(&mut link, 5).await;
+    assert!(!confirmed);
+}
+
+#[tokio::test]
+async fn a_disconnect_during_the_flush_leaves_the_cutoff_pending() {
+    let fake = fake_stt::start(Config { drop_on_finalize: true, ..Default::default() }).await;
+    let mut link = spawn(SttConfig { finalize_wait: ms(2_000), ..cfg(&fake) }).unwrap();
+    let id = begin(&link).await;
+    feed(&link, &fake, (0..60).map(|k| speech_frame(id, k))).await;
+    cutoff(&link, id, 6, 96_000).await;
+    let (seen, confirmed) = until_cutoff(&mut link, 6).await;
+    assert!(!confirmed);
+    feed(&link, &fake, (60..100).map(|k| speech_frame(id, k))).await;
+    end(&link, id, 100 * 1600).await;
+    let mut ev = seen;
+    ev.extend(until_ended(&mut link).await);
+    assert!(ev.iter().any(|e| matches!(e, SttEvent::Retrying { .. })));
+    assert_partition(&ev, 100 * 1600);
 }

@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
-use super::protocol::{self, is_refusal, refusal_message, to_samples, Partial, ServerMsg, AUDIO_DONE, SERVER_RESOLUTION};
+use super::protocol::{self, is_refusal, refusal_message, to_samples, Partial, ServerMsg, AUDIO_DONE, FINALIZE, SERVER_RESOLUTION};
 use super::transcript::{Transcript, Update, Utterance};
 use crate::audio::frame::{Frame, FRAME_SAMPLES};
 use crate::session::sidecar::{Gap, GapKind};
@@ -43,6 +43,8 @@ pub struct SttConfig {
     pub send_timeout: Duration,
     /// The server speaks every second or two while audio flows: this long without a message means the connection is dead.
     pub idle_timeout: Duration,
+    /// How long a cutoff waits for the final that settles it (spec §5.3).
+    pub finalize_wait: Duration,
     /// After `audio.done`, the wait for `transcript.done`.
     pub done_wait: Duration,
 }
@@ -57,6 +59,7 @@ impl SttConfig {
             connect_timeout: Duration::from_secs(10),
             send_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(5),
+            finalize_wait: Duration::from_secs(3),
             done_wait: Duration::from_secs(5),
         }
     }
@@ -87,6 +90,8 @@ pub enum SttInput {
     Begin { recording_id: Uuid },
     Frame(Frame),
     End { recording_id: Uuid, samples: u64 },
+    /// Finalize after the frames through `sample`, the end of the last frame forwarded before this (spec §5.3).
+    Cutoff { id: u64, recording_id: Uuid, sample: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +104,8 @@ pub enum SttEvent {
     Utterance { recording_id: Uuid, utterance: Utterance },
     /// The recording's live transcript is finished; `gap` is its tail that no connection transcribed.
     Ended { recording_id: Uuid, gap: Option<Gap> },
+    /// The cutoff is settled: confirmed when the recording's transcript is committed through it.
+    Cutoff { id: u64, confirmed: bool },
     Retrying { after: Duration, reason: String },
     /// An `error` message; the connection carries on.
     ServerError(String),
@@ -133,6 +140,13 @@ struct Epoch {
     transcript: Transcript,
     sent_to: u64,
     heard_at: Instant,
+    cutoffs: Vec<PendingCutoff>,
+}
+
+struct PendingCutoff {
+    id: u64,
+    sample: u64,
+    deadline: Instant,
 }
 
 struct Rec {
@@ -162,7 +176,7 @@ struct Worker {
 impl Worker {
     async fn run(mut self, mut input: mpsc::Receiver<SttInput>) {
         loop {
-            let (retry, idle) = (self.retry_at, self.idle_deadline());
+            let (retry, idle, cutoff) = (self.retry_at, self.idle_deadline(), self.cutoff_deadline());
             tokio::select! {
                 i = input.recv() => match i {
                     Some(i) => self.on_input(i).await,
@@ -178,6 +192,7 @@ impl Worker {
                     self.connect();
                 }
                 _ = sleep_until(idle) => self.lost(GapKind::SttOffline, format!("no message from the server for {:?}", self.cfg.idle_timeout)).await,
+                _ = sleep_until(cutoff) => self.expire_cutoffs().await,
             }
         }
         if let Some((id, to)) = self.rec.as_ref().map(|r| (r.id, r.received_to)) {
@@ -207,6 +222,7 @@ impl Worker {
                     self.end(recording_id, samples).await;
                 }
             }
+            SttInput::Cutoff { id, recording_id, sample } => self.cutoff(id, recording_id, sample).await,
         }
     }
 
@@ -230,7 +246,7 @@ impl Worker {
                 if self.rec.is_none() {
                     return;
                 }
-                self.epoch = Some(Epoch { ws, origin: None, transcript: Transcript::new(0), sent_to: 0, heard_at: Instant::now() });
+                self.epoch = Some(Epoch { ws, origin: None, transcript: Transcript::new(0), sent_to: 0, heard_at: Instant::now(), cutoffs: Vec::new() });
                 let held: Vec<Frame> = self.rec.as_mut().map(|r| r.held.drain(..).collect()).unwrap_or_default();
                 for f in held {
                     if !self.send(f).await {
@@ -319,13 +335,14 @@ impl Worker {
         }
     }
 
-    /// The connection is gone: what it had not closed waits for the next gap; reconnect after backoff.
+    /// The connection is gone: what it had not closed waits for the next gap, and so do its cutoffs.
     async fn lost(&mut self, cause: GapKind, reason: String) {
-        if self.epoch.take().is_none() {
-            return;
-        }
+        let Some(epoch) = self.epoch.take() else { return };
         if let Some(r) = self.rec.as_mut() {
             r.cause.get_or_insert(cause);
+        }
+        for c in epoch.cutoffs {
+            self.emit(SttEvent::Cutoff { id: c.id, confirmed: false }).await;
         }
         self.retry(reason).await;
     }
@@ -354,18 +371,69 @@ impl Worker {
         }
         let Some(update) = epoch.transcript.apply(p) else { return };
         let recording_id = rec.id;
-        let event = match update {
-            Update::Open { stable, tentative } => SttEvent::Open { recording_id, stable, tentative },
+        let mut out = Vec::new();
+        match update {
+            Update::Open { stable, tentative } => out.push(SttEvent::Open { recording_id, stable, tentative }),
             Update::Closed(u) => {
                 rec.settled = rec.settled.max(u.end_sample);
-                if u.text.is_empty() {
+                let settled = rec.settled;
+                out.push(if u.text.is_empty() {
                     SttEvent::Open { recording_id, stable: String::new(), tentative: String::new() }
                 } else {
                     SttEvent::Utterance { recording_id, utterance: u }
-                }
+                });
+                // A cutoff is confirmed by the close that settles the recording through it.
+                epoch.cutoffs.retain(|c| {
+                    let done = c.sample <= settled + SERVER_RESOLUTION;
+                    if done {
+                        out.push(SttEvent::Cutoff { id: c.id, confirmed: true });
+                    }
+                    !done
+                });
             }
+        }
+        for e in out {
+            self.emit(e).await;
+        }
+    }
+
+    fn cutoff_deadline(&self) -> Option<Instant> {
+        self.epoch.as_ref().and_then(|e| e.cutoffs.iter().map(|c| c.deadline).min())
+    }
+
+    async fn cutoff(&mut self, id: u64, recording_id: Uuid, sample: u64) {
+        let settled = match self.rec.as_ref().filter(|r| r.id == recording_id) {
+            Some(r) => r.settled,
+            None => return self.emit(SttEvent::Cutoff { id, confirmed: false }).await,
         };
-        self.emit(event).await;
+        if sample <= settled + SERVER_RESOLUTION {
+            return self.emit(SttEvent::Cutoff { id, confirmed: true }).await;
+        }
+        let (deadline, send_timeout) = (Instant::now() + self.cfg.finalize_wait, self.cfg.send_timeout);
+        let Some(epoch) = self.epoch.as_mut().filter(|e| e.origin.is_some() && e.sent_to >= sample) else {
+            // The cutoff's audio is not on this connection: it is left to a gap.
+            return self.emit(SttEvent::Cutoff { id, confirmed: false }).await;
+        };
+        epoch.cutoffs.push(PendingCutoff { id, sample, deadline });
+        let sent = tokio::time::timeout(send_timeout, epoch.ws.send(Message::Text(FINALIZE.into()))).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            self.lost(GapKind::SttOffline, "the finalize could not be sent".into()).await;
+        }
+    }
+
+    async fn expire_cutoffs(&mut self) {
+        let now = Instant::now();
+        let Some(epoch) = self.epoch.as_mut() else { return };
+        let mut expired = Vec::new();
+        epoch.cutoffs.retain(|c| {
+            if c.deadline <= now {
+                expired.push(c.id);
+            }
+            c.deadline > now
+        });
+        for id in expired {
+            self.emit(SttEvent::Cutoff { id, confirmed: false }).await;
+        }
     }
 
     /// The recording ended: flush what the server holds, then report the tail no connection transcribed.
@@ -377,7 +445,12 @@ impl Worker {
         if self.epoch.as_ref().is_some_and(|e| e.origin.is_some()) {
             self.finish().await;
         }
-        self.epoch = None;
+        if let Some(epoch) = self.epoch.take() {
+            let settled = self.rec.as_ref().map_or(0, |r| r.settled);
+            for c in epoch.cutoffs {
+                self.emit(SttEvent::Cutoff { id: c.id, confirmed: c.sample <= settled + SERVER_RESOLUTION }).await;
+            }
+        }
         let Some(rec) = self.rec.take() else { return };
         let cause = rec.cause.unwrap_or(if samples > rec.received_to { GapKind::SttOverflow } else { GapKind::SttOffline });
         let gap = (samples > rec.settled + SERVER_RESOLUTION).then(|| Gap::new(recording_id, rec.settled, Some(samples), cause));
