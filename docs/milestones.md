@@ -10,7 +10,7 @@ change it. Plans live in `docs/superpowers/plans/`.
 
 | M | Name | Status | Depends on | Destroys anything | Plan |
 |---|------|--------|-----------|-------------------|------|
-| M0 | Contract fixtures + packaged native canary | not started | — | Changes the system default output (restored by the canary) | [m0-native-canary](superpowers/plans/2026-09-22-m0-native-canary.md) |
+| M0 | Contract fixtures + packaged native canary | done | — | Changes the system default output (restored by the canary) | [m0-native-canary](superpowers/plans/2026-09-22-m0-native-canary.md) |
 | M1 | Recording + loopback foundation | not started | M0 | Same as M0 | written at M1 start |
 | M2 | Streaming + recovery | not started | M1 | No | written at M2 start |
 | M3 | Notes/session parity | not started | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | written at M3 start |
@@ -46,21 +46,107 @@ Tasks (detailed in the M0 plan):
 a person gives the two permission grants and one Zoom click in a single sitting of about
 three minutes, with no meeting; plan Task 8):
 
-- [ ] Packaged `.app` obtains microphone permission and records from BlackHole
-- [ ] Routing: signal from system audio present on BlackHole while routed; default output restored on stop
-- [ ] Zoom's own output (Settings → Audio → Test Speaker) audible and present on BlackHole, with Zoom's speaker setting recorded
-- [ ] Route restore offered and working after `kill -9` of the app while routed
-- [ ] WAV recorded by the app is playable up to the last one-second checkpoint after `kill -9` (after `canary repair`)
-- [ ] Packaged `.app` obtains Screen Recording permission and saves correct images of a known window and a Zoom window
-- [ ] STT protocol fixtures recorded for both finalize spellings; accepted spelling, timestamp origin and `speech_final` behaviour written below
-- [ ] Crate versions that build together recorded below
+- [x] Packaged `.app` obtains microphone permission and records from BlackHole
+- [x] Routing: signal from system audio present on BlackHole while routed; default output restored on stop
+- [x] Zoom's own output (Settings → Audio → Test Speaker) audible and present on BlackHole, with Zoom's speaker setting recorded
+- [x] Route restore offered and working after `kill -9` of the app while routed
+- [x] WAV recorded by the app is playable up to the last one-second checkpoint after `kill -9` (after `canary repair`)
+- [x] Packaged `.app` obtains Screen Recording permission and saves correct images of a known window and a Zoom window
+- [x] STT protocol fixtures recorded for both finalize spellings; accepted spelling, timestamp origin and `speech_final` behaviour written below
+- [x] Crate versions that build together recorded below
 
 **At the first Zoom lecture after M0** (holds before M1's gate is checked; that gate needs a
 Zoom lecture anyway):
 
 - [ ] The packaged `.app` captures the Zoom meeting window with a shared slide, and the image shows the slide
 
-**Findings:** _(filled in by M0 task 8)_
+**Findings** (acceptance run 2026-09-24; evidence in `~/Library/Application Support/LectureLive/canary/checks.log`
+and the plan ledger; recordings and images stay in that folder, outside the repository):
+
+*Environment.* macOS 27.0 (26A428), Apple Silicon; Xcode 27.0 beta (27A5218g); `rustc 1.96.1`
+(pinned in `rust-toolchain.toml`); BlackHole 2ch installed (UID `BlackHole2ch_UID`, 48 kHz, 2 ch).
+
+*Crate versions that build together* (`Cargo.lock`): `cpal 0.18.2`, `rubato 5.0.0`, `hound 3.5.1`,
+`xcap 0.9.8`, `image 0.25.10`, `tokio 1.53.1`, `tokio-tungstenite 0.30.0`, `rustls 0.23.45` (feature
+`ring`), `coreaudio-sys 0.2.18`, `core-foundation 0.10.1`, `serde_json 1.0.151`, `chrono 0.4.45`,
+`anyhow 1.0.104`, `clap 4.6.7`, `dirs 7.0.0`, `dotenvy 0.15.7`, `tauri 2.11.6`, `tauri-build 2.6.3`.
+Frontend: `svelte 5.57.1`, `@tauri-apps/api 2.11.1`, `@tauri-apps/cli 2.11.5`, `@sveltejs/kit 2.70.3`
+(the Tauri template's page is `src/routes/+page.svelte`), `vite 8.3.1`. Differences from the plan's
+lines: `rubato` is a new major line (`FftFixedIn` is gone; `Fft` with `FixedSync::Input` and
+`audioadapter` buffers replaces it); `cpal 0.18` names devices through `description()?.name()` and
+`SampleRate` is a plain `u32`; `tokio-tungstenite 0.30` brings `rustls` with no crypto provider, so
+`ring` is enabled explicitly (without it every `wss://` connect panics). Build: with `lto = true`,
+`strip = true` on host-side proc-macro dylibs makes rustc fail to load them (E0463,
+`ctor_proc_macro`) on this toolchain, so `[profile.release.build-override] strip = false`.
+
+*STT protocol* (fixtures `crates/core/tests/fixtures/stt/finalize_{json,text}.jsonl`, synthesised
+`speech.wav`, 8.6 s):
+- Accepted finalize spelling: `{"type":"finalize"}`. It produced `is_final: true, speech_final: true`
+  244 ms after it was sent. The bare text `finalize` is answered with
+  `{"type":"error","message":"Invalid message: expected ident at line 1 column 2"}`; the
+  connection stays open and nothing is finalized.
+- End of audio must also be JSON: `{"type":"audio.done"}`. The bare text `audio.done` is answered
+  with an `error` (`expected value at line 1 column 1`), the connection stays open and
+  `transcript.done` never comes.
+- Timestamp origin: `start`, `duration` and word `start`/`end` are seconds of audio from the first
+  frame sent on that connection, not wall-clock time (the segment after a finalize at 3.0 s of
+  audio starts at `start: 3.0`; the last word ends at 8.374 of 8.615 s). A new connection starts
+  again at 0.
+- `speech_final` behaviour: every final arrives as a pair at the same instant: an event with
+  `is_final: true, speech_final: false`, then an identical one (same text and words) with
+  `speech_final: true`. The second marks the utterance boundary and adds no text. Interim events
+  (`is_final: false`) arrive about once a second with `words: []`; words come only on finals.
+  Without a finalize, 8.6 s of continuous speech produced no chunk-final before `audio.done`.
+- `transcript.done` does not repeat the text: `{"text":"","words":[],"duration":8.615}`. It comes
+  after the flushed final pair. The client owns the whole transcript.
+
+*Routing and permissions.*
+- The default output on this Mac is the user-made Multi-Output "Macbook + Notes"
+  (`~:AMS2_StackedOutput:1`), which already contains BlackHole. Routed from there, §4.3's aggregate
+  nests one aggregate inside another, and a BlackHole signal cannot show that the route did
+  anything. The routing checks were therefore run from "MacBook Pro Speakers"
+  (`BuiltInSpeakerDevice`) as the default, and "Macbook + Notes" was restored afterwards.
+- `route on/off` from the CLI and from the packaged app: `abandoned: true` while routed,
+  `restored: true`, and the noted default came back each time. Negative control with speech
+  playing on the speakers and the route off: BlackHole at −120 dBFS. With the route on: −38.1 dBFS,
+  20.0 s, 0 dropped callbacks.
+- `AudioHardwareDestroyAggregateDevice` returns before the device disappears (its UID resolved for
+  about 13 ms more); `destroy_aggregate` waits for it.
+- Microphone: the packaged, ad-hoc-signed app (`adhoc,runtime`, entitlement
+  `com.apple.security.device.audio-input`) raised the prompt; after Allow it records BlackHole.
+- Screen Recording: `xcap` only preflights the permission, and without it silently leaves out other
+  apps' windows. The app was absent from Screen & System Audio Recording until it called
+  `CGRequestScreenCaptureAccess`; the person then allowed it, and listing returned other apps'
+  windows with titles. Without the grant, `windows` now fails with a distinct error instead of an
+  empty list.
+- Window capture (`CGWindowListCreateImage` through `xcap`) still works on macOS 27: TextEdit
+  README.md 1312×844, text correct; Zoom 1600×865, showing Zoom's window (login screen, Zoom
+  7.1.5). The Zoom image has a blank strip about 180 px wide on its right edge where Zoom's side
+  panel is clipped, probably the window running past the screen edge. Not diagnosed; relevant to
+  §7.1 region selection at M5.
+- Crash: a 120 s app recording killed with `kill -9` 31.6 s after its logged start read 31.0 s before
+  repair (the last checkpoint) and 31.512 s after `canary repair`; `afplay` plays it.
+  `route status` after the kill reported `abandoned: true`; `route off` restored the output. The
+  restore offer at launch (§4.3 step 5) is M1 work; M0 shows the detection and the restore.
+
+*Zoom and §4.3 compared with README.md.* Zoom's Speaker was pinned by name to "MacBook Pro
+Speakers". Three Test Speaker runs with the default output on the speakers:
+
+| Zoom Speaker | App route | BlackHole | Heard |
+|---|---|---|---|
+| MacBook Pro Speakers (as found) | on | −120.0 dBFS | not asked |
+| Same as System (§4.3) | on | −41.6 dBFS | yes |
+| Macbook + Notes (README) | off | −40.4 dBFS | yes |
+
+Both arrangements carry Zoom when Zoom is set up for them, and neither carries it when Zoom is
+pinned to a physical device: the setting found would have left the notes without Zoom audio.
+§4.3 depends on Zoom following the system output and routes every app's sound into the
+transcript. The README arrangement depends on Zoom being pinned to the Multi-Output device,
+keeps other sounds out, and needs no change to the system output. Here, though, the system output
+was itself "Macbook + Notes", so other sounds were reaching BlackHole anyway. Zoom was left on
+"Macbook + Notes". Which arrangement M1 builds is decided when M1's plan is written.
+
+*Failed lines:* none. No spec §14.1 fallback is indicated by M0.
 
 ## M1 — Recording + loopback foundation
 

@@ -1,0 +1,104 @@
+{"dir":"in","msg":{"id":"f61a4e7b-4759-4efe-b418-326407181945","type":"transcript.created"},"t_ms":1}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":104}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":207}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":309}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":412}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":515}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":618}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":722}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":823}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":926}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1029}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1132}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1236}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1337}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1438}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1541}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1644}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1747}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1848}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":1950}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2054}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2157}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2261}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2363}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2466}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2570}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2673}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2775}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2877}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":2980}
+{"dir":"out","msg":"{\"type\":\"finalize\"}","t_ms":2980}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3083}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3186}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3289}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3393}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3496}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3599}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3700}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3803}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":3905}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4008}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4112}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4213}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4316}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4420}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4524}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4627}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4728}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4831}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":4935}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5038}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5142}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5244}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5347}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5450}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5554}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5657}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5760}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5863}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":5965}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6069}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6173}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6275}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6378}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6480}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6581}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6684}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6786}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6889}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":6992}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7095}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7197}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7298}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7402}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7505}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7607}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7711}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7814}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":7917}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8019}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8121}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8223}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8327}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8430}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8533}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8635}
+{"dir":"out","msg":{"binary_bytes":3200},"t_ms":8737}
+{"dir":"out","msg":{"binary_bytes":476},"t_ms":8840}
+{"dir":"out","msg":"{\"type\":\"audio.done\"}","t_ms":8943}
+{"dir":"in","msg":{"duration":0.899,"is_final":false,"language":"en","speech_final":false,"start":0.001,"text":"Transfer learning.","type":"transcript.partial","words":[]},"t_ms":1086}
+{"dir":"in","msg":{"duration":1.899,"is_final":false,"language":"en","speech_final":false,"start":0.001,"text":"Transfer learning reuses pre-trained.","type":"transcript.partial","words":[]},"t_ms":2098}
+{"dir":"in","msg":{"duration":2.899,"is_final":false,"language":"en","speech_final":false,"start":0.001,"text":"Transfer learning reuses pre-trained weights.","type":"transcript.partial","words":[]},"t_ms":3092}
+{"dir":"in","msg":{"duration":2.999,"is_final":true,"language":"en","speech_final":false,"start":0.001,"text":"Transfer learning reuses pre-trained weights. The","type":"transcript.partial","words":[{"end":0.484,"start":0.021,"text":"Transfer"},{"end":0.826,"start":0.544,"text":"learning"},{"end":1.329,"start":0.866,"text":"reuses"},{"end":1.913,"start":1.369,"text":"pre-trained"},{"end":2.376,"start":1.973,"text":"weights."},{"end":2.758,"start":2.678,"text":"The"}]},"t_ms":3224}
+{"dir":"in","msg":{"duration":2.999,"is_final":true,"language":"en","speech_final":true,"start":0.001,"text":"Transfer learning reuses pre-trained weights. The","type":"transcript.partial","words":[{"end":0.484,"start":0.021,"text":"Transfer"},{"end":0.826,"start":0.544,"text":"learning"},{"end":1.329,"start":0.866,"text":"reuses"},{"end":1.913,"start":1.369,"text":"pre-trained"},{"end":2.376,"start":1.973,"text":"weights."},{"end":2.758,"start":2.678,"text":"The"}]},"t_ms":3224}
+{"dir":"in","msg":{"duration":0.9,"is_final":false,"language":"en","speech_final":false,"start":3.0,"text":"losses cross-entropy.","type":"transcript.partial","words":[]},"t_ms":4088}
+{"dir":"in","msg":{"duration":1.8,"is_final":false,"language":"en","speech_final":false,"start":3.0,"text":"losses cross entropy over the vocab.","type":"transcript.partial","words":[]},"t_ms":5087}
+{"dir":"in","msg":{"duration":2.7,"is_final":false,"language":"en","speech_final":false,"start":3.0,"text":"losses cross entropy over the vocabulary.","type":"transcript.partial","words":[]},"t_ms":6092}
+{"dir":"in","msg":{"duration":3.8,"is_final":false,"language":"en","speech_final":false,"start":3.0,"text":"losses cross entropy over the vocabulary, gradient descent updates","type":"transcript.partial","words":[]},"t_ms":7103}
+{"dir":"in","msg":{"duration":4.7,"is_final":false,"language":"en","speech_final":false,"start":3.0,"text":"losses cross entropy over the vocabulary, gradient descent updates the weights after","type":"transcript.partial","words":[]},"t_ms":8109}
+{"dir":"in","msg":{"duration":5.615,"is_final":false,"language":"en","speech_final":false,"start":3.0,"text":"losses cross entropy over the vocabulary, gradient descent updates the weights after every batch.","type":"transcript.partial","words":[]},"t_ms":9113}
+{"dir":"in","msg":{"duration":5.615,"is_final":true,"language":"en","speech_final":false,"start":3.0,"text":"losses cross entropy over the vocabulary, gradient descent updates the weights after every batch.","type":"transcript.partial","words":[{"end":3.16,"start":3.0,"text":"losses"},{"end":3.501,"start":3.201,"text":"cross"},{"end":3.963,"start":3.582,"text":"entropy"},{"end":4.283,"start":4.083,"text":"over"},{"end":4.404,"start":4.324,"text":"the"},{"end":5.226,"start":4.424,"text":"vocabulary,"},{"end":6.008,"start":5.547,"text":"gradient"},{"end":6.409,"start":6.048,"text":"descent"},{"end":6.87,"start":6.469,"text":"updates"},{"end":6.971,"start":6.89,"text":"the"},{"end":7.271,"start":7.011,"text":"weights"},{"end":7.612,"start":7.352,"text":"after"},{"end":7.913,"start":7.712,"text":"every"},{"end":8.374,"start":7.993,"text":"batch."}]},"t_ms":9211}
+{"dir":"in","msg":{"duration":5.615,"is_final":true,"language":"en","speech_final":true,"start":3.0,"text":"losses cross entropy over the vocabulary, gradient descent updates the weights after every batch.","type":"transcript.partial","words":[{"end":3.16,"start":3.0,"text":"losses"},{"end":3.501,"start":3.201,"text":"cross"},{"end":3.963,"start":3.582,"text":"entropy"},{"end":4.283,"start":4.083,"text":"over"},{"end":4.404,"start":4.324,"text":"the"},{"end":5.226,"start":4.424,"text":"vocabulary,"},{"end":6.008,"start":5.547,"text":"gradient"},{"end":6.409,"start":6.048,"text":"descent"},{"end":6.87,"start":6.469,"text":"updates"},{"end":6.971,"start":6.89,"text":"the"},{"end":7.271,"start":7.011,"text":"weights"},{"end":7.612,"start":7.352,"text":"after"},{"end":7.913,"start":7.712,"text":"every"},{"end":8.374,"start":7.993,"text":"batch."}]},"t_ms":9211}
+{"dir":"in","msg":{"duration":8.615,"text":"","type":"transcript.done","words":[]},"t_ms":9211}
