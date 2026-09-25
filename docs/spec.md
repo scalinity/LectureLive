@@ -321,53 +321,80 @@ commit purposes, finalize the recording, recover what is pending, take the last 
 
 ### 6.1 Batches and prompts
 
-A snapshot takes an immutable batch: segment-log positions after the committed cursor,
-slides after the committed slide index, and the hint. The prompt text is
-`live_notes.py`'s `notes_system` / `polish_system`, carried over unchanged and covered
-by golden tests.
+A snapshot takes an immutable batch: segment-log positions from the committed cursor up to the
+count its cutoff settled at (§5.3), registered slides after the committed slide index, and the
+hint. It does not wait for recovery still pending: recovered segments enter the log when they
+arrive and join the next snapshot, and the last snapshot of a session runs after it has drained
+recovery (§5.4). Between recordings a cutoff is confirmed only when no recording's live
+transcript is still being flushed; otherwise the snapshot takes what is logged and reports
+"transcription still catching up". The prompts are `live_notes.py`'s `notes_system` /
+`polish_system` and its user messages, carried over unchanged; golden tests compare the system
+prompts with its f-strings evaluated from its source.
 
 Timeline: segments and slide markers ordered by full timestamp with a deterministic tie
-rule (slide before speech at equal time). For streamed sessions, a segment spanning a
-slide's first-observed time is split at that point using word timings for the prompt
-only; legacy imported lines are marked approximate.
+rule (slide before speech at equal time), in the CLI's line format: `[HH:MM:SS] text` and
+`[HH:MM:SS] >>> Slide N shown (embed: ![Slide N](path))`. A streamed segment spanning a slide's
+first-shown time is split at that point using word timings, for the prompt only. Lines imported
+from the Python CLI are segments of source `imported`: second resolution, no words, never split.
 
-Context: the whole document is sent while the request fits a configured token budget
-(document + batch text + images + output allowance). Above the budget, the prompt
-carries a derived outline/summary of the omitted prefix plus the recent part verbatim;
-the summary is cached keyed to the document revision and invalidated by polish or any
-external edit. Text is sliced by characters, never bytes.
+Context: the whole document is sent while the request fits the budget of 200,000 tokens,
+`grok-4.7`'s long-context threshold (its window is 500,000; above the threshold every token of
+the request is billed at twice the rate). The estimate counts text at three characters per
+token, 1,800 tokens per slide and 16,000 for the output. Above the budget, the prompt carries the
+omitted prefix's own `#` headings, then the most recent part verbatim from a line start. The
+outline comes from the document itself: no summary request, nothing to cache. Text is cut at
+line starts, never inside a character.
 
 ### 6.2 Streaming, validation, commit
 
-SSE parsing handles split UTF-8, partial and multiple events per read, and
-non-content deltas; only content deltas reach the preview. A response is successful
-only with a normal finish reason and non-empty output. Validation, after stripping
-code fences and any `#` title: each expected embed line appears exactly once, on its
-own line, outside code fences; duplicates are removed; embeds for unregistered paths
-are rejected; missing embeds are appended under `### Slides not placed` without an
+Every chat request streams (`stream: true`) and asks for `stream_options: {"include_usage": true}`;
+without it a stream reports no cost. The server sends one `data: {json}` event per chunk:
+reasoning deltas (`delta.reasoning_content`) first, then content deltas (`delta.content`), then a
+chunk with `finish_reason`, then one chunk with `choices: []` and `usage` (with
+`cost_in_usd_ticks`), then `data: [DONE]`. SSE parsing handles split UTF-8 (a line is decoded
+only once its newline has arrived), partial and multiple events per read, comments and CRLF;
+only content deltas reach the preview. A stream silent for 180 s is broken. A response is
+successful only with `finish_reason: "stop"` and non-empty output: a `length` or filtered
+finish, an error event, an empty answer or a stream that ends before its finish all fail. A 4xx
+before the stream is a refusal (the key or a parameter), reported with the server's message.
+
+Validation, after stripping a wrapping code fence and any `#` title: each expected embed line
+appears exactly once, on its own line, outside code fences. A later own-line copy is removed;
+inline copies are removed, since an image in the middle of a bullet is not placed; embeds of
+slides not in the batch are removed; what fences hold is code and stays as written. Expected
+embeds still absent are appended under `### Slides not placed`, each on its own line, without an
 invented description.
 
-Commit (the coordinator, one at a time):
+Commit (through the sidecar's one writer, one at a time):
 
-1. Write the journal entry atomically (tmp + rename + fsync): `op_id`, batch ranges, notes length and SHA-256 before, block length and SHA-256.
-2. Append `\n<!-- HH:MM:SS -->\n{block}\n` to the notes file and fsync.
-3. Advance cursors and clear the journal atomically.
+1. Accept any external edit as the new revision, then write the journal atomically
+   (`.live_notes/<stem>.journal.json`; tmp + rename + fsync): `op_id`, the segment and slide
+   cursors before and after, notes length and SHA-256 before, block length and SHA-256.
+2. Append `\n<!-- HH:MM:SS -->\n{block}\n` to the notes file and fsync; the time is when the
+   snapshot was asked for.
+3. Advance the revision, the notes' fingerprint and the cursors in the sidecar, and save it atomically.
+4. Delete the journal.
 
-Recovery on launch with a journal entry present: notes length equals "before" → not
-appended, material stays pending; length equals "before + block" and the tail hash
-matches → complete, advance cursors; anything in between with a matching "before"
-prefix → truncate to "before", material stays pending. Any other state stops with an
-explicit recovery prompt; nothing is truncated without a verified prefix.
+Recovery on launch with a journal present, before any external edit is accepted: if the notes no
+longer begin with the recorded "before" (length and hash), stop and change nothing. Otherwise:
+nothing after it → not appended, material stays pending; exactly the block (length and hash) →
+complete, the cursors advance unless step 3 already did; a shorter tail → a torn append,
+truncated to "before", material stays pending; anything longer, or a tail of the block's length
+with another hash → stop and change nothing. Recovery that goes on saves the sidecar and deletes
+the journal; a stop leaves the journal for the person to look at. Nothing is truncated without
+a verified prefix.
 
-Failure, truncation or cancellation leaves the document untouched and the batch
-pending.
+Failure, truncation or cancellation leaves the document untouched and the batch pending.
 
 ### 6.3 Polish
 
-Runs only after a successful flush-and-commit of all pending material; if that fails,
-polish aborts. The previous document is copied to a uniquely named backup and fsynced,
-the result is validated (every embed exactly once), written to a temp file and
-atomically renamed over the notes file, and the revision advances.
+Runs only after a successful snapshot of all pending material; if that fails, polish stops
+before its own request. The request carries the notes and the whole transcript; the answer
+keeps its title, and every embed of the notes appears exactly once (§6.2's rules, with the
+notes' own embeds as the expected set). If the notes changed while the request ran, nothing is
+written: an edit is never overwritten from memory. Otherwise the previous document is copied to
+`.live_notes/<stem>_HHMMSS.md` (`_2`, `_3` … when that name exists) and fsynced, the result is
+written to a temp file and atomically renamed over the notes file, and the revision advances.
 
 ### 6.4 Study page
 
@@ -405,10 +432,14 @@ numbered `steps`, `map` (situation → method), `takeaways`, `glossary`, and
 every `<h2>`, so the page's structure never depends on the model's own wrappers;
 `<script>`, `<style>`, event and style attributes are stripped.
 
-Each request gets one retry; if it still fails, no page is written and the notes are
-untouched. The typeset page is stored in `.live_notes/<stem>.page.json` keyed by the
-SHA-256 of the prompt and the notes: a change to either typesets again, while a change to
-the template alone re-renders every lecture without requests. The page is filled in one
+Each request gets one retry (a refusal gets none); if it still fails, no page is written and
+the notes are untouched. The typeset page is stored in `.live_notes/<stem>.page.json` keyed by
+the SHA-256 of the prompt and the notes: a change to either typesets again, while a change to
+the template alone re-renders every lecture without requests. The file is the Python CLI's
+own, `{"source": <key>, "fills": {"keystone", "summary", "content", "slides"}, "words", "budget"}`
+written as Python's `json.dumps` writes it, so a page either tool typeset re-renders in the
+other without a request. Over a 2,000-word synthetic lecture one medium-effort request took
+about nine minutes. The page is filled in one
 pass (generated text is never read as a placeholder) and written atomically. Slide
 screenshots are embedded as JPEG data URIs (quality 80, subscripts still legible), read
 fresh from `slides/` at each fill while the cache keeps only their paths: the page is one
@@ -467,47 +498,60 @@ until a real capture succeeds.
 <lecture folder>/
   lecture_notes_YYYYMMDD.md           append-only during class; <!-- HH:MM:SS --> markers
   <lecture title>.html                the study page, named after the lecture (§6.4)
-  lecture_transcript_YYYYMMDD.txt     [HH:MM:SS] text, append-only, in commit order
+  lecture_transcript_YYYYMMDD.txt     [HH:MM:SS] text, append-only, in commit order;
+                                      --- started|resumed HH:MM:SS --- at each session
   slides/slide_NN_HHMMSS.png|jpg
   recordings/session_YYYYMMDD_HHMMSS.wav
-  .live_notes/<stem>.v2.json          sidecar (version, lecture date, recordings + anchors,
-                                      committed segment cursor, committed slide index,
-                                      open-utterance interval, gaps, route state)
-  .live_notes/<stem>.segments.jsonl   segment log: id, recording, samples, wall times, text, words
+  .live_notes/<stem>.v2.json          sidecar: version, lecture date, recordings + anchors, gaps,
+                                      open utterances, notes {revision, len, sha256,
+                                      segment_cursor, slide_index}, slides [{index, file, shown_at}]
+  .live_notes/<stem>.segments.jsonl   segment log: id, recording, samples, wall times, text, words,
+                                      source (live | recovered | imported)
   .live_notes/<stem>.journal.json     pending commit, present only mid-commit
   .live_notes/<stem>_HHMMSS.md        polish backups
-  .live_notes/<stem>.page.json        typeset study page parts, keyed by the notes' SHA-256
+  .live_notes/<stem>.page.json        typeset study page parts, keyed by prompt and notes (§6.4)
   .live_notes/lock                    exclusive advisory lock (GUI and CLI)
 ```
 
 - Resume is by cursor: segment-log position and slide index, both in registration order. No timestamp comparison decides what is committed.
 - The lecture date is fixed when the folder's files are created and does not change across midnight; full timestamps live in the sidecar and segment log.
-- Custom notes/transcript/slides paths, course name, JPEG and PNG slides, numbering from the highest existing index, and file-mtime capture time for imported images are supported as in the CLI.
-- Before append or polish, the notes file's length and hash are checked against the sidecar's revision; an external edit is accepted as the new revision (and invalidates the summary cache), never overwritten from memory.
+- Custom notes/transcript/slides paths, course name, JPEG and PNG slides, numbering from the highest existing index, and file-mtime capture time for imported images are supported as in the CLI. State files are named after the notes file's stem.
+- Before append or polish, the notes file's length and hash are checked against the sidecar's revision; an external edit is accepted as the new revision, never overwritten from memory.
+- The sidecar has one writer: the session coordinator while a session runs, which runs other parts' updates (commits, polish, slide registration) in turn and answers only after saving; the file itself when none runs.
+- Opening the segment log puts back the last segment's transcript line when a crash came between the log's sync and the transcript's (missing, or cut short).
+- Before a session starts, every other day's sidecar in the folder that holds unresolved transcript gaps gets a recovery-only session; its segments reach that day's transcript, and that day's notes stay as they are.
 
 Initialisation cases:
 
 | Folder state | Action |
 |---|---|
 | Empty | Create notes with title, empty sidecar |
-| v2 sidecar present | Resume; run journal recovery first |
-| v2 sidecar corrupt | Stop; offer rebuild from files (all transcript lines and slides after the last `<!-- -->` marker are pending) |
-| Legacy `<stem>.json` only | One-time migration: import transcript lines and slides as segments/slides; those after `noted_through` are pending, marked approximate; write v2 |
+| v2 sidecar present | Resume: journal recovery first, then any external edit is accepted, then slide files dropped in while no session ran are registered |
+| v2 sidecar corrupt | Stop, naming `--rebuild`. With it, the corrupt file is kept beside it as `<name>.corrupt-HHMMSS` and the state rebuilt: transcript lines and slides after the last `<!-- -->` marker are pending; an existing segment log is kept and its cursor set the same way |
+| Legacy `<stem>.json` only | One-time migration. The CLI's half-written snapshot (a `commit` entry) is finished or undone as its `recover_commit` does. Transcript lines become `imported` segments (rolled to the next day once the clock runs back past midnight) and slide files registered slides; lines before `transcript_offset` (for the older `noted_through`, before the first line at or after it) and slides up to `slide_index` count as noted. The legacy file stays; v2 is written last |
+| Notes but no state | Rebuilt as for a corrupt sidecar |
 | Transcript or slides but no notes | Create notes; everything existing is pending |
 
-Legacy writer: from M3 the Python CLI exits when a v2 sidecar exists, so the two
-writers never share a folder.
+Legacy writer: the Python CLI exits in any folder whose `.live_notes/` holds a v2 sidecar, so the
+two writers never share a folder; its `spend` still works everywhere.
 
 Spend ledger: every paid request appends one JSON line to `spend.jsonl` in the app's data
-directory, written by the coordinator and fsynced: time, course, lecture folder, kind
-(`transcribe`, `notes`, `polish`, `page`), USD, `billed`, and for transcription the audio seconds.
-`billed` is true when the cost is the response's own `usage.cost_in_usd_ticks` (10^10
-ticks per dollar; for a streamed chat response, the running total on its final chunk) and
-false when it is computed from the published rates, as for speech-to-text, whose
-responses carry no cost ($0.20 per hour of audio streamed, $0.10 per hour batch). A failed
-request records nothing; a cancelled stream records the last cost it reported. The format
-is the CLI's, and on first launch the app takes over the CLI's ledger so the history is
-continuous. A last line cut short by a crash is skipped on read.
+directory, fsynced: time, course, lecture folder, kind (`transcribe`, `notes`, `polish`,
+`page`), USD, `billed`, and for transcription the audio seconds. The format is the CLI's, byte
+for byte: Python's `json.dumps` with its defaults (`", "` and `": "` separators, non-ASCII as
+`\uXXXX`, floats as Python's `repr`), keys `at, course, lecture, what, usd, billed[, audio_s]`,
+`usd` rounded to 6 decimals and `audio_s` to 1. `billed` is true when the cost is the response's
+own `usage.cost_in_usd_ticks` (10^10 ticks per dollar), which a streamed chat response reports
+once, in its usage chunk after the finish; false when it is computed from published rates. Speech
+to text carries no cost: one `transcribe` line per recording for the audio its connections
+carried ($0.20 per hour), and one per recovery request ($0.10 per hour). A response whose usage
+chunk arrived is recorded whether or not its text is used (a `length` answer is billed); a request
+that reported no cost records nothing, and so does a cancelled stream, whose cost would have come
+only at the end. A ledger that cannot be written is a warning (§10). The app takes over the
+CLI's ledger at each start: the complete lines it gained since the last take-over are appended,
+tracked by `spend.import.json`; a crash between the append and that mark is caught by the app
+ledger already ending with exactly those lines. A last line cut short by a crash is skipped on
+read, and the next line starts on a line of its own.
 
 ## 9. UI (Svelte 5, Tauri 2)
 
