@@ -26,6 +26,9 @@ pub struct Journal {
     pub before_sha256: String,
     pub block_len: u64,
     pub block_sha256: String,
+    /// The block itself: a torn append is truncated only when what reached the notes is its start.
+    #[serde(default)]
+    pub block: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,6 +85,10 @@ pub fn commit(files: &LectureFiles, sc: &mut Sidecar, block: &str, segments_to: 
 
 /// The commit, stopping after `last`: the fault-injection tests crash between every pair of steps.
 pub(crate) fn commit_through(files: &LectureFiles, sc: &mut Sidecar, block: &str, segments_to: u64, slides_to: u32, last: Step) -> Result<()> {
+    // A commit that failed earlier in this session left its journal: repair it before building on the notes.
+    if files.journal().exists() && recover(files, sc)? == Recovered::Completed {
+        bail!("an earlier snapshot turned out to be complete, so this batch is already partly in the notes; try again");
+    }
     accept_external_edit(files, sc)?;
     let j = Journal {
         op_id: Uuid::new_v4(),
@@ -91,6 +98,7 @@ pub(crate) fn commit_through(files: &LectureFiles, sc: &mut Sidecar, block: &str
         before_sha256: sc.notes.sha256.clone(),
         block_len: block.len() as u64,
         block_sha256: sha256_hex(block.as_bytes()),
+        block: block.to_string(),
     };
     write_atomic(&files.journal(), &serde_json::to_vec_pretty(&j)?).context("write the commit journal")?;
     if last == Step::Journal {
@@ -147,13 +155,13 @@ pub fn recover(files: &LectureFiles, sc: &mut Sidecar) -> Result<Recovered> {
         Recovered::NotAppended
     } else if tail.len() as u64 == j.block_len && sha256_hex(tail) == j.block_sha256 {
         Recovered::Completed
-    } else if (tail.len() as u64) < j.block_len {
+    } else if (tail.len() as u64) < j.block_len && !j.block.is_empty() && j.block.as_bytes().starts_with(tail) {
         let f = OpenOptions::new().write(true).open(&files.notes)?;
         f.set_len(j.before_len)?;
         f.sync_all()?;
         Recovered::Truncated
     } else {
-        return Err(stop("the notes grew past the snapshot's block"));
+        return Err(stop("the notes hold other text after where the snapshot began (typed by hand, or grown past its block)"));
     };
     if outcome == Recovered::Completed {
         let applied = sc.notes.segment_cursor == j.segments[1] && sc.notes.slide_index == j.slides[1] && sc.notes.len == data.len() as u64;
@@ -327,5 +335,51 @@ mod tests {
         assert!(format!("{err:#}").contains("changed while"), "{err:#}");
         assert_eq!(std::fs::read(&files.notes).unwrap(), edited);
         assert_eq!(std::fs::read_dir(files.state_dir()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".md")).count(), 0, "no backup either");
+    }
+
+    /// Final review, Important 1: a tail shorter than the block that is not its start was typed by
+    /// hand after the crash; recovery must stop, never delete it.
+    #[test]
+    fn a_short_tail_that_is_not_the_blocks_start_stops_recovery_and_is_kept() {
+        let (_dir, files, mut sc) = folder();
+        commit_through(&files, &mut sc, BLOCK, 5, 2, Step::Journal).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&files.notes).unwrap().write_all(b"- my own note\n").unwrap();
+        let typed = std::fs::read(&files.notes).unwrap();
+        let mut sc = Sidecar::load(&files.sidecar()).unwrap().unwrap();
+        assert!(recover(&files, &mut sc).is_err(), "a tail that is not the block's start is not a torn append");
+        assert_eq!(std::fs::read(&files.notes).unwrap(), typed, "the hand-typed note is kept");
+        assert!(files.journal().exists());
+    }
+
+    /// Final review, Important 2: a commit that failed mid-append during a session leaves its journal
+    /// and a fragment; the next commit repairs them first instead of appending after the fragment.
+    #[test]
+    fn a_commit_after_a_failed_one_in_the_same_session_repairs_it_first() {
+        let (_dir, files, mut sc) = folder();
+        let before = std::fs::read_to_string(&files.notes).unwrap();
+        commit_through(&files, &mut sc, BLOCK, 5, 2, Step::Journal).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&files.notes).unwrap().write_all(&BLOCK.as_bytes()[..20]).unwrap(); // the append failed here
+        let next = "\n<!-- 10:10:00 -->\n## Momentum\n- Averages past gradients.\n";
+        commit(&files, &mut sc, next, 5, 2).unwrap(); // same process, same in-memory sidecar
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), format!("{before}{next}"), "no fragment before the new block");
+        assert!(!files.journal().exists());
+    }
+
+    /// When the failed commit had in fact completed, its batch is already noted: the caller's batch is
+    /// stale and the commit refuses, so nothing is noted twice.
+    #[test]
+    fn a_commit_after_one_that_completed_unrecorded_refuses_its_stale_batch() {
+        let (_dir, files, mut sc) = folder();
+        let before = std::fs::read_to_string(&files.notes).unwrap();
+        commit_through(&files, &mut sc, BLOCK, 5, 2, Step::Append).unwrap(); // saving the cursors failed
+        let mut stale = sc.clone();
+        stale.notes.segment_cursor = 0;
+        stale.notes.slide_index = 0;
+        stale.notes.len = before.len() as u64;
+        stale.notes.sha256 = sha256_hex(before.as_bytes());
+        let err = commit(&files, &mut stale, "\n<!-- 10:10:00 -->\n- again\n", 5, 2).unwrap_err();
+        assert!(format!("{err:#}").contains("try again"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), format!("{before}{BLOCK}"), "the block is there once");
+        assert_eq!((stale.notes.segment_cursor, stale.notes.slide_index), (5, 2), "the cursors now say so");
     }
 }

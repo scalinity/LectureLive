@@ -369,7 +369,10 @@ Commit (through the sidecar's one writer, one at a time):
 
 1. Accept any external edit as the new revision, then write the journal atomically
    (`.live_notes/<stem>.journal.json`; tmp + rename + fsync): `op_id`, the segment and slide
-   cursors before and after, notes length and SHA-256 before, block length and SHA-256.
+   cursors before and after, notes length and SHA-256 before, the block, its length and SHA-256.
+   A journal already there (an earlier commit in this session failed) is recovered first; if that
+   recovery finds the earlier block complete, this batch is stale and the commit refuses, to be
+   taken again from the new cursors.
 2. Append `\n<!-- HH:MM:SS -->\n{block}\n` to the notes file and fsync; the time is when the
    snapshot was asked for.
 3. Advance the revision, the notes' fingerprint and the cursors in the sidecar, and save it atomically.
@@ -378,9 +381,10 @@ Commit (through the sidecar's one writer, one at a time):
 Recovery on launch with a journal present, before any external edit is accepted: if the notes no
 longer begin with the recorded "before" (length and hash), stop and change nothing. Otherwise:
 nothing after it → not appended, material stays pending; exactly the block (length and hash) →
-complete, the cursors advance unless step 3 already did; a shorter tail → a torn append,
-truncated to "before", material stays pending; anything longer, or a tail of the block's length
-with another hash → stop and change nothing. Recovery that goes on saves the sidecar and deletes
+complete, the cursors advance unless step 3 already did; a shorter tail that is the block's own
+start → a torn append, truncated to "before", material stays pending; any other tail (text typed
+by hand after the crash, a tail longer than the block, or one of its length with another hash) →
+stop and change nothing. Recovery that goes on saves the sidecar and deletes
 the journal; a stop leaves the journal for the person to look at. Nothing is truncated without
 a verified prefix.
 
