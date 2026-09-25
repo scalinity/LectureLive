@@ -17,7 +17,7 @@ kickoff prompt carries this rule.
 |---|------|--------|-----------|-------------------|------|
 | M0 | Contract fixtures + packaged native canary | done | — | Changes the system default output (restored by the canary) | [m0-native-canary](superpowers/plans/2026-09-22-m0-native-canary.md) |
 | M1 | Recording + loopback foundation | done | M0 | Creates the "LectureLive Loopback" device; changes the system output only in the canary-route restore check, which restores it | [m1-recording-loopback](superpowers/plans/2026-09-25-m1-recording-loopback.md) |
-| M2 | Streaming + recovery | not started | M1 | No | written at M2 start |
+| M2 | Streaming + recovery | done | M1 | No | [m2-streaming-recovery](superpowers/plans/2026-09-25-m2-streaming-recovery.md) |
 | M3 | Notes/session parity | not started | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | written at M3 start |
 | M4 | Desktop app: transcript + notes panes | not started | M3 | No | written at M4 start |
 | M5 | Slide automation | not started | M4 | No | written at M5 start |
@@ -254,9 +254,151 @@ Tasks:
 6. Stop sequence: drain, `audio.done`, finals, finalize recording (§5.4)
 7. Fake STT server replaying M0 fixtures with injected disconnects
 
-**Gate:** exact outputs on protocol fixtures; disconnects of 3, 15, 45 and 300 s with no
-duplicate or missing committed intervals; REST recovery exercised; 4xx stops STT without
-a reconnect loop while recording continues.
+**Gate** (checked in `cargo test` without network, plus live checks with synthesised speech; plan Task 13):
+
+- [x] Exact outputs on protocol fixtures
+- [x] Disconnects of 3, 15, 45 and 300 s with no duplicate or missing committed intervals
+- [x] REST recovery exercised
+- [x] 4xx stops STT without a reconnect loop while recording continues
+
+**Findings** (acceptance run 2026-09-25; recordings and logs of the live runs in
+`~/Library/Application Support/LectureLive/m2-*`, outside the repository):
+
+*Suite.* `cargo test -p lecturelive-core`: 132 passed, 0 failed, 7 ignored (M1's four hardware
+tests and three live tests). The live tests, run by hand (`--test stt_live -- --ignored`), pass
+against the real endpoint.
+
+*New crates* (`Cargo.lock`): `reqwest 0.13.5` (no default features; `multipart`, `json`,
+`rustls-no-provider`), bringing `hyper-rustls 0.27.10` and `rustls-platform-verifier 0.7.1`
+(roots from the macOS keychain). reqwest 0.13 renamed its TLS features: `rustls` pulls
+`aws-lc-rs`, and beside the `ring` feature that leaves rustls with no default provider. With
+`rustls-no-provider`, reqwest panics at `Client::build` unless a provider is installed first,
+so `RestClient::new` installs ring (`cargo tree -i aws-lc-rs`: no match). Unchanged:
+`tokio-tungstenite 0.30.0` / `tungstenite 0.30.0`, `rustls 0.23.45` (ring), `tokio 1.53.1`,
+`serde_json 1.0.151`, `hound 3.5.1`.
+
+*Protocol recorded while planning* (new fixtures `endpoint_pauses`, `finalize_silence`,
+`finalize_between_pair`, `silence_after_speech`; spec §5 now states it):
+- The server endpoints by itself. A chunk-final comes about 0.5 s after speech stops, then a
+  `speech_final` about 0.5 s later, with the same text and words and a duration that runs on
+  through the endpoint silence. Utterances do not tile the audio: one closed at 3.08 s, the
+  next began at 3.72 s.
+- Every finalize is answered with a `speech_final` that ends exactly at the cutoff, within
+  40–250 ms. With nothing open it is an empty one of duration 0.
+- While audio flows the server sends an interim every second. In silence it also sends an
+  empty chunk-final every two seconds, which closes nothing (checked over 12 s). This is what
+  makes the 5 s idle watchdog sound.
+- Refusals come at the websocket upgrade: a bad key is 400 with a JSON body, an unknown model
+  404, a malformed parameter 400 with plain text. Every refusal body is sent chunked.
+- Unpaced audio is accepted (10.5 s returned the same finals within 0.7 s). `endpointing=400`
+  is accepted but changes nothing measurable. Keyterms apply on the websocket (live
+  "cross-entropy" where M0 heard "cross entropy"), but REST was not seen to apply them.
+- REST answers `{text, language, duration, words}`, with word times from the clip's start.
+  Silence has no `words` key, and there is no cost field.
+
+*What the fake server encodes* (`crates/core/tests/support/`):
+- Replay releases each recorded server message once the client has sent as many frames and
+  text messages as it had when that message arrived.
+- Synthetic speech puts k + 1 in every sample of frame k and places words at fixed positions.
+  The server closes an utterance 0.2 s after its last word, as a chunk-final plus an extended
+  `speech_final`. It sends an interim every tenth frame and answers a finalize at the position
+  it has heard (empty when nothing is open). On `audio.done` it flushes, then sends
+  `transcript.done` with empty text and the total duration. Bare text gets serde's error.
+- Injected faults: a connection that vanishes without a close frame, or one that stays open
+  and goes silent; refusals by HTTP status (with the real body) or by TCP close; a drop on
+  finalize; silence after `audio.done`.
+- The fake REST endpoint answers each clip with the words that start in it.
+
+*Disconnect suite* (`stt_gate`). Each run is a whole session: a paced source, the recorder, the
+real STT worker and the real recovery worker. The outage is measured in audio, dropped at 30 s
+mid-utterance. Five consecutive runs were green, 10.4 s per suite run.
+
+| Outage | Refused with | Result |
+|---|---|---|
+| 3 s | TCP close | Every word committed once. The 5 s hold streams the outage late; recovery covers the unclosed utterance |
+| 15 s | HTTP 503 | Every word committed once. The gap spans the outage less the 5 s hold, and is recovered |
+| 45 s | TCP close | As 15 s |
+| 300 s | HTTP 503 | As 15 s; about 295 s recovered in pieces of at most 30 s |
+
+In every run, no segment's interval overlaps another's, every transcript gap is resolved, and
+the transcript has one line per segment.
+
+*REST recovery evidence.*
+- Fake endpoint: the pieces tile the gap, recovery resumes after the pieces already logged and
+  waits for the recorder, and a refusal ends recovery for the session.
+- Gate: every disconnect run recovered through REST.
+- Live: a 5.615 s interval came back with 13 word times.
+- Live crash: `kill -9` 11 s into a continuous sentence left the recording's open-utterance mark
+  in the sidecar. The next `--stt` launch repaired the WAV to 13.3 s, turned the mark into an
+  `stt_interrupted` gap `[0, 212096)`, and recovered it as one line marked `(recovered)`.
+
+*"Resolved", per gap kind.* `capture_overflow`, `recorder_overflow`, `device_gone`,
+`rate_change` and `interrupted` are resolved when recorded: no audio exists behind them to
+recover. `stt_offline`, `stt_overflow`, `stt_refused` and `stt_interrupted` are resolved when
+recovery has committed their whole interval. Retention therefore keeps a recording exactly
+while it holds a transcript gap not yet recovered. `launch::tests::open_recording_is_repaired_and_its_tail_marked_interrupted`
+now expects `resolved: true`.
+
+*Live runs.* Synthesised speech went into BlackHole with `say -a`, which changes no output: the
+default output was `BuiltInSpeakerDevice` before and after.
+- Four sentences became four lines, one per sentence, each timed by its first word; no gaps;
+  a 30.0 s WAV.
+- The crash and recovery described above.
+- A bad key: one refusal, no reconnect lines, recording continued (4.95 s), recovery was
+  refused once, and the `stt_refused` gap was left unresolved.
+
+*Rulings during execution:*
+- The live endpoint's refusal body is chunked, and tungstenite hands the raw tail over (the
+  live test showed `400 Bad Request: 8a`). `refusal_message` now reads through the framing.
+- The endpoint-fixture gate test failed one run in two with single-frame recorder-overflow
+  gaps while passing alone every time: eight parallel sessions syncing every 10 frames at 1 ms
+  per frame. The fixture source now paces 3 ms per frame, with its assertions unchanged.
+- In `record`, the `secs` parameter became `secs_limit`, because the new `secs()` helper would
+  have been shadowed.
+
+*Review* (a fresh reviewer on the most capable model, over the whole branch): no Critical, one
+Important, eight Minor.
+- **The Important finding.** A crash in a recording whose STT never connected (a refused key,
+  or offline from the start) left no open-utterance mark, so its audio got no transcript gap
+  and retention could later delete it. Fixed test-first with one mark per recording
+  (`open_utterances`), set when a recording begins with transcription expected and moved by
+  each connection. A single mark would not do: after a rate change the next recording begins
+  while the last is still being flushed, and the earlier recording's tail would be lost.
+- **One Minor checked live first.** Its trigger was that the endpoint might refuse very short
+  clips; exact 10 ms and 50 ms clips are accepted with empty text, so it stays Minor.
+
+*Open threads.*
+- Deferred review minors:
+  - A cutoff taken between a recording's end and its final flush answers `confirmed`, while the
+    last sentence still arrives into the next batch. Owner: M3, snapshot semantics, which also
+    decides whether a snapshot waits for pending recovery.
+  - Any REST 4xx ends recovery for the session; only a key or authorisation refusal should.
+  - The reconnect backoff resets on every handshake.
+  - Recovery retries a failing piece without limit while the session runs.
+  - A failed transcript write can leave the segment log and the transcript diverging.
+  - A second Ctrl-C does not cut short a stop that is draining recovery.
+  - The refusal line prints a double period.
+
+  Owner of these seven: M3's `lecture` command and M6's error table (§10), whichever reaches
+  them first.
+- Sidecars written before M2 (only the M1 test folders) keep `resolved: false` on audio gaps,
+  so retention never prunes those recordings.
+- REST can mishear a word at the very start of a clip: "losses" came back as "This", and
+  "Backpropagation" as "That propagation". Gaps start where an utterance closed, so the first
+  word of the recovered interval sits on the clip's edge. M6 measures this over a real
+  lecture; starting each request a moment before the gap and keeping only the words inside it
+  is the likely remedy.
+- A transcript gap left in another day's sidecar is recovered only by a session with that
+  day's stem. Owner: M3, folder initialisation.
+- The transcript file does not yet have the Python CLI's `--- started/resumed HH:MM:SS ---`
+  lines. Owner: M3, golden file formats.
+- Speech-to-text spend is not yet written to the spend ledger ($0.20 per hour streamed and
+  $0.10 per hour recovered, both computed). Owner: M3 task 10.
+- A crash between the segment log's sync and the transcript's sync leaves a logged segment
+  without its transcript line (the safer order: never a line whose segment is lost). Owner:
+  M3, rebuild from files.
+
+*Failed lines:* none. No spec §14.1 fallback applies (§14.1 covers loopback only).
 
 ## M3 — Notes/session parity
 
