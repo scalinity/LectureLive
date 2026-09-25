@@ -5,6 +5,8 @@ use std::time::Duration;
 use lecturelive_core::audio::{input, routing};
 use lecturelive_core::capture::window;
 
+mod keychain;
+
 fn app_dir(sub: &str) -> Result<PathBuf, String> {
     let d = dirs::data_dir().ok_or("no Application Support dir")?.join("LectureLive").join(sub);
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;

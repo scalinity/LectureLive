@@ -1079,13 +1079,18 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "dirs 7.0.0",
+ "dotenvy",
  "lecturelive-core",
+ "security-framework",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
