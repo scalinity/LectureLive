@@ -235,46 +235,85 @@ setting.
 
 ### 5.1 Connection
 
-`wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&encoding=pcm&sample_rate=16000&interim_results=true&language=en&endpointing=400&keyterm=…`
-with `Authorization: Bearer`. Keyterms are validated (≤100, ≤50 chars) and URL-encoded
-individually. Wait for `transcript.created`, then one binary little-endian PCM16 frame
-per 100 ms through a single ordered writer. The exact spelling of the finalize control
-message (`{"type":"finalize"}` / bare text) and the server's timestamp origin are fixed
-by a recorded protocol fixture at M0.
+`wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&encoding=pcm&sample_rate=16000&interim_results=true&language=en`,
+plus `&keyterm=…` once per keyterm, with `Authorization: Bearer`. Keyterms are validated (at most 100, each
+1–50 characters) and URL-encoded one by one. The server endpoints by itself about 0.5 s after speech stops,
+so no endpointing parameter is sent (`endpointing=400` is accepted and changes nothing measurable).
+
+A refusal comes at the websocket upgrade as HTTP 4xx: an unknown key is 400 with a JSON body
+(`{"code":…,"error":"Incorrect API key provided…"}`), an unknown model 404, a malformed parameter 400 with a
+plain-text body. After `transcript.created`, audio goes as binary little-endian PCM16 frames of 100 ms, in
+order, through a single writer. The server takes audio faster than real time: 10.5 s sent unpaced returned
+the same finals within 0.7 s. Control messages are JSON text, `{"type":"finalize"}` and
+`{"type":"audio.done"}`; bare text is answered with an `error` message and otherwise ignored, and the
+connection stays open.
+
+Times in server messages (`start`, `duration`, word `start`/`end`) are seconds of audio, to the
+millisecond, from the first frame sent on that connection. Each connection is therefore an epoch anchored
+at (recording, sample of its first frame), and a new recording always gets a new connection. While audio
+flows the server sends a message at least every two seconds, speech or not: through 12 s of silence, an
+empty interim every second and an empty chunk-final every two. Five seconds without one means the
+connection is dead even if it has not closed.
 
 ### 5.2 Transcript state machine
 
+Messages are `transcript.partial` with `is_final` and `speech_final`. Interims (`is_final: false`) arrive
+about once a second with `words: []`; their text is the whole open utterance so far and `start` is its
+start. Finals carry words. At a natural endpoint a chunk-final (`is_final: true, speech_final: false`)
+comes about 0.5 s after speech stops and a `speech_final` about 0.5 s later, with the same text and words
+and a duration that runs on through the endpoint silence; after a finalize or `audio.done` both arrive at
+once. In silence the server sends empty interims and empty chunk-finals, which close nothing.
+`transcript.done` has empty text and the total duration: the client owns the whole transcript.
+
 State: closed utterances + open utterance (stable chunks + tentative tail).
 
-- `is_final=false`: replaces the tentative tail only. An empty hypothesis never erases stable content.
-- `is_final=true, speech_final=false`: locks the chunk's range into the open utterance's stable part.
-- `speech_final=true`: the message's text **replaces the whole open utterance** (it is the stitched utterance, not a continuation), produces exactly one segment, appended once to the segment log and the transcript file. Repeated finals for a closed utterance are ignored.
+- `is_final=false`: replaces the tentative tail only (less the stable text it repeats). An empty hypothesis never erases stable content.
+- `is_final=true`: its range `[start, start+duration)` replaces the stable chunks it overlaps; an empty final adds nothing.
+- `speech_final=true`: closes the open utterance. Its text is the stable part after that replacement, which with the recorded protocol is the `speech_final`'s own text. The utterance is its `[start, start+duration)` of the recording and produces exactly one segment, appended once to the segment log and the transcript file (an empty one produces none). A final ending at or before the last close is a repeat and is ignored.
 
-UI stability is not disk durability: the open utterance's sample interval is persisted
-in the sidecar, so after a crash an unclosed utterance becomes a gap recoverable from
-the recording.
+The transcript is settled through the end of the last close. UI stability is not disk durability: the
+sidecar records the open interval (the live epoch's origin), so after a crash the audio after the last
+logged segment becomes a gap recoverable from the recording.
 
 ### 5.3 Snapshot cutoff
 
-`snapshot` records an audio cutoff (sample offset), and the STT writer sends all frames
-through the cutoff, then the finalize message, then continues with live audio. The
-coordinator waits (3 s) for the utterance-final whose epoch and interval cover the
-cutoff; no open utterance means nothing to wait for. On timeout, the unconfirmed
-interval stays pending and the UI reports "snapshot of confirmed material; transcription
-still catching up". Recording never pauses and no lock is held while waiting.
+`snapshot` records an audio cutoff (the end of the last frame forwarded to the STT writer), and the writer
+sends all frames through the cutoff, then `{"type":"finalize"}`, then continues with live audio. The server
+answers every finalize with a `speech_final` that ends exactly at the cutoff, within 40–250 ms: the open
+utterance, or with nothing open an empty one of duration 0. The coordinator waits (3 s) for the close that
+settles the transcript through the cutoff; when it is already settled it does not ask. On timeout, or when
+the cutoff's audio is not on the live connection (connecting, disconnected), the unconfirmed interval stays
+pending and the UI reports "snapshot of confirmed material; transcription still catching up". Recording
+never pauses and no lock is held while waiting.
 
 ### 5.4 Reconnection and recovery
 
-On an unexpected close: reconnect live-first with backoff (1, 2, 4 … 30 s) and a new
-epoch anchored at the current sample offset. The gap is the interval from the last
-durably closed utterance's end to the new epoch's origin (including handshake time and
-any unclosed utterance). Gaps are recovered by the REST endpoint over the recorded
-interval, owned by the recovery path alone, so live and recovery commits are disjoint.
-Recovered segments enter the segment log when they arrive and are eligible for the next
-snapshot even though their speech times precede earlier snapshots. Auth and parameter
-errors (4xx) stop STT without a reconnect loop; recording continues. On stop: drain the
-framer, send `audio.done`, process remaining finals, ignore `transcript.done`'s full
-text for commit purposes, finalize the recording, take the last snapshot.
+Frames reach the writer through a bounded queue that keeps room for control messages: a full queue drops
+frames and never waits, and the writer, seeing the hole in sample offsets, ends the epoch. On an unexpected
+close, a send that fails or stalls (5 s), five silent seconds, or dropped frames, the writer reconnects
+live-first with backoff (1, 2, 4 … 30 s). While connecting it holds the newest 5 s of frames and sends them
+first, so a short outage costs only its unclosed utterance; the new epoch begins at the oldest held frame.
+The gap is the interval from the last close to the new epoch's origin (including handshake time and any
+unclosed utterance), written to the sidecar together with the new origin. Gap kinds name the cause:
+`stt_offline`, `stt_overflow`, `stt_refused`, `stt_interrupted` (the session stopped first).
+
+Gaps are recovered by the REST endpoint over the recorded interval, owned by the recovery path alone, so
+live and recovery commits are disjoint: `POST https://api.x.ai/v1/stt`, multipart `file` (a WAV of the
+interval), `language=en`, `format=true`, `keyterm` per keyterm (not observed to take effect). The answer is
+`{text, language, duration, words:[{text,start,end}]}` with times from the clip's start (silence: empty
+text, no `words`). The interval goes in pieces of at most 30 s, each cut at the quietest 100 ms of its last
+10 s; each piece with speech is one segment, and the pieces tile the gap. Recovery resumes after the pieces
+already in the segment log, so a crash mid-recovery writes no line twice. Recovered segments enter the
+segment log when they arrive and are eligible for the next snapshot even though their speech times precede
+earlier snapshots.
+
+A gap is resolved when nothing more can be done for its interval: a transcript gap once recovery has
+committed all of it, a gap with no audio behind it (capture or recorder overflow, device gone, rate change,
+interrupted) when it is recorded. A recording is therefore kept (§4.4) exactly while it holds a transcript
+not yet recovered. Auth and parameter errors (4xx) stop STT without a reconnect loop, and stop recovery for
+the session; recording continues and their gaps wait for a later session. On stop: drain the framer, send
+`audio.done`, process remaining finals until `transcript.done` (5 s), ignore `transcript.done`'s text for
+commit purposes, finalize the recording, recover what is pending, take the last snapshot.
 
 ## 6. Notes
 
