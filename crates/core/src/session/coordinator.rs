@@ -16,7 +16,7 @@ use crate::audio::frame::{Frame, FRAME_SAMPLES};
 use crate::audio::recorder::Recorder;
 use crate::audio::source::{Source, SourceEvent};
 use crate::session::segments::{NewSegment, Segment, SegmentLog, SegmentSource};
-use crate::session::sidecar::{sidecar_path, Gap, GapKind, OpenUtterance, RecState, RecordingEntry, Sidecar};
+use crate::session::sidecar::{sidecar_path, Gap, GapKind, RecState, RecordingEntry, Sidecar};
 use crate::stt::rest::{RecoverEvent, RecoverJob, RecoveryLink};
 use crate::stt::stream::{SttEvent, SttInput, SttLink};
 
@@ -216,6 +216,10 @@ impl Coordinator {
                 let path = recorder.path().to_path_buf();
                 let file = path.strip_prefix(&self.dir).unwrap_or(&path).to_string_lossy().into_owned();
                 self.sidecar.recordings.push(RecordingEntry { id: recording_id, file, anchor, source_uid, input_rate, samples: None, state: RecState::Open });
+                if self.stt.is_some() || self.stt_lost {
+                    // Its transcript is owed from the first sample, until a connection or a gap covers it.
+                    self.sidecar.open_transcript(recording_id, 0);
+                }
                 self.save().await?;
                 self.recorder()?.send(RecMsg::Open { recording_id, recorder }).await.map_err(|_| anyhow!("recorder stopped"))?;
                 self.notify(Notification::Recording { path });
@@ -316,15 +320,12 @@ impl Coordinator {
 
     /// With the STT worker gone, this recording's audio after what was committed becomes a gap.
     async fn untranscribed(&mut self, recording_id: Uuid, samples: u64) -> Result<()> {
-        let marker = self.sidecar.open_utterance.filter(|m| m.recording_id == recording_id);
+        let marker = self.sidecar.close_transcript(recording_id);
         let logged = self.segments.as_ref().and_then(|l| l.last_end(recording_id)).unwrap_or(0);
         let from = marker.map_or(0, |m| m.from_sample).max(logged);
         if samples > from {
             let g = self.add_gap(Gap::new(recording_id, from, Some(samples), GapKind::SttInterrupted));
             self.recover(&g);
-        }
-        if marker.is_some() {
-            self.sidecar.open_utterance = None;
         }
         self.save().await
     }
@@ -365,7 +366,7 @@ impl Coordinator {
         match ev {
             SttEvent::Connected { recording_id, origin, gap } => {
                 let gap = gap.map(|g| self.add_gap(g));
-                self.sidecar.open_utterance = Some(OpenUtterance { recording_id, from_sample: origin });
+                self.sidecar.open_transcript(recording_id, origin);
                 self.save().await?; // the gap and the new origin in one write (spec §5.4)
                 if let Some(g) = gap {
                     self.recover(&g);
@@ -378,9 +379,7 @@ impl Coordinator {
             }
             SttEvent::Ended { recording_id, gap } => {
                 let gap = gap.map(|g| self.add_gap(g));
-                if self.sidecar.open_utterance.is_some_and(|m| m.recording_id == recording_id) {
-                    self.sidecar.open_utterance = None;
-                }
+                self.sidecar.close_transcript(recording_id);
                 self.save().await?;
                 if let Some(g) = gap {
                     self.recover(&g);
@@ -846,7 +845,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(transcript_path(dir.path(), STEM)).unwrap(), "[10:00:00] gradient descent\n[10:00:00] recovered words\n");
         let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
         assert_eq!(sc.gaps, vec![Gap { recording_id: a, start_sample: 8_000, end_sample: Some(16_000), kind: GapKind::SttOffline, resolved: true }]);
-        assert_eq!(sc.open_utterance, None);
+        assert!(sc.open_utterances.is_empty());
         assert!(notes.iter().any(|n| matches!(n, Notification::Recovered(_))));
         assert_eq!(notes.iter().filter(|n| matches!(n, Notification::Segment(_))).count(), 2);
     }
@@ -967,5 +966,95 @@ mod tests {
         assert_eq!((jobs[0].gap_start, jobs[0].from, jobs[0].end), (8_000, 24_000, 40_000));
         assert_eq!(jobs[0].wav, dir.path().join("recordings/r.wav"));
         assert_eq!(std::fs::read_to_string(transcript_path(dir.path(), STEM)).unwrap(), "[10:00:00] already recovered\n[10:00:01] the rest\n");
+    }
+
+    /// A copy of the lecture folder as a crash would leave it at this moment.
+    fn crash_copy(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for e in std::fs::read_dir(src).unwrap() {
+            let e = e.unwrap();
+            let to = dst.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                crash_copy(&e.path(), &to);
+            } else {
+                std::fs::copy(e.path(), &to).unwrap();
+            }
+        }
+    }
+
+    /// Waits until the sidecar lists `recording` and the recorder has written `samples` of it.
+    async fn written(dir: &Path, recording: Uuid, samples: u64) {
+        for _ in 0..5_000 {
+            let sc = Sidecar::load(&sidecar_path(dir, STEM)).ok().flatten();
+            let wav = sc.and_then(|sc| sc.recordings.iter().find(|r| r.id == recording).map(|r| dir.join(&r.file)));
+            if wav.is_some_and(|w| std::fs::metadata(w).is_ok_and(|m| m.len() >= 44 + samples * 2)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("the recorder never wrote {samples} samples of {recording}");
+    }
+
+    #[tokio::test]
+    async fn a_crash_before_stt_ever_connected_leaves_the_audio_as_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4();
+        let stt = scripted_stt(|i| match i {
+            SttInput::Begin { .. } => vec![SttEvent::Refused("400 Bad Request: Incorrect API key provided.".into())],
+            SttInput::End { recording_id, samples } => vec![SttEvent::Ended { recording_id, gap: Some(Gap::new(recording_id, 0, Some(samples), GapKind::SttRefused)) }],
+            _ => vec![],
+        });
+        let go = Arc::new(AtomicBool::new(false));
+        let mut before = recording(a, 40);
+        let after = before.split_off(41); // Begin and forty frames, then End
+        let (handle, _notes) = spawn(SessionConfig { stt: Some(stt), ..cfg(dir.path()) }, Box::new(Gated { before, go: go.clone(), after }));
+        written(dir.path(), a, 48_000).await;
+        let crashed = tempfile::tempdir().unwrap();
+        crash_copy(dir.path(), crashed.path());
+        go.store(true, Ordering::Relaxed);
+        handle.finish().await.unwrap();
+
+        let report = crate::session::launch::recover(crashed.path(), crate::session::launch::Retention::KeepAll, Local::now()).unwrap();
+        let len = report.repaired[0].1;
+        assert_eq!(report.untranscribed, vec![Gap::new(a, 0, Some(len), GapKind::SttInterrupted)], "the crashed audio waits for recovery");
+    }
+
+    /// After a rate change the next recording begins while the worker is still flushing the last one.
+    #[tokio::test]
+    async fn a_crash_while_two_recordings_await_their_transcript_leaves_a_gap_for_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let stt = scripted_stt(move |i| match i {
+            SttInput::End { recording_id, .. } if recording_id == b => {
+                vec![SttEvent::Ended { recording_id: a, gap: None }, SttEvent::Ended { recording_id: b, gap: None }]
+            }
+            _ => vec![],
+        });
+        let go = Arc::new(AtomicBool::new(false));
+        let mut before = recording(a, 20);
+        before.push(begin(b, 2));
+        before.extend((0..20).map(|k| frame(b, k * 1600)));
+        let after = vec![SourceEvent::End { recording_id: b, samples: 32_000, stream_errors: 0 }];
+        let (handle, _notes) = spawn(SessionConfig { stt: Some(stt), ..cfg(dir.path()) }, Box::new(Gated { before, go: go.clone(), after }));
+        written(dir.path(), b, 16_000).await;
+        for _ in 0..5_000 {
+            let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
+            if sc.recordings.iter().any(|r| r.id == a && r.state == RecState::Finalized) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let crashed = tempfile::tempdir().unwrap();
+        crash_copy(dir.path(), crashed.path());
+        go.store(true, Ordering::Relaxed);
+        handle.finish().await.unwrap();
+
+        let report = crate::session::launch::recover(crashed.path(), crate::session::launch::Retention::KeepAll, Local::now()).unwrap();
+        let len_b = report.repaired[0].1;
+        assert_eq!(
+            report.untranscribed,
+            vec![Gap::new(a, 0, Some(32_000), GapKind::SttInterrupted), Gap::new(b, 0, Some(len_b), GapKind::SttInterrupted)],
+            "both recordings' audio waits for recovery"
+        );
     }
 }

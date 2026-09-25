@@ -19,15 +19,17 @@ pub struct Sidecar {
     pub recordings: Vec<RecordingEntry>,
     #[serde(default)]
     pub gaps: Vec<Gap>,
-    /// The live transcript's open interval (spec §5.2, §8): this recording was streamed from
-    /// `from_sample` and is committed only as far as the segment log shows. A crash turns the rest into a gap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_utterance: Option<OpenUtterance>,
+    /// The live transcript's open intervals (spec §5.2, §8): each recording whose live transcript is
+    /// not finished, from the sample its current connection streams from (0 until one does). It is
+    /// committed only as far as the segment log shows; a crash turns the rest into a gap. After a
+    /// rate change the next recording opens while the last is still being flushed, hence a list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_utterances: Vec<OpenUtterance>,
 }
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterance: None }
+        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new() }
     }
 }
 
@@ -135,6 +137,20 @@ impl Sidecar {
         self.recordings.iter_mut().find(|r| r.id == id)
     }
 
+    /// Marks the recording's live transcript open from `from_sample`, or moves its mark there.
+    pub fn open_transcript(&mut self, recording_id: Uuid, from_sample: u64) {
+        match self.open_utterances.iter_mut().find(|o| o.recording_id == recording_id) {
+            Some(o) => o.from_sample = from_sample,
+            None => self.open_utterances.push(OpenUtterance { recording_id, from_sample }),
+        }
+    }
+
+    /// The recording's live transcript is finished: drops its mark and returns it.
+    pub fn close_transcript(&mut self, recording_id: Uuid) -> Option<OpenUtterance> {
+        let i = self.open_utterances.iter().position(|o| o.recording_id == recording_id)?;
+        Some(self.open_utterances.remove(i))
+    }
+
     pub fn wall_time(&self, id: Uuid, sample: u64) -> Option<DateTime<Local>> {
         self.recordings.iter().find(|r| r.id == id).map(|r| wall_time_at(r.anchor, sample))
     }
@@ -207,29 +223,34 @@ mod tests {
     }
 
     #[test]
-    fn transcript_gaps_and_the_open_utterance_round_trip() {
+    fn transcript_gaps_and_the_open_utterances_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = sidecar_path(dir.path(), "x");
-        let id = Uuid::new_v4();
+        let (id, next) = (Uuid::new_v4(), Uuid::new_v4());
         let mut s = Sidecar::default();
         s.recordings.push(entry(id));
         s.gaps.push(Gap::new(id, 48_000, Some(96_000), GapKind::SttOffline));
-        s.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 96_000 });
+        s.open_transcript(id, 0);
+        s.open_transcript(next, 0);
+        s.open_transcript(id, 96_000); // a new connection moves the mark
+        assert_eq!(s.open_utterances, vec![OpenUtterance { recording_id: id, from_sample: 96_000 }, OpenUtterance { recording_id: next, from_sample: 0 }]);
         s.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"stt_offline\"") && text.contains("\"open_utterance\""), "{text}");
+        assert!(text.contains("\"stt_offline\"") && text.contains("\"open_utterances\""), "{text}");
         assert_eq!(Sidecar::load(&path).unwrap().unwrap(), s);
 
-        s.open_utterance = None;
+        assert_eq!(s.close_transcript(id), Some(OpenUtterance { recording_id: id, from_sample: 96_000 }));
+        assert_eq!(s.close_transcript(id), None);
+        s.close_transcript(next);
         s.save(&path).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("open_utterance"));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("open_utterances"));
     }
 
     #[test]
-    fn an_m1_sidecar_loads_with_no_open_utterance() {
+    fn an_m1_sidecar_loads_with_no_open_utterances() {
         let m1 = r#"{"version":2,"recordings":[],"gaps":[{"recording_id":"6f2c1f7e-0d6b-4d0c-9b8e-2a4c1f0e9d31","start_sample":0,"end_sample":null,"kind":"device_gone","resolved":false}]}"#;
         let s: Sidecar = serde_json::from_str(m1).unwrap();
-        assert_eq!(s.open_utterance, None);
+        assert!(s.open_utterances.is_empty());
         assert_eq!(s.gaps[0].kind, GapKind::DeviceGone);
     }
 

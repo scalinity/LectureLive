@@ -65,7 +65,7 @@ fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Loca
         gaps.push(Gap::new(r.id, start_sample, None, GapKind::Interrupted));
     }
     sc.gaps.extend(gaps);
-    if let Some(open) = sc.open_utterance.take() {
+    for open in std::mem::take(&mut sc.open_utterances) {
         if let Some(g) = untranscribed(dir, path, &sc, open)? {
             report.untranscribed.push(g.clone());
             sc.gaps.push(g);
@@ -304,7 +304,7 @@ mod tests {
         let id = Uuid::new_v4();
         let mut sc = Sidecar::default();
         sc.recordings.push(RecordingEntry { samples: None, ..entry(id, &file, 0, RecState::Open) });
-        sc.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 0 });
+        sc.open_utterances = vec![OpenUtterance { recording_id: id, from_sample: 0 }];
         let path = sidecar_path(dir.path(), STEM);
         sc.save(&path).unwrap();
         log_segment(dir.path(), id, 16, 12_000);
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(report.untranscribed, vec![gap.clone()]);
         let sc = Sidecar::load(&path).unwrap().unwrap();
         assert_eq!(sc.gaps, vec![Gap::new(id, len, None, GapKind::Interrupted), gap]);
-        assert_eq!(sc.open_utterance, None);
+        assert!(sc.open_utterances.is_empty());
         assert!(recover(dir.path(), Retention::KeepAll, now()).unwrap().untranscribed.is_empty(), "a second launch adds nothing");
     }
 
@@ -325,7 +325,7 @@ mod tests {
         let id = Uuid::new_v4();
         let mut sc = Sidecar::default();
         sc.recordings.push(RecordingEntry { samples: Some(160_000), ..entry(id, "recordings/r.wav", 0, RecState::Finalized) });
-        sc.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 96_000 });
+        sc.open_utterances = vec![OpenUtterance { recording_id: id, from_sample: 96_000 }];
         sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
         log_segment(dir.path(), id, 16, 90_000);
         let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
@@ -338,12 +338,12 @@ mod tests {
         let id = Uuid::new_v4();
         let mut sc = Sidecar::default();
         sc.recordings.push(entry(id, "recordings/gone.wav", 0, RecState::Open));
-        sc.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 0 });
+        sc.open_utterances = vec![OpenUtterance { recording_id: id, from_sample: 0 }];
         sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
         let report = recover(dir.path(), Retention::KeepAll, now()).unwrap();
         assert!(report.untranscribed.is_empty());
         let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
-        assert_eq!(sc.open_utterance, None);
+        assert!(sc.open_utterances.is_empty());
         assert_eq!(sc.gaps.len(), 1, "only the missing recording's interrupted gap");
     }
 }

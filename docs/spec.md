@@ -272,8 +272,10 @@ State: closed utterances + open utterance (stable chunks + tentative tail).
 - `speech_final=true`: closes the open utterance. Its text is the stable part after that replacement, which with the recorded protocol is the `speech_final`'s own text. The utterance is its `[start, start+duration)` of the recording and produces exactly one segment, appended once to the segment log and the transcript file (an empty one produces none). A final ending at or before the last close is a repeat and is ignored.
 
 The transcript is settled through the end of the last close. UI stability is not disk durability: the
-sidecar records the open interval (the live epoch's origin), so after a crash the audio after the last
-logged segment becomes a gap recoverable from the recording.
+sidecar records the open interval of every recording whose live transcript is not finished, from its
+first sample until a connection streams it and then from that connection's origin (the next recording
+can open while the last is still being flushed). After a crash, each one's audio after its last logged
+segment becomes a gap recoverable from the recording.
 
 ### 5.3 Snapshot cutoff
 

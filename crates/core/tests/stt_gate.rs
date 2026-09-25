@@ -96,7 +96,7 @@ async fn disconnect(outage_secs: u64, refusal: Refusal) {
     assert!(rest.state.requests.load(SeqCst) >= 1, "REST recovery was exercised");
     assert!(run.segments.iter().any(|s| s.source == SegmentSource::Recovered));
     assert_eq!(run.report.unresolved, 0);
-    assert_eq!(run.sidecar.open_utterance, None);
+    assert!(run.sidecar.open_utterances.is_empty());
     if outage_secs > 5 {
         let covered = stt_gaps.iter().any(|g| g.start_sample < 30 * 16_000 && g.end_sample.unwrap() >= (30 + outage_secs - 5) * 16_000);
         assert!(covered, "a gap spans the outage, less the 5 s held for the new connection: {stt_gaps:?}");
