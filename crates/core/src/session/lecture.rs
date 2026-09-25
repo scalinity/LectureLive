@@ -123,6 +123,14 @@ impl From<String> for OpError {
     }
 }
 
+/// Where macOS saves screenshots (`defaults read com.apple.screencapture location`), else the Desktop.
+pub fn screenshot_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let out = std::process::Command::new("defaults").args(["read", "com.apple.screencapture", "location"]).output().ok();
+    let found = out.filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).map(|raw| raw.strip_prefix("~/").map_or_else(|| PathBuf::from(&raw), |r| home.join(r)));
+    Some(found.filter(|p| p.is_dir()).unwrap_or_else(|| home.join("Desktop")))
+}
+
 const NOTES_TIMEOUT: Duration = Duration::from_secs(600);
 const IMAGE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
 const SLIDE_MAX_PX: u32 = 1600;

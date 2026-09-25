@@ -1,7 +1,7 @@
 //! The API key in the macOS Keychain (spec §2): the app's credential store. The key is read by the
 //! backend only; the frontend learns whether one is stored, never the key.
 use anyhow::{Context, Result};
-use security_framework::passwords::{delete_generic_password, get_generic_password, set_generic_password};
+use security_framework::passwords::{get_generic_password, set_generic_password};
 
 pub const SERVICE: &str = "com.lecturelive.app";
 pub const ACCOUNT: &str = "GROK_API_KEY";
@@ -21,8 +21,9 @@ pub fn set(service: &str, key: &str) -> Result<()> {
     set_generic_password(service, ACCOUNT, key.as_bytes()).context("store the API key in the Keychain")
 }
 
+#[cfg(test)]
 pub fn delete(service: &str) -> Result<()> {
-    match delete_generic_password(service, ACCOUNT) {
+    match security_framework::passwords::delete_generic_password(service, ACCOUNT) {
         Err(e) if e.code() != NOT_FOUND => Err(e).context("delete the API key from the Keychain"),
         _ => Ok(()),
     }

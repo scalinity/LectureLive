@@ -447,14 +447,6 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
-/// Where macOS saves screenshots (`defaults read com.apple.screencapture location`), else the Desktop.
-fn screenshot_dir() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let out = std::process::Command::new("defaults").args(["read", "com.apple.screencapture", "location"]).output().ok();
-    let found = out.filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).map(|raw| raw.strip_prefix("~/").map_or_else(|| PathBuf::from(&raw), |r| home.join(r)));
-    Some(found.filter(|p| p.is_dir()).unwrap_or_else(|| home.join("Desktop")))
-}
-
 /// An input by UID, or by part of its name; checked before the folder is touched.
 fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, String)> {
     if loopback {
@@ -694,7 +686,7 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             show(p, &e, &mut watch);
         }
     });
-    let watch_slides = SlideWatch { screenshots: screenshot_dir(), poll: Duration::from_secs(1) };
+    let watch_slides = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
     let result = lecture::run(lec, session, Box::new(DeviceSource { uid }), watch_slides, cmd_rx, ev_tx).await;
     printer.await?;
     let report = result?;
