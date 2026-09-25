@@ -13,11 +13,14 @@ chrono = "0.4.45"
 core-foundation = "0.10.1"
 coreaudio-sys = "0.2.18"
 cpal = "0.18.2"
+futures-util = "0.3.34"
 hound = "3.5"
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 rubato = "5.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 xcap = "0.9.8"
 
 [dev-dependencies]
