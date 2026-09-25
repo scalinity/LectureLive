@@ -13,12 +13,13 @@ use lecturelive_core::session::coordinator::{self, Notification, SessionConfig, 
 use lecturelive_core::session::launch::{self, Retention};
 use lecturelive_core::notes::chat::{self, ChatClient, ChatConfig};
 use lecturelive_core::notes::prompts;
-use lecturelive_core::session::files::LectureFiles;
-use lecturelive_core::session::folder::{self, How};
+use lecturelive_core::session::files::{course_from_path, LectureFiles};
+use lecturelive_core::session::folder::How;
 use lecturelive_core::session::lecture::{self, Command as LectureCommand, Event, Lecture, Op, SlideWatch};
 use lecturelive_core::session::lock::FolderLock;
+use lecturelive_core::session::start;
 use lecturelive_core::session::notesfile::Recovered;
-use lecturelive_core::session::segments::{self, SegmentSource};
+use lecturelive_core::session::segments::SegmentSource;
 use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::stt::{probe, rest, stream};
 
@@ -420,12 +421,6 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| dotenvy::from_path_iter(REPO_ENV).ok()?.flatten().find(|(k, _)| k == name).map(|(_, v)| v))
 }
 
-/// The folder above `Weeks/` in `<course>/Weeks/<lecture>`, so each course names itself.
-fn course_from_path(dir: &Path) -> Option<String> {
-    let parts: Vec<String> = dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-    (1..parts.len()).rev().find(|&i| parts[i] == "Weeks").map(|i| parts[i - 1].clone())
-}
-
 /// A message's own final period dropped before the sentence that follows it.
 fn sentence(m: &str) -> &str {
     m.trim_end().trim_end_matches('.')
@@ -522,12 +517,13 @@ fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
             say(p, "notes", "notes", &detail);
         }
         Event::SnapshotFailed(m) => say(p, "warn", "snapshot failed", m),
-        Event::Polished { backup, usd } => {
+        Event::Polished { backup, usd, .. } => {
             let name = backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             say(p, "done", "polished", &format!("previous version in .live_notes/{name}  {}", p.paint(&spend::money(*usd), &["dim"])));
         }
         Event::PolishStopped(m) => say(p, "warn", "polish stopped", m),
         Event::PolishFailed(m) => say(p, "warn", "polish failed", m),
+        Event::Cancelled(what) => say(p, "warn", "cancelled", &format!("{what}; nothing was written, everything is kept for the next snapshot")),
         Event::Page { outcome, usd } => {
             let name = outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let length = p.paint(&format!("{} words of {} allowed", outcome.words, outcome.budget), &[if outcome.words > outcome.budget as usize { "red" } else { "dim" }]);
@@ -604,17 +600,18 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     if let Some(restored) = launch::restore_abandoned_route(&data_dir()?.join("route.json"))? {
         println!("  undid a canary route left behind; default output restored: {restored}");
     }
-    let report = launch::recover(&dir, a.keep_days.map_or(Retention::KeepAll, Retention::KeepDays), chrono::Local::now())?;
-    for (path, n) in &report.repaired {
+    let mut announce = |stem: &str| say(p, "notes", "recovering", &format!("{stem}'s transcript gaps, before today's session"));
+    let ready = start::prepare(&files, &title, a.rebuild, a.keep_days.map_or(Retention::KeepAll, Retention::KeepDays), &recovery, Some(spend.clone()), &mut announce).await?;
+    for (path, n) in &ready.launch.repaired {
         say(p, "done", "repaired", &format!("{} ({:.1} s)", path.display(), secs(*n)));
     }
-    for path in &report.missing {
+    for path in &ready.launch.missing {
         say(p, "warn", "missing", &format!("{} (marked as a gap)", path.display()));
     }
-    for path in &report.pruned {
+    for path in &ready.launch.pruned {
         say(p, "done", "deleted", &format!("{} (retention)", path.display()));
     }
-    let (_, init) = folder::open(&files, &title, a.rebuild)?;
+    let init = ready.init;
     match init.how {
         How::Created => say(p, "notes", "notes", &format!("{} created", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
         How::Migrated => say(p, "notes", "migrated", "this folder's Python CLI state is now the app's (the Python CLI no longer writes here)"),
@@ -636,10 +633,9 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     if init.external_edit {
         say(p, "notes", "notes", "edited outside the app since the last session; kept as they are");
     }
-    for (stem, r) in folder::recover_other_days(&dir, &files.stem, &recovery, Some(spend.clone())).await? {
+    for (stem, r) in &ready.other_days {
         say(p, "done", "recovered", &format!("{stem}'s transcript gaps{}", if r.unresolved > 0 { format!(", {} still waiting", r.unresolved) } else { String::new() }));
     }
-    segments::session_marker(&files.transcript, chrono::Local::now())?;
 
     println!();
     println!("  {}  {}  {name}", p.paint(&course, &["bold"]), p.paint("›", &["dim"]));

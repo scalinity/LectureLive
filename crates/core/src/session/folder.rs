@@ -247,8 +247,9 @@ fn rebuilt(files: &LectureFiles) -> Result<Sidecar> {
 }
 
 /// Transcript gaps other days' sessions left in this folder (spec §5.4): a recovery-only session per
-/// such day, before today's starts. Their segments reach that day's transcript; its notes stay as they are.
-pub async fn recover_other_days(dir: &Path, today: &str, recovery: impl Fn() -> Result<RecoveryLink>, spend: Option<Spend>) -> Result<Vec<(String, StopReport)>> {
+/// such day, before today's starts, announced to `on_start` by its stem. Their segments reach that
+/// day's transcript; its notes stay as they are.
+pub async fn recover_other_days(dir: &Path, today: &str, recovery: impl Fn() -> Result<RecoveryLink>, spend: Option<Spend>, on_start: &mut (dyn FnMut(&str) + Send)) -> Result<Vec<(String, StopReport)>> {
     let mut sidecars: Vec<PathBuf> = match std::fs::read_dir(dir.join(".live_notes")) {
         Ok(e) => e.flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(".v2.json")).collect(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -265,6 +266,7 @@ pub async fn recover_other_days(dir: &Path, today: &str, recovery: impl Fn() -> 
         if !sc.gaps.iter().any(|g| g.kind.is_transcript() && !g.resolved) {
             continue;
         }
+        on_start(&stem);
         let cfg = SessionConfig { dir: dir.to_path_buf(), stem: stem.clone(), recovery: Some(recovery()?), spend: spend.clone(), ..Default::default() };
         let (handle, _notes) = coordinator::spawn(cfg, Box::new(NoAudio));
         out.push((stem, handle.finish().await?));
@@ -483,9 +485,11 @@ mod tests {
             });
             Ok(RecoveryLink { jobs, events })
         };
-        let done = recover_other_days(dir.path(), "lecture_notes_20260925", recovery, None).await.unwrap();
+        let mut seen = Vec::new();
+        let done = recover_other_days(dir.path(), "lecture_notes_20260925", recovery, None, &mut |s: &str| seen.push(s.to_string())).await.unwrap();
+        assert_eq!(seen, vec!["lecture_notes_20260924"], "each day's recovery is announced before it runs");
         assert_eq!(done.iter().map(|(s, r)| (s.as_str(), r.unresolved)).collect::<Vec<_>>(), vec![("lecture_notes_20260924", 0)]);
         assert_eq!(std::fs::read_to_string(dir.path().join("lecture_transcript_20260924.txt")).unwrap(), "[10:00:01] recovered a day later\n");
-        assert!(recover_other_days(dir.path(), "lecture_notes_20260925", recovery, None).await.unwrap().is_empty(), "nothing is left to recover");
+        assert!(recover_other_days(dir.path(), "lecture_notes_20260925", recovery, None, &mut |_: &str| {}).await.unwrap().is_empty(), "nothing is left to recover");
     }
 }

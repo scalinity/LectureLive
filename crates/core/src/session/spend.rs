@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::fsutil::write_atomic;
@@ -231,12 +231,44 @@ fn by_amount(v: &mut [(String, f64)]) {
     v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 }
 
-/// The Python CLI's `lecture spend` view, line for line.
-pub fn render(entries: &[SpendEntry], columns: usize, p: Paint, ledger: &Path) -> String {
-    if entries.is_empty() {
-        return format!("\n  Nothing spent yet. Every paid call is logged in {} from the next run.\n\n", ledger.display());
-    }
-    let width = columns.min(92) as isize - 2;
+/// The spend view's figures (spec §9.1): all-time totals, the last three months by course, and the
+/// eight most recent lectures by kind.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Summary {
+    pub total: f64,
+    /// The part computed from published rates rather than billed.
+    pub estimated: f64,
+    pub calls: usize,
+    /// Oldest first; each month's courses largest first.
+    pub months: Vec<Month>,
+    /// Newest first; each lecture's kinds largest first.
+    pub recent: Vec<Recent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Month {
+    /// `YYYY-MM`.
+    pub key: String,
+    /// `September 2026`.
+    pub label: String,
+    pub total: f64,
+    pub courses: Vec<(String, f64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Recent {
+    /// `YYYY-MM-DD`.
+    pub day: String,
+    /// `25 Sep`.
+    pub label: String,
+    pub course: String,
+    pub lecture: String,
+    pub total: f64,
+    pub kinds: Vec<(String, f64)>,
+}
+
+/// The CLI's `show_spend` aggregation: sums in first-seen order, ties kept in that order.
+pub fn summary(entries: &[SpendEntry]) -> Summary {
     let mut months: Vec<(String, Vec<(String, f64)>)> = Vec::new();
     let mut lectures: Vec<((String, String, String), Vec<(String, f64)>)> = Vec::new();
     for e in entries {
@@ -253,9 +285,39 @@ pub fn render(entries: &[SpendEntry], columns: usize, p: Paint, ledger: &Path) -
         });
         add_to(&mut lectures[j].1, &e.what, e.usd);
     }
-    let total: f64 = entries.iter().map(|e| e.usd).sum();
-    let estimated: f64 = entries.iter().filter(|e| !e.billed).map(|e| e.usd).sum();
-    let name_w = months.iter().flat_map(|(_, c)| c.iter().map(|(n, _)| n.chars().count())).max().unwrap_or(0).min(34);
+    months.sort_by(|a, b| a.0.cmp(&b.0));
+    let recent_months = months.len().saturating_sub(3);
+    let months = months
+        .drain(recent_months..)
+        .map(|(key, mut courses)| {
+            let total = courses.iter().map(|(_, u)| u).sum();
+            by_amount(&mut courses);
+            let label = NaiveDate::parse_from_str(&format!("{key}-01"), "%Y-%m-%d").map_or_else(|_| key.clone(), |d| d.format("%B %Y").to_string());
+            Month { key, label, total, courses }
+        })
+        .collect();
+    lectures.sort_by(|a, b| b.0.cmp(&a.0));
+    let recent = lectures
+        .into_iter()
+        .take(8)
+        .map(|((day, course, lecture), mut kinds)| {
+            let total = kinds.iter().map(|(_, u)| u).sum();
+            by_amount(&mut kinds);
+            let label = NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_or_else(|_| day.clone(), |d| d.format("%-d %b").to_string());
+            Recent { day, label, course, lecture, total, kinds }
+        })
+        .collect();
+    Summary { total: entries.iter().map(|e| e.usd).sum(), estimated: entries.iter().filter(|e| !e.billed).map(|e| e.usd).sum(), calls: entries.len(), months, recent }
+}
+
+/// The Python CLI's `lecture spend` view, line for line.
+pub fn render(entries: &[SpendEntry], columns: usize, p: Paint, ledger: &Path) -> String {
+    if entries.is_empty() {
+        return format!("\n  Nothing spent yet. Every paid call is logged in {} from the next run.\n\n", ledger.display());
+    }
+    let s = summary(entries);
+    let width = columns.min(92) as isize - 2;
+    let name_w = s.months.iter().flat_map(|m| m.courses.iter().map(|(n, _)| n.chars().count())).max().unwrap_or(0).min(34);
     let len = |s: &str| s.chars().count() as isize;
     // Every amount ends at the same right edge; `fill` (a bar) sits between the name and the amount.
     let row = |left: &str, right: &str, left_style: &[&str], right_style: &[&str], fill: &str| {
@@ -263,34 +325,27 @@ pub fn render(entries: &[SpendEntry], columns: usize, p: Paint, ledger: &Path) -
         format!("{}{}{}\n", p.paint(left, left_style), p.paint(fill, &["teal"]), p.paint(&format!("{right:>w$}"), right_style))
     };
     let mut out = String::from("\n");
-    out += &row("  Spend", &format!("all time {}", money(total)), &["bold"], &["dim"], "");
-    months.sort_by(|a, b| a.0.cmp(&b.0));
-    let recent = months.len().saturating_sub(3);
-    for (month, courses) in &mut months[recent..] {
-        let name = NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").map_or_else(|_| month.clone(), |d| d.format("%B %Y").to_string());
+    out += &row("  Spend", &format!("all time {}", money(s.total)), &["bold"], &["dim"], "");
+    for m in &s.months {
         out += "\n";
-        out += &row(&format!("  {name}"), &money(courses.iter().map(|(_, u)| u).sum()), &["bold"], &[], "");
-        let top = courses.iter().map(|(_, u)| *u).fold(0.0, f64::max);
-        by_amount(courses);
-        for (course, usd) in courses.iter() {
+        out += &row(&format!("  {}", m.label), &money(m.total), &["bold"], &[], "");
+        let top = m.courses.iter().map(|(_, u)| *u).fold(0.0, f64::max);
+        for (course, usd) in &m.courses {
             let short: String = course.chars().take(name_w).collect();
             out += &row(&format!("    {short:<name_w$}  "), &money(*usd), &[], &[], &bar(if top > 0.0 { usd / top } else { 0.0 }, 20));
         }
     }
     out += "\n";
     out += &row("  Recent lectures", "", &["bold"], &[], "");
-    lectures.sort_by(|a, b| b.0.cmp(&a.0));
-    for ((day, course, lecture), kinds) in lectures.iter_mut().take(8) {
-        let when = NaiveDate::parse_from_str(day, "%Y-%m-%d").map_or_else(|_| day.clone(), |d| d.format("%-d %b").to_string());
-        let label: String = format!("{course}  ›  {lecture}").chars().take((width - 22).max(0) as usize).collect();
-        out += &row(&format!("    {when:<7} {label}"), &money(kinds.iter().map(|(_, u)| u).sum()), &[], &[], "");
-        by_amount(kinds);
-        let parts: Vec<String> = kinds.iter().map(|(k, v)| format!("{k} {}", money(*v))).collect();
+    for r in &s.recent {
+        let label: String = format!("{}  ›  {}", r.course, r.lecture).chars().take((width - 22).max(0) as usize).collect();
+        out += &row(&format!("    {:<7} {label}", r.label), &money(r.total), &[], &[], "");
+        let parts: Vec<String> = r.kinds.iter().map(|(k, v)| format!("{k} {}", money(*v))).collect();
         out += &format!("{}\n", p.paint(&format!("            {}", parts.join("   ")), &["dim"]));
     }
-    let share = if total > 0.0 { round_int(100.0 * estimated / total) } else { 0 };
-    let note = if estimated == 0.0 { "all billed by xAI".to_string() } else { format!("{share}% estimated from published rates, the rest billed by xAI") };
-    out += &format!("\n{}\n\n", p.paint(&format!("  {} paid calls; {note}.", entries.len()), &["dim"]));
+    let share = if s.total > 0.0 { round_int(100.0 * s.estimated / s.total) } else { 0 };
+    let note = if s.estimated == 0.0 { "all billed by xAI".to_string() } else { format!("{share}% estimated from published rates, the rest billed by xAI") };
+    out += &format!("\n{}\n\n", p.paint(&format!("  {} paid calls; {note}.", s.calls), &["dim"]));
     out
 }
 
@@ -407,5 +462,22 @@ mod tests {
         let plain = Paint { color: false, truecolor: false };
         assert_eq!(render(&entries, 94, plain, Path::new("/ledger/spend.jsonl")), expected);
         assert_eq!(render(&[], 94, plain, Path::new("/ledger/spend.jsonl")), "\n  Nothing spent yet. Every paid call is logged in /ledger/spend.jsonl from the next run.\n\n");
+    }
+
+    #[test]
+    fn the_summary_holds_what_the_spend_view_shows() {
+        let e = |at: &str, course: &str, lecture: &str, what: &str, usd: f64, billed: bool| SpendEntry { at: at.into(), course: course.into(), lecture: lecture.into(), what: what.into(), usd, billed, audio_s: None };
+        let s = summary(&[
+            e("2026-09-24T16:50:11", "Machine Learning", "Week 06 — Optimisation", "page", 0.265218, true),
+            e("2026-09-24T10:00:00", "Machine Learning", "Week 06 — Optimisation", "transcribe", 0.0027, false),
+            e("2026-09-25T11:00:00", "Biology", "Week 02", "notes", 0.004, true),
+        ]);
+        assert_eq!(s.calls, 3);
+        assert!((s.total - 0.271918).abs() < 1e-9 && (s.estimated - 0.0027).abs() < 1e-9);
+        assert_eq!(s.months.len(), 1);
+        assert_eq!((s.months[0].key.as_str(), s.months[0].label.as_str()), ("2026-09", "September 2026"));
+        assert_eq!(s.months[0].courses.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["Machine Learning", "Biology"]);
+        assert_eq!(s.recent.iter().map(|r| (r.label.as_str(), r.course.as_str())).collect::<Vec<_>>(), [("25 Sep", "Biology"), ("24 Sep", "Machine Learning")]);
+        assert_eq!(s.recent[1].kinds.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["page", "transcribe"]);
     }
 }

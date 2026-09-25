@@ -69,6 +69,12 @@ impl LectureFiles {
     }
 }
 
+/// The folder above `Weeks/` in `<course>/Weeks/<lecture>`, so each course names itself.
+pub fn course_from_path(dir: &Path) -> Option<String> {
+    let parts: Vec<String> = dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    (1..parts.len()).rev().find(|&i| parts[i] == "Weeks").map(|i| parts[i - 1].clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +97,11 @@ mod tests {
         assert_eq!(f.stem, "week1");
         assert_eq!(f.sidecar(), Path::new("/l/.live_notes/week1.v2.json"));
         assert_eq!((f.transcript.as_path(), f.slides.as_path()), (Path::new("/l/t.txt"), Path::new("/shots")));
+    }
+
+    #[test]
+    fn the_course_is_the_folder_above_weeks() {
+        assert_eq!(course_from_path(Path::new("/u/Machine Learning/Weeks/Week 06 — Optimisation")).as_deref(), Some("Machine Learning"));
+        assert_eq!(course_from_path(Path::new("/u/Lectures/Week 1")), None);
     }
 }

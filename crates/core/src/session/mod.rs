@@ -8,3 +8,4 @@ pub mod files;
 pub mod notesfile;
 pub mod folder;
 pub mod lecture;
+pub mod start;

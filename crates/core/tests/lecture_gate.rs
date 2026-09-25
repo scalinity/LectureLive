@@ -287,3 +287,56 @@ async fn a_second_stop_skips_queued_operations() {
     assert_eq!(systems.iter().filter(|s| s.starts_with("You are the note-taker")).count(), 2, "the snapshot in flight and the last one: {systems:?}");
     assert!(!systems.iter().any(|s| s.starts_with("You turn raw")), "the queued polish was skipped");
 }
+
+/// Cancel (spec §6.2, §10): the request in flight stops, the polish queued behind it never sends, the
+/// notes are untouched, and the next snapshot sends the same material. The state the session serves
+/// carries the revision its events report.
+#[tokio::test]
+async fn a_cancelled_snapshot_writes_nothing_drops_the_queue_and_its_material_goes_again() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use tokio::sync::oneshot;
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let first = Arc::new(AtomicBool::new(true));
+    let sse = fake_sse::start(move |b| if first.swap(false, SeqCst) { Reply::Stall } else { respond(b) }).await;
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, cmd_rx, ev_tx));
+    segments_seen(&mut ev, 1).await;
+    let untouched = std::fs::read(&f.notes).unwrap();
+    cmd.send(Command::Op(Op::Snapshot("first".into()))).unwrap();
+    until(&mut ev, "the snapshot in flight", |e| matches!(e, Event::Busy(m) if m.starts_with("snapshot"))).await;
+    while sse.state.requests() == 0 {
+        tokio::time::sleep(ms(5)).await; // the request is on the wire, stalled
+    }
+    cmd.send(Command::Op(Op::Polish)).unwrap();
+    cmd.send(Command::Cancel).unwrap();
+    until(&mut ev, "the cancel", |e| matches!(e, Event::Cancelled(what) if what == "the snapshot")).await;
+    assert_eq!(std::fs::read(&f.notes).unwrap(), untouched, "nothing is written");
+    let state = |cmd: &mpsc::UnboundedSender<Command>| {
+        let (tx, rx) = oneshot::channel();
+        cmd.send(Command::State(tx)).unwrap();
+        rx
+    };
+    let sc = state(&cmd).await.unwrap().unwrap();
+    assert_eq!(sc.notes.segment_cursor, 0, "the batch stays pending");
+    cmd.send(Command::Op(Op::Snapshot(String::new()))).unwrap();
+    let Event::Committed { revision, .. } = until(&mut ev, "the next snapshot", |e| matches!(e, Event::Committed { .. })).await else { unreachable!() };
+    let sc = state(&cmd).await.unwrap().unwrap();
+    assert_eq!(sc.notes.revision, revision, "the event carries the revision the state reports");
+    assert!(sc.notes.segment_cursor >= 1);
+    cmd.send(Command::Stop).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+    let bodies = sse.state.bodies();
+    assert!(!bodies.iter().any(|b| b["messages"][0]["content"].as_str().unwrap_or_default().starts_with("You turn raw")), "the queued polish never sent its request");
+    let cancelled: Vec<String> = user_text(&bodies[0]).lines().filter(|l| l.starts_with('[')).map(str::to_string).collect();
+    assert!(!cancelled.is_empty());
+    assert!(cancelled.iter().all(|l| user_text(&bodies[1]).contains(l.as_str())), "the cancelled material went again");
+    assert!(spend::read(&ledger).unwrap().iter().filter(|e| e.what == "notes").count() <= bodies.len() - 1, "a cancelled stream records nothing");
+}
