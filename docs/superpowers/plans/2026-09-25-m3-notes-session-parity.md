@@ -3777,7 +3777,7 @@ uniquely named backup first, and a polish over notes edited while it ran is not 
 
 **Files:**
 - Create: `crates/core/src/notes/page.rs`; `notes/mod.rs` gains `pub mod page;`
-- Create: `crates/core/tests/notes_page.rs`; `crates/core/tests/fixtures/notes/lecture/lecture_notes_20260925.md`. The fixture is synthetic notes on gradient descent and its variants, about 2,200 words: a title line, three `<!-- HH:MM:SS -->` blocks, `##`/`###` sections with formulas in TeX, one worked example, and three slide embeds `![Slide 1](slides/slide_01_100512.png)`, `![Slide 2](slides/slide_02_101830.png)`, `![Slide 3](slides/slide_03_103245.png)`. It is written for this task, and no real lecture's notes are used.
+- Create: `crates/core/tests/notes_page.rs`; `crates/core/tests/fixtures/notes/lecture/fixture_lecture.md`. The fixture is synthetic notes on gradient descent and its variants, about 2,200 words: a title line, three `<!-- HH:MM:SS -->` blocks, `##`/`###` sections with formulas in TeX, one worked example, and three slide embeds `![Slide 1](slides/slide_01_100512.png)`, `![Slide 2](slides/slide_02_101830.png)`, `![Slide 3](slides/slide_03_103245.png)`. It is written for this task, and no real lecture's notes are used.
 - Modify: `crates/core/tests/support/fake_sse.rs` (`study_page(words) -> String`), `crates/core/tests/support/mod.rs` (`slides.rs` with `png(&Path)`, which draws a small chart so `sips` has something to convert)
 
 **Interfaces:**
@@ -3889,7 +3889,7 @@ use support::fake_sse::{self, study_page};
 fn lecture() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let notes = dir.path().join("lecture_notes_20260925.md");
-    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes/lecture/lecture_notes_20260925.md"), &notes).unwrap();
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes/lecture/fixture_lecture.md"), &notes).unwrap();
     for name in ["slide_01_100512.png", "slide_02_101830.png", "slide_03_103245.png"] {
         support::slides::png(&dir.path().join("slides").join(name));
     }
@@ -4332,7 +4332,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/core/src/notes/mod.rs crates/core/src/notes/page.rs crates/core/tests/notes_page.rs crates/core/tests/support/mod.rs crates/core/tests/support/fake_sse.rs crates/core/tests/support/slides.rs crates/core/tests/fixtures/notes/lecture/lecture_notes_20260925.md
+git add crates/core/src/notes/mod.rs crates/core/src/notes/page.rs crates/core/tests/notes_page.rs crates/core/tests/support/mod.rs crates/core/tests/support/fake_sse.rs crates/core/tests/support/slides.rs crates/core/tests/fixtures/notes/lecture/fixture_lecture.md
 git commit -m "Distil the notes into the study page within its word budget, cached against prompt and notes
 
 One medium-effort request over the whole notes and slides, one revision when the draft is
@@ -5469,7 +5469,7 @@ async fn a_live_snapshot_streams_commits_and_reports_its_billed_cost() {
 async fn the_fixture_lecture_distils_within_its_budget_live_and_rerenders_free() {
     let dir = tempfile::tempdir().unwrap();
     let notes = dir.path().join("lecture_notes_20260925.md");
-    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes/lecture/lecture_notes_20260925.md"), &notes).unwrap();
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes/lecture/fixture_lecture.md"), &notes).unwrap();
     for name in ["slide_01_100512.png", "slide_02_101830.png", "slide_03_103245.png"] {
         support::slides::png(&dir.path().join("slides").join(name));
     }
