@@ -29,4 +29,11 @@ export default defineConfig(() => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+
+  // Unit tests run in jsdom with Svelte's client runtime, so rune stores behave as in the app.
+  resolve: process.env.VITEST ? { conditions: ["browser"] } : undefined,
+  test: {
+    environment: "jsdom",
+    include: ["src/**/*.test.ts"],
+  },
 }));

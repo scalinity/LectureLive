@@ -1,0 +1,91 @@
+/* LectureLive's tokens (spec §9.4): the study page's own palette, so the app and the page are one
+   family; readable at arm's length; light and dark follow the system; large type scales the root. */
+:root {
+  --paper: #f4f6f8;
+  --ink: #14213d;
+  --graphite: #5a6478;
+  --rule: #d6dce4;
+  --plate: #e7ecf1;
+  --signal: #b3261e;
+  --signal-soft: #f3dedc;
+  --teal: #1d6b72;
+  --teal-soft: #d9eaeb;
+  --scrim: rgb(20 33 61 / 0.35);
+
+  --text: "Atkinson Hyperlegible Next", -apple-system, system-ui, sans-serif;
+  /* 18 px base, ratio 1.2 (The Elements of Typographic Style's modular scale). */
+  --step--1: 0.8333rem;
+  --step-0: 1rem;
+  --step-1: 1.2rem;
+  --step-2: 1.44rem;
+  --leading: 1.55;
+  --measure: 72ch;
+  --radius: 6px;
+  --fade: 180ms;
+
+  color-scheme: light dark;
+  font-size: 18px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #0e1522;
+    --ink: #e3e8f0;
+    --graphite: #98a3b5;
+    --rule: #263247;
+    --plate: #172235;
+    --signal: #f2766b;
+    --signal-soft: #3a1f24;
+    --teal: #5db8c0;
+    --teal-soft: #16333a;
+    --scrim: rgb(0 0 0 / 0.5);
+  }
+}
+
+:root.large {
+  font-size: 22.5px; /* 125% */
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--text);
+  font-size: var(--step-0);
+  line-height: var(--leading);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Times, money and elapsed: tabular numbers in the text face, not a monospace. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 3px solid var(--teal);
+  outline-offset: 2px;
+}
+
+/* The two fades that carry meaning: a new word appears, a finished preview block lands. */
+@keyframes arrive {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --fade: 0ms;
+  }
+}
