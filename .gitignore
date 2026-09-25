@@ -9,3 +9,7 @@ __pycache__/
 /*.html
 !/notes_template.html
 spend.jsonl
+
+target/
+node_modules/
+recordings/

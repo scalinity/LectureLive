@@ -1,0 +1,15 @@
+[package]
+name = "lecturelive-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "lecturelive_core"
+
+[dependencies]
+anyhow = "1"
+hound = "3.5"
+
+[dev-dependencies]
+tempfile = "3"
