@@ -73,3 +73,27 @@ impl Source for Silence {
         out.blocking_send(SourceEvent::End { recording_id: id, samples: self.samples, stream_errors: 0 }).unwrap();
     }
 }
+
+/// Synthetic speech, paced, until the session stops it: a lecture of no fixed length.
+pub struct Talking {
+    pub pace: Duration,
+    pub fake: Arc<State>,
+}
+
+impl Source for Talking {
+    fn run(self: Box<Self>, out: Sender<SourceEvent>, stop: Arc<AtomicBool>) {
+        let id = Uuid::new_v4();
+        out.blocking_send(begin(id)).unwrap();
+        let mut k = 0;
+        while !stop.load(SeqCst) {
+            let f = Frame { recording_id: id, sample_offset: k * 1600, valid_samples: 1600, pcm16: speech::frame_pcm(k) };
+            if out.blocking_send(SourceEvent::Frame(f)).is_err() {
+                return;
+            }
+            self.fake.feed.store((k + 1) * 1600, SeqCst);
+            k += 1;
+            std::thread::sleep(self.pace);
+        }
+        let _ = out.blocking_send(SourceEvent::End { recording_id: id, samples: k * 1600, stream_errors: 0 });
+    }
+}

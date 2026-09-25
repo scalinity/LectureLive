@@ -285,6 +285,7 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
                 ),
                 Some(Notification::RecoveryFailed(m)) => eprintln!("recovery: {m}"),
                 Some(Notification::SpendFailed(m)) => eprintln!("warning: {m}"),
+                Some(Notification::SourceEnded) => {}
             },
             _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; handle.request_stop(); }
             _ = &mut timer, if !stopping => { stopping = true; handle.request_stop(); }

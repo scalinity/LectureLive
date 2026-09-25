@@ -58,6 +58,8 @@ pub enum Notification {
     RecoveryFailed(String),
     /// The spend ledger could not be written (spec §10: a warning; nothing else stops).
     SpendFailed(String),
+    /// The audio has ended; the session is draining (transcript flush, recovery, stores).
+    SourceEnded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,17 +111,90 @@ impl SessionHandle {
         rx.await.map_err(|_| anyhow!("the session ended before the cutoff settled"))
     }
 
-    /// Waits for the session to end (after `request_stop`, or when the source ends).
+    /// Waits for the session to end (after `request_stop`, or when the source ends) and every `Store`
+    /// of it has been dropped.
     pub async fn finish(self) -> Result<StopReport> {
-        self.task.await?
+        let Self { cmd, task } = self;
+        drop(cmd);
+        task.await?
+    }
+}
+
+/// A store update and, once the coordinator has saved its result, the reply to send.
+type StoreJob = Box<dyn FnOnce(&mut Sidecar) -> StoreReply + Send>;
+type StoreReply = Box<dyn FnOnce(Result<()>) + Send>;
+
+/// The sidecar's one writer, however it is reached (spec §3.2): the coordinator while a session runs,
+/// the file itself when none does.
+#[derive(Clone)]
+pub struct Store(StoreInner);
+
+#[derive(Clone)]
+enum StoreInner {
+    Session { jobs: mpsc::Sender<StoreJob>, cmd: mpsc::Sender<Command> },
+    Offline { sidecar: Arc<std::sync::Mutex<Sidecar>>, path: PathBuf },
+}
+
+impl Store {
+    pub fn offline(sidecar: Sidecar, path: PathBuf) -> Self {
+        Self(StoreInner::Offline { sidecar: Arc::new(std::sync::Mutex::new(sidecar)), path })
+    }
+
+    /// Runs `f` on the sidecar and saves it; in a session, inside the coordinator. When it returns,
+    /// the result is on disk.
+    pub async fn update<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Sidecar) -> Result<T> + Send + 'static,
+    {
+        match &self.0 {
+            StoreInner::Session { jobs, .. } => {
+                let (tx, rx) = oneshot::channel();
+                let job: StoreJob = Box::new(move |sc| {
+                    let out = f(sc);
+                    Box::new(move |saved: Result<()>| {
+                        let _ = tx.send(saved.and(out));
+                    })
+                });
+                jobs.send(job).await.map_err(|_| anyhow!("the session has ended"))?;
+                rx.await.map_err(|_| anyhow!("the session ended before the update ran"))?
+            }
+            StoreInner::Offline { sidecar, path } => {
+                let mut sc = sidecar.lock().expect("the sidecar lock");
+                let out = f(&mut sc);
+                sc.save(path)?;
+                out
+            }
+        }
+    }
+
+    pub async fn read(&self) -> Result<Sidecar> {
+        self.update(|sc| Ok(sc.clone())).await
+    }
+
+    /// A snapshot cutoff (spec §5.3); None without a session.
+    pub async fn cutoff(&self) -> Result<Option<CutoffResult>> {
+        let StoreInner::Session { cmd, .. } = &self.0 else { return Ok(None) };
+        let (tx, rx) = oneshot::channel();
+        cmd.send(Command::Cutoff(tx)).await.map_err(|_| anyhow!("the session has ended"))?;
+        Ok(Some(rx.await.map_err(|_| anyhow!("the session ended before the cutoff settled"))?))
     }
 }
 
 pub fn spawn(cfg: SessionConfig, source: Box<dyn Source>) -> (SessionHandle, mpsc::Receiver<Notification>) {
+    let (handle, notes, _store) = spawn_with_store(cfg, source);
+    (handle, notes)
+}
+
+/// A session and a `Store` of it. The session serves its stores until every clone is dropped, so an
+/// update in flight when the audio ends still goes through the one writer.
+pub fn spawn_with_store(cfg: SessionConfig, source: Box<dyn Source>) -> (SessionHandle, mpsc::Receiver<Notification>, Store) {
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (store_tx, store_rx) = mpsc::channel(8);
     let (notify_tx, notify_rx) = mpsc::channel(256);
-    let task = tokio::spawn(run(cfg, source, cmd_rx, notify_tx));
-    (SessionHandle { cmd: cmd_tx, task }, notify_rx)
+    let task = tokio::spawn(run(cfg, source, cmd_rx, store_rx, notify_tx));
+    let store = Store(StoreInner::Session { jobs: store_tx, cmd: cmd_tx.clone() });
+    (SessionHandle { cmd: cmd_tx, task }, notify_rx, store)
 }
 
 enum RecMsg {
@@ -445,14 +520,39 @@ impl Coordinator {
     fn cutoff(&mut self, reply: oneshot::Sender<CutoffResult>) {
         let segments = self.segment_count();
         let Some(recording_id) = self.current.filter(|_| self.stt.is_some()) else {
-            // Without live STT nothing is confirmed; with it but between recordings, nothing is open.
-            let _ = reply.send(CutoffResult { confirmed: self.stt.is_some(), segments });
+            // Without live STT nothing is confirmed. Between recordings, one whose live transcript is
+            // still being flushed (its mark is still set) may yet commit its last sentence.
+            let settled = self.stt.is_some() && self.sidecar.open_utterances.is_empty();
+            let _ = reply.send(CutoffResult { confirmed: settled, segments });
             return;
         };
         let id = self.next_cutoff;
         self.next_cutoff += 1;
         self.cutoffs.insert(id, reply);
         self.stt_control(SttInput::Cutoff { id, recording_id, sample: self.forwarded_to });
+    }
+
+    /// A store update (spec §3.2): run against a copy on a blocking thread, adopted, saved, and only
+    /// then answered, so an update that returns is durable.
+    async fn run_job(&mut self, job: StoreJob) -> Result<()> {
+        let sc = self.sidecar.clone();
+        let (sc, reply) = tokio::task::spawn_blocking(move || {
+            let mut sc = sc;
+            let reply = job(&mut sc);
+            (sc, reply)
+        })
+        .await?;
+        self.sidecar = sc;
+        match self.save().await {
+            Ok(()) => {
+                reply(Ok(()));
+                Ok(())
+            }
+            Err(e) => {
+                reply(Err(anyhow!("save the sidecar: {e:#}")));
+                Err(e)
+            }
+        }
     }
 
     async fn on_recorder(&mut self, ev: RecorderEvent) -> Result<()> {
@@ -478,7 +578,8 @@ async fn recv<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
     }
 }
 
-async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Receiver<Command>, notify: mpsc::Sender<Notification>) -> Result<StopReport> {
+async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Receiver<Command>, store_rx: mpsc::Receiver<StoreJob>, notify: mpsc::Sender<Notification>) -> Result<StopReport> {
+    let mut store_rx = Some(store_rx);
     let sidecar_path = sidecar_path(&cfg.dir, &cfg.stem);
     let sidecar = Sidecar::load(&sidecar_path)?.unwrap_or_default();
     let segments = if cfg.stt.is_some() || cfg.recovery.is_some() {
@@ -553,14 +654,20 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
                 Some(ev) => if let Err(e) = c.on_recovery(ev).await { fail(e, &mut failure) },
                 None => c.recovery_events = None,
             },
+            job = recv(&mut store_rx), if store_rx.is_some() => match job {
+                Some(job) => if let Err(e) = c.run_job(job).await { fail(e, &mut failure) },
+                None => store_rx = None,
+            },
         }
     }
+    c.notify(Notification::SourceEnded);
     // The source has ended: close the recorder and STT queues and drain every worker. Recovery's
-    // queue closes once STT can raise no more gaps, and recovery finishes what it holds.
+    // queue closes once STT can raise no more gaps, and recovery finishes what it holds. Stores are
+    // served until the last one is dropped.
     c.rec_tx = None;
     c.stt = None;
     let mut recorder_open = true;
-    loop {
+    while recorder_open || c.stt_events.is_some() || c.recovery_events.is_some() || store_rx.is_some() {
         if c.stt_events.is_none() {
             c.recovery = None;
         }
@@ -577,7 +684,20 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
                 Some(ev) => if let Err(e) = c.on_recovery(ev).await { failure.get_or_insert(e); },
                 None => c.recovery_events = None,
             },
-            else => break,
+            job = recv(&mut store_rx), if store_rx.is_some() => match job {
+                Some(job) => if let Err(e) = c.run_job(job).await { failure.get_or_insert(e); },
+                None => store_rx = None,
+            },
+            Some(cmd) = cmd_rx.recv() => match cmd {
+                // A stop while draining: stop waiting for recovery; its gaps wait for the next session.
+                Command::Stop => {
+                    if c.recovery_events.take().is_some() {
+                        c.recovery = None;
+                        c.notify(Notification::RecoveryFailed("recovery stopped by a second stop; its gaps wait for the next session".into()));
+                    }
+                }
+                Command::Cutoff(reply) => c.cutoff(reply),
+            },
         }
     }
     let segments = c.segment_count();
@@ -1105,5 +1225,133 @@ mod tests {
         let got: Vec<(&str, f64, bool, Option<f64>)> = entries.iter().map(|e| (e.what.as_str(), e.usd, e.billed, e.audio_s)).collect();
         assert_eq!(got, vec![("transcribe", 0.000056, false, Some(1.0)), ("transcribe", 0.000014, false, Some(0.5))]);
         assert!(entries.iter().all(|e| e.course == "Machine Learning" && e.lecture == "Week 01"));
+    }
+
+    #[tokio::test]
+    async fn a_store_update_runs_in_the_coordinator_and_later_saves_keep_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4();
+        let go = Arc::new(AtomicBool::new(false));
+        let mut before = recording(a, 4);
+        let after = before.split_off(3);
+        let (handle, _notes, store) = spawn_with_store(cfg(dir.path()), Box::new(Gated { before, go: go.clone(), after }));
+        while !Sidecar::load(&sidecar_path(dir.path(), STEM)).ok().flatten().is_some_and(|sc| sc.recordings.iter().any(|r| r.id == a)) {
+            tokio::time::sleep(Duration::from_millis(1)).await; // the recording has begun
+        }
+        let seen = store
+            .update(|sc| {
+                sc.notes.segment_cursor = 7;
+                Ok(sc.recordings.len())
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, 1, "the update sees the coordinator's sidecar");
+        assert_eq!(Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap().notes.segment_cursor, 7);
+        go.store(true, Ordering::Relaxed);
+        drop(store);
+        handle.finish().await.unwrap();
+        let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
+        assert_eq!((sc.notes.segment_cursor, sc.recordings[0].state), (7, RecState::Finalized), "the coordinator's own saves keep it");
+    }
+
+    #[tokio::test]
+    async fn the_session_serves_its_stores_until_they_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4();
+        let (handle, _notes, store) = spawn_with_store(cfg(dir.path()), Box::new(Script(recording(a, 3))));
+        let finished = tokio::spawn(handle.finish());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!finished.is_finished(), "a store still held keeps the session open");
+        store
+            .update(|sc| {
+                sc.notes.slide_index = 4;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.cutoff().await.unwrap(), Some(CutoffResult { confirmed: false, segments: 0 }), "after the audio nothing more is confirmed");
+        drop(store);
+        finished.await.unwrap().unwrap();
+        let path = sidecar_path(dir.path(), STEM);
+        assert_eq!(Sidecar::load(&path).unwrap().unwrap().notes.slide_index, 4);
+        let offline = Store::offline(Sidecar::load(&path).unwrap().unwrap(), path.clone());
+        offline
+            .update(|sc| {
+                sc.notes.slide_index = 5;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(offline.cutoff().await.unwrap(), None);
+        assert_eq!(Sidecar::load(&path).unwrap().unwrap().notes.slide_index, 5);
+    }
+
+    #[tokio::test]
+    async fn a_cutoff_while_a_recordings_transcript_is_still_flushing_is_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (input, mut rx) = mpsc::channel(INPUT_QUEUE);
+        let (tx, events) = mpsc::channel(8);
+        let (flushed_tx, flushed_rx) = oneshot::channel::<()>();
+        let ended = Arc::new(AtomicBool::new(false));
+        let seen_end = ended.clone();
+        tokio::spawn(async move {
+            let mut flushed = Some(flushed_rx);
+            while let Some(i) = rx.recv().await {
+                if let SttInput::End { recording_id, .. } = i {
+                    seen_end.store(true, Ordering::SeqCst);
+                    if let Some(f) = flushed.take() {
+                        let _ = f.await; // still flushing this recording's last sentence
+                    }
+                    let _ = tx.send(SttEvent::Ended { recording_id, gap: None }).await;
+                }
+            }
+        });
+        let a = Uuid::new_v4();
+        let go = Arc::new(AtomicBool::new(false));
+        let (handle, _notes) = spawn(SessionConfig { stt: Some(SttLink { input, events }), ..cfg(dir.path()) }, Box::new(Gated { before: recording(a, 3), go: go.clone(), after: vec![] }));
+        while !ended.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!handle.cutoff().await.unwrap().confirmed, "the last sentence may still arrive");
+        flushed_tx.send(()).unwrap();
+        while !Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap().open_utterances.is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(handle.cutoff().await.unwrap().confirmed, "between recordings with nothing flushing, all is settled");
+        go.store(true, Ordering::Relaxed);
+        handle.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_stop_abandons_pending_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Uuid::new_v4();
+        let anchor = Local.with_ymd_and_hms(2026, 9, 25, 9, 0, 0).unwrap();
+        let mut sc = Sidecar::default();
+        sc.recordings.push(RecordingEntry { id: old, file: "recordings/old.wav".into(), anchor, source_uid: "X".into(), input_rate: 48_000, samples: Some(16_000), state: RecState::Finalized });
+        sc.gaps.push(Gap::new(old, 0, Some(16_000), GapKind::SttOffline));
+        sc.save(&sidecar_path(dir.path(), STEM)).unwrap();
+        let (jobs, mut jobs_rx) = mpsc::unbounded_channel::<RecoverJob>();
+        let (events_tx, events) = mpsc::channel::<RecoverEvent>(8);
+        tokio::spawn(async move {
+            let _hold = events_tx;
+            while jobs_rx.recv().await.is_some() {
+                std::future::pending::<()>().await; // a long gap that never finishes
+            }
+        });
+        let (handle, _notes) = spawn(SessionConfig { recovery: Some(RecoveryLink { jobs, events }), ..cfg(dir.path()) }, Box::new(Endless));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handle.request_stop();
+        loop {
+            let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
+            if sc.recordings.len() == 2 && sc.recordings.iter().all(|r| r.state == RecState::Finalized) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        handle.request_stop();
+        let report = tokio::time::timeout(Duration::from_secs(5), handle.finish()).await.expect("the second stop ends the wait").unwrap();
+        assert_eq!(report.unresolved, 1, "the gap waits for the next session");
+        assert_eq!(report.recordings.len(), 1, "this session's recording is intact");
     }
 }
