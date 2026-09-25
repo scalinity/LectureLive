@@ -59,7 +59,7 @@ fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Loca
             report.missing.push(wav);
             0
         };
-        gaps.push(Gap { recording_id: r.id, start_sample, end_sample: None, kind: GapKind::Interrupted, resolved: false });
+        gaps.push(Gap::new(r.id, start_sample, None, GapKind::Interrupted));
     }
     sc.gaps.extend(gaps);
     for id in prunable(&sc, retention, now) {
@@ -156,7 +156,7 @@ mod tests {
         let r = &sc.recordings[0];
         assert_eq!(r.state, RecState::Repaired);
         assert_eq!(r.samples, Some(report.repaired[0].1));
-        assert_eq!(sc.gaps, vec![Gap { recording_id: id, start_sample: report.repaired[0].1, end_sample: None, kind: GapKind::Interrupted, resolved: false }]);
+        assert_eq!(sc.gaps, vec![Gap { recording_id: id, start_sample: report.repaired[0].1, end_sample: None, kind: GapKind::Interrupted, resolved: true }]);
         assert_eq!(hound::WavReader::open(dir.path().join(&file)).unwrap().len() as u64, report.repaired[0].1);
 
         let again = recover(dir.path(), Retention::KeepAll, now()).unwrap();
@@ -256,5 +256,18 @@ mod tests {
         assert!(!dir.path().join("recordings/old.wav").exists());
         let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
         assert_eq!(sc.recordings[0].state, RecState::Deleted);
+    }
+
+    /// The resolved rule's effect on retention: gaps with no audio behind them do not keep a recording.
+    #[test]
+    fn a_recording_is_kept_only_while_its_transcript_awaits_recovery() {
+        let (audio_only, pending) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut sc = Sidecar::default();
+        sc.recordings.push(entry(audio_only, "a.wav", 30, RecState::Finalized));
+        sc.recordings.push(entry(pending, "b.wav", 30, RecState::Finalized));
+        sc.gaps.push(Gap::new(audio_only, 6_400, None, GapKind::DeviceGone));
+        sc.gaps.push(Gap::new(audio_only, 0, Some(1_600), GapKind::CaptureOverflow));
+        sc.gaps.push(Gap::new(pending, 0, Some(16_000), GapKind::SttOffline));
+        assert_eq!(prunable(&sc, Retention::KeepDays(14), now()), vec![audio_only]);
     }
 }

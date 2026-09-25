@@ -164,7 +164,7 @@ impl Coordinator {
                         match self.overflow {
                             Some(i) => self.sidecar.gaps[i].end_sample = Some(end),
                             None => {
-                                let gap = Gap { recording_id: id, start_sample: start, end_sample: Some(end), kind: GapKind::RecorderOverflow, resolved: false };
+                                let gap = Gap::new(id, start, Some(end), GapKind::RecorderOverflow);
                                 self.sidecar.gaps.push(gap.clone());
                                 self.overflow = Some(self.sidecar.gaps.len() - 1);
                                 self.save().await?;

@@ -136,7 +136,7 @@ impl Segment<'_> {
             Chunk::Audio(a) => pipeline.push(a)?.into_iter().try_for_each(|f| self.emit(f)),
             Chunk::Silence(n) => {
                 let (lost, frames) = pipeline.push_silence(n)?;
-                let gap = Gap { recording_id: self.recording_id, start_sample: lost.start, end_sample: Some(lost.end), kind: GapKind::CaptureOverflow, resolved: false };
+                let gap = Gap::new(self.recording_id, lost.start, Some(lost.end), GapKind::CaptureOverflow);
                 send(self.out, SourceEvent::Gap(gap))?;
                 frames.into_iter().try_for_each(|f| self.emit(f))
             }
@@ -228,7 +228,7 @@ fn run_segment(device: &cpal::Device, uid: &str, out: &Sender<SourceEvent>, stop
         SegmentEnd::Gone => GapKind::DeviceGone,
         SegmentEnd::Invalidated => GapKind::RateChange,
     };
-    send(out, SourceEvent::Gap(Gap { recording_id, start_sample: seg.samples, end_sample: None, kind, resolved: false }))?;
+    send(out, SourceEvent::Gap(Gap::new(recording_id, seg.samples, None, kind)))?;
     Ok(Outcome::Ended(end))
 }
 

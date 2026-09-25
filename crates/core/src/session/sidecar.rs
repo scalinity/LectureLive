@@ -19,12 +19,22 @@ pub struct Sidecar {
     pub recordings: Vec<RecordingEntry>,
     #[serde(default)]
     pub gaps: Vec<Gap>,
+    /// The live transcript's open interval (spec §5.2, §8): this recording was streamed from
+    /// `from_sample` and is committed only as far as the segment log shows. A crash turns the rest into a gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_utterance: Option<OpenUtterance>,
 }
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new() }
+        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterance: None }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenUtterance {
+    pub recording_id: Uuid,
+    pub from_sample: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,8 +60,9 @@ pub enum RecState {
     Deleted,
 }
 
-/// An interval of a recording without durable captured audio. `end_sample: None` runs
-/// from `start_sample` to the next recording's anchor, or to the end of the session.
+/// An interval of a recording without durable audio (audio kinds) or without a committed
+/// transcript (`stt_*` kinds). `end_sample: None` runs from `start_sample` to the next recording's
+/// anchor, or to the end of the session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gap {
     pub recording_id: Uuid,
@@ -70,6 +81,34 @@ pub enum GapKind {
     DeviceGone,
     RateChange,
     Interrupted,
+    /// No live STT connection carried this audio: connecting, disconnected, or it did not finish in time.
+    SttOffline,
+    /// Frames were dropped on the way to the STT writer.
+    SttOverflow,
+    /// STT was refused (4xx) and stopped for the session.
+    SttRefused,
+    /// The session stopped (a crash, or the STT worker ended) before this audio's transcript was committed.
+    SttInterrupted,
+}
+
+impl GapKind {
+    /// Audio exists for the interval but its transcript does not: recovery can fill it (spec §5.4).
+    pub fn is_transcript(self) -> bool {
+        matches!(self, Self::SttOffline | Self::SttOverflow | Self::SttRefused | Self::SttInterrupted)
+    }
+}
+
+impl Gap {
+    /// A gap is resolved when nothing more can be done for it: a transcript gap once recovery has
+    /// committed its interval, an audio gap at once, since it has no audio to recover from.
+    pub fn new(recording_id: Uuid, start_sample: u64, end_sample: Option<u64>, kind: GapKind) -> Self {
+        Self { recording_id, start_sample, end_sample, kind, resolved: !kind.is_transcript() }
+    }
+}
+
+/// Wall time of a recording's sample: its anchor plus sample / 16 kHz (spec §3.3).
+pub fn wall_time_at(anchor: DateTime<Local>, sample: u64) -> DateTime<Local> {
+    anchor + chrono::Duration::microseconds((sample * 1_000_000 / SAMPLE_RATE as u64) as i64)
 }
 
 pub fn sidecar_path(dir: &Path, stem: &str) -> PathBuf {
@@ -97,8 +136,7 @@ impl Sidecar {
     }
 
     pub fn wall_time(&self, id: Uuid, sample: u64) -> Option<DateTime<Local>> {
-        let r = self.recordings.iter().find(|r| r.id == id)?;
-        Some(r.anchor + chrono::Duration::microseconds((sample * 1_000_000 / SAMPLE_RATE as u64) as i64))
+        self.recordings.iter().find(|r| r.id == id).map(|r| wall_time_at(r.anchor, sample))
     }
 }
 
@@ -153,5 +191,51 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not json").unwrap();
         assert!(Sidecar::load(&path).is_err());
+    }
+
+    #[test]
+    fn audio_gaps_are_resolved_when_recorded_and_transcript_gaps_wait_for_recovery() {
+        let id = Uuid::new_v4();
+        for kind in [GapKind::CaptureOverflow, GapKind::RecorderOverflow, GapKind::DeviceGone, GapKind::RateChange, GapKind::Interrupted] {
+            assert!(!kind.is_transcript());
+            assert!(Gap::new(id, 0, None, kind).resolved, "{kind:?} has no audio to recover");
+        }
+        for kind in [GapKind::SttOffline, GapKind::SttOverflow, GapKind::SttRefused, GapKind::SttInterrupted] {
+            assert!(kind.is_transcript());
+            assert!(!Gap::new(id, 0, Some(16_000), kind).resolved, "{kind:?} waits for recovery");
+        }
+    }
+
+    #[test]
+    fn transcript_gaps_and_the_open_utterance_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sidecar_path(dir.path(), "x");
+        let id = Uuid::new_v4();
+        let mut s = Sidecar::default();
+        s.recordings.push(entry(id));
+        s.gaps.push(Gap::new(id, 48_000, Some(96_000), GapKind::SttOffline));
+        s.open_utterance = Some(OpenUtterance { recording_id: id, from_sample: 96_000 });
+        s.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"stt_offline\"") && text.contains("\"open_utterance\""), "{text}");
+        assert_eq!(Sidecar::load(&path).unwrap().unwrap(), s);
+
+        s.open_utterance = None;
+        s.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("open_utterance"));
+    }
+
+    #[test]
+    fn an_m1_sidecar_loads_with_no_open_utterance() {
+        let m1 = r#"{"version":2,"recordings":[],"gaps":[{"recording_id":"6f2c1f7e-0d6b-4d0c-9b8e-2a4c1f0e9d31","start_sample":0,"end_sample":null,"kind":"device_gone","resolved":false}]}"#;
+        let s: Sidecar = serde_json::from_str(m1).unwrap();
+        assert_eq!(s.open_utterance, None);
+        assert_eq!(s.gaps[0].kind, GapKind::DeviceGone);
+    }
+
+    #[test]
+    fn wall_time_is_the_anchor_plus_samples() {
+        let anchor = Local.with_ymd_and_hms(2026, 9, 25, 10, 0, 0).unwrap();
+        assert_eq!(wall_time_at(anchor, 66_288), anchor + chrono::Duration::milliseconds(4_143));
     }
 }
