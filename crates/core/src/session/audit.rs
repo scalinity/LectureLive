@@ -159,6 +159,18 @@ pub fn audit_day(files: &LectureFiles) -> Result<Audit> {
     Ok(a)
 }
 
+/// The audit's exit status: 0 only for a whole folder; 1 when anything is unexplained; 2 when nothing is unexplained but
+/// something still waits (a recording not yet repaired, a transcript gap not yet recovered), which it cannot vouch for.
+pub fn exit_code(days: &[(String, Audit)]) -> i32 {
+    if days.iter().any(|(_, a)| a.unexplained > 0) {
+        1
+    } else if days.iter().any(|(_, a)| a.waiting > 0) {
+        2
+    } else {
+        0
+    }
+}
+
 /// Every day's sidecar in the folder, by its stem (`lecture_notes_YYYYMMDD`).
 pub fn audit_folder(dir: &Path) -> Result<Vec<(String, Audit)>> {
     let state = dir.join(".live_notes");
@@ -304,6 +316,16 @@ mod tests {
         f.sc.gaps.push(Gap::new(a, 0, Some(16_000), GapKind::SttOffline));
         let audit = f.run();
         assert_eq!((audit.unexplained, audit.waiting), (0, 1), "{:#?}", audit.lines);
+    }
+
+    /// Final review, I3 (Review Focus 5): only a whole folder exits 0; anything unexplained is 1, anything still waiting
+    /// (a recording not repaired, a transcript gap not recovered) is 2, since the audit cannot vouch for it yet.
+    #[test]
+    fn the_exit_status_is_0_only_for_a_whole_folder() {
+        let day = |unexplained, waiting| ("lecture_notes_20260926".to_string(), Audit { lines: vec![], unexplained, waiting });
+        assert_eq!(exit_code(&[day(0, 0)]), 0);
+        assert_eq!(exit_code(&[day(0, 0), day(0, 1)]), 2, "waiting");
+        assert_eq!(exit_code(&[day(1, 3)]), 1, "unexplained comes first");
     }
 
     #[test]

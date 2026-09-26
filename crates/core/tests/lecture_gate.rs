@@ -390,3 +390,27 @@ async fn a_failed_session_still_takes_its_last_snapshot() {
     assert!(logged > 0);
     assert_eq!(sc.notes.segment_cursor, logged);
 }
+
+/// Final review, I5: a last snapshot that fails is in the stop report, so the end does not read as if the notes were
+/// complete.
+#[tokio::test]
+async fn a_last_snapshot_that_fails_is_in_the_stop_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let sse = fake_sse::start(|_| Reply::Status(503, "{\"code\":\"unavailable\",\"error\":\"overloaded\"}".into())).await;
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let source = Talking { pace: ms(2), fake: stt.state.clone() };
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(source), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+    segments_seen(&mut ev, 2).await;
+    cmd.send(Command::Stop).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+    assert!(report.last_snapshot.is_some(), "the failure is reported: {:?}", report.last_snapshot);
+    assert_eq!(Sidecar::load(&f.sidecar()).unwrap().unwrap().notes.segment_cursor, 0, "nothing was written; everything stays pending");
+}

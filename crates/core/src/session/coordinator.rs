@@ -79,6 +79,9 @@ pub struct StopReport {
     pub segments: u64,
     /// Transcript gaps still waiting for recovery.
     pub unresolved: usize,
+    /// Why the lecture's last snapshot did not reach the notes, when it did not: what it missed stays pending for the
+    /// next session in the folder (spec §10).
+    pub last_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

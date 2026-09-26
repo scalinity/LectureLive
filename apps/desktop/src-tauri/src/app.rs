@@ -417,13 +417,23 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         pump.lecture_ended();
         match result {
             Ok(report) => {
-                let waiting = if report.unresolved > 0 { format!("; {} transcript gaps still to recover, the next session in this folder does it", report.unresolved) } else { String::new() };
-                pump.notice(NoticeKind::Done, "Saved", &format!("the notes and transcript{waiting}"));
+                let (kind, label, detail) = saved_notice(&report);
+                pump.notice(kind, label, &detail);
             }
             Err(e) => pump.notice(NoticeKind::Warn, "Session failed", &format!("{e:#}")),
         }
     });
     Ok(session)
+}
+
+/// The notice at the end of a lecture: "Saved", and when the last snapshot failed it says so, since what it missed waits
+/// for the next session in the folder (spec §10), and "Saved" alone would read as if the notes were complete.
+fn saved_notice(report: &lecturelive_core::session::coordinator::StopReport) -> (NoticeKind, &'static str, String) {
+    let waiting = if report.unresolved > 0 { format!("; {} transcript gaps still to recover, the next session in this folder does it", report.unresolved) } else { String::new() };
+    match &report.last_snapshot {
+        None => (NoticeKind::Done, "Saved", format!("the notes and transcript{waiting}")),
+        Some(e) => (NoticeKind::Warn, "Saved", format!("the recording and transcript; the last snapshot failed ({e}), so the notes miss the end until the next session in this folder adds it{waiting}")),
+    }
 }
 
 /// The first stop finishes the transcript and recovery, then takes the last snapshot; the second stops
@@ -886,6 +896,20 @@ mod tests {
         let sc = tokio::time::timeout(Duration::from_secs(10), sidecar(Some(&tx), &files, false)).await.expect("a silent lecture falls back to the file");
         assert_eq!(sc.map(|s| s.notes.revision), Some(7));
         assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    }
+
+    /// Final review, I5: the end says when the last snapshot failed, rather than "Saved" alone.
+    #[test]
+    fn the_end_notice_says_when_the_last_snapshot_failed() {
+        use lecturelive_core::session::coordinator::StopReport;
+        let (kind, label, detail) = saved_notice(&StopReport::default());
+        assert_eq!((kind, label), (NoticeKind::Done, "Saved"));
+        assert_eq!(detail, "the notes and transcript");
+        let failed = StopReport { last_snapshot: Some("error sending request".into()), unresolved: 1, ..StopReport::default() };
+        let (kind, label, detail) = saved_notice(&failed);
+        assert_eq!((kind, label), (NoticeKind::Warn, "Saved"));
+        assert!(detail.contains("the last snapshot failed (error sending request)") && detail.contains("next session in this folder"), "{detail}");
+        assert!(detail.contains("1 transcript gaps still to recover"), "{detail}");
     }
 
     #[test]

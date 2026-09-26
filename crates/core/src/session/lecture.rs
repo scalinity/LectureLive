@@ -496,18 +496,19 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
     }
     // The last snapshot, after recovery has drained (spec §5.4), on the sidecar the session left: also after a
     // session that failed (a full disk), so what was logged reaches the notes before the failure is reported (§10).
-    match Sidecar::load(&lec.files.sidecar()).and_then(|sc| sc.context("the session left no sidecar")) {
-        Ok(sc) => {
-            if let Err(e) = lec.snapshot(&Store::offline(sc, lec.files.sidecar()), "", &events).await {
-                let _ = events.send(Event::SnapshotFailed(format!("{e}; everything is kept for the next one")));
-            }
-        }
-        Err(e) if result.is_err() => {
-            let _ = events.send(Event::SnapshotFailed(format!("{e:#}; everything is kept for the next one")));
-        }
+    // Its failure goes into the report too, so the end never reads as if the notes were complete.
+    let failed = match Sidecar::load(&lec.files.sidecar()).and_then(|sc| sc.context("the session left no sidecar")) {
+        Ok(sc) => lec.snapshot(&Store::offline(sc, lec.files.sidecar()), "", &events).await.err(),
+        Err(e) if result.is_err() => Some(format!("{e:#}")),
         Err(e) => return Err(e),
+    };
+    if let Some(e) = &failed {
+        let _ = events.send(Event::SnapshotFailed(format!("{e}; everything is kept for the next one")));
     }
-    result
+    result.map(|mut report| {
+        report.last_snapshot = failed;
+        report
+    })
 }
 
 /// The sidecar as its file holds it: the one writer saves it atomically before every answer (spec §8).

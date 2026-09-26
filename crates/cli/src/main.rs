@@ -76,7 +76,7 @@ enum Cmd {
 #[derive(clap::Args)]
 struct LectureArgs {
     /// page: typeset the study page from the notes; spend: what the tool has cost; audit: whether the folder's
-    /// audio is whole (exit 1 when anything is unexplained). Leave out to record.
+    /// audio is whole (exit 1 when anything is unexplained, 2 while something waits). Leave out to record.
     #[arg(value_parser = ["page", "spend", "audit"])]
     command: Option<String>,
     /// The lecture folder (default: the current directory)
@@ -474,7 +474,8 @@ fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, Stri
         .with_context(|| format!("No audio input matches {want:?}. Inputs now: {}.", inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
-/// `lecture audit`: each day's findings, then the counts; exits 1 when anything is unexplained (the M6 gate).
+/// `lecture audit`: each day's findings, then the counts. Exits 0 only for a whole folder, 1 when anything is unexplained,
+/// 2 when something still waits for repair or recovery (the M6 gate).
 fn audit_cmd(dir: &Path) -> Result<()> {
     let days = audit::audit_folder(dir)?;
     anyhow::ensure!(!days.is_empty(), "no lecture state in {} (.live_notes/*.v2.json)", dir.display());
@@ -488,10 +489,10 @@ fn audit_cmd(dir: &Path) -> Result<()> {
         waiting += a.waiting;
     }
     println!("{unexplained} unexplained, {waiting} waiting");
-    if unexplained > 0 {
-        std::process::exit(1);
+    match audit::exit_code(&days) {
+        0 => Ok(()),
+        code => std::process::exit(code),
     }
-    Ok(())
 }
 
 /// The lecture folder as an absolute path, `.` components dropped, without touching the filesystem: the course is
@@ -778,6 +779,9 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let file_name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     println!();
     println!("  {} {}  {}  {}", p.paint("✓", &["teal"]), p.paint("saved", &["bold"]), file_name(&files.notes), file_name(&files.transcript));
+    if let Some(e) = &report.last_snapshot {
+        say(p, "warn", "notes", &format!("the last snapshot failed ({e}); the next session in this folder adds what it missed"));
+    }
     if report.unresolved > 0 {
         println!("{}", p.paint(&format!("    {} still to recover; the next session in this folder does it", plural(report.unresolved, "transcript gap")), &["dim"]));
     }
