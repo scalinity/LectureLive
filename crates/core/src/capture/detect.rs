@@ -2,7 +2,7 @@
 //! grayscale; its 16×16 tiles are compared with the last kept frame. A change becomes a candidate, a
 //! candidate that holds still for a sample becomes a slide, tiles that keep moving are masked, and a
 //! candidate that never settles is kept after 10 samples, flagged uncertain.
-use image::{imageops::FilterType, GrayImage, RgbaImage};
+use image::{imageops::FilterType, DynamicImage, GrayImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 
 pub const W: u32 = 256;
@@ -36,17 +36,20 @@ impl Region {
     }
 }
 
+// The pixel work goes through `DynamicImage`'s own methods: they are compiled inside `image`, which the
+// dev profile optimises, where the generic `imageops` functions would be compiled here, unoptimised.
+
 /// The region at full resolution: what a slide saves.
-pub fn crop(img: &RgbaImage, region: &Region) -> Option<RgbaImage> {
+pub fn crop(img: &RgbaImage, region: &Region) -> Option<DynamicImage> {
     let (x, y, w, h) = region.pixels(img.width(), img.height())?;
-    Some(image::imageops::crop_imm(img, x, y, w, h).to_image())
+    Some(DynamicImage::ImageRgba8(img.clone()).crop_imm(x, y, w, h))
 }
 
 /// The detector's input: the region, 256×144, grayscale. None for an invalid frame (zero size, or all
 /// black), which is a failed capture rather than a slide.
 pub fn thumb(img: &RgbaImage, region: &Region) -> Option<GrayImage> {
-    let gray = image::DynamicImage::ImageRgba8(crop(img, region)?).to_luma8();
-    let small = image::imageops::resize(&gray, W, H, FilterType::Triangle);
+    let gray = DynamicImage::ImageLuma8(crop(img, region)?.to_luma8());
+    let small = gray.resize_exact(W, H, FilterType::Triangle).into_luma8();
     (!small.as_raw().iter().all(|&v| v < 8)).then_some(small)
 }
 
@@ -155,8 +158,10 @@ impl<T: Clone> Detector<T> {
             self.candidate = None; // it reverted, or only animated tiles changed
             return None;
         }
+        // Settled: nothing unmasked moved since the candidate. Checking only the tiles that differ from the
+        // kept frame would let an animation's quieter tiles pass for a still frame.
         let d_cand = tile_diffs(&frame, &c.frame);
-        if changed.iter().all(|&i| d_cand[i] < self.t.settle) {
+        if (0..TILES).all(|i| self.masked[i] || d_cand[i] < self.t.settle) {
             let since = c.since.clone();
             self.keep(frame);
             return Some(Decision { shown_at: since, uncertain: false });

@@ -277,7 +277,7 @@ impl Worker {
     fn save(&mut self, img: &RgbaImage, region: &Region, shown_at: DateTime<Local>, auto: bool, uncertain: bool) -> Result<(), String> {
         let slide = crop(img, region).ok_or("the slide region is empty")?;
         let (w, h) = fit_within(slide.width(), slide.height(), MAX_PX);
-        let slide = if (w, h) == slide.dimensions() { slide } else { image::imageops::resize(&slide, w, h, FilterType::Lanczos3) };
+        let slide = if (w, h) == (slide.width(), slide.height()) { slide } else { slide.resize_exact(w, h, FilterType::Lanczos3) };
         let path = self.cfg.slides.join(format!(".capture-{}.png.tmp", uuid::Uuid::new_v4()));
         slide.save_with_format(&path, image::ImageFormat::Png).map_err(|e| {
             let _ = std::fs::remove_file(&path);
@@ -319,7 +319,7 @@ impl Recorder {
             self.last_frame = Some(t.clone());
         }
         let (w, h) = fit_within(img.width(), img.height(), RECORD_WINDOW_PX);
-        let whole = image::imageops::resize(&image::DynamicImage::ImageRgba8(img.clone()).to_luma8(), w, h, FilterType::Triangle);
+        let whole = image::DynamicImage::ImageLuma8(image::DynamicImage::ImageRgba8(img.clone()).to_luma8()).resize_exact(w, h, FilterType::Triangle).into_luma8();
         if self.last_window.as_ref() != Some(&whole) {
             self.windows += 1;
             let _ = whole.save_with_format(self.dir.join(format!("window/{:05}.png", self.windows)), image::ImageFormat::Png);
