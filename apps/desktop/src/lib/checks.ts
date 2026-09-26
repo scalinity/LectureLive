@@ -436,7 +436,9 @@ export async function faultsCheck(session: Session, t: Transport, dir: string, m
       rows.push({ at: stamp(), phase: s.phase, stt: s.stt, gaps: s.gaps, input_gone: s.input_gone, notice });
     }
   };
-  const write = () => t.call("check_report", { name, json: JSON.stringify({ dir, minutes, error: session.error, rows }, null, 2) });
+  // Every notice, in full: the rows sample the latest one only every 500 ms.
+  const notices = () => session.notices.map((n) => `${n.at} ${n.kind} ${n.label}: ${n.detail}`);
+  const write = () => t.call("check_report", { name, json: JSON.stringify({ dir, minutes, error: session.error, rows, notices: notices() }, null, 2) });
   await session.selectFolder(dir);
   await session.start("loopback");
   const end = Date.now() + minutes * 60_000;
@@ -452,5 +454,5 @@ export async function faultsCheck(session: Session, t: Transport, dir: string, m
   if (session.status.phase === "running") await session.stop();
   await until("the lecture to end", () => { look(); return session.status.phase === "ended"; }, 600_000).catch(() => {});
   look();
-  await finish(t, name, { dir, minutes, error: session.error, rows });
+  await finish(t, name, { dir, minutes, error: session.error, rows, notices: notices() });
 }

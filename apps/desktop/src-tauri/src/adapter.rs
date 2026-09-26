@@ -340,7 +340,9 @@ impl Pump {
             Notification::Failed(m) => self.notice(NoticeKind::Warn, "Session failed", &m),
             Notification::RecoveryFailed(m) => self.notice(NoticeKind::Warn, "Recovery", &m),
             Notification::SpendFailed(m) => self.notice(NoticeKind::Warn, "Spend", &m),
-            Notification::SourceEnded => self.mirror.status.phase = Phase::Stopping,
+            // Only a running lecture starts stopping here: after a second stop, a late SourceEnded must not bring back "Stop waiting".
+            Notification::SourceEnded if matches!(self.mirror.status.phase, Phase::Running | Phase::Starting) => self.mirror.status.phase = Phase::Stopping,
+            Notification::SourceEnded => {}
             Notification::Recording { .. } => {}
         }
     }
@@ -413,6 +415,19 @@ mod tests {
     fn pump_with(kind: SourceKind) -> (Pump, Arc<Recorded>) {
         let sink = Arc::new(Recorded::default());
         (Pump::new("s1".into(), sink.clone(), None, kind), sink)
+    }
+
+    /// M4 minor M4: a SourceEnded that arrives after the second stop does not bring back "Stop waiting".
+    #[test]
+    fn a_late_source_ended_does_not_undo_the_second_stop() {
+        let (mut p, _) = pump();
+        p.set_status(|s| s.phase = Phase::StoppingNow);
+        p.apply(Event::Session(Notification::SourceEnded));
+        assert_eq!(p.mirror().status.phase, Phase::StoppingNow);
+        let (mut q, _) = pump();
+        q.set_status(|s| s.phase = Phase::Running);
+        q.apply(Event::Session(Notification::SourceEnded));
+        assert_eq!(q.mirror().status.phase, Phase::Stopping, "an audio source that ends by itself still starts the stop");
     }
 
     #[test]
