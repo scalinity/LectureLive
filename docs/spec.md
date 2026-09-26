@@ -491,39 +491,65 @@ hashes; offline the page stays readable with math shown as TeX.
 
 ### 7.1 Window and region
 
-`xcap` enumerates windows; enumeration and capture errors are distinct from "no
-windows". The saved selection is a descriptor (app bundle id, title pattern, size) that
-is revalidated on start; a mismatch asks the user rather than rebinding silently. The
-user drags a slide region inside the window (excluding Zoom controls and participant
-video); the region is stored relative to the window. Invalid frames (all-black,
-zero-size) are capture failures, not slides.
+A capture worker runs beside the session on its own thread, because its native calls and image
+work block (§3.2). Windows are enumerated through CoreGraphics (`CGWindowListCopyWindowInfo`), on
+screen or not, and captured through `xcap` (`CGWindowListCreateImage` on the window alone, so windows
+covering it do not appear). A missing Screen Recording grant is an error of its own, never "no
+windows". The app is named by its bundle id, or by its name outside a bundle.
+
+The person chooses a window and drags the slide region over a still of it, leaving out Zoom's
+controls and the video tiles. The selection, a descriptor (bundle id, title, size) and the region
+as fractions of the window, is saved per course in the app's data folder (`capture.json`).
+
+When a lecture starts, exactly one window matching the descriptor (the same size within 2%) is
+watched. Anything else asks, in the slides strip, with the windows the person may mean. Once a
+window is watched, nothing is watched in its place without the person:
+
+- it is off screen (minimised, or on another desktop): capture pauses and resumes by itself when it
+  is back;
+- it closes: capture pauses; a window matching the descriptor that opens, or is already on screen
+  while the old one is off screen (a closed window's id can stay listed), is offered with "Watch it";
+- it changes size: capture pauses and asks, since the slide may no longer sit in the region;
+- captures fail (an error, a blank window, a black region): nothing is kept, and three in a row are
+  shown with the reason.
 
 ### 7.2 Change detection
 
-Every 1.0 s: capture, crop to the region, downscale to 256×144 grayscale, divide into
-16×16 tiles (144 tiles). A tile changes when its mean absolute difference from the
-last kept frame exceeds 0.08.
+Every 1.0 s: capture, crop to the region, downscale to 256×144 grayscale, divide into 16×16 tiles
+(144 tiles). A tile has changed when its mean absolute difference from the last kept frame exceeds
+0.08, and it is moving when it differs from the previous sample by more than 0.03.
 
-- **Candidate**: at least one changed tile. Its image and first-observed time are kept.
-- **Confirm**: on the next sample, the changed tiles differ from the candidate by < 0.03 → the candidate becomes a slide (captured full-size ≤1600 px, PNG).
-- **Animated tiles**: a tile that changes on 3 consecutive samples without settling is masked until the next confirmed slide, so a looping animation neither blocks nor triggers capture.
-- **Expiry**: a candidate that has not settled within 10 s is saved flagged `uncertain`.
-- The first valid frame of a session is captured unconditionally.
+- **Candidate**: at least one changed tile outside the mask. Its image and first-observed time are kept.
+- **Confirm**: on a later sample in which no tile outside the mask moved since the candidate, the
+  candidate becomes a slide (the region at full size, at most 1600 px, PNG). A candidate whose
+  changed tiles return to the kept frame is dropped.
+- **Animated tiles**: a tile moving on 3 consecutive samples is masked until the next kept slide, so
+  a looping animation neither blocks nor triggers capture.
+- **Expiry**: a candidate that has not settled after 10 samples is kept, flagged `uncertain`.
+- The first valid frame of a lecture is kept unconditionally.
+- A manual capture becomes the kept frame, so auto capture does not take the same slide again.
 
-Thresholds are initial values, calibrated on recorded Zoom lectures with annotated
-small builds. Content shown for less than one sample interval can be missed; manual
-capture covers it.
+The thresholds are calibrated on a recording of Zoom showing a synthetic lecture deck with builds,
+dissolves, an animated chart and a blinking caret, annotated from the deck's schedule. The measures
+are recall of states visible for at least 3 s and false captures per 10 minutes (M5 Findings).
+Content shown for less than one sample interval can be missed, and marks thinner than about 1% of
+the slide's height change too little of a tile to count; manual capture covers both.
 
 ### 7.3 Manual and imported
 
-Capture button, global shortcut, and drag-and-drop of image files all go through the
-same registration path and index allocator as auto capture. Files are written to a temp
-name and renamed into `slides/` before registration.
+The Capture button, the global shortcut ⌘⇧2 (registered only while a lecture runs), images dropped
+on the window, and screenshots taken with macOS (⌘⇧4, from its screenshot folder) all go through the
+one registration path and index allocator that auto capture uses. A file reaches `slides/` under a
+temporary name, and registration renames it to `slide_NN_HHMMSS.png|jpg` inside the sidecar's
+writer. A file already registered is never registered again. Dropped images are copied, so the
+originals stay where they were, and take their own file time. Each slide records whether it was
+auto and whether it was uncertain.
 
 ### 7.4 Permissions
 
-Screen Recording (TCC), verified in the packaged app. Capture controls stay disabled
-until a real capture succeeds.
+Screen Recording (TCC), verified in the packaged app; a binary run from a terminal uses the
+terminal's grant. Without it the strip says so and offers System Settings. The Capture button works
+once a real capture of the watched window has succeeded.
 
 ## 8. Files, state, resume
 
@@ -599,8 +625,11 @@ read, and the next line starts on a line of its own.
   and frozen, with its time in the same gutter. The streaming preview renders below it on the teal
   rule, marked "writing"; each finished block fades in once, and the committed block replaces it.
   The pane follows the newest writing while the reader is at its end.
-- **Slides** (right strip): thumbnails with time and auto/manual/uncertain badges; window and region
-  picker on top. Below 1100 px the strip folds away.
+- **Slides** (right strip): the watched window on top, on a teal rule while it is watched, with
+  Capture (⌘⇧2) and Choose… for the window and region picker; a pause, a question or a failure is said
+  there in words. Below it, each slide in time order: its time in the gutter with "auto", "manual" or
+  "unsettled" under it, and its thumbnail; images dropped on the window join them. Below 1100 px the
+  strip folds away.
 - **Status strip** (top): the phase in one word (Ready, Starting, Listening, Stopping, Stopped) with
   what it means while it lasts; a static red dot while recording; course › lecture; the source with a
   level meter (−60 to 0 dBFS, once a second, red while ten silent seconds on loopback last); elapsed
