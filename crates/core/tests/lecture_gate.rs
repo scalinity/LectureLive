@@ -463,3 +463,147 @@ async fn a_polish_after_the_lecture_leaves_a_python_cli_folder_alone() {
     assert!(!f.sidecar().exists(), "the folder is not migrated");
     assert!(sse.state.bodies().is_empty(), "nothing is sent");
 }
+
+/// M7 Task 3 (plan §C invariants 3 and 6): the frontend's `Event` receiver is held but not read until
+/// each run has finished. Nothing waits for it; control and completion stay correct; every segment is
+/// in the log whatever notifications arrived. No test counts `Level`, `Open` or STT-status events,
+/// which are latest-value and may be coalesced or lost.
+mod frontend_boundary {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    use lecturelive_core::audio::frame::Frame;
+    use lecturelive_core::audio::source::{Source, SourceEvent};
+    use lecturelive_core::session::coordinator::Notification;
+    use lecturelive_core::session::sidecar::RecState;
+    use support::sources::Speech;
+
+    const FRAME_MS: u64 = 100;
+
+    /// Silence at a device's own cadence: a 1600-sample frame every 100 ms, and a `Level` once a second,
+    /// sent as `DeviceSource` sends it (`try_send`, before the frame). `frames` long, or until the session
+    /// stops it.
+    struct Device {
+        frames: Option<u64>,
+    }
+
+    impl Source for Device {
+        fn run(self: Box<Self>, out: mpsc::Sender<SourceEvent>, stop: Arc<AtomicBool>) {
+            let id = uuid::Uuid::new_v4();
+            out.blocking_send(SourceEvent::Begin { recording_id: id, anchor: support::sources::anchor(), source_uid: "Test_UID".into(), input_rate: 16_000, channels: 1 }).unwrap();
+            let mut k = 0;
+            while self.frames.map_or(!stop.load(SeqCst), |n| k < n) {
+                if k % 10 == 9 {
+                    let _ = out.try_send(SourceEvent::Level(0.0));
+                }
+                if out.blocking_send(SourceEvent::Frame(Frame { recording_id: id, sample_offset: k * 1600, valid_samples: 1600, pcm16: [0; 1600] })).is_err() {
+                    return;
+                }
+                k += 1;
+                std::thread::sleep(ms(FRAME_MS));
+            }
+            let _ = out.blocking_send(SourceEvent::End { recording_id: id, samples: k * 1600, stream_errors: 0 });
+        }
+    }
+
+    /// A lecture on a fresh folder, audio only, with a fake model for the last snapshot.
+    async fn audio_only(dir: &Path) -> (LectureFiles, Arc<Lecture>, SessionConfig) {
+        let f = files(dir);
+        folder::open(&f, TITLE, false).unwrap();
+        let sse = fake_sse::start(respond).await;
+        let lec = Arc::new(lecture_for(&f, &sse.url, &dir.join("spend.jsonl")));
+        let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: None, recovery: None, spend: Some(lec.spend.clone()), ..Default::default() };
+        (f, lec, session)
+    }
+
+    fn drain(events: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+        let mut all = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            all.push(e);
+        }
+        all
+    }
+
+    fn source_ended(events: &[Event]) -> usize {
+        events.iter().filter(|e| matches!(e, Event::Session(Notification::SourceEnded))).count()
+    }
+
+    fn finalized(f: &LectureFiles) -> Vec<(RecState, Option<u64>)> {
+        Sidecar::load(&f.sidecar()).unwrap().unwrap().recordings.iter().map(|r| (r.state, r.samples)).collect()
+    }
+
+    #[tokio::test]
+    async fn an_unread_frontend_holds_the_lecture_up_nowhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let (f, lec, session) = audio_only(dir.path()).await;
+        let frames = 30; // 3 s of audio at its own pace
+        let (_cmd, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev) = mpsc::unbounded_channel();
+        let run = tokio::spawn(lecture::run(lec, session, Box::new(Device { frames: Some(frames) }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+        // The source's own length plus a margin; nothing reads `ev` meanwhile.
+        let bound = ms(frames * FRAME_MS) + Duration::from_secs(20);
+        let report = tokio::time::timeout(bound, run).await.expect("the lecture ends while its events go unread").unwrap().unwrap();
+
+        assert_eq!(report.recordings.len(), 1);
+        assert_eq!(report.recordings[0].1, frames * 1600, "the recording is whole");
+        assert_eq!(finalized(&f), vec![(RecState::Finalized, Some(frames * 1600))]);
+        assert_eq!(source_ended(&drain(&mut ev)), 1, "the audio's end reached the frontend once");
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_lecture_while_its_events_go_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (f, lec, session) = audio_only(dir.path()).await;
+        let (cmd, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev) = mpsc::unbounded_channel();
+        let run = tokio::spawn(lecture::run(lec, session, Box::new(Device { frames: None }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+        tokio::time::sleep(ms(500)).await;
+        cmd.send(Command::Stop).unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(20), run).await.expect("the stop ends the lecture while its events go unread").unwrap().unwrap();
+
+        assert_eq!(report.recordings.len(), 1);
+        let samples = report.recordings[0].1;
+        assert!(samples > 0 && samples % 1600 == 0, "{samples}");
+        assert_eq!(finalized(&f), vec![(RecState::Finalized, Some(samples))], "the recording is finalized on disk");
+        assert_eq!(source_ended(&drain(&mut ev)), 1);
+    }
+
+    #[tokio::test]
+    async fn every_segment_is_in_the_log_whatever_the_frontend_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = files(dir.path());
+        folder::open(&f, TITLE, false).unwrap();
+        let stt = fake_stt::start(fake_stt::Config::default()).await;
+        let sse = fake_sse::start(respond).await;
+        let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+        let lec = Arc::new(lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl")));
+        let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), recovery: None, spend: Some(lec.spend.clone()), ..Default::default() };
+        let frames = 300; // 30 s of synthetic speech: six utterances
+        let len = frames * 1600;
+        let (cmd, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev) = mpsc::unbounded_channel();
+        let run = tokio::spawn(lecture::run(lec, session, Box::new(Speech { frames, pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+        // Once every frame has been produced, the person stops; nothing reads `ev` meanwhile.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while stt.state.feed.load(SeqCst) < len {
+            assert!(tokio::time::Instant::now() < deadline, "the source never finished");
+            tokio::time::sleep(ms(5)).await;
+        }
+        cmd.send(Command::Stop).unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+        assert_eq!(report.recordings[0].1, len);
+
+        let log = segments::read(&f.segments()).unwrap();
+        assert!(log.len() >= 2, "several segments: {}", log.len());
+        assert!(log.iter().enumerate().all(|(k, s)| s.id == k as u64), "ids run from 0 without a hole: {:?}", log.iter().map(|s| s.id).collect::<Vec<_>>());
+        let mut words: Vec<(u64, String)> = log.iter().flat_map(|s| s.words.iter().map(|w| (w.start_sample, w.text.clone()))).collect();
+        words.sort();
+        assert_eq!(words.into_iter().map(|w| w.1).collect::<Vec<_>>(), support::speech::expected_words(len), "the log holds every word once");
+        for e in drain(&mut ev) {
+            if let Event::Session(Notification::Segment(s)) = e {
+                let logged = log.get(s.id as usize).unwrap_or_else(|| panic!("segment {} is not in the log", s.id));
+                assert_eq!((logged.id, &logged.text), (s.id, &s.text), "an event matches its log entry");
+            }
+        }
+    }
+}
