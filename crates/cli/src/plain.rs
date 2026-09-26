@@ -1,9 +1,10 @@
 //! The plain frontend's presentation (M7 plan §E): the `say`/`show` event lines, the start-up and
-//! end reports, the stdin grammar and the Ctrl-C counter, exactly as the CLI prints them today.
+//! end reports, the stdin grammar and the words for each stop stage, exactly as the CLI prints them today.
 
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lecturelive_core::audio::level::SilenceWatch;
 use lecturelive_core::audio::{input, loopback};
@@ -15,6 +16,8 @@ use lecturelive_core::session::notesfile::Recovered;
 use lecturelive_core::session::segments::SegmentSource;
 use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::session::start;
+
+use crate::stop::{Origin, Stage, Step, StopController};
 
 pub(crate) fn secs(samples: u64) -> f64 {
     samples as f64 / 16_000.0
@@ -221,35 +224,46 @@ pub(crate) fn read_commands(stdin_tx: tokio::sync::mpsc::UnboundedSender<Lecture
     });
 }
 
-/// Ctrl-C as the plain CLI counts it: the first press stops, the second stops waiting for recovery,
-/// the third quits at once.
-pub(crate) fn stop_on_ctrl_c(stop_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, p: spend::Paint) {
+/// One stop request as plain handles it (M7 plan §G): the shared controller's next stage, its words,
+/// then the `Stop`s it asks for. Stage 3 sends nothing; the caller quits.
+pub(crate) fn request_stop(out: &mut impl Write, p: spend::Paint, controller: &mut StopController, origin: Origin, stop_tx: &tokio::sync::mpsc::UnboundedSender<LectureCommand>) -> Result<Step, tokio::sync::mpsc::error::SendError<LectureCommand>> {
+    let step = controller.advance(origin, Instant::now());
+    match step {
+        Step::Advance { stage: Stage::Stopping, .. } => say(out, p, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)"),
+        Step::Advance { stage: Stage::StopWaiting, .. } => say(out, p, "warn", "stopping", "no longer waiting for recovery or queued requests; its gaps wait for the next session (Ctrl-C again quits at once)"),
+        // The recording is durable to its last second and gaps and journals are on disk: the next
+        // session in this folder repairs, recovers and notes what is left.
+        Step::Quit => say(out, p, "warn", "quit", "stopped at once; the next session in this folder picks up what was left"),
+        Step::Advance { stage: Stage::Listening, .. } | Step::Ignored(_) => {}
+    }
+    if let Step::Advance { stops_to_send, .. } = step {
+        for _ in 0..stops_to_send {
+            stop_tx.send(LectureCommand::Stop)?;
+        }
+    }
+    Ok(step)
+}
+
+/// Ctrl-C as the plain CLI counts it, on the controller the `--secs` timer shares: the first stop,
+/// then stopping the wait for recovery, then quitting at once.
+pub(crate) fn stop_on_ctrl_c(stop_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, p: spend::Paint, controller: Arc<Mutex<StopController>>) {
     tokio::spawn(async move {
-        let mut presses = 0;
         while tokio::signal::ctrl_c().await.is_ok() {
-            presses += 1;
-            match presses {
-                1 => say(&mut std::io::stdout().lock(), p, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)"),
-                2 => say(&mut std::io::stdout().lock(), p, "warn", "stopping", "no longer waiting for recovery or queued requests; its gaps wait for the next session (Ctrl-C again quits at once)"),
-                _ => {
-                    // The recording is durable to its last second and gaps and journals are on disk: the next
-                    // session in this folder repairs, recovers and notes what is left.
-                    say(&mut std::io::stdout().lock(), p, "warn", "quit", "stopped at once; the next session in this folder picks up what was left");
-                    std::process::exit(130);
-                }
-            }
-            if stop_tx.send(LectureCommand::Stop).is_err() {
-                return;
+            let step = request_stop(&mut std::io::stdout().lock(), p, &mut controller.lock().expect("the stop controller"), Origin::Signal, &stop_tx);
+            match step {
+                Ok(Step::Quit) => std::process::exit(130),
+                Ok(_) => {}
+                Err(_) => return,
             }
         }
     });
 }
 
-/// The `--secs` timer: one stop when the limit passes.
-pub(crate) fn stop_after_secs(limit: u64, timer_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>) {
+/// The `--secs` timer: the first stop when the limit passes, silent as it has always been.
+pub(crate) fn stop_after_secs(limit: u64, timer_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, p: spend::Paint, controller: Arc<Mutex<StopController>>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(limit)).await;
-        let _ = timer_tx.send(LectureCommand::Stop);
+        let _ = request_stop(&mut std::io::sink(), p, &mut controller.lock().expect("the stop controller"), Origin::Timer, &timer_tx);
     });
 }
 
@@ -585,5 +599,55 @@ mod goldens {
     #[should_panic(expected = "failed printing to stdout")]
     fn a_failed_end_line_panics_as_println_did() {
         print_end(&mut Broken, OFF, &files(), &StopReport::default(), &ledger());
+    }
+
+    const STOPPING: &str = "  ◆ stopping  finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)\n";
+    const STOP_WAITING: &str = "  ▲ stopping  no longer waiting for recovery or queued requests; its gaps wait for the next session (Ctrl-C again quits at once)\n";
+    const QUIT: &str = "  ▲ quit  stopped at once; the next session in this folder picks up what was left\n";
+
+    /// One Ctrl-C through plain's handler: what it printed, how many `Stop`s it sent, and the step.
+    fn ctrl_c(controller: &mut StopController) -> (String, usize, Step) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut out = Vec::new();
+        let step = request_stop(&mut out, OFF, controller, Origin::Signal, &tx).unwrap();
+        let mut sent = 0;
+        while let Ok(LectureCommand::Stop) = rx.try_recv() {
+            sent += 1;
+        }
+        (String::from_utf8(out).unwrap(), sent, step)
+    }
+
+    #[test]
+    fn ctrl_c_stop_lines_are_unchanged() {
+        let mut controller = StopController::default();
+        assert_eq!(ctrl_c(&mut controller), (STOPPING.into(), 1, Step::Advance { stage: Stage::Stopping, stops_to_send: 1 }));
+        assert_eq!(ctrl_c(&mut controller), (STOP_WAITING.into(), 1, Step::Advance { stage: Stage::StopWaiting, stops_to_send: 1 }));
+        assert_eq!(ctrl_c(&mut controller), (QUIT.into(), 0, Step::Quit));
+    }
+
+    /// Plan §B (a), the Task 2 ruling: the `--secs` timer's silent `Stop` is stage 1, so the next Ctrl-C
+    /// prints the stage-2 words core then acts on.
+    #[test]
+    fn secs_then_ctrl_c_prints_the_stop_waiting_line() {
+        let mut controller = StopController::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let step = request_stop(&mut std::io::sink(), OFF, &mut controller, Origin::Timer, &tx).unwrap();
+        assert_eq!(step, Step::Advance { stage: Stage::Stopping, stops_to_send: 1 });
+        assert!(matches!(rx.try_recv(), Ok(LectureCommand::Stop)) && rx.try_recv().is_err());
+        assert_eq!(ctrl_c(&mut controller), (STOP_WAITING.into(), 1, Step::Advance { stage: Stage::StopWaiting, stops_to_send: 1 }));
+        assert_eq!(ctrl_c(&mut controller), (QUIT.into(), 0, Step::Quit));
+    }
+
+    /// Plain prints nothing when the audio ends and never feeds `SourceEnded` to its controller, so a
+    /// Ctrl-C after it still means "stop": one `Stop`, the stage-1 words, both true of core then.
+    #[test]
+    fn plain_after_source_ended_still_means_stop() {
+        let mut controller = StopController::default();
+        assert_eq!(plain(&Event::Session(Notification::SourceEnded)), "");
+        assert_eq!(ctrl_c(&mut controller), (STOPPING.into(), 1, Step::Advance { stage: Stage::Stopping, stops_to_send: 1 }));
+        // The TUI feeds it: there the same Ctrl-C stops waiting, with two `Stop`s.
+        let mut fed = StopController::default();
+        fed.advance(Origin::SourceEnded, std::time::Instant::now());
+        assert_eq!(ctrl_c(&mut fed), (STOP_WAITING.into(), 2, Step::Advance { stage: Stage::StopWaiting, stops_to_send: 2 }));
     }
 }

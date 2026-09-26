@@ -2,7 +2,7 @@
 //! course resolution, and the live lecture's preflight, prepare, session and end.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -26,6 +26,7 @@ use lecturelive_core::stt::{rest, stream};
 use crate::args::LectureArgs;
 use crate::data_dir;
 use crate::plain;
+use crate::stop::StopController;
 
 const REPO_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env");
 /// The Python CLI's ledger, taken over by the app's (spec §8).
@@ -170,9 +171,10 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let session = SessionConfig { dir: dir.clone(), stem: files.stem.clone(), stt: Some(stt_link), recovery: Some(recovery()?), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     plain::read_commands(cmd_tx.clone());
-    plain::stop_on_ctrl_c(cmd_tx.clone(), p);
+    let stop = Arc::new(Mutex::new(StopController::default()));
+    plain::stop_on_ctrl_c(cmd_tx.clone(), p, stop.clone());
     if let Some(limit) = a.secs {
-        plain::stop_after_secs(limit, cmd_tx.clone());
+        plain::stop_after_secs(limit, cmd_tx.clone(), p, stop);
     }
     drop(cmd_tx);
     let mut watch = (uid == loopback::BLACKHOLE_UID || uid.starts_with("mixed:")).then(|| SilenceWatch::new(-60.0, 10));

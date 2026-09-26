@@ -6,6 +6,7 @@ use clap::Parser;
 mod args;
 mod lecture;
 mod plain;
+mod stop;
 mod utility;
 
 use args::{Cli, Cmd};
