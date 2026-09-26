@@ -41,7 +41,7 @@
   }
 </script>
 
-<header class="strip">
+<header class="strip" data-tauri-drag-region="deep">
   <div class="left">
     <span class="phase" class:on={recording}>
       {#if recording}<span class="dot" aria-hidden="true"></span>{/if}{PHASE[session.status.phase][0]}
@@ -72,12 +72,14 @@
 </header>
 
 <style>
+  /* The window has no title bar: the strip is its top edge. The traffic lights sit in its left end (fixed in
+     pixels by tauri.conf.json, whatever the type size), and anything but a button drags the window. */
   .strip {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 1.5rem;
-    padding: 0.55rem 1.25rem;
+    padding: 0.55rem 1.25rem 0.55rem calc(80px + 1.25rem);
     background: var(--plate);
     border-bottom: 1px solid var(--rule);
     font-size: var(--step--1);
@@ -178,6 +180,13 @@
 
   @media (max-width: 1100px) {
     .source-name {
+      display: none;
+    }
+  }
+
+  /* Large type is 125%: the name goes at 1320 px, so the clock stays whole beside the traffic lights. */
+  @media (max-width: 1320px) {
+    :global(.large) .source-name {
       display: none;
     }
   }
