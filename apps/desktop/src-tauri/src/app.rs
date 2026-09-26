@@ -672,6 +672,37 @@ pub async fn hide_window_for(ms: u64, handle: AppHandle) -> Res<()> {
     w.set_focus().map_err(text)
 }
 
+/// Records the detector's input from the course's chosen window for `minutes`, with no lecture: nothing is
+/// registered, transcribed or sent anywhere. For a recorded lecture measured locally, and the synthetic deck.
+#[tauri::command]
+pub async fn check_record(minutes: u64, app: State<'_, App>) -> Res<Value> {
+    use lecturelive_core::capture::worker::{self, CaptureEvent, WorkerConfig};
+    let folder = app.folder().ok_or("Choose a lecture folder first.")?;
+    let selection = Selections::load(&selections_path()?).map_err(chain)?.get(&folder.course).cloned().ok_or("No window is chosen for this course.")?;
+    let record = std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from).ok_or("LECTURELIVE_RECORD is not set")?;
+    let scratch = data_dir()?.join("m5-record-scratch");
+    std::fs::create_dir_all(&scratch).map_err(text)?;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let cfg = WorkerConfig { slides: scratch, interval: Duration::from_secs(1), thresholds: Thresholds::default(), record: Some(record) };
+    let handle = worker::spawn(Box::new(SystemWindows), Some(selection), cfg, tx);
+    let end = tokio::time::Instant::now() + Duration::from_secs(minutes * 60);
+    let (mut states, mut kept) = (Vec::new(), Vec::new());
+    while let Ok(Some(e)) = tokio::time::timeout_at(end, rx.recv()).await {
+        match e {
+            CaptureEvent::State(s) => {
+                states.push(serde_json::json!({ "at": Local::now().to_rfc3339(), "state": s.words().0, "detail": s.words().1 }));
+                app.pump.lock().await.apply(Event::Capture(s));
+            }
+            CaptureEvent::Captured(c) => {
+                kept.push(serde_json::json!({ "at": Local::now().to_rfc3339(), "shown_at": c.shown_at.to_rfc3339(), "uncertain": c.uncertain }));
+                let _ = std::fs::remove_file(&c.path); // measured, not kept: nothing of the window is registered
+            }
+        }
+    }
+    drop(handle);
+    Ok(serde_json::json!({ "minutes": minutes, "states": states, "live_decisions": kept }))
+}
+
 /// The deck window's title: what the capture check binds to, and finds again after replacing it.
 const DECK_TITLE: &str = "LectureLive deck";
 
@@ -713,6 +744,7 @@ pub async fn check_deck(action: String, handle: AppHandle) -> Res<Value> {
             main()?.set_position(tauri::PhysicalPosition::new(1500, 60)).map_err(text)?;
             Ok(Value::Null)
         }
+        "start" => deck()?.eval("window.__deck.start()").map(|_| Value::Null).map_err(text),
         "minimize" => deck()?.minimize().map(|_| Value::Null).map_err(text),
         "unminimize" => deck()?.unminimize().map(|_| Value::Null).map_err(text),
         "replace" => {

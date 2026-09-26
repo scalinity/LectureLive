@@ -335,3 +335,38 @@ export async function zoomCheck(session: Session, t: Transport, dir: string) {
   const manual = session.slides.filter((s) => !s.auto);
   await finish(t, "zoom", { dir, steps, slides: session.slides, manual, capture_notices: session.notices.filter((n) => n.kind === "slide" || n.label === "Capture") });
 }
+
+/** A recorded lecture played in a window the person chooses, measured locally (M5 plan, Task 11 as
+ *  changed): only the detector's input is recorded; no lecture starts, nothing is registered or sent. */
+export async function recordCheck(session: Session, t: Transport, dir: string) {
+  const steps: Step[] = [];
+  const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
+  try {
+    await session.selectFolder(dir);
+    await until("the window to be chosen", () => session.capture.state === "ready", 24 * 3600_000); // the person comes when they can
+    log("window chosen", true, session.capture);
+    log("recorded", true, await t.call("check_record", { minutes: 40 }));
+  } catch (e) {
+    log("failed", false, { error: String(e), capture: session.capture });
+  }
+  await finish(t, "record", { dir, steps });
+}
+
+/** The synthetic deck played in the app's own window and recorded as a fixture, no person needed. */
+export async function deckRecordCheck(session: Session, t: Transport, dir: string) {
+  const steps: Step[] = [];
+  const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
+  try {
+    await session.selectFolder(dir);
+    const id = (await t.call<number>("check_deck", { action: "open" }))!;
+    log("deck window opened", await session.captureSelect(id, { x: 0.02, y: 0.06, w: 0.96, h: 0.92 }), session.error);
+    const recording = t.call("check_record", { minutes: 26 });
+    await sleep(5000);
+    await t.call("check_deck", { action: "start" });
+    log("deck started", true);
+    log("recorded", true, await recording);
+  } catch (e) {
+    log("failed", false, { error: String(e) });
+  }
+  await finish(t, "deck-record", { dir, steps });
+}

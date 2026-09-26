@@ -51,6 +51,7 @@ pub fn run() {
             app::capture_watch,
             app::capture_saved_region,
             app::check_deck,
+            app::check_record,
             app::capture_now,
             app::import_slides,
             app::open_screen_settings,

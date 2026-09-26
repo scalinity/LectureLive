@@ -36,8 +36,8 @@
     });
   }
 
-  (globalThis as { __deck?: unknown }).__deck = { show: (i: number) => (at = i), count: steps.length };
-  if (isTauri()) at = 0; // the in-app check drives it
+  (globalThis as { __deck?: unknown }).__deck = { show: (i: number) => (at = i), start, count: steps.length };
+  // Inside the app, a check drives it from the title slide (show, or start to play the schedule).
 
   /** Bar heights for the animated charts: they cycle every 15 s and never rest. */
   const bars = (seed: number) => Array.from({ length: 8 }, (_, j) => 60 + ((phase % 15) * 37 + j * 53 + seed * 29) % 220);
