@@ -187,7 +187,7 @@ impl Pump {
                 self.notice(NoticeKind::Page, "Study page", &detail);
             }
             Event::PageFailed(m) => self.failed("Study page failed", &m),
-            Event::Slide { index, file } => {
+            Event::Slide { index, file, .. } => {
                 let path = self.slide_path(&file);
                 let name = Path::new(&file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path }));
@@ -352,7 +352,7 @@ mod tests {
         p.apply(Event::Preview("## A".into()));
         p.apply(Event::Session(Notification::Segment(seg(0, "the rate", SegmentSource::Live))));
         p.apply(committed(2));
-        p.apply(Event::Slide { index: 1, file: "slides/slide_01_100203.png".into() });
+        p.apply(Event::Slide { index: 1, file: "slides/slide_01_100203.png".into(), auto: false, uncertain: false, shown_at: Local::now() });
         let all = sink.take();
         assert!(all.len() >= 5);
         assert!(all.iter().all(|(_, m)| m["session"] == "s1"));

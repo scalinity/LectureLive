@@ -165,7 +165,7 @@ pub fn slide_files(files: &LectureFiles) -> Result<Vec<SlideEntry>> {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(c) = SLIDE_NAME.captures(&name) else { continue };
         let (Ok(index), Ok(t)) = (c[1].parse::<u32>(), NaiveTime::parse_from_str(&c[2], "%H%M%S")) else { continue };
-        out.push(SlideEntry { index, file: relative(files, &e.path()), shown_at: local(files.date, t) });
+        out.push(SlideEntry { index, file: relative(files, &e.path()), shown_at: local(files.date, t), auto: false, uncertain: false });
     }
     out.sort_by_key(|s| s.index);
     Ok(out)

@@ -69,6 +69,16 @@ pub struct SlideEntry {
     pub file: String,
     /// When it was first on screen; for an imported image, its file time.
     pub shown_at: DateTime<Local>,
+    /// Captured by the change detector rather than by the person (spec §3.5, §7.2).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto: bool,
+    /// Kept after 10 s of change without settling: it may show a transition (spec §7.2).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub uncertain: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,12 +309,25 @@ mod tests {
     }
 
     #[test]
+    fn slide_badges_default_to_manual_and_certain_and_are_not_written_when_unset() {
+        let at = Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 12).unwrap();
+        let old = r#"{"version":2,"recordings":[],"gaps":[],"slides":[{"index":1,"file":"slides/slide_01_100512.png","shown_at":"2026-09-25T10:05:12+02:00"}]}"#;
+        let sc: Sidecar = serde_json::from_str(old).unwrap();
+        assert!(!sc.slides[0].auto && !sc.slides[0].uncertain, "an M4 sidecar's slides are screenshots");
+        let manual = SlideEntry { index: 1, file: "slides/a.png".into(), shown_at: at, auto: false, uncertain: false };
+        assert!(!serde_json::to_string(&manual).unwrap().contains("auto"));
+        let auto = SlideEntry { auto: true, uncertain: true, ..manual };
+        let back: SlideEntry = serde_json::from_str(&serde_json::to_string(&auto).unwrap()).unwrap();
+        assert_eq!(back, auto);
+    }
+
+    #[test]
     fn notes_state_and_slides_round_trip_and_an_m2_sidecar_is_written_back_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = sidecar_path(dir.path(), "x");
         let mut s = Sidecar { lecture_date: chrono::NaiveDate::from_ymd_opt(2026, 9, 25), ..Sidecar::default() };
         s.notes = NotesState { revision: 3, len: 120, sha256: "ab".repeat(32), segment_cursor: 7, slide_index: 2 };
-        s.slides.push(SlideEntry { index: 1, file: "slides/slide_01_100512.png".into(), shown_at: Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 12).unwrap() });
+        s.slides.push(SlideEntry { index: 1, file: "slides/slide_01_100512.png".into(), shown_at: Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 12).unwrap(), auto: false, uncertain: false });
         s.save(&path).unwrap();
         assert_eq!(Sidecar::load(&path).unwrap().unwrap(), s);
 

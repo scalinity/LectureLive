@@ -3,6 +3,7 @@ pub mod launch;
 pub mod lock;
 pub mod segments;
 pub mod sidecar;
+pub mod slides;
 pub mod spend;
 pub mod files;
 pub mod notesfile;

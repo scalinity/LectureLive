@@ -21,10 +21,11 @@ use crate::notes::timeline::{embed_line, timeline, Batch};
 use crate::notes::{context, polish, prompts};
 use crate::session::coordinator::{self, Notification, SessionConfig, StopReport, Store};
 use crate::session::files::LectureFiles;
-use crate::session::folder::{next_slide_index, relative};
+
 use crate::session::notesfile::{self, sha256_hex};
 use crate::session::segments;
 use crate::session::sidecar::{Sidecar, SlideEntry};
+use crate::session::slides::{self, SlideMeta};
 use crate::session::spend::{Spend, SpendKind};
 
 pub struct Lecture {
@@ -74,7 +75,7 @@ pub enum Event {
     Cancelled(String),
     Page { outcome: PageOutcome, usd: f64 },
     PageFailed(String),
-    Slide { index: u32, file: String },
+    Slide { index: u32, file: String, auto: bool, uncertain: bool, shown_at: DateTime<Local> },
     Warning(String),
 }
 
@@ -132,8 +133,6 @@ pub fn screenshot_dir() -> Option<PathBuf> {
 }
 
 const NOTES_TIMEOUT: Duration = Duration::from_secs(600);
-const IMAGE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
-const SLIDE_MAX_PX: u32 = 1600;
 
 impl Lecture {
     /// Spec §6.1–6.2: cutoff, batch after the cursors, one streamed request, repair, journaled commit.
@@ -326,51 +325,8 @@ async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceive
     }
 }
 
-fn is_image(p: &Path) -> bool {
-    p.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-}
-
 fn listing(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default()
-}
-
-/// Moves a file, copying when it crosses file systems.
-fn move_file(from: &Path, to: &Path) -> Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    std::fs::copy(from, to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
-    std::fs::remove_file(from).with_context(|| format!("remove {}", from.display()))
-}
-
-/// The CLI's `shrink_if_large`: `sips -Z` scales up as well as down, so it runs only when there is something to shrink.
-fn shrink_if_large(path: &Path) {
-    let Ok(out) = std::process::Command::new("sips").args(["-g", "pixelWidth", "-g", "pixelHeight"]).arg(path).output() else { return };
-    let dims: Vec<u32> = String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("pixel")).filter_map(|l| l.split(':').nth(1)?.trim().parse().ok()).collect();
-    if dims.iter().any(|&d| d > SLIDE_MAX_PX) {
-        let _ = std::process::Command::new("sips").args(["-Z", &SLIDE_MAX_PX.to_string()]).arg(path).output();
-    }
-}
-
-/// Registers an image as the next slide (spec §7.3, §8): renamed into `slides/` as the CLI names it,
-/// timed by its file time, shrunk to 1600 px, inside the sidecar's writer so indexes never collide.
-async fn register(files: &LectureFiles, store: &Store, p: &Path) -> Result<SlideEntry> {
-    let shown_at: DateTime<Local> = std::fs::metadata(p)?.modified()?.into();
-    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
-    let (files, p) = (files.clone(), p.to_path_buf());
-    store
-        .update(move |sc| {
-            let index = next_slide_index(&files, sc)?;
-            let dest = files.slides.join(format!("slide_{index:02}_{}.{ext}", shown_at.format("%H%M%S")));
-            if p != dest {
-                move_file(&p, &dest)?;
-            }
-            shrink_if_large(&dest);
-            let entry = SlideEntry { index, file: relative(&files, &dest), shown_at };
-            sc.slides.push(entry.clone());
-            Ok(entry)
-        })
-        .await
 }
 
 /// The CLI's `slide_watcher`: images dropped into `slides/`, and screenshots taken after the start,
@@ -387,7 +343,7 @@ async fn slide_watcher(lec: Arc<Lecture>, store: Store, watch: SlideWatch, mut s
             }));
         }
         for p in candidates {
-            if known.contains(&p) || !is_image(&p) {
+            if known.contains(&p) || !slides::is_image(&p) {
                 continue;
             }
             let Ok(size) = std::fs::metadata(&p).map(|m| m.len()) else { continue };
@@ -395,11 +351,16 @@ async fn slide_watcher(lec: Arc<Lecture>, store: Store, watch: SlideWatch, mut s
                 continue; // still being written
             }
             known.insert(p.clone());
-            match register(&lec.files, &store, &p).await {
-                Ok(s) => {
+            let registered = match slides::file_time(&p) {
+                Ok(t) => slides::register(&lec.files, &store, &p, SlideMeta::manual(t)).await,
+                Err(e) => Err(e),
+            };
+            match registered {
+                Ok(Some(s)) => {
                     known.insert(lec.files.dir.join(&s.file));
-                    let _ = events.send(Event::Slide { index: s.index, file: s.file });
+                    let _ = events.send(slide_event(&s));
                 }
+                Ok(None) => {} // another path registered it
                 Err(e) => {
                     let _ = events.send(Event::Warning(format!("slide {}: {e:#}", p.display())));
                 }
@@ -487,4 +448,8 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
 /// The sidecar as its file holds it: the one writer saves it atomically before every answer (spec §8).
 fn read_sidecar(files: &LectureFiles) -> Result<Sidecar, String> {
     Sidecar::load(&files.sidecar()).map_err(|e| format!("{e:#}"))?.ok_or_else(|| "the lecture has no sidecar yet".to_string())
+}
+
+fn slide_event(s: &SlideEntry) -> Event {
+    Event::Slide { index: s.index, file: s.file.clone(), auto: s.auto, uncertain: s.uncertain, shown_at: s.shown_at }
 }

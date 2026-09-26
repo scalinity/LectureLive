@@ -236,8 +236,8 @@ async fn a_registered_slide_whose_file_is_gone_is_skipped_with_a_warning() {
     let at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 25, 10, 0, 1).unwrap();
     let mut sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
     sc.slides = vec![
-        SlideEntry { index: 1, file: "slides/slide_01_100001.png".into(), shown_at: at },
-        SlideEntry { index: 2, file: "slides/slide_02_100002.png".into(), shown_at: at }, // deleted by hand
+        SlideEntry { index: 1, file: "slides/slide_01_100001.png".into(), shown_at: at, auto: false, uncertain: false },
+        SlideEntry { index: 2, file: "slides/slide_02_100002.png".into(), shown_at: at, auto: false, uncertain: false }, // deleted by hand
     ];
     sc.save(&f.sidecar()).unwrap();
     let sse = fake_sse::start(respond).await;

@@ -529,7 +529,14 @@ fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
             say(p, "done", "page", &detail);
         }
         Event::PageFailed(m) => say(p, "warn", "page failed", m),
-        Event::Slide { index, file } => say(p, "slide", &format!("slide {index}"), &format!("{}, into the next snapshot", Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+        Event::Slide { index, file, auto, uncertain, .. } => {
+            let how = match (auto, uncertain) {
+                (true, true) => " (auto, still changing)",
+                (true, false) => " (auto)",
+                _ => "",
+            };
+            say(p, "slide", &format!("slide {index}{how}"), &format!("{}, into the next snapshot", Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
+        }
         Event::Warning(m) => say(p, "warn", "warning", m),
     }
 }

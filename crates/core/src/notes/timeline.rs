@@ -142,7 +142,7 @@ mod tests {
     }
 
     fn slide(index: u32, at: DateTime<Local>) -> SlideEntry {
-        SlideEntry { index, file: format!("slides/slide_{index:02}_{}.png", at.format("%H%M%S")), shown_at: at }
+        SlideEntry { index, file: format!("slides/slide_{index:02}_{}.png", at.format("%H%M%S")), shown_at: at, auto: false, uncertain: false }
     }
 
     const DIR: &str = "/lecture";
