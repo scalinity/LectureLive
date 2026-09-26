@@ -2576,6 +2576,7 @@ dependencies = [
  "dotenvy",
  "hound",
  "lecturelive-core",
+ "tempfile",
  "tokio",
 ]
 

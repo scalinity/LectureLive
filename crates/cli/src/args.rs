@@ -94,6 +94,12 @@ pub(crate) struct LectureArgs {
     /// Rebuild a corrupt sidecar from the notes, transcript and slides
     #[arg(long)]
     pub(crate) rebuild: bool,
+    /// Show the lecture full-screen in the terminal (needs a terminal on stdin and stdout)
+    #[arg(long, conflicts_with_all = ["plain", "command"])]
+    pub(crate) tui: bool,
+    /// Print the lecture line by line, as in a pipe
+    #[arg(long, visible_alias = "no-tui", conflicts_with = "command")]
+    pub(crate) plain: bool,
 }
 
 #[derive(Subcommand)]

@@ -31,6 +31,8 @@ fn lecture_help_is_pinned() {
         "      --secs <SECS>              Stop after this many seconds\n",
         "      --keep-days <KEEP_DAYS>    Delete closed recordings older than this many days that have no unresolved gap\n",
         "      --rebuild                  Rebuild a corrupt sidecar from the notes, transcript and slides\n",
+        "      --tui                      Show the lecture full-screen in the terminal (needs a terminal on stdin and stdout)\n",
+        "      --plain                    Print the lecture line by line, as in a pipe [alias: --no-tui]\n",
         "  -h, --help                     Print help\n",
     ));
 }
