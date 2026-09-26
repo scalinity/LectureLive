@@ -10,6 +10,7 @@ use lecturelive_core::audio::mixed::{MixedSource, MIXED_MODE};
 use lecturelive_core::audio::source::{DeviceSource, Fallback, Source};
 use lecturelive_core::audio::{input, loopback, recorder, routing};
 use lecturelive_core::capture::window;
+use lecturelive_core::session::audit;
 use lecturelive_core::session::coordinator::{self, Notification, SessionConfig, SttStatus};
 use lecturelive_core::session::launch::{self, Retention};
 use lecturelive_core::notes::chat::{self, ChatClient, ChatConfig};
@@ -74,8 +75,9 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct LectureArgs {
-    /// page: typeset the study page from the notes; spend: what the tool has cost. Leave out to record.
-    #[arg(value_parser = ["page", "spend"])]
+    /// page: typeset the study page from the notes; spend: what the tool has cost; audit: whether the folder's
+    /// audio is whole (exit 1 when anything is unexplained). Leave out to record.
+    #[arg(value_parser = ["page", "spend", "audit"])]
     command: Option<String>,
     /// The lecture folder (default: the current directory)
     #[arg(long)]
@@ -472,6 +474,26 @@ fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, Stri
         .with_context(|| format!("No audio input matches {want:?}. Inputs now: {}.", inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
+/// `lecture audit`: each day's findings, then the counts; exits 1 when anything is unexplained (the M6 gate).
+fn audit_cmd(dir: &Path) -> Result<()> {
+    let days = audit::audit_folder(dir)?;
+    anyhow::ensure!(!days.is_empty(), "no lecture state in {} (.live_notes/*.v2.json)", dir.display());
+    let (mut unexplained, mut waiting) = (0, 0);
+    for (stem, a) in &days {
+        println!("{stem}");
+        for l in &a.lines {
+            println!("  {l}");
+        }
+        unexplained += a.unexplained;
+        waiting += a.waiting;
+    }
+    println!("{unexplained} unexplained, {waiting} waiting");
+    if unexplained > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// The lecture folder as an absolute path, `.` components dropped, without touching the filesystem: the course is
 /// read from the folder's real names (so `--dir .` works), and a folder is still created only once the input is known.
 fn lecture_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -600,6 +622,9 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         return Ok(());
     }
     let dir = lecture_dir(a.dir)?;
+    if a.command.as_deref() == Some("audit") {
+        return audit_cmd(&dir);
+    }
     let key = env_value("GROK_API_KEY").context("GROK_API_KEY is not set (the environment, a .env here or above, or the repository's .env)")?;
     let course = a.course.or_else(|| course_from_path(&dir)).or_else(|| env_value("LECTURE_COURSE")).unwrap_or_else(|| "Lecture".into());
     let recording = a.command.is_none();

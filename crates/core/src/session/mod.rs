@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod coordinator;
 pub mod launch;
 pub mod lock;
