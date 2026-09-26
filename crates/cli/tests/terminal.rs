@@ -23,6 +23,8 @@ const ENTER_ALTERNATE: &str = "\x1b[?1049h";
 const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
 const PASTE_ON: &str = "\x1b[?2004h";
 const PASTE_OFF: &str = "\x1b[?2004l";
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const CTRL_C: &[u8] = b"\x03";
 
@@ -67,7 +69,8 @@ impl Lecture {
     fn listening(&mut self) -> usize {
         let enter = self.pty.wait_for(ENTER_ALTERNATE, 0, START);
         let paste = self.pty.wait_for(PASTE_ON, enter, SOON);
-        let listening = self.pty.wait_for("Listening", paste, SOON);
+        let mouse = self.pty.wait_for(MOUSE_ON, paste, SOON);
+        let listening = self.pty.wait_for("Listening", mouse, SOON);
         let during = self.pty.termios();
         assert!(!during.local_modes.intersects(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG), "raw mode while the TUI runs: {:?}", during.local_modes);
         listening
@@ -81,11 +84,12 @@ impl Lecture {
         find(self.out(), needle.as_bytes(), from).unwrap_or_else(|| panic!("{needle:?} was not written after byte {from}:\n{}", visible(self.out())))
     }
 
-    /// The terminal is given back, in order, after byte `from`: bracketed paste off, the alternate screen
-    /// left, the cursor shown; the modes are the ones from before; `HOME` is untouched. Returns the index
-    /// just past the restoration, where the ordinary screen's output begins.
+    /// The terminal is given back, in order, after byte `from`: mouse capture off, bracketed paste off,
+    /// the alternate screen left, the cursor shown; the modes are the ones from before; `HOME` is untouched.
+    /// Returns the index just past the restoration, where the ordinary screen's output begins.
     fn restored(&self, from: usize) -> usize {
-        let paste = self.at(PASTE_OFF, from);
+        let mouse = self.at(MOUSE_OFF, from);
+        let paste = self.at(PASTE_OFF, mouse);
         let leave = self.at(LEAVE_ALTERNATE, paste);
         let show = self.at(SHOW_CURSOR, leave);
         same_modes(&self.before, &self.pty.termios());
@@ -135,8 +139,8 @@ fn the_harness_gives_the_child_a_terminal() {
     assert!(!after.local_modes.contains(LocalModes::ICANON), "the child's raw mode is read back after it ended: {:?}", after.local_modes);
 }
 
-/// PTY 1: the lecture ends by itself (`--secs`). Raw mode, the alternate screen and bracketed paste are
-/// taken, then given back, and the end summary is printed after the alternate screen is left.
+/// PTY 1: the lecture ends by itself (`--secs`). Raw mode, the alternate screen, bracketed paste and
+/// mouse capture are taken, then given back, and the end summary is printed after the alternate screen is left.
 #[test]
 fn a_lecture_that_ends_gives_the_terminal_back_before_its_summary() {
     let mut l = tui("quiet", &["--secs", "2"], 100, 30);
@@ -145,6 +149,11 @@ fn a_lecture_that_ends_gives_the_terminal_back_before_its_summary() {
     assert!(prepared < l.at(ENTER_ALTERNATE, 0), "the start-up lines print before the terminal is taken");
     let status = l.pty.wait(SOON);
     assert_eq!(code(status, &l), Some(0));
+    // The smaller capture mode: no any-event tracking (passive motion would only wake the reactor)
+    // and no alternate scroll (the wheel must not masquerade as cursor keys).
+    for never in ["\x1b[?1003", "\x1b[?1007", "\x1b[?1015"] {
+        assert!(find(l.out(), never.as_bytes(), 0).is_none(), "{never:?} was written:\n{}", visible(l.out()));
+    }
     let after = l.restored(listening);
     l.at("saved", after);
     l.at("spent on this lecture today", after);
@@ -268,8 +277,9 @@ fn the_session_view_shows_the_scripted_lecture_live() {
     l.at("saved", after);
 }
 
-/// PTY 8: taking the terminal fails at its last step, after raw mode, the alternate screen and bracketed
-/// paste: each is given back and `--tui` exits 1 with the reason, with nothing drawn and nothing started.
+/// PTY 8: taking the terminal fails at its last step, after raw mode, the alternate screen, bracketed
+/// paste and mouse capture: each is given back and `--tui` exits 1 with the reason, with nothing drawn
+/// and nothing started.
 #[test]
 fn a_failure_while_taking_the_terminal_gives_back_what_was_taken() {
     let mut l = tui("init-fail", &[], 100, 30);
@@ -277,6 +287,28 @@ fn a_failure_while_taking_the_terminal_gives_back_what_was_taken() {
     assert_eq!(code(status, &l), Some(1));
     let enter = l.at(ENTER_ALTERNATE, 0);
     let paste = l.at(PASTE_ON, enter);
+    let mouse = l.at(MOUSE_ON, paste);
+    let leave = l.at(LEAVE_ALTERNATE, l.at(PASTE_OFF, l.at(MOUSE_OFF, mouse)));
+    assert!(find(l.out(), b"\x1b[?25", 0).is_none(), "no drawing surface, so no cursor was hidden and none is shown");
+    assert!(find(l.out(), b"Listening", 0).is_none(), "nothing was drawn");
+    same_modes(&l.before, &l.pty.termios());
+    assert!(untouched(&l.home));
+    l.at("Error: the terminal could not be taken over (a failure injected by the debug fixture)", leave);
+}
+
+/// Taking the terminal fails at mouse capture, after raw mode, the alternate screen and bracketed
+/// paste: those are given back, no mouse sequence is written either way, and `--tui` exits 1 with the
+/// reason, with nothing drawn and nothing started.
+#[test]
+fn a_failure_at_mouse_capture_restores_without_touching_the_mouse() {
+    let mut l = tui("init-fail-mouse", &[], 100, 30);
+    let status = l.pty.wait(START);
+    assert_eq!(code(status, &l), Some(1));
+    let enter = l.at(ENTER_ALTERNATE, 0);
+    let paste = l.at(PASTE_ON, enter);
+    for never in ["\x1b[?1000", "\x1b[?1002", "\x1b[?1006"] {
+        assert!(find(l.out(), never.as_bytes(), 0).is_none(), "{never:?} was written:\n{}", visible(l.out()));
+    }
     let leave = l.at(LEAVE_ALTERNATE, l.at(PASTE_OFF, paste));
     assert!(find(l.out(), b"\x1b[?25", 0).is_none(), "no drawing surface, so no cursor was hidden and none is shown");
     assert!(find(l.out(), b"Listening", 0).is_none(), "nothing was drawn");
@@ -286,13 +318,13 @@ fn a_failure_while_taking_the_terminal_gives_back_what_was_taken() {
 }
 
 /// PTY 8: taking the terminal fails right after raw mode: raw mode is given back and nothing is written
-/// for the steps never taken, so no alternate-screen or paste sequence reaches the terminal.
+/// for the steps never taken, so no alternate-screen, paste or mouse sequence reaches the terminal.
 #[test]
 fn a_failure_after_raw_mode_writes_nothing_it_did_not_take() {
     let mut l = tui("init-fail-raw", &[], 100, 30);
     let status = l.pty.wait(START);
     assert_eq!(code(status, &l), Some(1));
-    for never in ["\x1b[?1049", "\x1b[?2004", "\x1b[?25"] {
+    for never in ["\x1b[?1049", "\x1b[?2004", "\x1b[?1000", "\x1b[?1002", "\x1b[?1006", "\x1b[?25"] {
         assert!(find(l.out(), never.as_bytes(), 0).is_none(), "{never:?} was written:\n{}", visible(l.out()));
     }
     same_modes(&l.before, &l.pty.termios());

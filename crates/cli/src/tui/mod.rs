@@ -20,7 +20,7 @@ use lecturelive_core::session::coordinator::{Notification, StopReport};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::lecture::{Command, Event};
 use lecturelive_core::session::spend::Spend;
-use ratatui::crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinError;
@@ -92,6 +92,13 @@ impl Ui {
         let effect = self.view.reduce(e, Local::now());
         let step = matches!(e, Event::Session(Notification::SourceEnded)).then(|| self.stop(Origin::SourceEnded, now));
         (step, effect.hydrate)
+    }
+
+    /// Captured, so the terminal reports it here instead of scrolling the viewport, and ignored:
+    /// wheel, press, release and drag all mean nothing until Task 8 scrolls with the wheel. Taking
+    /// `&mut self` keeps the reactor's one decision shape; nothing is changed through it.
+    fn mouse(&mut self, _mouse: MouseEvent) -> Act {
+        Act::Nothing
     }
 
     /// In raw mode Ctrl-C, Ctrl-Z and Ctrl-L are keys, not signals. Everything else waits for later tasks.
@@ -247,6 +254,12 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
                 },
                 // The next draw lays out `frame.area()` at the new size; nothing else keeps one.
                 Some(Ok(TermEvent::Resize(..))) => dirty = true,
+                // The lease captures the mouse so scrolls and drags reach the TUI instead of moving
+                // the viewport; every one is consumed here and changes nothing — no dirty, no redraw.
+                Some(Ok(TermEvent::Mouse(mouse))) => match ui.mouse(mouse) {
+                    Act::Nothing => {}
+                    Act::Redraw | Act::Clear | Act::Stop(_) => unreachable!("the mouse is captured and ignored"),
+                },
                 // A paste is text, never keys; Task 10 inserts it into the hint.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Exit::Lost(e),
@@ -426,6 +439,18 @@ mod tests {
         assert_eq!((ui.view.phase, ui.notice), (Stage::Listening, Some(view::SUSPEND)));
         assert_eq!(ui.key(ctrl('l'), t0), Act::Clear);
         assert_eq!(ui.view.phase, Stage::Listening);
+    }
+
+    #[test]
+    fn mouse_input_is_captured_and_changes_nothing() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut ui = ui();
+        let held = (ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone());
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::ScrollUp, MouseEventKind::ScrollDown, MouseEventKind::ScrollLeft, MouseEventKind::ScrollRight, MouseEventKind::Moved] {
+            assert_eq!(ui.mouse(MouseEvent { kind, column: 40, row: 12, modifiers: KeyModifiers::NONE }), Act::Nothing, "{kind:?} asks for nothing: no command, no stop, no redraw");
+        }
+        assert_eq!((ui.view.phase, ui.notice, ui.events), (Stage::Listening, None, 0), "no stop transition, no notice, no event counted");
+        assert_eq!((ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone()), held, "no hydration and no state moved");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! atomics, so any thread restores without a lock of LectureLive's, an await or a destructor: the
 //! release build aborts on panic, so no `Drop` can be the guarantee.
 
+use std::fmt;
 use std::io::{self, Stdout, Write};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -14,6 +15,7 @@ use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::ResetColor;
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::Command;
 use ratatui::layout::Rect;
 use ratatui::{Frame, Terminal};
 
@@ -32,8 +34,10 @@ const RESTORED: u8 = 4;
 const RAW: u8 = 1 << 0;
 const ALTERNATE: u8 = 1 << 1;
 const PASTE: u8 = 1 << 2;
+/// Mouse reporting is on: buttons, wheel and drags reach `EventStream` instead of the viewport.
+const MOUSE: u8 = 1 << 3;
 /// The drawing surface exists: its draws hide the cursor and set colours.
-const SURFACE: u8 = 1 << 3;
+const SURFACE: u8 = 1 << 4;
 
 struct Lease {
     state: AtomicU8,
@@ -83,8 +87,35 @@ impl Lease {
 
 static LEASE: Lease = Lease::new();
 
-/// Takes the terminal: raw mode, the alternate screen, bracketed paste, then the drawing surface, each
-/// recorded as it succeeds. When a step fails, the ones already taken are undone before the error returns.
+/// Mouse capture without passive motion: the standard xterm private modes that report button
+/// presses and releases (`?1000h`, which also carries the wheel as buttons 64–67), button drags
+/// (`?1002h`) and SGR coordinates (`?1006h`). It is Crossterm 0.29's `EnableMouseCapture` minus
+/// `?1003h` (any-event tracking: every pointer movement would wake the reactor, which ignores the
+/// mouse entirely until Task 8 scrolls with it) and minus `?1015h` (the legacy RXVT encoding SGR
+/// supersedes). Deliberately not `?1007` (alternate scroll), which would turn the wheel into cursor
+/// keys: the wheel means nothing yet. Unknown modes are ignored by the terminal, so this is safe
+/// wherever mouse reporting is absent; where it is present, scrolls and drags reach `EventStream`
+/// instead of moving the viewport, and the frame stays anchored.
+struct EnableMouse;
+
+impl Command for EnableMouse {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+    }
+}
+
+/// The exact inverse of [`EnableMouse`], in reverse order: no reporting mode may survive the lease.
+struct DisableMouse;
+
+impl Command for DisableMouse {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1006l\x1b[?1002l\x1b[?1000l")
+    }
+}
+
+/// Takes the terminal: raw mode, the alternate screen, bracketed paste, mouse capture, then the
+/// drawing surface, each recorded as it succeeds. When a step fails, the ones already taken are
+/// undone before the error returns.
 pub(crate) fn enter() -> io::Result<Screen> {
     if !LEASE.begin() {
         return Err(io::Error::other("the terminal was already taken once"));
@@ -109,6 +140,9 @@ fn acquire() -> io::Result<Screen> {
     fault(PASTE)?;
     execute!(io::stdout(), EnableBracketedPaste)?;
     LEASE.took(PASTE);
+    fault(MOUSE)?;
+    execute!(io::stdout(), EnableMouse)?;
+    LEASE.took(MOUSE);
     fault(SURFACE)?;
     let screen = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     LEASE.took(SURFACE);
@@ -143,8 +177,11 @@ fn undo<W: Write>(taken: u8, raw_off: impl FnOnce() -> io::Result<()>, out: impl
     if taken & RAW != 0 {
         note(raw_off());
     }
-    if taken & (ALTERNATE | PASTE | SURFACE) != 0 {
+    if taken & (ALTERNATE | PASTE | MOUSE | SURFACE) != 0 {
         let mut out = out();
+        if taken & MOUSE != 0 {
+            note(execute!(out, DisableMouse));
+        }
         if taken & PASTE != 0 {
             note(execute!(out, DisableBracketedPaste));
         }
@@ -202,7 +239,10 @@ pub(crate) fn clear(screen: &mut Screen) -> io::Result<()> {
 pub(crate) enum Fault {
     /// Entering the alternate screen fails: only raw mode has been taken.
     AlternateScreen,
-    /// Making the drawing surface fails: raw mode, the alternate screen and bracketed paste have been taken.
+    /// Enabling mouse capture fails: raw mode, the alternate screen and bracketed paste have been taken.
+    Mouse,
+    /// Making the drawing surface fails: raw mode, the alternate screen, bracketed paste and mouse capture
+    /// have been taken.
     Surface,
     /// The second draw fails.
     SecondDraw,
@@ -217,6 +257,7 @@ static DRAWS_BEFORE_FAILURE: std::sync::atomic::AtomicU32 = std::sync::atomic::A
 pub(crate) fn inject(fault: Fault) {
     match fault {
         Fault::AlternateScreen => FAIL_STEP.store(ALTERNATE, Ordering::Relaxed),
+        Fault::Mouse => FAIL_STEP.store(MOUSE, Ordering::Relaxed),
         Fault::Surface => FAIL_STEP.store(SURFACE, Ordering::Relaxed),
         Fault::SecondDraw => DRAWS_BEFORE_FAILURE.store(2, Ordering::Relaxed),
     }
@@ -247,7 +288,7 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::{Arc, Barrier};
 
-    const ALL: u8 = RAW | ALTERNATE | PASTE | SURFACE;
+    const ALL: u8 = RAW | ALTERNATE | PASTE | MOUSE | SURFACE;
 
     /// What `undo` did, in order: "raw", then "out" when it took the writer, then the bytes written.
     fn undone(taken: u8) -> (Vec<&'static str>, String) {
@@ -289,13 +330,22 @@ mod tests {
         lease.took(RAW);
         lease.took(ALTERNATE);
         lease.took(PASTE);
-        assert_eq!(lease.claim(), Some(RAW | ALTERNATE | PASTE), "the drawing surface failed");
-        assert_eq!(undone(RAW | ALTERNATE | PASTE), (vec!["raw", "out"], "\x1b[?2004l\x1b[?1049l".to_string()));
+        assert_eq!(lease.claim(), Some(RAW | ALTERNATE | PASTE), "mouse capture failed");
+        assert_eq!(undone(RAW | ALTERNATE | PASTE), (vec!["raw", "out"], "\x1b[?2004l\x1b[?1049l".to_string()), "a mode never taken is never disabled");
+
+        let lease = Lease::new();
+        assert!(lease.begin());
+        lease.took(RAW);
+        lease.took(ALTERNATE);
+        lease.took(PASTE);
+        lease.took(MOUSE);
+        assert_eq!(lease.claim(), Some(RAW | ALTERNATE | PASTE | MOUSE), "the drawing surface failed");
+        assert_eq!(undone(RAW | ALTERNATE | PASTE | MOUSE), (vec!["raw", "out"], "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l".to_string()));
     }
 
     #[test]
     fn restoration_turns_raw_mode_off_first_then_writes_every_step() {
-        assert_eq!(undone(ALL), (vec!["raw", "out"], "\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m".to_string()));
+        assert_eq!(undone(ALL), (vec!["raw", "out"], "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m".to_string()));
     }
 
     #[test]
@@ -365,6 +415,6 @@ mod tests {
         let mut broken = Broken(0);
         let result = undo(ALL, || Err(io::Error::other("raw")), || &mut broken);
         assert_eq!(result.unwrap_err().to_string(), "raw");
-        assert_eq!(broken.0, 4, "paste, alternate screen, cursor and colour each tried");
+        assert_eq!(broken.0, 5, "mouse, paste, alternate screen, cursor and colour each tried");
     }
 }

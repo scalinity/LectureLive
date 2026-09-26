@@ -271,6 +271,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         #[cfg(debug_assertions)]
         match fixture {
             Some(fixture::Scenario::InitFailRaw) => tui::terminal::inject(tui::terminal::Fault::AlternateScreen),
+            Some(fixture::Scenario::InitFailMouse) => tui::terminal::inject(tui::terminal::Fault::Mouse),
             Some(fixture::Scenario::InitFail) => tui::terminal::inject(tui::terminal::Fault::Surface),
             Some(fixture::Scenario::DrawFail) => tui::terminal::inject(tui::terminal::Fault::SecondDraw),
             _ => {}

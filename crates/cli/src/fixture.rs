@@ -25,7 +25,10 @@ pub(crate) enum Scenario {
     Panic,
     /// As quiet; the TUI fails to enter the alternate screen, with raw mode already taken.
     InitFailRaw,
-    /// As quiet; the TUI fails to make its drawing surface, with raw mode, the alternate screen and paste taken.
+    /// As quiet; the TUI fails to capture the mouse, with raw mode, the alternate screen and paste taken.
+    InitFailMouse,
+    /// As quiet; the TUI fails to make its drawing surface, with raw mode, the alternate screen, paste
+    /// and mouse capture taken.
     InitFail,
     /// As quiet; the TUI's second draw fails.
     DrawFail,
@@ -38,9 +41,10 @@ impl Scenario {
             "slow-stop" => Ok(Scenario::SlowStop),
             "panic" => Ok(Scenario::Panic),
             "init-fail-raw" => Ok(Scenario::InitFailRaw),
+            "init-fail-mouse" => Ok(Scenario::InitFailMouse),
             "init-fail" => Ok(Scenario::InitFail),
             "draw-fail" => Ok(Scenario::DrawFail),
-            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail\" and \"draw-fail\""),
+            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\" and \"draw-fail\""),
         }
     }
 }
