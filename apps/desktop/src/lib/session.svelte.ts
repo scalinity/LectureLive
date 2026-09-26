@@ -69,9 +69,9 @@ export class Session {
     return p === "running" || p === "starting" ? "Stop" : p === "stopping" ? "Stop waiting" : null;
   }
 
-  /** Snapshots are taken while the lecture runs, and while its first stop drains. */
+  /** Snapshots and polish are asked for only while the lecture runs: once it stops, the last snapshot takes what is left. */
   get canSnapshot(): boolean {
-    return this.status.phase === "running" || this.status.phase === "stopping";
+    return this.status.phase === "running";
   }
 
   /** A snapshot or a polish is running: the one thing Cancel stops. */
@@ -308,11 +308,12 @@ export class Session {
       this.open = { utterance: m.utterance, words: nextWords(same, m.stable, m.tentative, () => ++this.wordIds) };
       return true;
     }
+    // The live utterance closes even when the state already held its segment.
+    if (m.type === "closed" && this.open?.utterance === m.utterance) this.open = null;
     const expected = this.segments.length ? this.segments[this.segments.length - 1].id + 1 : 0;
     if (m.segment.id < expected) return true; // already in the state
     if (m.segment.id > expected) return false;
     this.segments = [...this.segments, m.segment];
-    if (m.type === "closed" && this.open?.utterance === m.utterance) this.open = null;
     return true;
   }
 
@@ -326,7 +327,10 @@ export class Session {
         this.previewDirty = true;
         return true;
       case "committed":
-        if (m.revision <= this.revision) return true;
+        if (m.revision <= this.revision) {
+          this.endPreview(m.op); // the state already held this block; its preview ends all the same
+          return true;
+        }
         if (m.revision > this.revision + 1) return false;
         this.revision = m.revision;
         this.committed = [...this.committed, m.block];

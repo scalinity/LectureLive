@@ -110,6 +110,10 @@ impl App {
     }
 
     fn send(&self, c: Command) -> Res<()> {
+        // Core takes no new operation once the lecture is stopping; say so rather than drop it.
+        if matches!(c, Command::Op(_)) && self.running.lock().expect("the running lock").as_ref().is_some_and(|r| r.stops > 0) {
+            return Err("The lecture is stopping; the last snapshot takes what is left.".into());
+        }
         self.commands().ok_or("No lecture is running.")?.send(c).map_err(|_| "The lecture has ended.".to_string())
     }
 }
@@ -130,12 +134,16 @@ pub fn attach(transcript: Channel<Value>, notes: Channel<Value>, app: State<'_, 
     *app.sink.channels.lock().expect("the channel lock") = Some((transcript, notes));
 }
 
-/// The sidecar: from the running lecture's one writer, else its file.
-async fn sidecar(commands: Option<&mpsc::UnboundedSender<Command>>, files: &LectureFiles) -> Option<Sidecar> {
-    if let Some(c) = commands {
+/// How long a running lecture has to answer a state read before the file answers instead.
+const STATE_WAIT: Duration = Duration::from_secs(2);
+
+/// The sidecar: from the running lecture's one writer, else its file. Once the lecture is stopping it
+/// reads no commands (the last snapshot runs), so the file answers at once (spec §3.6).
+async fn sidecar(commands: Option<&mpsc::UnboundedSender<Command>>, files: &LectureFiles, stopping: bool) -> Option<Sidecar> {
+    if let Some(c) = commands.filter(|_| !stopping) {
         let (tx, rx) = oneshot::channel();
         if c.send(Command::State(tx)).is_ok() {
-            if let Ok(Ok(sc)) = rx.await {
+            if let Ok(Ok(Ok(sc))) = tokio::time::timeout(STATE_WAIT, rx).await {
                 return Some(sc);
             }
         }
@@ -151,9 +159,10 @@ pub async fn get_session_state(app: State<'_, App>) -> Res<SessionState> {
     let Some(folder) = app.folder() else { return Ok(pump.state(None, &[], String::new(), None)) };
     let files = &folder.files;
     let commands = app.commands();
+    let stopping = matches!(pump.phase(), Phase::Stopping | Phase::StoppingNow | Phase::Ended);
     let mut tries = 0;
     let (sc, document) = loop {
-        let sc = sidecar(commands.as_ref(), files).await;
+        let sc = sidecar(commands.as_ref(), files, stopping).await;
         let doc = match &sc {
             Some(sc) => read_document(files, &sc.notes),
             None => Some(std::fs::read_to_string(&files.notes).unwrap_or_default()),
@@ -506,6 +515,27 @@ pub fn exit_app(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final review, I1: once the lecture is stopping it no longer reads its commands (the last snapshot
+    /// runs), so the state comes from the file at once; a lecture that does not answer falls back to it too.
+    #[tokio::test]
+    async fn a_stopping_or_silent_lecture_s_state_comes_from_the_file_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap());
+        std::fs::create_dir_all(files.state_dir()).unwrap();
+        let mut on_disk = Sidecar::default();
+        on_disk.notes.revision = 7;
+        on_disk.save(&files.sidecar()).unwrap();
+        let (tx, _unread) = mpsc::unbounded_channel::<Command>();
+        let t0 = std::time::Instant::now();
+        let sc = tokio::time::timeout(Duration::from_secs(10), sidecar(Some(&tx), &files, true)).await.expect("no wait while stopping");
+        assert_eq!(sc.map(|s| s.notes.revision), Some(7));
+        assert!(t0.elapsed() < Duration::from_millis(500), "{:?}", t0.elapsed());
+        let t0 = std::time::Instant::now();
+        let sc = tokio::time::timeout(Duration::from_secs(10), sidecar(Some(&tx), &files, false)).await.expect("a silent lecture falls back to the file");
+        assert_eq!(sc.map(|s| s.notes.revision), Some(7));
+        assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    }
 
     #[test]
     fn the_spend_view_takes_over_the_cli_ledger_first() {

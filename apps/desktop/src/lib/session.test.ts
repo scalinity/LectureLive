@@ -149,4 +149,45 @@ describe("session store", () => {
     frame();
     expect(s.stopLabel).toBeNull();
   });
+
+  // Final review, I2: a committed message the state already holds still ends its preview.
+  test("a committed revision the state already holds still ends its preview", async () => {
+    const st = emptyState("s1");
+    st.revision = 2;
+    st.document = "# T\n\n<!-- 10:00:00 -->\n## A\n";
+    st.preview = { op: 2, text: "## A and more " };
+    st.op = 2;
+    const { t, s, ready, frame } = setup(st);
+    await ready;
+    t.emitNotes({ type: "committed", op: 2, revision: 2, block: "\n<!-- 10:00:00 -->\n## A\n" });
+    frame();
+    expect(s.preview).toBeNull();
+    expect(s.previewShown).toBe("");
+    expect(s.committed).toEqual([]);
+  });
+
+  // Final review, M2 (graded Important): a closed segment the state already holds still closes the live line.
+  test("a closed segment the state already holds still closes the live utterance", async () => {
+    const st = emptyState("s1");
+    st.segments = [{ id: 0, at: "10:00:00", text: "the rate sets", recovered: false }];
+    st.open = { utterance: 1, stable: "the rate", tentative: "sets" };
+    const { t, s, ready, frame } = setup(st);
+    await ready;
+    t.emitTranscript({ type: "closed", utterance: 1, segment: { id: 0, at: "10:00:00", text: "the rate sets", recovered: false } });
+    frame();
+    expect(s.open).toBeNull();
+    expect(s.segments).toHaveLength(1);
+  });
+
+  // Final review, I3: once stopping, the command line takes nothing new (core would drop it).
+  test("while stopping, the command line offers no snapshot or polish", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running" });
+    frame();
+    expect(s.canSnapshot).toBe(true);
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "stopping" });
+    frame();
+    expect(s.canSnapshot).toBe(false);
+  });
 });

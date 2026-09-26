@@ -81,6 +81,10 @@ impl Pump {
         Self { session, seq: 0, sink, spend, silence: loopback.then(|| SilenceWatch::new(-60.0, 10)), mirror, sent: None }
     }
 
+    pub fn phase(&self) -> Phase {
+        self.mirror.status.phase
+    }
+
     #[cfg(test)]
     pub fn seq(&self) -> u64 {
         self.seq
