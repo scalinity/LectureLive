@@ -55,6 +55,9 @@ pub fn run() {
             app::capture_now,
             app::import_slides,
             app::open_screen_settings,
+            app::microphone,
+            app::open_microphone_settings,
+            app::use_input,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

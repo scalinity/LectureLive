@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use chrono::Local;
 use lecturelive_core::audio::permission::{self, MicPermission};
-use lecturelive_core::audio::source::DeviceSource;
+use lecturelive_core::audio::mixed::{MixedSource, MIXED_MODE};
+use lecturelive_core::audio::source::{DeviceSource, Fallback, Source};
 use lecturelive_core::audio::{input, loopback};
 use lecturelive_core::capture::detect::{Region, Thresholds};
 use lecturelive_core::capture::select::{Descriptor, Selection, Selections};
@@ -32,7 +33,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::adapter::{read_document, Phase, Pump, Sink, Stream};
+use crate::adapter::{read_document, Phase, Pump, Sink, SourceKind, Stream};
 use crate::keychain;
 use crate::wire::{CaptureView, CaptureWord, FolderView, NoticeKind, PreviewShot, SavedRegion, SessionState, WindowView};
 
@@ -89,6 +90,8 @@ struct Running {
     commands: mpsc::UnboundedSender<Command>,
     lecture: Arc<Lecture>,
     stops: u32,
+    /// The input the person may choose while a single input is gone.
+    fallback: Option<Fallback>,
     _lock: FolderLock,
 }
 
@@ -102,7 +105,7 @@ pub struct App {
 impl App {
     pub fn new(app: AppHandle) -> Self {
         let sink = Arc::new(TauriSink { app, channels: StdMutex::new(None) });
-        Self { pump: Arc::new(Mutex::new(Pump::new(String::new(), sink.clone(), None, false))), sink, folder: StdMutex::new(None), running: StdMutex::new(None) }
+        Self { pump: Arc::new(Mutex::new(Pump::new(String::new(), sink.clone(), None, SourceKind::Input))), sink, folder: StdMutex::new(None), running: StdMutex::new(None) }
     }
 
     fn folder(&self) -> Option<OpenFolder> {
@@ -184,7 +187,10 @@ pub async fn get_session_state(app: State<'_, App>) -> Res<SessionState> {
         };
         match doc {
             Some(d) => break (sc, d),
-            None if tries < 2 => tries += 1,
+            None if tries < 2 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await; // a commit being written: give it a moment
+            }
             // An edit made outside the app since its last session: shown as it is, accepted at the next start.
             None => break (sc, std::fs::read_to_string(&files.notes).unwrap_or_default()),
         }
@@ -210,7 +216,7 @@ pub async fn select_folder(dir: String, app: State<'_, App>, handle: AppHandle) 
     let capture = ready_view(&selections_path()?, &folder.course);
     *app.folder.lock().expect("the folder lock") = Some(folder);
     let mut pump = app.pump.lock().await;
-    *pump = Pump::new(uuid::Uuid::new_v4().to_string(), app.sink.clone(), None, false);
+    *pump = Pump::new(uuid::Uuid::new_v4().to_string(), app.sink.clone(), None, SourceKind::Input);
     let v = view.clone();
     pump.set_status(move |s| {
         s.folder = Some(v);
@@ -234,12 +240,14 @@ pub async fn inputs() -> Res<Vec<InputView>> {
 pub struct LoopbackView {
     present: bool,
     blackhole_present: bool,
+    /// Zoom and an input together can be chosen: mixed mode has passed its drift test and BlackHole is here.
+    mixed: bool,
 }
 
 #[tauri::command]
 pub async fn loopback_status() -> Res<LoopbackView> {
     let s = tauri::async_runtime::spawn_blocking(loopback::status).await.map_err(text)?.map_err(chain)?;
-    Ok(LoopbackView { present: s.present, blackhole_present: s.blackhole_present })
+    Ok(LoopbackView { present: s.present, blackhole_present: s.blackhole_present, mixed: MIXED_MODE && s.blackhole_present })
 }
 
 /// Everything before the session, as the CLI's `lecture` command does it, then `lecture::run` on
@@ -254,16 +262,27 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     if matches!(permission::microphone(), MicPermission::Denied | MicPermission::Restricted) {
         return Err("Microphone access is denied: System Settings → Privacy & Security → Microphone.".into());
     }
-    let (uid, source_name) = if source == "loopback" {
+    let blackhole = || async {
         let s = tauri::async_runtime::spawn_blocking(loopback::status).await.map_err(text)?.map_err(chain)?;
-        if !s.blackhole_present {
-            return Err("BlackHole 2ch is not installed (brew install blackhole-2ch).".into());
-        }
-        (loopback::BLACKHOLE_UID.to_string(), "BlackHole 2ch".to_string())
-    } else {
+        if s.blackhole_present { Ok(()) } else { Err("BlackHole 2ch is not installed (brew install blackhole-2ch).".to_string()) }
+    };
+    let input_named = |uid: String| async move {
         let inputs = tauri::async_runtime::spawn_blocking(input::list_inputs).await.map_err(text)?.map_err(chain)?;
-        let i = inputs.into_iter().find(|i| i.uid == source).ok_or("That input is no longer connected.")?;
-        (i.uid, i.name)
+        inputs.into_iter().find(|i| i.uid == uid).map(|i| (i.uid, i.name)).ok_or_else(|| "That input is no longer connected.".to_string())
+    };
+    let (uid, source_name, kind) = if source == "loopback" {
+        blackhole().await?;
+        (loopback::BLACKHOLE_UID.to_string(), "BlackHole 2ch".to_string(), SourceKind::Loopback)
+    } else if let Some(with) = source.strip_prefix("mixed:") {
+        if !MIXED_MODE {
+            return Err("Mixed mode is off in this build.".into());
+        }
+        blackhole().await?;
+        let (uid, name) = input_named(with.to_string()).await?;
+        (uid, format!("Zoom + {name}"), SourceKind::Mixed)
+    } else {
+        let (uid, name) = input_named(source.clone()).await?;
+        (uid, name, SourceKind::Input)
     };
     let data = data_dir()?;
     let app_ledger = data.join("spend.jsonl");
@@ -276,7 +295,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let session = uuid::Uuid::new_v4().to_string();
     {
         let mut pump = app.pump.lock().await;
-        *pump = Pump::new(session.clone(), app.sink.clone(), Some(spend.clone()), uid == loopback::BLACKHOLE_UID);
+        *pump = Pump::new(session.clone(), app.sink.clone(), Some(spend.clone()), kind);
         let (view, name) = (folder_view(&folder), source_name.clone());
         let capture_view = ready_view(&selections_path()?, &folder.course);
         pump.set_status(move |s| {
@@ -348,6 +367,10 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         if ready.init.pending_segments > 0 || ready.init.pending_slides > 0 {
             pump.notice(NoticeKind::Notes, "Resumed", &format!("{} lines and {} slides wait for the next snapshot", ready.init.pending_segments, ready.init.pending_slides));
         }
+        // Transcript gaps an earlier session left (a crash) are this session's first work: counted from the start.
+        if let Ok(Some(sc)) = Sidecar::load(&files.sidecar()) {
+            pump.set_open_gaps(sc.gaps.iter().filter(|g| g.kind.is_transcript() && !g.resolved).count());
+        }
     }
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
@@ -368,8 +391,15 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     // Spec §7: the course's saved window, revalidated by the worker as the lecture starts.
     let selection = Selections::load(&selections_path()?).ok().and_then(|s| s.get(&folder.course).cloned());
     let capture = CaptureSetup { source: Box::new(SystemWindows), selection, interval: Duration::from_secs(1), thresholds: Thresholds::default(), record: std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from) };
-    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid, fallback: Default::default() }), watch, Some(capture), cmd_rx, ev_tx);
-    *app.running.lock().expect("the running lock") = Some(Running { commands: cmd_tx, lecture: lec, stops: 0, _lock: lock });
+    let (source, fallback): (Box<dyn Source>, Option<Fallback>) = match kind {
+        SourceKind::Mixed => (Box::new(MixedSource::new(loopback::BLACKHOLE_UID, &uid)), None),
+        _ => {
+            let fallback = Fallback::default();
+            (Box::new(DeviceSource { uid, fallback: fallback.clone() }), Some(fallback))
+        }
+    };
+    let run = lecture::run(lec.clone(), cfg, source, watch, Some(capture), cmd_rx, ev_tx);
+    *app.running.lock().expect("the running lock") = Some(Running { commands: cmd_tx, lecture: lec, stops: 0, fallback, _lock: lock });
     app.pump.lock().await.set_status(|s| s.phase = Phase::Running);
     // ⌘⇧2 captures the slide from anywhere, only while a lecture runs: it takes the keys from every other app.
     if let Err(e) = handle.global_shortcut().register(SHORTCUT) {
@@ -384,11 +414,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         let running = app.running.lock().expect("the running lock").take(); // the folder lock goes with it
         drop(running);
         let mut pump = app.pump.lock().await;
-        pump.set_status(|s| {
-            s.phase = Phase::Ended;
-            s.busy = None;
-            s.level_dbfs = None;
-        });
+        pump.lecture_ended();
         match result {
             Ok(report) => {
                 let waiting = if report.unresolved > 0 { format!("; {} transcript gaps still to recover, the next session in this folder does it", report.unresolved) } else { String::new() };
@@ -577,6 +603,41 @@ pub fn import_slides(paths: Vec<String>, app: State<'_, App>) -> Res<()> {
     app.send(Command::Import(paths.into_iter().map(PathBuf::from).collect()))
 }
 
+/// Whether macOS lets this app record: "granted", "denied", "restricted" or "undetermined" (spec §10's fix-it).
+#[tauri::command]
+pub fn microphone() -> String {
+    match permission::microphone() {
+        MicPermission::Granted => "granted",
+        MicPermission::Denied => "denied",
+        MicPermission::Restricted => "restricted",
+        MicPermission::NotDetermined => "undetermined",
+    }
+    .into()
+}
+
+/// The fix-it for a denied microphone (spec §10).
+#[tauri::command]
+pub fn open_microphone_settings() -> Res<()> {
+    std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone").status().map_err(text)?;
+    Ok(())
+}
+
+/// The person's choice while their single input is gone (spec §4.1): record from this input instead.
+#[tauri::command]
+pub async fn use_input(uid: String, app: State<'_, App>) -> Res<()> {
+    if app.pump.lock().await.status_input_gone().is_none() {
+        return Err("The input is back; nothing to change.".into());
+    }
+    let listed = tauri::async_runtime::spawn_blocking(input::list_inputs).await.map_err(text)?.map_err(chain)?.iter().any(|i| i.uid == uid);
+    if !listed {
+        return Err("That input is no longer connected.".into());
+    }
+    let running = app.running.lock().expect("the running lock");
+    let fallback = running.as_ref().and_then(|r| r.fallback.clone()).ok_or("No lecture is recording from a single input.")?;
+    fallback.offer(&uid);
+    Ok(())
+}
+
 /// The fix-it for a missing Screen Recording grant (spec §10).
 #[tauri::command]
 pub fn open_screen_settings() -> Res<()> {
@@ -664,6 +725,8 @@ pub fn spend_summary() -> Res<spend::Summary> {
 pub struct CheckConfig {
     mode: String,
     dir: Option<String>,
+    /// How long a timed check runs (`LECTURELIVE_CHECK_MINUTES`).
+    minutes: Option<u64>,
 }
 
 /// A measurement or check the page runs by itself, from `LECTURELIVE_CHECK` (and `LECTURELIVE_CHECK_DIR`,
@@ -671,7 +734,7 @@ pub struct CheckConfig {
 #[tauri::command]
 pub fn check_config() -> Option<CheckConfig> {
     let mode = std::env::var("LECTURELIVE_CHECK").ok().filter(|m| !m.is_empty())?;
-    Some(CheckConfig { mode, dir: std::env::var("LECTURELIVE_CHECK_DIR").ok() })
+    Some(CheckConfig { mode, dir: std::env::var("LECTURELIVE_CHECK_DIR").ok(), minutes: std::env::var("LECTURELIVE_CHECK_MINUTES").ok().and_then(|m| m.parse().ok()) })
 }
 
 /// Writes a check's report to `~/Library/Application Support/LectureLive/m5-checks/<name>.json`.
@@ -680,7 +743,7 @@ pub fn check_report(name: String, json: String) -> Res<String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("not a report name: {name:?}"));
     }
-    let dir = data_dir()?.join("m5-checks");
+    let dir = data_dir()?.join("m6-checks");
     std::fs::create_dir_all(&dir).map_err(text)?;
     let path = dir.join(format!("{name}.json"));
     std::fs::write(&path, json).map_err(text)?;

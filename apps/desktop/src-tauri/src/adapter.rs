@@ -38,6 +38,17 @@ pub trait Sink: Send + Sync {
 /// Notices a reload shows again.
 const NOTICES: usize = 50;
 
+/// What the lecture listens to: which silence to watch, and whether a gone input is offered a fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// One input: when it goes, the person may choose another (spec §4.1).
+    Input,
+    /// Zoom through BlackHole: ten silent seconds are a warning (spec §4.3).
+    Loopback,
+    /// Zoom and an input: the level is the loopback's, and a gone input leaves Zoom going.
+    Mixed,
+}
+
 /// What a reloaded frontend needs beyond the files: the live parts of the view.
 #[derive(Debug, Clone, Default)]
 pub struct Mirror {
@@ -57,6 +68,7 @@ pub struct Pump {
     sink: Arc<dyn Sink>,
     spend: Option<Spend>,
     silence: Option<SilenceWatch>,
+    kind: SourceKind,
     mirror: Mirror,
     /// The status as the frontend last received it.
     sent: Option<Status>,
@@ -77,13 +89,40 @@ fn stt_words(s: &SttStatus) -> (String, bool) {
 }
 
 impl Pump {
-    pub fn new(session: String, sink: Arc<dyn Sink>, spend: Option<Spend>, loopback: bool) -> Self {
+    pub fn new(session: String, sink: Arc<dyn Sink>, spend: Option<Spend>, kind: SourceKind) -> Self {
         let mirror = Mirror { op: 1, status: Status { stt: "not started".into(), ..Status::default() }, ..Mirror::default() };
-        Self { session, seq: 0, sink, spend, silence: loopback.then(|| SilenceWatch::new(-60.0, 10)), mirror, sent: None }
+        let silence = (kind != SourceKind::Input).then(|| SilenceWatch::new(-60.0, 10));
+        Self { session, seq: 0, sink, spend, silence, kind, mirror, sent: None }
     }
 
     pub fn phase(&self) -> Phase {
         self.mirror.status.phase
+    }
+
+    /// The single input that went, while it is away.
+    pub fn status_input_gone(&self) -> Option<&str> {
+        self.mirror.status.input_gone.as_deref()
+    }
+
+    /// Transcript gaps an earlier session left, still to recover: counted from the start (the session recovers them first).
+    pub fn set_open_gaps(&mut self, n: usize) {
+        self.mirror.status.gaps = n;
+        self.flush_status();
+    }
+
+    /// The lecture has ended: nothing is being done or heard, and capture is back to its word before a lecture.
+    pub fn lecture_ended(&mut self) {
+        let s = &mut self.mirror.status;
+        s.phase = Phase::Ended;
+        s.busy = None;
+        s.level_dbfs = None;
+        s.input_gone = None;
+        if s.capture.window.is_some() {
+            s.capture = CaptureView { state: CaptureWord::Ready, window: s.capture.window.take(), ..CaptureView::default() };
+        } else {
+            s.capture = CaptureView::default();
+        }
+        self.flush_status();
     }
 
     #[cfg(test)]
@@ -288,8 +327,16 @@ impl Pump {
                 self.mirror.status.gaps = self.mirror.status.gaps.saturating_sub(1);
                 self.notice(NoticeKind::Done, "Recovered", &format!("the transcript of {:.1}–{:.1} s of recording {}", g.start_sample as f64 / 16_000.0, g.end_sample.map_or(0.0, |e| e as f64 / 16_000.0), g.recording_id));
             }
-            Notification::DeviceGone { uid } => self.notice(NoticeKind::Warn, "Input gone", &format!("{uid}; waiting for it to return (no other input is used)")),
-            Notification::DeviceBack { uid } => self.notice(NoticeKind::Done, "Input back", &format!("{uid}; recording continues in a new file")),
+            Notification::DeviceGone { uid } if self.kind == SourceKind::Mixed => self.notice(NoticeKind::Warn, "Input gone", &format!("{uid}; Zoom goes on, and the gap is marked")),
+            Notification::DeviceGone { uid } => {
+                // Nothing switches by itself (spec §4.1): the person is offered the other inputs.
+                self.mirror.status.input_gone = Some(uid.clone());
+                self.notice(NoticeKind::Warn, "Input gone", &format!("{uid}; waiting for it to return. Choose another input to record from it."));
+            }
+            Notification::DeviceBack { uid } => match self.mirror.status.input_gone.take() {
+                Some(gone) if gone != uid => self.notice(NoticeKind::Done, "Recording from", &format!("{uid}, in a new file")),
+                _ => self.notice(NoticeKind::Done, "Input back", &format!("{uid}; recording continues in a new file")),
+            },
             Notification::Failed(m) => self.notice(NoticeKind::Warn, "Session failed", &m),
             Notification::RecoveryFailed(m) => self.notice(NoticeKind::Warn, "Recovery", &m),
             Notification::SpendFailed(m) => self.notice(NoticeKind::Warn, "Spend", &m),
@@ -360,8 +407,60 @@ mod tests {
     }
 
     fn pump() -> (Pump, Arc<Recorded>) {
+        pump_with(SourceKind::Input)
+    }
+
+    fn pump_with(kind: SourceKind) -> (Pump, Arc<Recorded>) {
         let sink = Arc::new(Recorded::default());
-        (Pump::new("s1".into(), sink.clone(), None, false), sink)
+        (Pump::new("s1".into(), sink.clone(), None, kind), sink)
+    }
+
+    #[test]
+    fn a_single_input_that_goes_is_offered_a_fallback_and_one_that_returns_clears_it() {
+        let (mut p, _) = pump_with(SourceKind::Input);
+        p.apply(Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }));
+        assert_eq!(p.mirror().status.input_gone.as_deref(), Some("Receiver_UID"));
+        p.apply(Event::Session(Notification::DeviceBack { uid: "BuiltInMicrophoneDevice".into() }));
+        assert_eq!(p.mirror().status.input_gone, None);
+        let last = p.mirror().notices.back().unwrap();
+        assert_eq!((last.label.as_str(), last.detail.contains("BuiltInMicrophoneDevice")), ("Recording from", true));
+    }
+
+    #[test]
+    fn in_mixed_mode_a_gone_input_is_a_notice_not_an_offer() {
+        let (mut p, _) = pump_with(SourceKind::Mixed);
+        p.apply(Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }));
+        assert_eq!(p.mirror().status.input_gone, None);
+        assert!(p.mirror().notices.back().unwrap().detail.contains("Zoom goes on"));
+    }
+
+    #[test]
+    fn mixed_mode_watches_the_loopback_for_silence() {
+        let (mut p, _) = pump_with(SourceKind::Mixed);
+        for _ in 0..10 {
+            p.apply(Event::Session(Notification::Level(0.0)));
+        }
+        assert!(p.mirror().status.silence);
+    }
+
+    /// M4 minor M9: gaps an earlier session left are counted from the start, and recovery counts them down.
+    #[test]
+    fn open_gaps_from_earlier_sessions_are_counted_from_the_start() {
+        use lecturelive_core::session::sidecar::{Gap, GapKind};
+        let (mut p, _) = pump_with(SourceKind::Loopback);
+        p.set_open_gaps(2);
+        p.apply(Event::Session(Notification::Recovered(Gap::new(uuid::Uuid::new_v4(), 0, Some(1), GapKind::SttInterrupted))));
+        assert_eq!(p.mirror().status.gaps, 1);
+    }
+
+    /// M5 minor M1: once the lecture has ended the strip no longer says Watching.
+    #[test]
+    fn the_end_puts_capture_back_to_its_word_before_a_lecture() {
+        let (mut p, _) = pump_with(SourceKind::Loopback);
+        p.apply(Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }));
+        p.lecture_ended();
+        assert_eq!(p.mirror().status.phase, Phase::Ended);
+        assert_eq!((p.mirror().status.capture.state, p.mirror().status.capture.window.as_deref()), (CaptureWord::Ready, Some("Zoom Meeting")));
     }
 
     fn seg(id: u64, text: &str, source: SegmentSource) -> Segment {
@@ -467,7 +566,7 @@ mod tests {
     #[test]
     fn ten_silent_seconds_on_loopback_raise_the_warning_once() {
         let sink = Arc::new(Recorded::default());
-        let mut p = Pump::new("s1".into(), sink.clone(), None, true);
+        let mut p = Pump::new("s1".into(), sink.clone(), None, SourceKind::Loopback);
         for _ in 0..12 {
             p.apply(Event::Session(Notification::Level(0.0)));
         }
