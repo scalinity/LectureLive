@@ -26,9 +26,11 @@ review's fixes are in. Then, in this order:
    branch is cut from `main`, so a fast-forward always applies. A merge commit would mean something
    landed on `main` meanwhile, and that is a reason to stop and look.
 4. **Push `main`:** `git push origin main`, a normal push. Never force-push unless the person asks.
-   Push `main` only, never the milestone branches: the older ones (m0–m3) hold history from before a
-   redaction.
-5. **Say so in the handover:** the commit `origin/main` now points to, and that the next milestone
+   Push `main` only; milestone branches never go to the remote.
+5. **Delete the milestone branch:** `git branch -d m<N>-<name>`. Once merged it serves no purpose.
+   If a redaction changed its hashes, Git no longer sees it as merged: confirm its tip differs from
+   `main`'s commit of the same subject only in the redacted lines, then delete it with `-D`.
+6. **Say so in the handover:** the commit `origin/main` now points to, and that the next milestone
    branches from `main`.
 
 This step applies even when a milestone's kickoff prompt says to leave the branch unmerged and
