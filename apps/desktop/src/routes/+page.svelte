@@ -5,7 +5,10 @@
   import { demoWithNotes } from "$lib/fixture";
   import { session } from "$lib/session.svelte";
   import { tauriTransport, type Transport } from "$lib/transport";
+  import CommandLine from "$lib/CommandLine.svelte";
+  import KeyDialog from "$lib/KeyDialog.svelte";
   import Notes from "$lib/Notes.svelte";
+  import StatusStrip from "$lib/StatusStrip.svelte";
   import Transcript from "$lib/Transcript.svelte";
 
   /** The app talks to Tauri; the browser preview (`?fixture=demo`) plays a scripted lecture. */
@@ -14,12 +17,21 @@
     return demoWithNotes();
   }
 
+  try {
+    if (localStorage.getItem("lecturelive.large") === "1") document.documentElement.classList.add("large");
+  } catch {
+    // private storage unavailable: normal type
+  }
+
+  let keyDialog: KeyDialog;
   const t = transport();
-  const started = session.init(t);
+  const started = session.init(t).then(async () => {
+    if (!(await session.keyStatus())?.stored) keyDialog.show();
+  });
 </script>
 
 <div class="window">
-  <header class="strip"></header>
+  <StatusStrip onSpend={() => {}} onKey={() => keyDialog.show()} />
   <main class="panes">
     <Transcript />
     <Notes toUrl={(p) => t.assetUrl(p)} />
@@ -33,8 +45,9 @@
       {/if}
     </aside>
   </main>
-  <footer class="command"></footer>
+  <CommandLine />
 </div>
+<KeyDialog bind:this={keyDialog} />
 {#await started catch e}
   <p class="fatal" role="alert">The app could not reach its backend: {String(e)}</p>
 {/await}
@@ -44,20 +57,7 @@
     height: 100vh;
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
-  }
-
-  .strip,
-  .command {
-    background: var(--plate);
-    min-height: 3.2rem;
-  }
-
-  .strip {
-    border-bottom: 1px solid var(--rule);
-  }
-
-  .command {
-    border-top: 1px solid var(--rule);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .panes {

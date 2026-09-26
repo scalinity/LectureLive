@@ -17,6 +17,8 @@ export class FixtureTransport implements Transport {
   state_: SessionState;
   lastSeq: number;
   calls: [string, unknown][] = [];
+  /** What `call` answers, by command. */
+  answers: Record<string, unknown> = {};
   /** The order the store reached the backend in. */
   order: string[] = [];
   stateReads = 0;
@@ -80,7 +82,7 @@ export class FixtureTransport implements Transport {
 
   async call<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     this.calls.push([cmd, args]);
-    return undefined as T;
+    return this.answers[cmd] as T;
   }
 
   assetUrl(path: string) {
@@ -188,6 +190,8 @@ export function demoWithNotes(): FixtureTransport {
   t.state_.revision = 2;
   t.state_.slides = [{ index: 1, file: "slides/slide_01_100251.png", path: `${DEMO_DIR}/slides/slide_01_100251.png` }];
   t.assetUrl = () => "/demo-slide.svg";
+  t.answers = { key_status: { stored: true, env_available: true }, inputs: [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }], loopback_status: { present: true, blackhole_present: true } };
+  (globalThis as { __fixture?: FixtureTransport }).__fixture = t; // the preview's checks drive states through it
   const words = DEMO_SNAPSHOT.match(/\S+\s*/g) ?? [];
   setTimeout(() => {
     let i = 0;

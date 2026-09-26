@@ -31,9 +31,13 @@
 
   // Follows the newest writing while the reader is at the end, as the transcript does.
   let pinned = true;
+  let lastTop = 0;
   function onscroll(e: Event) {
     const el = e.currentTarget as HTMLElement;
-    pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 4;
+    // Only the reader scrolls up; a layout change that moves the end away must not unpin.
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 4) pinned = true;
+    else if (el.scrollTop < lastTop - 1) pinned = false;
+    lastTop = el.scrollTop;
   }
   function follow(node: HTMLElement) {
     return { destroy: session.onFrame(() => pinned && (node.scrollTop = node.scrollHeight)) };

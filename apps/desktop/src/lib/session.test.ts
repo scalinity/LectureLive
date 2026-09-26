@@ -129,4 +129,24 @@ describe("session store", () => {
     expect(s.open).toBeNull();
     expect(s.segments.map((x) => x.text)).toEqual(["the rate sets"]);
   });
+
+  test("the command line maps to the CLI's operations and the stop button to its levels", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running" });
+    frame();
+    expect(s.stopLabel).toBe("Stop");
+    await s.snapshot("");
+    await s.snapshot("  focus on momentum  ");
+    await s.polish();
+    await s.cancel();
+    await s.stop();
+    expect(t.calls).toEqual([["snapshot", { hint: "" }], ["snapshot", { hint: "focus on momentum" }], ["polish", undefined], ["cancel", undefined], ["stop", undefined]]);
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "stopping" });
+    frame();
+    expect(s.stopLabel).toBe("Stop waiting");
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "stopping_now" });
+    frame();
+    expect(s.stopLabel).toBeNull();
+  });
 });

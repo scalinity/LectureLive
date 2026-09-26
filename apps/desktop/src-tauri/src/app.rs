@@ -418,3 +418,31 @@ pub async fn open_page(app: State<'_, App>) -> Res<String> {
     std::process::Command::new("open").arg(&outcome.path).status().map_err(text)?;
     Ok(outcome.path.to_string_lossy().into_owned())
 }
+
+#[derive(Serialize)]
+pub struct KeyStatus {
+    stored: bool,
+    /// The CLI's key is in the environment or the repository's `.env`, ready to move into the Keychain.
+    env_available: bool,
+}
+
+/// Whether a key is stored; the key itself never reaches the frontend (spec §2).
+#[tauri::command]
+pub fn key_status() -> Res<KeyStatus> {
+    Ok(KeyStatus { stored: keychain::get(keychain::SERVICE).map_err(chain)?.is_some(), env_available: keychain::env_key().is_some() })
+}
+
+#[tauri::command]
+pub fn save_key(key: String) -> Res<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("Paste the API key first.".into());
+    }
+    keychain::set(keychain::SERVICE, key).map_err(chain)
+}
+
+#[tauri::command]
+pub fn import_key_from_env() -> Res<()> {
+    let key = keychain::env_key().ok_or("GROK_API_KEY is not in the environment or the repository's .env.")?;
+    keychain::set(keychain::SERVICE, &key).map_err(chain)
+}

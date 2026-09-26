@@ -2,7 +2,7 @@
 // the state, once per animation frame. Runes only; no effects: every update comes from an event.
 import { idleStatus } from "./fixture";
 import type { Transport } from "./transport";
-import type { Envelope, FolderView, Notice, NotesMsg, SegmentView, SlideView, Status, StatusMsg, TranscriptMsg } from "./wire";
+import type { Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, SegmentView, SlideView, Status, StatusMsg, TranscriptMsg } from "./wire";
 import { nextWords, type Word } from "./words";
 
 type Stream = "status" | "transcript" | "notes";
@@ -60,6 +60,100 @@ export class Session {
     return this.status.folder;
   }
 
+  /** The stop button's label at each level (spec §9.1): null when there is nothing left to stop. */
+  get stopLabel(): "Stop" | "Stop waiting" | null {
+    const p = this.status.phase;
+    return p === "running" || p === "starting" ? "Stop" : p === "stopping" ? "Stop waiting" : null;
+  }
+
+  /** Snapshots are taken while the lecture runs, and while its first stop drains. */
+  get canSnapshot(): boolean {
+    return this.status.phase === "running" || this.status.phase === "stopping";
+  }
+
+  /** A snapshot or a polish is running: the one thing Cancel stops. */
+  get busyOp(): boolean {
+    const b = this.status.busy ?? "";
+    return b.startsWith("snapshot") || b.startsWith("polishing");
+  }
+
+  /** Seconds since the lecture started, updated once a second. */
+  get elapsed(): number | null {
+    const at = this.status.started_at;
+    return at ? Math.max(0, Math.floor((this.clockNow - Date.parse(at)) / 1000)) : null;
+  }
+
+  /** The last command that failed, in the backend's words; cleared by the next one that succeeds. */
+  error = $state<string | null>(null);
+  private clockNow = $state(Date.now());
+
+  private async act<T>(cmd: string, args?: Record<string, unknown>): Promise<T | undefined> {
+    try {
+      const r = await this.t!.call<T>(cmd, args);
+      this.error = null;
+      return r;
+    } catch (e) {
+      this.error = String(e);
+      return undefined;
+    }
+  }
+
+  /** The CLI's command line: ⏎ is a snapshot, a hint then ⏎ a hinted one, `polish` ⏎ a polish. */
+  async snapshot(hint: string) {
+    const h = hint.trim();
+    if (h.toLowerCase() === "polish") return this.polish();
+    await this.act("snapshot", { hint: h });
+  }
+
+  async polish() {
+    await this.act("polish");
+  }
+
+  async cancel() {
+    await this.act("cancel");
+  }
+
+  async stop() {
+    await this.act("stop");
+  }
+
+  async start(source: string) {
+    await this.act("start_lecture", { source });
+    await this.hydrate();
+  }
+
+  async selectFolder(dir: string) {
+    await this.act("select_folder", { dir });
+    await this.hydrate();
+  }
+
+  async openPage() {
+    await this.act("open_page");
+  }
+
+  inputs(): Promise<InputView[]> {
+    return this.act<InputView[]>("inputs").then((v) => v ?? []);
+  }
+
+  loopback(): Promise<LoopbackView | undefined> {
+    return this.act<LoopbackView>("loopback_status");
+  }
+
+  keyStatus(): Promise<{ stored: boolean; env_available: boolean } | undefined> {
+    return this.act("key_status");
+  }
+
+  /** True when the key was stored; the key is not kept anywhere in the frontend. */
+  async saveKey(key: string): Promise<boolean> {
+    await this.act("save_key", { key });
+    return this.error === null;
+  }
+
+  async importKey(): Promise<boolean> {
+    await this.act("import_key_from_env");
+    return this.error === null;
+  }
+
   /** Attaches the listener and both channels, then hydrates; messages meanwhile wait (spec §9.2). */
   async init(t: Transport, opts: Options = {}): Promise<void> {
     this.t = t;
@@ -70,6 +164,8 @@ export class Session {
     const attached = t.attach((m) => this.accept("transcript", m), (m) => this.accept("notes", m));
     this.disposers.push(await listening);
     await attached;
+    const tick = setInterval(() => (this.clockNow = Date.now()), 1000);
+    this.disposers.push(() => clearInterval(tick));
     if (typeof document !== "undefined") {
       const onVisibility = () => void this.setHidden(document.hidden);
       document.addEventListener("visibilitychange", onVisibility);

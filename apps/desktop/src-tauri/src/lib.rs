@@ -35,6 +35,9 @@ pub fn run() {
             app::polish,
             app::cancel,
             app::open_page,
+            app::key_status,
+            app::save_key,
+            app::import_key_from_env,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
