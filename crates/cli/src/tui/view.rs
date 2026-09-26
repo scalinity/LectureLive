@@ -105,7 +105,7 @@ fn live_row(v: &View) -> Line<'static> {
     if let Some(s) = &v.stt {
         spans.extend([Span::raw("  "), Span::styled(stt_words(s), DIM)]);
     }
-    spans.extend([Span::raw("  "), Span::styled(format!("{} gap{}", v.gaps, if v.gaps == 1 { "" } else { "s" }), DIM)]);
+    spans.extend([Span::raw("  "), Span::styled(format!("{} gap{}", v.gaps(), if v.gaps() == 1 { "" } else { "s" }), DIM)]);
     if let Some(usd) = v.spend {
         spans.extend([Span::raw("  "), Span::styled(format!("{} today", spend::money(usd)), DIM)]);
     }
@@ -204,7 +204,9 @@ mod tests {
         v.stt = Some(SttStatus::Retrying { after: Duration::from_secs(1), reason: "socket closed".into() });
         let row = lines(&drawn(110, 24, &v, None))[1].clone();
         assert!(row.contains("reconnecting in 1 s (socket closed)"), "{row}");
-        v.gaps = 1;
+        let gap = lecturelive_core::session::sidecar::Gap::new(Default::default(), 0, None, lecturelive_core::session::sidecar::GapKind::SttOffline);
+        v.reduce(&lecturelive_core::session::lecture::Event::Session(lecturelive_core::session::coordinator::Notification::Gap(gap)), chrono::Local::now());
+        v.notice = None;
         assert!(lines(&drawn(110, 24, &v, None))[1].contains("1 gap"), "the singular count");
         v.level = None;
         v.stt = None;

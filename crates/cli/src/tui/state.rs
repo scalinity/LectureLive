@@ -10,15 +10,16 @@
 //! activity ring and the notice are display-only.
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use chrono::{DateTime, Local};
 use lecturelive_core::audio::level::{dbfs, SilenceWatch};
+use lecturelive_core::capture::window::WindowInfo;
 use lecturelive_core::capture::worker::CaptureState;
 use lecturelive_core::session::coordinator::{Notification, SttStatus};
 use lecturelive_core::session::lecture::Event;
 use lecturelive_core::session::segments::{Segment, SegmentSource};
-use lecturelive_core::session::sidecar::SlideEntry;
+use lecturelive_core::session::sidecar::{Gap, SlideEntry};
 use lecturelive_core::session::spend::Paint;
 
 use crate::plain::{self, Notice};
@@ -147,6 +148,14 @@ pub(crate) struct Effect {
     pub(crate) hydrate: bool,
 }
 
+/// A transcript gap's identity: its recording and first sample, the pair core itself resolves a gap
+/// by. Its end may arrive later and its resolution changes; neither changes which gap it is.
+type GapKey = (u128, u64);
+
+fn gap_key(g: &Gap) -> GapKey {
+    (g.recording_id.as_u128(), g.start_sample)
+}
+
 /// The session projection (plan §F). One owner: the reactor. Never shared, never locked.
 pub(crate) struct View {
     /// The lecture's identity, cleaned as it entered (plan §C 12).
@@ -168,10 +177,15 @@ pub(crate) struct View {
     pub(crate) capture: Option<CaptureState>,
 
     // Canonical, reconciled state (plan §F): durable ids, canonical files.
-    /// Transcript gaps waiting for recovery.
-    pub(crate) gaps: u64,
-    /// Closed segments: contiguous log ids. [`View::pending`] holds arrivals beyond a hole until a
-    /// hydration brings what was missed.
+    /// Transcript gaps waiting for recovery, by identity; [`View::gaps`] is their count.
+    waiting: BTreeSet<GapKey>,
+    /// Transcript gaps known to be resolved, by identity. A gap only ever moves from waiting to
+    /// resolved (core never reopens or removes one), so this set is what keeps a hydration read
+    /// before a live `Recovered` from bringing that gap back.
+    resolved: BTreeSet<GapKey>,
+    /// Closed segments: always the log's contiguous prefix, ids 0, 1, 2, … with no hole.
+    /// [`View::pending`] holds every known segment after the first missing id until the hole is
+    /// filled, by a hydration or by the missing segment itself.
     pub(crate) closed: Vec<Line>,
     pending: Vec<Line>,
     /// The utterance being said.
@@ -209,19 +223,19 @@ impl View {
             input_gone: None,
             stt: None,
             capture: None,
-            gaps: h.unresolved,
-            closed: h.segments.iter().map(segment_line).collect(),
+            waiting: BTreeSet::new(),
+            resolved: BTreeSet::new(),
+            closed: Vec::new(),
             pending: Vec::new(),
             open: None,
-            notes: match h.notes {
-                NotesSnapshot::At { revision, document } => Notes { revision, document, preview: None },
-                NotesSnapshot::Incoherent => Notes::default(),
-            },
-            slides: h.slides.iter().map(slide_line).collect(),
+            notes: Notes::default(),
+            slides: Vec::new(),
             spend: None,
             activity: Ring::default(),
             notice: None,
         };
+        // An empty projection merging its first read: one reconciliation rule for every hydration.
+        v.merge(h);
         let at = Local::now();
         for n in seed {
             v.record(n, at);
@@ -273,13 +287,10 @@ impl View {
                     }
                 }
             }
-            Notification::Gap(g) => {
-                // Only a transcript gap waits for recovery; an audio gap is explained as it is
-                // (spec §5.4), and neither kind is counted as the other.
-                if g.kind.is_transcript() && !g.resolved {
-                    self.gaps += 1;
-                }
-            }
+            // Only a transcript gap waits for recovery; an audio gap is explained as it is (spec §5.4),
+            // and neither kind is counted as the other.
+            Notification::Gap(g) if g.kind.is_transcript() => self.gap(g),
+            Notification::Gap(_) => {}
             Notification::DeviceGone { uid } => {
                 if self.identity.kind == SourceKind::Input {
                     self.input_gone = Some(plain::clean(uid));
@@ -299,9 +310,12 @@ impl View {
             Notification::Open { stable, tentative } => {
                 self.open = Some(OpenUtterance { stable: plain::clean(stable), tentative: plain::clean(tentative) });
             }
-            // One `Recovered` resolves the gap core says it resolved, one at a time; the transcript
+            // One `Recovered` resolves the gap core says it resolved, by its identity; the transcript
             // is never called whole on the strength of one telemetry event.
-            Notification::Recovered(_) => self.gaps = self.gaps.saturating_sub(1),
+            Notification::Recovered(g) => {
+                self.waiting.remove(&gap_key(g));
+                self.resolved.insert(gap_key(g));
+            }
             Notification::Recording { .. } | Notification::Failed(_) | Notification::RecoveryFailed(_) | Notification::SpendFailed(_) | Notification::SourceEnded => {}
         }
     }
@@ -310,13 +324,17 @@ impl View {
     /// next id appends, and anything beyond that asks for the files while the arrival waits for
     /// them — no text is ever guessed into a hole.
     fn segment(&mut self, s: &Segment, effect: &mut Effect) {
-        let next = self.closed.last().map_or(0, |l| l.id + 1);
+        let next = self.next_id();
         if s.id < next {
             return; // a duplicate or an old id: the log's id is the identity, and it is held
         }
         let line = segment_line(s);
         if s.id == next {
             self.append(line);
+            // the hole, if there was one, is filled: what waited after it continues the prefix
+            while self.pending.first().is_some_and(|p| p.id == self.next_id()) {
+                self.closed.push(self.pending.remove(0));
+            }
         } else {
             effect.hydrate = true; // canonical segments may have been missed
             match self.pending.iter().position(|p| p.id >= line.id) {
@@ -324,6 +342,29 @@ impl View {
                 Some(i) => self.pending.insert(i, line),
                 None => self.pending.push(line),
             }
+        }
+    }
+
+    /// The id that continues the closed prefix: closed ids are exactly 0 up to it.
+    fn next_id(&self) -> u64 {
+        self.closed.len() as u64
+    }
+
+    /// Transcript gaps waiting for recovery: the header's count.
+    pub(crate) fn gaps(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// A transcript gap seen, live or in a read: it waits unless it is resolved, and once resolved —
+    /// here or earlier — it never waits again, because core never reopens a gap. Seeing it twice
+    /// changes nothing.
+    fn gap(&mut self, g: &Gap) {
+        let key = gap_key(g);
+        if g.resolved || self.resolved.contains(&key) {
+            self.waiting.remove(&key);
+            self.resolved.insert(key);
+        } else {
+            self.waiting.insert(key);
         }
     }
 
@@ -364,18 +405,29 @@ impl View {
     }
 
     /// A hydration result (plan §F): canonical state is adopted, and a result that read earlier than
-    /// what the projection already holds loses nothing. Segments beyond the log's end stay; the
-    /// notes move only to a revision at or past the one held; slides are only added, never taken
-    /// away or rolled back.
+    /// what the projection already holds loses nothing. Segments reconcile by id; the notes move
+    /// only to a revision at or past the one held; slides are only added, never taken away or
+    /// rolled back; gaps move only forward, from waiting to resolved.
     pub(crate) fn merge(&mut self, h: Hydration) {
-        // Segments: the log as it was read, then anything the projection holds beyond its end.
-        let mut merged: Vec<Line> = h.segments.iter().map(segment_line).collect();
-        let end = merged.last().map_or(0, |l| l.id + 1);
-        let mut held: Vec<Line> = self.closed.drain(..).chain(self.pending.drain(..)).collect();
-        held.sort_by_key(|l| l.id);
-        held.dedup_by_key(|l| l.id);
-        merged.extend(held.into_iter().filter(|l| l.id >= end));
-        self.closed = merged;
+        // Segments: every id known — the log as read (canonical wins for an id both hold), the
+        // closed prefix, and what waits beyond a hole — then split again at the first missing id.
+        // A stale read that stops short of a hole cannot promote what lies past it.
+        let mut known: BTreeMap<u64, Line> = self.closed.drain(..).chain(self.pending.drain(..)).map(|l| (l.id, l)).collect();
+        known.extend(h.segments.iter().map(|s| (s.id, segment_line(s))));
+        for (id, line) in known {
+            if self.pending.is_empty() && id == self.next_id() {
+                self.closed.push(line);
+            } else {
+                self.pending.push(line);
+            }
+        }
+
+        // Gaps: each canonical transcript gap by identity. A read's resolution clears a gap whose
+        // `Recovered` was missed; a read older than a live `Recovered` cannot bring it back; a live
+        // gap the read predates is not in it, and stays.
+        for g in &h.gaps {
+            self.gap(g);
+        }
 
         // Notes: a coherent pair at or past the held revision (an equal revision is the same
         // document by its fingerprint). A stale pair keeps what is held; an incoherent one keeps it
@@ -438,13 +490,19 @@ fn stt_cleaned(s: &SttStatus) -> SttStatus {
     }
 }
 
-/// A capture state, its window titles and reasons cleaned as they enter.
+/// A capture state, its window titles and reasons cleaned as they enter. A candidate window's app
+/// and title are what a person reads, so they are cleaned; its id and bundle id are what choosing it
+/// sends back to core, so they stay exactly as core gave them.
 fn capture_cleaned(s: &CaptureState) -> CaptureState {
     match s {
         CaptureState::Unbound => CaptureState::Unbound,
         CaptureState::Watching { window } => CaptureState::Watching { window: plain::clean(window) },
         CaptureState::Paused { window, reason } => CaptureState::Paused { window: plain::clean(window), reason: plain::clean(reason) },
-        CaptureState::Asking { window, reason, candidates } => CaptureState::Asking { window: plain::clean(window), reason: plain::clean(reason), candidates: candidates.clone() },
+        CaptureState::Asking { window, reason, candidates } => CaptureState::Asking {
+            window: plain::clean(window),
+            reason: plain::clean(reason),
+            candidates: candidates.iter().map(|w| WindowInfo { app: plain::clean(&w.app), title: plain::clean(&w.title), ..w.clone() }).collect(),
+        },
         CaptureState::Denied => CaptureState::Denied,
         CaptureState::Failing { window, reason } => CaptureState::Failing { window: plain::clean(window), reason: plain::clean(reason) },
     }
@@ -488,7 +546,7 @@ mod tests {
     }
 
     fn hydration(notes: NotesSnapshot) -> Hydration {
-        Hydration { segments: Vec::new(), notes, slides: Vec::new(), unresolved: 0 }
+        Hydration { segments: Vec::new(), notes, slides: Vec::new(), gaps: Vec::new() }
     }
 
     /// Plan §J: an Open utterance appears provisionally, a newer Open replaces it, and the live
@@ -562,6 +620,8 @@ mod tests {
         for id in 0..=4u64 {
             assert!(!v.reduce(&segment(id, &format!("line {id}"), SegmentSource::Live), at()).hydrate);
         }
+        // a read taken while the log still ended at 4, which will land late
+        let stale = hydrate::read(&files).await.unwrap();
         // the log grew to 9 while the session ran; the notifications for 5 and 6 were lost, and 7's
         // arrives now
         let mut log = SegmentLog::open(dir.path(), &files.stem).unwrap();
@@ -570,7 +630,11 @@ mod tests {
         }
         drop(log);
         assert!(v.reduce(&segment(7, "line 7", SegmentSource::Live), at()).hydrate, "a hole at 5 and 6");
+        v.merge(stale);
+        assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), (0..=4).collect::<Vec<_>>(), "the stale read closed nothing past the hole");
+        assert_eq!(v.pending.iter().map(|l| l.id).collect::<Vec<_>>(), vec![7]);
         v.merge(hydrate::read(&files).await.unwrap());
+        assert!(v.pending.is_empty(), "the fresh read filled the hole and released 7");
         assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), (0..=9).collect::<Vec<_>>(), "contiguous, from the log");
         assert_eq!(v.closed.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), (0..=9).map(|id| format!("line {id}")).collect::<Vec<_>>(), "once each");
         // the stream continues from there with no further read
@@ -595,7 +659,7 @@ mod tests {
             segments: (0..=10).map(|id| seg(id, &format!("line {id}"), SegmentSource::Live)).collect(),
             notes: NotesSnapshot::At { revision: 1, document: "only the first block\n".into() },
             slides: vec![SlideEntry { index: 2, file: "slides/slide_02_100000.png".into(), shown_at: at(), auto: false, uncertain: false }],
-            unresolved: 0,
+            gaps: Vec::new(),
         };
         v.merge(stale);
         assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), (0..=12).collect::<Vec<_>>(), "segments 11 and 12 survive the read that stopped at 10");
@@ -611,12 +675,12 @@ mod tests {
         let mut v = view();
         v.reduce(&segment(0, "one", SegmentSource::Live), at());
         v.reduce(&committed(1), at());
-        let before = (v.phase, v.closed.len(), v.gaps, v.notes.revision, v.slides.len(), v.spend);
+        let before = (v.phase, v.closed.len(), v.gaps(), v.notes.revision, v.slides.len(), v.spend);
         v.reduce(&Event::Session(Notification::Stt(SttStatus::Retrying { after: std::time::Duration::from_secs(4), reason: "socket closed".into() })), at());
         assert!(matches!(v.stt, Some(SttStatus::Retrying { .. })));
         v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
         assert_eq!(v.stt, Some(SttStatus::Connected));
-        assert_eq!((v.phase, v.closed.len(), v.gaps, v.notes.revision, v.slides.len(), v.spend), before, "recording state untouched");
+        assert_eq!((v.phase, v.closed.len(), v.gaps(), v.notes.revision, v.slides.len(), v.spend), before, "recording state untouched");
     }
 
     /// Plan §J: a refusal stays a refusal — semantically, not as a string — until a real later event
@@ -640,11 +704,11 @@ mod tests {
         v.reduce(&segment(0, "one", SegmentSource::Live), at());
         v.reduce(&committed(1), at());
         v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
-        let before = (v.closed.clone(), v.gaps, v.slides.clone(), v.notes.revision, v.notes.document.clone(), v.stt.clone(), v.phase);
+        let before = (v.closed.clone(), v.gaps(), v.slides.clone(), v.notes.revision, v.notes.document.clone(), v.stt.clone(), v.phase);
         assert!(!v.reduce(&Event::Session(Notification::Level(0.5)), at()).hydrate);
         assert!(!v.reduce(&Event::Session(Notification::Level(0.000_1)), at()).hydrate, "whatever arrived in between was missed");
         assert_eq!(v.level, Some(0.000_1), "the meter shows the latest sample");
-        assert_eq!((v.closed.clone(), v.gaps, v.slides.clone(), v.notes.revision, v.notes.document.clone(), v.stt.clone(), v.phase), before);
+        assert_eq!((v.closed.clone(), v.gaps(), v.slides.clone(), v.notes.revision, v.notes.document.clone(), v.stt.clone(), v.phase), before);
     }
 
     /// Plan §J: held revision N, a commit at N + 2 asks for the files; the re-read's document lands.
@@ -695,13 +759,132 @@ mod tests {
     fn gap_and_recovered_move_the_waiting_count() {
         let mut v = view();
         v.reduce(&Event::Session(Notification::Gap(audio_gap())), at());
-        assert_eq!(v.gaps, 0, "an audio gap is explained as it is");
+        assert_eq!(v.gaps(), 0, "an audio gap is explained as it is");
         v.reduce(&Event::Session(Notification::Gap(transcript_gap())), at());
-        assert_eq!(v.gaps, 1);
+        assert_eq!(v.gaps(), 1);
         v.reduce(&Event::Session(Notification::Recovered(resolved(transcript_gap()))), at());
-        assert_eq!(v.gaps, 0);
+        assert_eq!(v.gaps(), 0);
         v.reduce(&Event::Session(Notification::Recovered(resolved(transcript_gap()))), at());
-        assert_eq!(v.gaps, 0, "saturating: no recovery counts twice");
+        assert_eq!(v.gaps(), 0, "a duplicate recovery cannot underflow");
+        v.reduce(&Event::Session(Notification::Gap(transcript_gap())), at());
+        assert_eq!(v.gaps(), 0, "a resolved gap seen again does not wait again");
+        // two gaps wait; recovering one leaves exactly the other, by identity, not by count
+        let (a, b) = (gap_at(1, 0), gap_at(1, 16_000));
+        v.reduce(&Event::Session(Notification::Gap(a.clone())), at());
+        v.reduce(&Event::Session(Notification::Gap(b.clone())), at());
+        v.reduce(&Event::Session(Notification::Gap(a.clone())), at());
+        assert_eq!(v.gaps(), 2, "the same gap twice is one gap");
+        v.reduce(&Event::Session(Notification::Recovered(resolved(b))), at());
+        assert_eq!(v.waiting.iter().copied().collect::<Vec<_>>(), vec![gap_key(&a)]);
+    }
+
+    /// The sidecar says a gap was recovered, but its `Recovered` never reached the view: the next
+    /// read clears it. Canonical state wins over a count kept from events alone.
+    #[test]
+    fn hydration_clears_a_gap_when_recovered_notification_was_missed() {
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Gap(gap_at(1, 0))), at());
+        v.reduce(&Event::Session(Notification::Gap(gap_at(1, 16_000))), at());
+        assert_eq!(v.gaps(), 2);
+        // the read: the first gap resolved (its notification lost), the second still waiting, and
+        // a third the view never heard of, waiting too
+        v.merge(Hydration { gaps: vec![resolved(gap_at(1, 0)), gap_at(1, 16_000), gap_at(2, 0)], ..Hydration::empty() });
+        assert_eq!(v.gaps(), 2, "the missed recovery cleared; the unheard gap waits");
+        assert!(!v.waiting.contains(&gap_key(&gap_at(1, 0))));
+        assert!(v.waiting.contains(&gap_key(&gap_at(2, 0))));
+        // a gap the read predates (it arrived live after the read) is not in the read, and stays
+        v.reduce(&Event::Session(Notification::Gap(gap_at(3, 0))), at());
+        v.merge(Hydration { gaps: vec![resolved(gap_at(1, 0)), gap_at(1, 16_000), gap_at(2, 0)], ..Hydration::empty() });
+        assert_eq!(v.gaps(), 3);
+        // and a first read that finds gaps opens the view with them
+        let opened = View::new(identity(SourceKind::Loopback), Hydration { gaps: vec![gap_at(1, 0), resolved(gap_at(1, 16_000))], ..Hydration::empty() }, Vec::new());
+        assert_eq!(opened.gaps(), 1);
+    }
+
+    /// A read taken before a live `Recovered` still shows that gap waiting. It must not bring it
+    /// back: a gap only moves forward, from waiting to resolved.
+    #[test]
+    fn stale_hydration_does_not_resurrect_a_live_resolved_gap() {
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Gap(gap_at(1, 0))), at());
+        let stale = || Hydration { gaps: vec![gap_at(1, 0)], ..Hydration::empty() };
+        v.reduce(&Event::Session(Notification::Recovered(resolved(gap_at(1, 0)))), at());
+        assert_eq!(v.gaps(), 0);
+        v.merge(stale());
+        assert_eq!(v.gaps(), 0, "the older read did not roll the recovery back");
+        // the same holds for a recovery heard of before its gap ever was
+        let mut w = view();
+        w.reduce(&Event::Session(Notification::Recovered(resolved(gap_at(1, 0)))), at());
+        w.merge(stale());
+        w.reduce(&Event::Session(Notification::Gap(gap_at(1, 0))), at());
+        assert_eq!(w.gaps(), 0);
+    }
+
+    /// The closed transcript is always the log's contiguous prefix: a read that stops short of a
+    /// hole cannot move what lies beyond it into the closed prefix, and the missing segment, once
+    /// it comes, releases what waited behind it.
+    #[test]
+    fn stale_hydration_does_not_promote_a_segment_past_a_hole() {
+        let ids = |l: &[Line]| l.iter().map(|l| l.id).collect::<Vec<_>>();
+        let mut v = view();
+        v.reduce(&segment(0, "zero", SegmentSource::Live), at());
+        v.reduce(&segment(1, "one", SegmentSource::Live), at());
+        assert!(v.reduce(&segment(3, "three", SegmentSource::Live), at()).hydrate);
+        assert_eq!((ids(&v.closed), ids(&v.pending)), (vec![0, 1], vec![3]));
+        // a read taken before segment 2 reached the log
+        v.merge(Hydration { segments: vec![seg(0, "zero", SegmentSource::Live), seg(1, "one", SegmentSource::Live)], ..Hydration::empty() });
+        assert_eq!((ids(&v.closed), ids(&v.pending)), (vec![0, 1], vec![3]), "3 still waits behind the hole");
+        // segment 2 is not taken for an old one: it fills the hole and releases 3
+        assert!(!v.reduce(&segment(2, "two", SegmentSource::Live), at()).hydrate);
+        assert_eq!((ids(&v.closed), ids(&v.pending)), (vec![0, 1, 2, 3], vec![]));
+        assert_eq!(v.closed.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["zero", "one", "two", "three"]);
+    }
+
+    /// The merge rule's cases: a read that covers the hole closes everything after it; live
+    /// segments held beyond a read continue its prefix when they are contiguous with it; a read
+    /// that reaches past a still-open hole leaves what is past the hole waiting.
+    #[test]
+    fn hydration_partitions_segments_at_the_first_missing_id() {
+        let ids = |l: &[Line]| l.iter().map(|l| l.id).collect::<Vec<_>>();
+        let log = |r: std::ops::RangeInclusive<u64>| Hydration { segments: r.map(|id| seg(id, &format!("line {id}"), SegmentSource::Live)).collect(), ..Hydration::empty() };
+        // the read covers the hole
+        let mut v = view();
+        for id in [0, 1, 3] {
+            v.reduce(&segment(id, &format!("line {id}"), SegmentSource::Live), at());
+        }
+        v.merge(log(0..=2));
+        assert_eq!((ids(&v.closed), ids(&v.pending)), (vec![0, 1, 2, 3], vec![]));
+        // live-held 2 and 3 continue a read of 0 and 1
+        let mut v = view();
+        for id in 0..=3 {
+            v.reduce(&segment(id, &format!("line {id}"), SegmentSource::Live), at());
+        }
+        v.merge(log(0..=1));
+        assert_eq!((ids(&v.closed), ids(&v.pending)), (vec![0, 1, 2, 3], vec![]));
+        // a first read that is empty while live segments wait past a hole at 0
+        let mut v = view();
+        v.reduce(&segment(2, "line 2", SegmentSource::Live), at());
+        v.merge(log(0..=0));
+        assert_eq!((ids(&v.closed), ids(&v.pending)), (vec![0], vec![2]), "1 is still missing");
+        // canonical text wins for an id both hold
+        v.merge(Hydration { segments: vec![seg(0, "the log's words", SegmentSource::Live)], ..Hydration::empty() });
+        assert_eq!(v.closed[0].text, "the log's words");
+    }
+
+    /// Capture candidates are shown to the person by app and title: those are cleaned; the window
+    /// id and bundle id are what choosing a window sends back to core, and stay exactly as given.
+    #[test]
+    fn capture_candidates_are_cleaned_but_keep_their_identity() {
+        let hostile = WindowInfo { id: 4242, app: "zoom.us\x1b]0;owned\x07".into(), bundle_id: Some("us.zoom.xos".into()), title: "\x1b[2JZoom Meeting\x1b]52;c;cGF5\x07".into(), width: 1280, height: 800, on_screen: true };
+        let mut v = view();
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom\x1b[31m".into(), reason: "moved\r\x1b[2K".into(), candidates: vec![hostile.clone()] }), at());
+        let Some(CaptureState::Asking { window, reason, candidates }) = &v.capture else { panic!("{:?}", v.capture) };
+        assert_eq!((window.as_str(), reason.as_str()), ("Zoom", "moved\n"));
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        assert_eq!((c.app.as_str(), c.title.as_str()), ("zoom.us", "Zoom Meeting"));
+        assert_eq!((c.id, c.bundle_id.as_deref(), c.width, c.height, c.on_screen), (4242, Some("us.zoom.xos"), 1280, 800, true), "identity untouched");
+        assert_eq!(hostile.title, "\x1b[2JZoom Meeting\x1b]52;c;cGF5\x07", "the event's own data is not mutated");
     }
 
     /// Plan §J: a single input's gone mark is held until it returns.
@@ -804,6 +987,14 @@ mod tests {
     /// A transcript gap, waiting for recovery, and an audio gap, explained as it is (spec §5.4).
     fn transcript_gap() -> Gap {
         Gap::new(Default::default(), 32_000, Some(48_000), GapKind::SttOffline)
+    }
+
+    /// A transcript gap waiting, in recording `rec`, from `start`. The recording id is parsed into
+    /// the field's own type, which the CLI does not otherwise name.
+    fn gap_at(rec: u128, start: u64) -> Gap {
+        let mut g = Gap::new(Default::default(), start, Some(start + 8_000), GapKind::SttOffline);
+        g.recording_id = format!("00000000-0000-0000-0000-{rec:012x}").parse().unwrap();
+        g
     }
 
     fn audio_gap() -> Gap {

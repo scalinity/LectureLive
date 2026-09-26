@@ -380,10 +380,10 @@ mod tests {
         assert_eq!(ui.view.phase, Stage::Listening);
         assert_eq!(ui.stop(Origin::Key, t0), Step::Advance { stage: Stage::Stopping, stops_to_send: 1 });
         assert_eq!(ui.view.phase, Stage::Stopping);
-        let held = (ui.view.closed.clone(), ui.view.gaps, ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone());
+        let held = (ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone());
         assert_eq!(ui.stop(Origin::Key, t0 + ms(2500)), Step::Advance { stage: Stage::StopWaiting, stops_to_send: 1 });
         assert_eq!(ui.view.phase, Stage::StopWaiting, "the projection reflects the stage and nothing more");
-        assert_eq!((ui.view.closed.clone(), ui.view.gaps, ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone()), held);
+        assert_eq!((ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone()), held);
         assert_eq!(ui.stop(Origin::Key, t0 + ms(5000)), Step::Quit);
     }
 

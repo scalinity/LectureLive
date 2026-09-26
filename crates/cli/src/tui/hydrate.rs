@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::notesfile::sha256_hex;
 use lecturelive_core::session::segments::{self, Segment};
-use lecturelive_core::session::sidecar::{Sidecar, SlideEntry};
+use lecturelive_core::session::sidecar::{Gap, Sidecar, SlideEntry};
 
 /// The initial attempt and two retries, 50 ms apart (plan §B 31, the desktop's `read_document` rule):
 /// long enough for a commit to finish writing between the two reads, never a blocking wait.
@@ -38,8 +38,10 @@ pub(crate) struct Hydration {
     pub(crate) notes: NotesSnapshot,
     /// The registered slides, in registration order.
     pub(crate) slides: Vec<SlideEntry>,
-    /// Transcript gaps waiting for recovery, as the sidecar counts them.
-    pub(crate) unresolved: u64,
+    /// The sidecar's transcript gaps, resolved or not: the projection reconciles its waiting set by
+    /// each gap's identity, so a recovery whose notification was missed still clears (plan §F).
+    /// Audio gaps are not here: nothing recovers them.
+    pub(crate) gaps: Vec<Gap>,
 }
 
 impl Hydration {
@@ -52,7 +54,7 @@ impl Hydration {
     /// No canonical state at all: a folder before anything was recorded.
     #[cfg(test)]
     pub(crate) fn empty() -> Hydration {
-        Hydration { segments: Vec::new(), notes: NotesSnapshot::At { revision: 0, document: String::new() }, slides: Vec::new(), unresolved: 0 }
+        Hydration { segments: Vec::new(), notes: NotesSnapshot::At { revision: 0, document: String::new() }, slides: Vec::new(), gaps: Vec::new() }
     }
 }
 
@@ -79,8 +81,14 @@ fn read_once(files: &LectureFiles) -> Result<Hydration> {
     let sc = Sidecar::load(&files.sidecar())?;
     let segments = segments::read(&files.segments())?;
     let notes = match &sc {
-        // No sidecar is no state: whatever the notes hold is revision 0's document, shown as it is.
-        None => NotesSnapshot::At { revision: 0, document: std::fs::read_to_string(&files.notes).unwrap_or_default() },
+        // No sidecar is no state: whatever the notes hold is revision 0's document, shown as it is. A
+        // missing notes file is an empty document; one that exists but cannot be read is an error,
+        // never an empty document.
+        None => match std::fs::read(&files.notes) {
+            Ok(bytes) => NotesSnapshot::At { revision: 0, document: String::from_utf8_lossy(&bytes).into_owned() },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => NotesSnapshot::At { revision: 0, document: String::new() },
+            Err(e) => return Err(e).with_context(|| format!("read {}", files.notes.display())),
+        },
         Some(sc) => match std::fs::read(&files.notes) {
             Ok(bytes) if bytes.len() as u64 == sc.notes.len && sha256_hex(&bytes) == sc.notes.sha256 => {
                 NotesSnapshot::At { revision: sc.notes.revision, document: String::from_utf8_lossy(&bytes).into_owned() }
@@ -90,9 +98,9 @@ fn read_once(files: &LectureFiles) -> Result<Hydration> {
             Err(e) => return Err(e).with_context(|| format!("read {}", files.notes.display())),
         },
     };
-    let unresolved = sc.as_ref().map_or(0, |s| s.gaps.iter().filter(|g| g.kind.is_transcript() && !g.resolved).count() as u64);
+    let gaps = sc.as_ref().map_or_else(Vec::new, |s| s.gaps.iter().filter(|g| g.kind.is_transcript()).cloned().collect());
     let slides = sc.map_or_else(Vec::new, |mut s| std::mem::take(&mut s.slides));
-    Ok(Hydration { segments, notes, slides, unresolved })
+    Ok(Hydration { segments, notes, slides, gaps })
 }
 
 #[cfg(test)]
@@ -148,7 +156,7 @@ mod tests {
 
         let h = read(&files).await.unwrap().coherent().expect("the folder is coherent");
         assert_eq!(h.segments.iter().map(|s| (s.id, s.text.as_str())).collect::<Vec<_>>(), vec![(0, "line 0"), (1, "line 1"), (2, "line 2")], "the log is the transcript");
-        assert_eq!(h.unresolved, 1, "only the unresolved transcript gap waits");
+        assert_eq!(h.gaps.iter().map(|g| (g.start_sample, g.resolved)).collect::<Vec<_>>(), vec![(0, false), (64_000, true)], "the transcript gaps, waiting and resolved; the audio gap is not one");
         assert_eq!(h.slides.iter().map(|s| (s.index, s.file.as_str(), s.auto)).collect::<Vec<_>>(), vec![(1, "slides/slide_01_100512.png", true)], "the registered slides");
         match h.notes {
             NotesSnapshot::At { revision, document } => {
@@ -164,7 +172,7 @@ mod tests {
     async fn a_folder_with_no_state_hydrates_empty() {
         let (_dir, files) = folder();
         let h = read(&files).await.unwrap().coherent().unwrap();
-        assert!(h.segments.is_empty() && h.slides.is_empty() && h.unresolved == 0);
+        assert!(h.segments.is_empty() && h.slides.is_empty() && h.gaps.is_empty());
         assert!(matches!(h.notes, NotesSnapshot::At { revision: 0, ref document } if document.is_empty()));
     }
 
@@ -216,5 +224,29 @@ mod tests {
         sc.notes.sha256 = sha256_hex(b"# T\n");
         sc.save(&files.sidecar()).unwrap();
         assert!(matches!(read(&files).await.unwrap().notes, NotesSnapshot::Incoherent));
+    }
+
+    /// Canonical files that exist but cannot be read are an error, never an empty lecture: notes
+    /// without a sidecar that cannot be read, a corrupt sidecar, a corrupt segment log. Notes that
+    /// simply are not there yet are an empty document.
+    #[tokio::test]
+    async fn an_unreadable_canonical_file_is_an_error_not_empty_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, files) = folder();
+        std::fs::write(&files.notes, "# private\n").unwrap();
+        std::fs::set_permissions(&files.notes, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read(&files.notes).is_err(); // a superuser reads it anyway
+        let r = read(&files).await;
+        std::fs::set_permissions(&files.notes, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if unreadable {
+            assert!(r.is_err(), "an unreadable notes file is not an empty document");
+        }
+        std::fs::remove_file(&files.notes).unwrap();
+        assert!(matches!(read(&files).await.unwrap().notes, NotesSnapshot::At { revision: 0, ref document } if document.is_empty()), "absent notes are an empty document");
+        std::fs::write(files.sidecar(), "{ not json").unwrap();
+        assert!(read(&files).await.is_err(), "a corrupt sidecar is an error");
+        std::fs::remove_file(files.sidecar()).unwrap();
+        std::fs::write(files.segments(), "not json\n").unwrap();
+        assert!(read(&files).await.is_err(), "a corrupt segment log is an error");
     }
 }

@@ -64,13 +64,77 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
-/// Strips what could act on a terminal from text about to be shown (M7 plan §C 12): every C0 and C1
-/// control character — ESC, so every CSI and OSC sequence's introducer, BEL, the carriage return
-/// that rewrites a line — keeping `\n` and tab, which mean something in notes and transcript text.
-/// An escape's payload without its introducer is inert text; Unicode, punctuation, useful spaces and
-/// Markdown are untouched. Display cleaning only: canonical files are never altered.
+/// Strips what could act on a terminal from text about to be shown (M7 plan §C 12), whole sequences
+/// at a time, so no escape's payload is left behind as fake lecture text:
+/// - CSI (`ESC [` or C1 `U+009B`): its parameter and intermediate characters and its final one;
+/// - OSC, DCS, SOS, PM and APC (`ESC ] P X ^ _` or their C1 forms): everything up to BEL or ST, so a
+///   title, a clipboard write or a hyperlink's target goes, and a hyperlink's visible text stays;
+/// - any other escape: `ESC`, its intermediates and its final character;
+/// - every remaining C0 and C1 control and DEL.
+///
+/// A carriage return would rewrite the line it ends, so CR LF and a lone CR each become one `\n`.
+/// `\n` and tab stay, as do Unicode, punctuation, spaces and Markdown. A sequence broken by a
+/// character that cannot belong to it ends there, and that character is kept as text. Display
+/// cleaning only: canonical files are never altered.
 pub(crate) fn clean(text: &str) -> String {
-    text.chars().filter(|&c| c == '\n' || c == '\t' || !c.is_control()).collect()
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push('\n');
+            }
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    skip_csi(&mut chars);
+                }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    skip_string(&mut chars);
+                }
+                Some(' '..='/') => {
+                    while chars.next_if(|c| matches!(c, ' '..='/')).is_some() {}
+                    chars.next_if(|c| matches!(c, '0'..='~'));
+                }
+                Some('0'..='~') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A control sequence's body after its introducer: parameter and intermediate characters
+/// (`0x20..=0x3F`), then one final character (`0x40..=0x7E`).
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while chars.next_if(|c| matches!(c, ' '..='?')).is_some() {}
+    chars.next_if(|c| matches!(c, '@'..='~'));
+}
+
+/// A control string's body after its introducer, up to its terminator: BEL or C1 ST are consumed; an
+/// ESC is left for [`clean`], which takes `ESC \` as the ST it is (or starts the next sequence).
+fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while let Some(&c) = chars.peek() {
+        match c {
+            '\x07' | '\u{9c}' => {
+                chars.next();
+                return;
+            }
+            '\x1b' => return,
+            _ => {
+                chars.next();
+            }
+        }
+    }
 }
 
 /// The input-gone notice (plan §H's notice line, top priority): the fixed sentence. The plain CLI
@@ -747,29 +811,40 @@ mod goldens {
     /// C0/C1 control), so each sequence's payload is left as the inert text it then is.
     #[test]
     fn display_text_cannot_emit_terminal_controls() {
-        let hostile = [
-            "\x1b[31mred\x1b[0m",            // a CSI colour
-            "\x1b[2J\x1b[H",                 // clear screen, cursor home
-            "\x1b]0;popup title\x07",        // an OSC title
-            "\x1b]52;c,QmFzZTY0\x07",        // an OSC clipboard write
-            "\x1b]8;;http://x.example\x1b\\click\x1b]8;;\x1b\\", // a hyperlink
-            "fine\x07audio",                 // BEL
-            "was written\rwas rewritten",    // a carriage return that rewrites the line
-            "a\x00b\x1fc\x7fd",              // other C0 controls and DEL
-            "line\u{9b}31mfeed\u{85}next",       // C1 CSI and NEL as single characters
+        // Whole sequences go, payload and all; what a person would read stays.
+        let cases = [
+            ("\x1b[31mred\x1b[0m", "red"),                                   // a CSI colour
+            ("\x1b[1;38;2;255;0;0mbold red", "bold red"),                    // a truecolour CSI
+            ("before\x1b[2J\x1b[Hafter", "beforeafter"),                     // clear screen, cursor home
+            ("\x1b]0;popup title\x07said", "said"),                          // an OSC title, BEL-terminated
+            ("\x1b]2;window title\x1b\\said", "said"),                       // an OSC title, ST-terminated
+            ("\x1b]52;c;QmFzZTY0\x07copied?", "copied?"),                    // an OSC 52 clipboard write
+            ("\x1b]8;;http://x.example\x1b\\click\x1b]8;;\x1b\\", "click"), // an OSC 8 hyperlink: its text stays
+            ("\x1bPq#0;2;0;0;0\x1b\\sixel", "sixel"),                        // a DCS string
+            ("\x1bXsos\x1b\\\x1b^pm\x1b\\\x1b_apc\x1b\\end", "end"),         // SOS, PM, APC
+            ("line\u{9b}31mfeed\u{85}next", "linefeednext"),                 // C1 CSI and NEL as characters
+            ("\u{9d}0;c1 title\u{9c}text", "text"),                          // a C1 OSC ended by C1 ST
+            ("fine\x07audio", "fineaudio"),                                  // BEL
+            ("was written\rwas rewritten", "was written\nwas rewritten"),    // CR cannot rewrite the line
+            ("windows\r\nline", "windows\nline"),                            // CR LF is one line break
+            ("a\x00b\x1fc\x7fd\x1b", "abcd"),                                // C0, DEL, a trailing ESC
+            ("\x1b(Bcharset \x1b7saved\x1b8", "charset saved"),              // nF and Fp escapes
+            ("\x1b[émoji", "émoji"),                                         // a broken CSI keeps the text
+            ("unterminated \x1b]0;title", "unterminated "),                  // an OSC that never ends
         ];
-        for text in hostile {
+        for (text, want) in cases {
             let safe = clean(text);
-            assert!(!safe.contains('\x1b') && !safe.contains('\r') && !safe.contains('\x07'), "{text:?} left controls: {safe:?}");
+            assert_eq!(safe, want, "{text:?}");
             assert!(safe.chars().all(|c| c == '\n' || c == '\t' || !c.is_control()), "{text:?} left a control: {safe:?}");
-            assert!(!safe.is_empty(), "{text:?} still has its human text: {safe:?}");
         }
-        assert_eq!(clean("\x1b[31m"), "[31m", "the payload without its introducer is inert text");
-        assert_eq!(clean("\x1b]0;title\x07"), "]0;title");
         // what people and models actually write survives, Markdown and all
-        assert_eq!(clean("Voilà — naïve… 🎓 ελληνικά"), "Voilà — naïve… 🎓 ελληνικά");
-        assert_eq!(clean("## Heading\n\n- bullet **bold** `code`\n![Slide 3](slides/slide_3.png)\n"), "## Heading\n\n- bullet **bold** `code`\n![Slide 3](slides/slide_3.png)\n");
-        assert_eq!(clean("col1\tcol2\n"), "col1\tcol2\n");
+        for kept in [
+            "Voilà — naïve… 🎓 ελληνικά 数学 👩🏽‍🔬",
+            "## Heading\n\n- bullet **bold** `code` [link](https://example.org)\n![Slide 3](slides/slide_3.png)\n",
+            "col1\tcol2\n  indented [x] ~tilde~ ^caret^ _under_ \\back\n",
+        ] {
+            assert_eq!(clean(kept), kept);
+        }
     }
 
     /// The shared wording, unstyled: what the TUI's activity and notice line hold, and what `show`
