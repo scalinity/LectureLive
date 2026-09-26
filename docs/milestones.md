@@ -21,7 +21,7 @@ kickoff prompt carries this rule.
 | M3 | Notes/session parity | done | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | [m3-notes-session-parity](superpowers/plans/2026-09-25-m3-notes-session-parity.md) |
 | M4 | Desktop app: transcript + notes panes | done | M3 | No | [m4-desktop-panes](superpowers/plans/2026-09-25-m4-desktop-panes.md) |
 | M5 | Slide automation | done | M4 | No | [m5-slide-automation](superpowers/plans/2026-09-25-m5-slide-automation.md) |
-| M6 | Full-lecture acceptance; mixed mode; Python retired | not started | M5 | Removes `live_notes.py` | written at M6 start |
+| M6 | Full-lecture acceptance; mixed mode; Python retired | in progress: the two-hour lecture waits for a real class | M5 | Removes `live_notes.py` | [m6-full-lecture](superpowers/plans/2026-09-26-m6-full-lecture.md) |
 
 The Python CLI (`live_notes.py`) stays the in-class tool until M6 passes.
 
@@ -827,5 +827,120 @@ Tasks:
 3. Two-hour real lecture with forced restart, receiver removal, permission denial, disk-full and network loss
 4. Remove `live_notes.py` and `pyproject.toml` (`notes_template.html` stays; core embeds it); README switches to the app and Rust CLI
 
-**Gate:** zero unexplained missing or duplicate audio intervals over the two-hour run;
-every §10 row observed; mixed mode passes the drift test or ships disabled.
+**Gate** (checked in `cargo test` against fakes and simulated clocks, live on synthetic lectures this Mac plays to itself, and in a real two-hour lecture run from `docs/VERIFICATION.html`; plan Tasks 2, 3, 10, 11 and 13):
+
+- [ ] Zero unexplained missing or duplicate audio intervals over the two-hour run. **Not run:** the real lecture waits for a class ("Your two-hour lecture with LectureLive" on `docs/VERIFICATION.html`). Its instrument, `lecturelive lecture audit`, is built, and every synthetic lecture below audits at 0 unexplained, 0 waiting.
+- [ ] Every §10 row observed. **Held in tests and synthetic lectures** (the table below); **its live half, in the real lecture, not run** (V10–V14; V15 and V16 at the desk).
+- [x] Mixed mode passes the drift test or ships disabled. It passes, and ships enabled.
+
+**Findings** (acceptance run 2026-09-26; reports in `$HOME/Library/Application Support/LectureLive/m6-checks/`, synthetic lectures in `m6-faults/`, `m6-disk/`, `m6-app/` to `m6-app5/`, `m6-app-key/` and `m6-v09/` beside it, outside the repository):
+
+*Suites.* `cargo test -p lecturelive-core --no-fail-fast`: 319 passed, 0 failed, 20 ignored (M5's 277 plus the mixer, mixed source, fallback, audit, network address, disk and ledger tests; the ignored ones add the live mixed run). `cargo test -p desktop`: 23 passed, 0 failed, 1 ignored (the Keychain round trip). `cargo test -p lecturelive-cli`: 1 passed. `npx vitest run`: 32 passed in 6 files. `npx svelte-check`: 0 errors, 0 warnings. Under load, never alone: `stt_gate`'s refusal, 15 s and 45 s disconnect tests failed twice while the two-hour live mixed run and a full suite ran together (an extra recorder-overflow gap, shifted gap starts); alone they passed 8/8 three times each, and M5 recorded the same three once under load. The final run above had nothing beside it.
+
+*New crates and packages:* none. `rubato 5.0.0` (already a dependency) gains its asynchronous resampler, and `lecturelive-core`, `rubato`, `realfft 3.5.0` and `rustfft 6.4.1` are optimised in the dev profile: `rubato`'s generic resamplers compile inside core, and the two-hour simulation took 330 s unoptimised, 60 s at opt-level 1 and 11 s at 3.
+
+*Mixed mode as built* (spec §4.2 now states it):
+- The host clock is the timeline, and both sources are steered to it; a device's clock would need a handoff when that device goes, which is §10's "surviving source continues". Each source is resampled to 16 kHz at its nominal rate, then passes a drift stage (`rubato`'s asynchronous septic polynomial, ratio within 0.2% of 1) into a FIFO; the mixer takes exactly what the host clock says is due, 200 ms behind it.
+- A source joins with silence in front of it, so its oldest waiting sample lands at its capture time. Its FIFO's level over the first 4 s becomes the target, and a proportional-integral controller steers the ratio to it. More than 100 ms from the target is not drift: a source that ran dry is realigned behind silence, a backlog is dropped to the target, and both are gaps for that source.
+- The meter and the silence warning follow the loopback. The recording lasts while either source is there; a source that goes leaves a `device_gone` gap, written open at once and closed when it returns (`SourceEvent::GapEnd`).
+- The CLI takes `--mixed <input>` on `record` and `lecture`; the app offers "Zoom and <input> together" in its "Listen to" choice, with a hint to wear headphones.
+
+*The drift test's numbers:*
+
+| Run | Worst offset after settling | Underruns, gaps |
+|---|---|---|
+| Simulated, 2 h, 48 kHz at +100 ppm (`mix::tests::two_sources_on_drifting_clocks_stay_aligned_for_two_hours`) | 22 samples (1.4 ms); first click +1 sample | 0, 0 |
+| Simulated, 2 h, 44.1 kHz at −100 ppm (same test) | 35 samples (2.2 ms); first click −10 | 0, 0 |
+| Simulated, 30 min, ±500 ppm (`mix::tests::five_hundred_ppm_either_way_is_held_within_20_ms`) | 136 and 103 samples (8.5 and 6.4 ms) | 0, 0 |
+| The same unsteered, for comparison | the fast source 0.90 s late; the slow one ran dry | — |
+| Live, 60 s, BlackHole and the built-in microphone | relative 17.5 samples (1.09 ms) | 0, 0 |
+| Live, 2 h, the same (`mixed::tests::blackhole_and_the_built_in_microphone_stay_aligned`, `m6-checks/mix-live-7200.txt`) | relative 39.0 samples (2.43 ms); each lane within 21.5 and 18.7 samples of its target | 0, 0 |
+
+- In the two-hour live run the corrections ranged −65 to +55 ppm around means of −0.5 and −3.9 ppm: the steering answers callback timing, not drift. A probe before the plan measured BlackHole at −0.0 ppm and the built-in microphone at +1.9 ppm against the host clock, so the live run tests two hours of real callbacks and scheduling, and the simulation tests drift. The DJI receiver, a truly independent clock, is first measured in the real lecture.
+- **Mixed mode ships enabled** (`MIXED_MODE = true`): both simulated tests pass, and the live run had no gap, no underrun, and 2.43 ms against the 10 ms allowed. The live run's binary predates the review's fix pass; that pass changed only a source rejoining while it still drains and a source still dry at the recording's end, neither of which occurs in a clean run.
+
+*Spec §10, row by row.* Evidence is a test against fakes, a synthetic lecture run here, or the real lecture's check id on `docs/VERIFICATION.html`. Network loss comes from a local forwarder (`crates/core/examples/netcut.rs`, `LECTURELIVE_API_ADDR`) that LectureLive alone goes through, so Zoom and the Python CLI keep the network; the disk fills on a 40 MB HFS+ image; a crash is `kill -9`.
+
+| Row | Tests | Synthetic lectures | Real lecture |
+|---|---|---|---|
+| Network down / websocket error | `stt_gate::a_{3,15,45}_s_disconnect_commits_every_interval_once` | CLI, `m6-faults`: link dropped 60 s ("no message from the server for 5s; reconnecting in 1 s", backoff 2/4/8/16 s), gap 174.4–250.9 s recovered; connections refused 30 s, gap 354.3–386.3 s recovered. App, `m6-app` and `m6-app5`: the strip said "reconnecting", the gap recovered 2.5 s after the link returned | V10 |
+| STT 4xx | `stt_gate::a_refusal_stops_stt_without_a_reconnect_loop_while_recording_continues` | App, `m6-app-key`: "refused: 400 Bad Request: Incorrect API key provided…" at once, no reconnect loop, the recording kept, the gap left for the next session | — |
+| Notes call fails, truncates or is cancelled | `lecture_gate::failed_empty_and_truncated_answers_leave_the_notes_untouched_and_the_batch_pending`, `lecture_gate::a_cancelled_snapshot_writes_nothing_drops_the_queue_and_its_material_goes_again`, `lecture_gate::a_last_snapshot_that_fails_is_in_the_stop_report` | `m6-app`: one last snapshot did not commit; its 72 lines stayed pending, and the next session in the folder took them all | — |
+| Study page part fails after its retry | `notes_page::a_page_that_fails_after_its_retry_writes_nothing` | — | — |
+| Crash mid-commit | `notesfile::tests::a_crash_at_every_commit_step_recovers_to_the_block_exactly_once` | `m6-faults`: `kill -9` while a 977-word snapshot streamed: nothing written, 55 lines pending, "resumed with 55 lines" | V14 |
+| Microphone or Screen Recording denied | session store "the microphone's state is read for the fix-it"; the fix-it and the Screen Recording strip checked at 1168 px on the fixture | — | V12 (Screen Recording); V16 at the desk (microphone) |
+| BlackHole missing | the hint (`FolderPicker.svelte`) and the CLI's refusal "BlackHole 2ch is not installed (brew install blackhole-2ch)"; unchanged since M1 | — | — |
+| Loopback preflight fails | `adapter::tests::ten_silent_seconds_on_loopback_raise_the_warning_once`, `adapter::tests::mixed_mode_watches_the_loopback_for_silence`, `mixed::tests::the_level_follows_the_loopback_even_when_the_input_is_loud`; `lecturelive loopback check` (M1) | — | — |
+| Device disappears | Mixed: `mixed::tests::a_mixed_recording_carries_both_and_goes_on_when_one_leaves`, `…when_both_leave_the_recording_ends_and_the_next_begins_when_one_returns`, `adapter::tests::in_mixed_mode_a_gone_input_is_a_notice_not_an_offer`. Single: `source::tests::while_a_gone_device_is_waited_for_the_person_may_choose_another_input`, `…a_fallback_that_cannot_be_found_keeps_the_wait_for_the_original`, `…a_fallback_that_cannot_be_opened_keeps_the_wait_for_the_original`, `adapter::tests::a_single_input_that_goes_is_offered_a_fallback_and_one_that_returns_clears_it`, and the store's offer tests; M1's live receiver unplug and replug | — | V11 (mixed); V15 at the desk (single) |
+| Sample-rate change | `source::tests::a_failed_rebuild_after_a_rate_change_waits_instead_of_ending_the_session`; mixed: `mix::tests::a_source_that_rejoins_at_once_keeps_what_it_delivered` | — | — |
+| Disk write error | `coordinator::tests::unwritable_recordings_dir_stops_with_the_path`, `coordinator::tests::a_sidecar_that_cannot_be_saved_stops_the_session_with_its_path`, `segments::tests::a_write_that_fails_names_its_file`, `lecture_gate::a_failed_session_still_takes_its_last_snapshot` | CLI, `m6-disk`: "session failed  recording to /Volumes/LLDisk/…/session_20260926_050808.wav failed: No space left on device (os error 28)", the last snapshot attempted and kept pending, exit 1 within 8 s; the relaunch repaired the recording (65.7 s) and recovered its gap | V13 |
+| Spend ledger write fails | `notes_chat::a_ledger_that_cannot_be_written_is_a_warning_and_the_answer_is_kept`, `coordinator::tests::a_ledger_that_cannot_be_written_is_a_warning_and_the_session_goes_on` | — | — |
+| App crash | `recorder::tests::checkpointed_audio_survives_a_crash`, `coordinator::tests::a_crash_before_stt_ever_connected_leaves_the_audio_as_a_gap`, `coordinator::tests::a_crash_while_two_recordings_await_their_transcript_leaves_a_gap_for_each` | CLI, `m6-faults` (repaired at 539.8 s), and app, `m6-app` (at 299.0 s) and `m6-app4`: repaired, resumed, the unclosed utterance recovered as a gap, the system output `BuiltInSpeakerDevice` before and after | V14 |
+| External edit of notes | `notesfile::tests::an_external_edit_is_kept_and_the_block_appended_after_it` | — | — |
+
+- The audit (`lecturelive lecture audit --dir …`) checks each recording against its file, the holes and overlaps between recordings against gaps and session markers, and segments for overlaps; transcript gaps not yet recovered count as waiting. It exits 0 when the folder is whole, 1 on anything unexplained, 2 while anything waits. `m6-faults`, `m6-disk`, `m6-app` and `m6-app5`: 0 unexplained, 0 waiting, each crash's hole (1.5 to 5.5 s) explained as interrupted. Read-only on earlier folders: M1's receiver unplug (a 21.0 s hole explained by `device_gone`), M2's crash (16.8 s explained by `interrupted`), and M3's and M4's lectures whole.
+- One app run (`m6-app`, after its relaunch) ended its stop in 0.8 s without its last snapshot committing, and the check then kept only the latest notice, so the reason was lost. Nothing was lost with it (above). Four runs did not reproduce it: the app direct, through the forwarder, crash and relaunch, and the whole timeline again with every notice recorded (`m6-app5`: "Snapshot taken: 1350 words", every line taken). The likeliest cause is one failed notes request through the forwarder. The faults check now records every notice, and the end notice now says when the last snapshot failed (review, below).
+- **REST's first word** (an M2 thread), over `m6-faults`' seven recovered clips: the first word right 7 times of 7 (Dropout, Second-order, Gradients, Remember, Schedules, Noise, Newton). The mishearings seen were mid-clip ("Hash and vector" for Hessian vector). The lead-in remedy is not taken. The synthetic speech pauses 1.2 s between sentences, so its clip edges fall in silence; real speech pauses less, and the real lecture's recovered lines are the better sample.
+
+*The lecture checks found done from files:* none (no `m1-zoom/`, no `zoom-live-*` fixture, the newest canary image M5's own deck). *Lines ticked:* none. M0's and M1's "at the first Zoom lecture" lines (V03, V01) and M5's live Zoom checks (V02, V04) are inside the two-hour lecture's run sheet.
+
+*`docs/VERIFICATION.html`:* one run sheet, "Your two-hour lecture with LectureLive", replaces the earlier Zoom-lecture occasion: setup (the forwarder, the disk image, the app in mixed mode with the receiver, the Python CLI in its own folder), then in class order V02 and V01 (the first 30 minutes clean), V10 network loss (the forwarder stopped 60 s, later killed 30 s), V11 the receiver unplugged 30 s, V12 Screen Recording off for Terminal for a minute, V04 Zoom full screen, V13 disk full, V14 `kill -9` and a relaunch, V03 the canary's capture, and after class the audit and the Study page. V01, V02, V04, V06 and V09 are revised to r2; V15 (the fallback offer, with the receiver as the only input) and V16 (the microphone fix-it) are desk checks.
+
+*V09, run here:* synthetic notes (671 words, no slides) typeset by `lecturelive lecture page` in 5 min 36 s ($0.20); the Python CLI, in a copy with the same course and folder names and the page removed, reapplied the cached design without a request ("notes unchanged since they were typeset"), and `cmp` found the two study pages byte-identical (38,740 bytes). The golden tests that read `live_notes.py` read a verbatim excerpt of it now (`crates/core/tests/fixtures/prompts/live_notes_excerpt.txt`, from `live_notes.py` at 6f11f84).
+
+*`/frontend-design:frontend-design` runs*, recorded in the plan and the ledger:
+- **Milestone:** what the app says when something stands between the person and a recording: what stopped, that nothing switched behind their back, and the one click that fixes it. Pass 2 turned a full-width red banner for the fallback into the notice line, a microphone modal into the command bar's error line, a separate mix toggle into one option per pairing, a filled offer button into an outline one, and a spliced em-dash sentence into two.
+- **Microphone fix-it, fallback offer, mixed choice, strip copy (Task 9):** built from the milestone run; pass 2 kept it (the offer's bold device name is the notice line's own label convention). The 1168 px checks moved the headphones hint below the row, capped the select in large type, and narrowed the large-type column minimums to 48rem, where the strip ran off the window.
+- **The lecture run sheet (Task 13):** the page's own run-sheet treatment, times in the gutter as time into the class, one item per injected failure. Pass 2 dropped a two-hour timeline graphic (the gutter times are the timeline) and severity badges.
+
+The app's views were checked in Chromium through Playwright on the dev server at 1168 px, in light and dark and with large type; the checks page at 1168 px in light and 390 px in dark. Screenshots were deleted.
+
+*Live spend:* $0.5378, all in `spend.jsonl` under courses `m6-*`: the synthetic lectures' notes and transcription $0.3367 (`m6-faults` $0.1134, `m6-disk` $0.0292, `m6-app` to `m6-app5` $0.1941), and V09's page $0.2011. The live STT tests through the forwarder write no ledger lines: about 14 s of speech, computed at $0.0008.
+
+*Rulings during execution* (the ledger has all of them with their costs):
+- A joining source is placed against the host clock's current position, not the mixer's last pull, which lags it by up to a tick (the first click was 345 samples early).
+- The drift stage is `rubato`'s polynomial resampler after the existing FFT resampler, and core is optimised in the dev profile (above).
+- `SourceEnded` waits at most 1 s for room, since a session whose owner holds the receiver without reading would otherwise wait out the whole timeout.
+- `lecture_dir` makes the folder absolute without touching the filesystem, because the folder is created only after the input is found.
+- The network-address tests use port-less URLs, since `reqwest` prefers a URL's explicit port to the override's.
+- `coordinator::tests::a_stuck_stt_worker_loses_frames_not_control_messages` has a paced source, as M3 named, with its assertions unchanged.
+- The app's preview has fixture-only states (`?look=`) for the new views, which the real transport never reads.
+- Mixed mode ships enabled (above).
+- The reviewer's suggestion to retry a failed last snapshot once is not built: §6.2 and §10 keep a failed batch pending, the end notice says so, and the next session takes it.
+- The plan ran in the main checkout, because its tools read the git-ignored `.env` at the repository root.
+
+*Review* (a fresh reviewer on the most capable model, over `394bd13..0eab1da`): 0 Critical, 5 Important, 12 Minor. Re-graded by effect, since the gate is zero unexplained missing audio: four Important and two Minor entered the fix pass, and each was fixed test-first:
+1. **A fallback that could not be opened sent the wait back to nothing.** The source now keeps waiting for the person's own input (`source::tests::a_fallback_that_cannot_be_opened_keeps_the_wait_for_the_original`).
+2. **A segment-log or transcript write that failed said "Bad file descriptor" without its file.** Every such write, and the session line's, names its path (`segments::tests::a_write_that_fails_names_its_file`).
+3. **`lecture audit` exited 0 while transcript gaps still waited.** It exits 0 only for a whole folder, 1 on anything unexplained, 2 while anything waits (`audit::tests::the_exit_status_is_0_only_for_a_whole_folder`).
+4. **The end notice said "Saved" after the last snapshot failed.** The stop report carries the last snapshot's result, and the app and the CLI both warn that the notes miss the end until the next session in the folder adds it (`lecture_gate::a_last_snapshot_that_fails_is_in_the_stop_report`, `app::tests::the_end_notice_says_when_the_last_snapshot_failed`).
+5. **In mixed mode a source rejoining at once (a rate change) threw away the audio it had delivered**, unmarked (Minor, re-graded). What it delivered now plays in front of its new audio (`mix::tests::a_source_that_rejoins_at_once_keeps_what_it_delivered`).
+6. **A source still silent when a mixed recording ended left that stretch unmarked** (Minor, re-graded). It is a gap (`mix::tests::a_source_still_dry_when_the_recording_ends_is_a_gap`).
+
+The fifth Important finding, that `MIXED_MODE` was set before the live run ended, was sequencing: nothing merged before the live run's numbers.
+
+*Open threads, each taken or left.* No milestone follows M6, so "left" means left for good unless the person asks.
+- **Taken:**
+  - the capture ring's unpublished tail drop (the `concurrent_overflow` flake; 50 runs under a parallel full suite, 50 passed);
+  - the dropped `SourceEnded`, and M4 minor M4 (a late one re-showing "Stop waiting");
+  - M3's minors: the last snapshot after a failed session, the session marker glued onto a torn line, `course` from a relative `--dir`, and `"error": null` read as an error;
+  - M4's minors M1 (a pause between hash retries), M6 ("Stop" while starting), M9 (the gap count from the sidecar at start) and M11 (unhandled `hydrate()` rejections);
+  - M5's minors M1 (the strip back to its word before a lecture at the end) and M2 (the Screen Recording copy says to reopen the app);
+  - the golden tests frozen; spec §8's slide fields, §13's keyring and `rubato` lines and §14.3, as built;
+  - a failed transcript write leaving the log and the transcript apart (M2): M3 puts back a line lost between the two writes, and the write error now names its file;
+  - the Python CLI byte comparison (M3's optional check): V09, above.
+- **Decided from measurement:** REST's first word (above): the lead-in remedy is not taken.
+- **Waiting for the real lecture** (the run sheet holds each): Zoom's window drawing while full screen elsewhere (V04); the detector on a live Zoom meeting (V02); whether a real lecture draws empty snapshot answers; §14.2's page latency on a real lecture (the synthetic page took 5 min 36 s for 671 words); the receiver's clock in mixed mode (V11 and the audit).
+- **Waiting for the person's answer:** D1, Polish after a lecture has ended; D2, one production build to check the built app's security policy.
+- **Left for good:**
+  - M2's minors: any REST 4xx ends recovery for the session, and the reconnect backoff resets on every handshake (neither met in M6's runs; a refused piece stays a gap for the next session); recovery retries without limit while the session runs (that is what lets recovery finish after a long outage, and a second stop ends it).
+  - M3's minors: a relaunch after midnight starts the next day's files, and migration and rebuild date slide files and markers after midnight on the start day (a lecture's files split at midnight, and other days' gaps are recovered at launch); the page retries a billed `length` or empty answer once (one page's cost at most); `lecture page` runs without journal recovery (the next session recovers the journal, and the page can be made again).
+  - A Python CLI already running in a folder when the Rust CLI starts there: the run sheet gives the Python CLI its own folder, and the Python CLI goes once the lecture holds.
+  - Keychain prompts after each dev rebuild: a dev binary's signature changes at each link (V08 answers it once per build).
+  - M4's minors M3 (the page shares the busy line with snapshot and polish), M5 (a start that fails late stays in "starting"), M7 (a hydration begun before hiding reused on return) and M10 (the CLI's start-up line order): not met in M6's runs, and none loses material.
+  - M5's minors M3 to M7 and the title bar's large-type crowding: each concerns capture's questions or narrow windows, the display is 1168 pt wide, and the real lecture's V02 and V04 would show any that matter.
+  - This review's minors: M1 a resync after a dry spell adds a spurious, explained overflow gap; M3 overflow gap positions ignore drift correction; M5 mixed-mode copy (DeviceBack says "in a new file", notices show device ids, the CLI's mixed line suggests `--device`); M6 the offer names the original device after a chosen fallback goes; M7 a failed "Record from it" shows nothing while the offer is up, and the list is not refreshed while waiting; M8 a fallback chosen as the device returns can switch at the next disappearance; M9 tests built with `::new` configs inherit `LECTURELIVE_API_ADDR` from the shell; M10 `--mixed`'s name match can pick BlackHole itself and skips the loopback set-up warning; M11 the CLI test changes the process's directory; M12 mixed mode's end count of stream errors is always 0.
+
+*Failed lines:* none. No spec §14.1 fallback applies.
+
+*Next:* after the real lecture, a follow-up session reads its evidence (the audit's output, V01–V04 and V10–V14), ticks the gate lines that hold, and only then runs the plan's Task 17: `live_notes.py` and `pyproject.toml` are removed and the README moves to the app and the Rust CLI. Until then `live_notes.py` is the in-class tool, and it stays on `main`.
