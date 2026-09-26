@@ -3,7 +3,7 @@
 //! its own, never "no windows".
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -202,13 +202,11 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     Ok(SystemWindows.windows()?)
 }
 
+/// A still of one window, as the worker captures it: by id, so a window full screen on another desktop has a
+/// still too (xcap's window list holds only windows on screen).
 pub fn capture_window(id: u32, out: &Path) -> Result<(u32, u32)> {
     ensure_screen_access()?;
-    let window = xcap::Window::all()?
-        .into_iter()
-        .find(|w| w.id().map(|i| i == id).unwrap_or(false))
-        .with_context(|| format!("window {id} not found"))?;
-    let img = window.capture_image().context("capture window")?;
+    let img = capture_by_id(id).map_err(|e| anyhow::anyhow!("capture window {id}: {e}"))?;
     if is_blank(&img) {
         bail!("capture of window {id} is blank (permission missing or window hidden)");
     }

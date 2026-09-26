@@ -21,6 +21,9 @@ use crate::capture::window::{fit_within, is_blank, CaptureError, WindowInfo, Win
 
 /// Failed captures in a row before the strip says so: a minimise animation or one bad frame is not worth a word.
 const FAILURES_SHOWN: u32 = 3;
+/// Samples between searches for the slide while it is not found: the new layout may not be drawn yet, or a
+/// gallery comes before the share.
+const SEARCH_AGAIN: u32 = 5;
 /// The width of the whole-window copies a recording keeps for re-cropping (never committed).
 const RECORD_WINDOW_PX: u32 = 1024;
 
@@ -121,11 +124,11 @@ struct Worker {
     detector: Detector<DateTime<Local>>,
     sent: Option<CaptureState>,
     failures: u32,
-    /// The last window size a search for the slide was made at.
-    tried: Option<(u32, u32)>,
+    /// The window size the last search for the slide was made at, and the samples since.
+    tried: Option<((u32, u32), u32)>,
     /// A size the window reported that differs from the region's, and for how many samples in a row.
     new_size: Option<((u32, u32), u32)>,
-    /// Samples after a new region that only settle the kept frame.
+    /// Samples after a new region that settle the kept frame while they still show it.
     settling: u32,
     recorder: Option<Recorder>,
 }
@@ -269,12 +272,13 @@ impl Worker {
                 }
                 self.failures = 0;
                 self.set(CaptureState::Watching { window: window.clone() });
-                if self.settling > 0 {
-                    // Just after a new region: the frames settle into the kept frame, never a slide of their own.
+                if self.settling > 0 && self.detector.shows_kept(&t) {
+                    // Just after a new region: a frame still showing the kept slide settles into it.
                     self.settling -= 1;
                     self.detector.keep(t);
                     None
                 } else {
+                    self.settling = 0;
                     self.detector.observe(Local::now(), t).map(|d| (img, d))
                 }
             }
@@ -309,16 +313,21 @@ impl Worker {
     /// by looking for the last kept slide; None while the person is asked.
     fn resized(&mut self, id: u32, sel: &Selection, w: &WindowInfo) -> Option<Selection> {
         let window = sel.descriptor.label();
-        if let Some(known) = sel.at_size(w.width, w.height) {
-            let note = if sel.descriptor.same_size(w) {
-                format!("{window} is {} × {} now; watching the same region", w.width, w.height)
-            } else {
-                format!("{window} is {} × {} again; watching its slide there", w.width, w.height)
-            };
-            return Some(self.rebind(id, known, note));
+        let size = (w.width, w.height);
+        let known = sel.at_size(w.width, w.height);
+        // A region found or chosen at exactly this size frames the slide there; one within 2% of it may be a few
+        // pixels off, so the slide is searched for first.
+        if let Some(known) = known.as_ref().filter(|_| sel.sizes.iter().any(|s| (s.width, s.height) == size)) {
+            return Some(self.rebind(id, known.clone(), format!("{window} is {} × {} again; watching its slide there", w.width, w.height)));
         }
-        if self.tried != Some((w.width, w.height)) {
-            self.tried = Some((w.width, w.height)); // one search per new size, not one per second
+        let due = match self.tried {
+            Some((at, n)) => at != size || n >= SEARCH_AGAIN,
+            None => true,
+        };
+        if !due {
+            self.tried = self.tried.map(|(at, n)| (at, n + 1));
+        } else {
+            self.tried = Some((size, 0));
             let kept = self.detector.kept().cloned();
             if let (Ok(img), Some(kept)) = (self.source.capture(id), kept) {
                 let aspect = (sel.region.w * sel.descriptor.width as f64) / (sel.region.h * sel.descriptor.height as f64);
@@ -328,20 +337,24 @@ impl Worker {
                 }
             }
         }
+        if let Some(known) = known {
+            return Some(self.rebind(id, known, format!("{window} is {} × {} now; watching the same region", w.width, w.height)));
+        }
+        // No window to "Watch it": the old region is what could not be checked at this size.
         let reason = format!("it is {} × {} now and the slide was not found in it; check the region", w.width, w.height);
-        self.set(CaptureState::Asking { window, reason, candidates: vec![w.clone()] });
+        self.set(CaptureState::Asking { window, reason, candidates: vec![] });
         None
     }
 
-    /// The same window through another region: the slide on screen becomes the kept frame rather than a new
-    /// slide, and the app is told (it saves the region and says so).
+    /// The same window through another region, and the app is told (it saves the region and says so). The
+    /// slide on screen becomes the kept frame when it is the kept slide; a slide that changed as the window did,
+    /// or the first one, is left to the detector, so it is taken.
     fn rebind(&mut self, id: u32, sel: Selection, note: String) -> Selection {
-        // Before the first slide there is nothing to settle into: the next good frame is the first slide.
-        if self.detector.kept().is_some() {
-            if let Ok((_, t)) = self.frame(id, &sel) {
+        if let Ok((_, t)) = self.frame(id, &sel) {
+            if self.detector.shows_kept(&t) {
                 self.detector.keep(t);
+                self.settling = 2;
             }
-            self.settling = 2;
         }
         self.bound = Some((id, sel.clone()));
         self.tried = None;

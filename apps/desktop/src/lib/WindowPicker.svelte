@@ -2,6 +2,7 @@
   // The window and region picker (spec §7.1): which window shows the slides, and the part of it that is
   // the slide. Saved per course; when the saved window no longer matches, the strip opens this again
   // with the reason, and the saved region drawn on the new window's still.
+  import { inRegion, inWindow } from "./parts";
   import { session } from "./session.svelte";
   import type { PreviewShot, Region, WindowView } from "./wire";
 
@@ -17,6 +18,11 @@
   let shotError = $state<string | null>(null);
   let loading = $state(false);
   let region = $state.raw<Region>(WHOLE);
+  /** Parts of the region that are not the slide (a speaker's camera), in fractions of the window while drawn. */
+  let parts = $state.raw<Region[]>([]);
+  /** The next drag draws a part to leave out rather than the region. */
+  let leaving = $state(false);
+  let drawing = $state.raw<Region | null>(null);
   let reason = $state<string | null>(null);
   let saving = $state(false);
 
@@ -29,7 +35,10 @@
     shot = null;
     shotError = null;
     dialog.showModal();
-    region = (await session.captureSavedRegion()) ?? WHOLE;
+    leaving = false;
+    const saved = await session.captureSavedRegion();
+    region = saved?.region ?? WHOLE;
+    parts = saved ? saved.leave_out.map((p) => inWindow(p, saved.region)) : [];
     await list();
     const asked = session.capture.candidates[0]?.id;
     const first = windows.find((w) => w.id === asked) ?? windows.find((w) => zoom(w) && w.on_screen) ?? windows.find((w) => w.on_screen);
@@ -57,12 +66,18 @@
   async function save() {
     if (chosen === null) return;
     saving = true;
-    const ok = await session.captureSelect(chosen, region);
+    const kept = parts.map((p) => inRegion(p, region)).filter((p): p is Region => p !== null);
+    const ok = await session.captureSelect(chosen, region, kept);
     saving = false;
     if (ok) dialog.close();
   }
 
-  /** Dragging over the still draws the region, in fractions of the window; a new drag redraws it. */
+  function watchAgain(i: number) {
+    parts = parts.filter((_, j) => j !== i);
+  }
+
+  /** Dragging over the still draws the region, in fractions of the window; a new drag redraws it. While
+   *  leaving a part out, one drag draws one part, cut to the region. */
   function draw(node: HTMLElement) {
     let start: { x: number; y: number } | null = null;
     const at = (e: PointerEvent) => {
@@ -80,9 +95,19 @@
       if (!start) return;
       const p = at(e);
       const r = { x: Math.min(start.x, p.x), y: Math.min(start.y, p.y), w: Math.abs(p.x - start.x), h: Math.abs(p.y - start.y) };
-      if (r.w > 0.02 && r.h > 0.02) region = r; // a click keeps the region drawn before
+      if (r.w > 0.02 && r.h > 0.02) {
+        if (leaving) drawing = r;
+        else region = r; // a click keeps the region drawn before
+      }
     };
-    const up = () => (start = null);
+    const up = () => {
+      start = null;
+      if (!leaving || !drawing) return;
+      const cut = inRegion(drawing, region);
+      if (cut) parts = [...parts, inWindow(cut, region)];
+      drawing = null;
+      leaving = false;
+    };
     node.addEventListener("pointerdown", down);
     node.addEventListener("pointermove", move);
     node.addEventListener("pointerup", up);
@@ -130,14 +155,25 @@
         <div class="frame" use:draw style:aspect-ratio="{shot.width} / {shot.height}" style:max-width="calc((100vh - 20rem) * {shot.width / shot.height})">
           <img src={toUrl(shot.path)} alt="The chosen window" draggable="false" />
           <div class="region" style:left="{region.x * 100}%" style:top="{region.y * 100}%" style:width="{region.w * 100}%" style:height="{region.h * 100}%"></div>
+          {#each parts as p, i (i)}
+            <!-- Dimmed like outside the region: not watched. -->
+            <div class="part" style:left="{p.x * 100}%" style:top="{p.y * 100}%" style:width="{p.w * 100}%" style:height="{p.h * 100}%">
+              <button class="again" onpointerdown={(e) => e.stopPropagation()} onclick={() => watchAgain(i)} aria-label="Watch this part again" title="Watch this part again">×</button>
+            </div>
+          {/each}
+          {#if drawing}<div class="part" style:left="{drawing.x * 100}%" style:top="{drawing.y * 100}%" style:width="{drawing.w * 100}%" style:height="{drawing.h * 100}%"></div>{/if}
         </div>
-        <p class="hint">Drag over the slide; leave out Zoom's controls and the video tiles.</p>
-        <p class="hint num readout"><span>Region {px(region.w, shot.width)} × {px(region.h, shot.height)} of {shot.width} × {shot.height}</span><button class="quiet" onclick={() => (region = WHOLE)}>Use the whole window</button></p>
+        <p class="hint">{leaving ? "Drag over what covers the slide, such as the speaker's camera." : "Drag over the slide, without Zoom's controls and the video tiles."}</p>
+        <p class="hint num readout">
+          <span>Region {px(region.w, shot.width)} × {px(region.h, shot.height)} of {shot.width} × {shot.height}{#if parts.length}, {parts.length} {parts.length === 1 ? "part" : "parts"} left out{/if}</span>
+          <button class="quiet" aria-pressed={leaving} onclick={() => (leaving = !leaving)}>Leave out a part</button>
+          <button class="quiet" onclick={() => (region = WHOLE)}>Use the whole window</button>
+        </p>
       {:else if loading}
         <p class="hint">Capturing the window…</p>
       {:else if shotError}
         <p class="error" role="alert">{shotError}</p>
-        <p class="hint">A window that is minimised or on another desktop cannot be captured: bring it back, then choose it again.</p>
+        <p class="hint">A minimised window cannot be captured: bring it back, then choose it again.</p>
       {:else if !listError}
         <p class="hint">Choose a window to see it here.</p>
       {/if}
@@ -261,6 +297,25 @@
     pointer-events: none;
   }
 
+  /* A part left out is a hole in what is watched, so it is dimmed as outside the region is. */
+  .part {
+    position: absolute;
+    background: var(--scrim);
+    pointer-events: none;
+  }
+
+  .again {
+    position: absolute;
+    top: 0.25rem;
+    right: 0.25rem;
+    padding: 0 0.4rem;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--ink);
+    line-height: 1.4;
+    pointer-events: auto;
+  }
+
   .hint {
     margin: 0.5rem 0 0;
     color: var(--graphite);
@@ -317,6 +372,10 @@
 
   .quiet:hover {
     color: var(--ink);
+  }
+
+  .quiet[aria-pressed="true"] {
+    color: var(--teal);
   }
 
   .readout {

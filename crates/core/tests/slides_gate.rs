@@ -253,3 +253,16 @@ fn explain_captures() {
         }
     }
 }
+
+/// Final review, I1, live (M5 full-screen check): the deck's slide windowed and then full screen through the
+/// region found for it differs by up to 0.063 in four tiles of fine text, which is realignment, not a change:
+/// it is the kept slide, so a switch does not take it again. The next slide is not.
+#[test]
+fn a_re_laid_out_slide_shows_the_kept_one_and_the_next_slide_does_not() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relayout");
+    let frame = |name: &str| image::open(dir.join(name)).unwrap().to_luma8();
+    let mut d = lecturelive_core::capture::detect::Detector::<usize>::new(Thresholds::default());
+    d.keep(frame("windowed.png"));
+    assert!(d.shows_kept(&frame("full-screen.png")), "the same slide, re-laid out");
+    assert!(!d.shows_kept(&frame("next-slide.png")), "another slide");
+}

@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::adapter::{read_document, Phase, Pump, Sink, Stream};
 use crate::keychain;
-use crate::wire::{CaptureView, CaptureWord, FolderView, NoticeKind, PreviewShot, SessionState, WindowView};
+use crate::wire::{CaptureView, CaptureWord, FolderView, NoticeKind, PreviewShot, SavedRegion, SessionState, WindowView};
 
 /// The Python CLI's ledger, taken over by the app's at each start (spec §8).
 const CLI_LEDGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../spend.jsonl");
@@ -439,12 +439,15 @@ fn selections_path() -> Res<PathBuf> {
 }
 
 /// Keeps the window, region and parts left out that the person chose for a course. The same window chosen
-/// again at another size (full screen) adds that size, and its other sizes are kept.
-fn save_selection(path: &Path, course: &str, w: &WindowInfo, region: Region, leave_out: Vec<Region>) -> anyhow::Result<Selection> {
+/// again at another size (full screen) adds that size, and its other sizes are kept; without parts of its own,
+/// it keeps the parts already left out.
+fn save_selection(path: &Path, course: &str, w: &WindowInfo, region: Region, leave_out: Option<Vec<Region>>) -> anyhow::Result<Selection> {
     anyhow::ensure!(region.is_valid(), "The region must lie inside the window.");
-    anyhow::ensure!(leave_out.iter().all(Region::is_valid), "A part left out must lie inside the region.");
     let mut all = Selections::load(path)?;
-    let sel = match all.get(course).filter(|s| s.descriptor.same_app(w) && s.descriptor.title == w.title) {
+    let old = all.get(course).filter(|s| s.descriptor.same_app(w) && s.descriptor.title == w.title).cloned();
+    let leave_out = leave_out.unwrap_or_else(|| old.as_ref().map(|o| o.leave_out.clone()).unwrap_or_default());
+    anyhow::ensure!(leave_out.iter().all(Region::is_valid), "A part left out must lie inside the region.");
+    let sel = match old {
         Some(old) => Selection { leave_out, ..old.with_size(w.width, w.height, region) },
         None => Selection { descriptor: Descriptor::of(w), region, leave_out, sizes: vec![] },
     };
@@ -461,20 +464,21 @@ fn keep_selection(path: &Path, course: &str, sel: &Selection) -> anyhow::Result<
     all.save(path)
 }
 
-/// The person's "Watch it" on an ask: this window, through the region and parts already saved for the course.
+/// The person's "Watch it" on an ask: this window, through the region and parts already saved for the course
+/// at its size. At a size with no region, nobody has checked where the slide is, so the person chooses it.
 fn watch_saved(path: &Path, course: &str, w: &WindowInfo) -> anyhow::Result<Selection> {
     let saved = Selections::load(path)?.get(course).cloned().ok_or_else(|| anyhow::anyhow!("No window is chosen for {course} yet: choose one."))?;
-    let at = saved.at_size(w.width, w.height).unwrap_or(saved);
-    save_selection(path, course, w, at.region, at.leave_out)
+    let at = saved.at_size(w.width, w.height).ok_or_else(|| anyhow::anyhow!("{} is {} × {}, a size with no region yet: choose where its slide is.", saved.descriptor.label(), w.width, w.height))?;
+    save_selection(path, course, w, at.region, Some(at.leave_out))
 }
 
-/// The region saved for a course, so the picker can draw it on a new window's still.
-fn saved_region(path: &Path, course: &str) -> Option<Region> {
-    Selections::load(path).ok()?.get(course).map(|s| s.region)
+/// The region saved for a course and its parts left out, so the picker can draw them on a new window's still.
+fn saved_region(path: &Path, course: &str) -> Option<SavedRegion> {
+    Selections::load(path).ok()?.get(course).map(|s| SavedRegion { region: s.region, leave_out: s.leave_out.clone() })
 }
 
 #[tauri::command]
-pub fn capture_saved_region(app: State<'_, App>) -> Res<Option<Region>> {
+pub fn capture_saved_region(app: State<'_, App>) -> Res<Option<SavedRegion>> {
     let folder = app.folder().ok_or("Choose a lecture folder first.")?;
     Ok(saved_region(&selections_path()?, &folder.course))
 }
@@ -519,7 +523,7 @@ pub async fn capture_select(id: u32, region: Region, leave_out: Option<Vec<Regio
     let windows = tauri::async_runtime::spawn_blocking(|| SystemWindows.windows()).await.map_err(text)?.map_err(|e| e.to_string())?;
     let w = windows.into_iter().find(|w| w.id == id).ok_or("That window is no longer open.")?;
     let path = selections_path()?;
-    let selection = save_selection(&path, &folder.course, &w, region, leave_out.unwrap_or_default()).map_err(chain)?;
+    let selection = save_selection(&path, &folder.course, &w, region, leave_out).map_err(chain)?;
     match app.commands() {
         Some(c) => c.send(Command::Bind { window: id, selection }).map_err(|_| "The lecture has ended.".to_string()),
         None => {
@@ -839,11 +843,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("capture.json");
         let w = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
-        save_selection(&path, "Machine Learning", &w, Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, vec![]).unwrap();
+        save_selection(&path, "Machine Learning", &w, Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, Some(vec![])).unwrap();
         assert_eq!(ready_view(&path, "Machine Learning").state, CaptureWord::Ready);
         assert_eq!(ready_view(&path, "Machine Learning").window.as_deref(), Some("Zoom Meeting"));
         assert_eq!(ready_view(&path, "Statistics").state, CaptureWord::Unbound);
-        assert!(save_selection(&path, "Machine Learning", &w, Region { x: 0.5, y: 0.5, w: 0.9, h: 0.9 }, vec![]).is_err(), "a region outside the window is refused");
+        assert!(save_selection(&path, "Machine Learning", &w, Region { x: 0.5, y: 0.5, w: 0.9, h: 0.9 }, Some(vec![])).is_err(), "a region outside the window is refused");
     }
 
     #[test]
@@ -854,11 +858,16 @@ mod tests {
         let path = dir.path().join("capture.json");
         let old = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
         let region = Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-        save_selection(&path, "Machine Learning", &old, region, vec![]).unwrap();
-        let new = WindowInfo { id: 77, width: 1280, height: 800, ..old };
+        save_selection(&path, "Machine Learning", &old, region, Some(vec![])).unwrap();
+        let new = WindowInfo { id: 77, width: 1604, height: 898, ..old.clone() };
         let sel = watch_saved(&path, "Machine Learning", &new).unwrap();
-        assert_eq!((sel.region, sel.descriptor.width, sel.descriptor.height), (region, 1280, 800));
+        assert_eq!((sel.region, sel.descriptor.width, sel.descriptor.height), (region, 1604, 898));
         assert!(watch_saved(&path, "Statistics", &new).is_err(), "a course with no saved window must choose one");
+        // Final review, I2: no region was checked at a size never seen, so the person chooses one.
+        let other_size = WindowInfo { id: 78, width: 1280, height: 800, ..old };
+        let refused = watch_saved(&path, "Machine Learning", &other_size).unwrap_err().to_string();
+        assert!(refused.contains("1280 × 800"), "{refused}");
+        assert_eq!(Selections::load(&path).unwrap().get("Machine Learning").map(|s| s.sizes.len()), Some(1), "nothing saved for 1280 × 800");
     }
 
     #[test]
@@ -868,10 +877,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("capture.json");
         assert_eq!(saved_region(&path, "Machine Learning"), None);
+        let camera = vec![Region { x: 0.8, y: 0.0, w: 0.2, h: 0.2 }];
         let w = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: None, title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
         let region = Region { x: 0.1, y: 0.2, w: 0.7, h: 0.6 };
-        save_selection(&path, "Machine Learning", &w, region, vec![]).unwrap();
-        assert_eq!(saved_region(&path, "Machine Learning"), Some(region));
+        save_selection(&path, "Machine Learning", &w, region, Some(camera.clone())).unwrap();
+        assert_eq!(saved_region(&path, "Machine Learning"), Some(SavedRegion { region, leave_out: camera }));
     }
 
     #[test]
@@ -882,16 +892,35 @@ mod tests {
         let path = dir.path().join("capture.json");
         let windowed = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
         let small = Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-        save_selection(&path, "ML", &windowed, small, vec![]).unwrap();
+        save_selection(&path, "ML", &windowed, small, Some(vec![])).unwrap();
         let full = WindowInfo { width: 1920, height: 1200, ..windowed.clone() };
         let big = Region { x: 0.05, y: 0.15, w: 0.9, h: 0.7 };
         let camera = vec![Region { x: 0.82, y: 0.0, w: 0.18, h: 0.18 }];
-        save_selection(&path, "ML", &full, big, camera.clone()).unwrap();
+        save_selection(&path, "ML", &full, big, Some(camera.clone())).unwrap();
         let saved = Selections::load(&path).unwrap().get("ML").cloned().unwrap();
         assert_eq!(saved.at_size(1600, 900).map(|s| s.region), Some(small), "the windowed region is kept");
         assert_eq!(saved.at_size(1920, 1200).map(|s| (s.region, s.leave_out)), Some((big, camera)));
         let moved = saved.with_size(1280, 800, Region::WHOLE);
         keep_selection(&path, "ML", &moved).unwrap();
         assert_eq!(Selections::load(&path).unwrap().get("ML"), Some(&moved), "a region found again is kept for the course");
+    }
+
+    /// Final review, C1: the parts left out are the person's; choosing the window again without sending them
+    /// keeps them, an empty list clears them, and another window starts with none.
+    #[test]
+    fn a_re_choose_keeps_the_parts_left_out_unless_it_sends_its_own() {
+        use lecturelive_core::capture::detect::Region;
+        use lecturelive_core::capture::window::WindowInfo;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.json");
+        let w = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
+        let camera = vec![Region { x: 0.82, y: 0.0, w: 0.18, h: 0.18 }];
+        let region = Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+        save_selection(&path, "ML", &w, region, Some(camera.clone())).unwrap();
+        assert_eq!(save_selection(&path, "ML", &w, region, None).unwrap().leave_out, camera, "kept");
+        assert_eq!(save_selection(&path, "ML", &w, region, Some(vec![])).unwrap().leave_out, vec![], "cleared");
+        save_selection(&path, "ML", &w, region, Some(camera)).unwrap();
+        let home = WindowInfo { id: 7, title: "Zoom Workplace".into(), ..w };
+        assert_eq!(save_selection(&path, "ML", &home, region, None).unwrap().leave_out, vec![], "another window");
     }
 }

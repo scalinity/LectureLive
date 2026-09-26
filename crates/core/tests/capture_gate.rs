@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use lecturelive_core::capture::detect::{Region, Thresholds};
-use lecturelive_core::capture::select::{Descriptor, Selection};
+use lecturelive_core::capture::select::{Descriptor, Selection, SizedRegion};
 use lecturelive_core::capture::worker::{self, CaptureCmd, CaptureEvent, CaptureState, WorkerConfig};
 use lecturelive_core::notes::chat::{ChatClient, ChatConfig};
 use lecturelive_core::notes::embeds::embeds_in;
@@ -158,6 +158,76 @@ async fn a_window_on_another_desktop_is_still_watched() {
     assert_eq!(shots, vec![(true, false)], "the slide shown while the person works elsewhere");
 }
 
+/// Final review, I1: a build that lands as the window changes size (Zoom going full screen as a share starts)
+/// is a new slide, not the kept one found again.
+#[tokio::test]
+async fn a_build_that_lands_as_the_window_changes_size_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    let (windowed, full) = (zoom_window(800, 450, (80, 60, 560, 315), 1), zoom_window(1280, 800, (160, 120, 960, 540), 2));
+    fake.add(42, "Zoom Meeting", 800, 450, windowed);
+    let mut sel = selection(&fake, 42);
+    sel.region = Region { x: 80.0 / 800.0, y: 60.0 / 450.0, w: 560.0 / 800.0, h: 315.0 / 450.0 };
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (_, shots) = watch(&mut rx, 200).await;
+    assert_eq!(shots.len(), 1);
+    fake.resize(42, 1280, 800);
+    fake.show(42, full);
+    let (_, shots, moved) = until_moved(&mut rx, 10_000).await;
+    assert!(moved, "the slide was found again in full screen");
+    let (_, more) = watch(&mut rx, 300).await;
+    assert_eq!([shots, more].concat(), vec![(true, false)], "the build, taken once");
+}
+
+/// Final review, I1: back at a size whose region is known, a slide that changed meanwhile is taken.
+#[tokio::test]
+async fn a_slide_that_changes_as_the_window_returns_to_a_known_size_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    let (windowed, full) = (zoom_window(800, 450, (80, 60, 560, 315), 1), zoom_window(1280, 800, (160, 120, 960, 540), 3));
+    fake.add(42, "Zoom Meeting", 800, 450, windowed);
+    let mut sel = selection(&fake, 42);
+    sel.region = Region { x: 80.0 / 800.0, y: 60.0 / 450.0, w: 560.0 / 800.0, h: 315.0 / 450.0 };
+    sel.sizes = vec![SizedRegion { width: 1280, height: 800, region: Region { x: 160.0 / 1280.0, y: 120.0 / 800.0, w: 960.0 / 1280.0, h: 540.0 / 800.0 } }];
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (_, shots) = watch(&mut rx, 200).await;
+    assert_eq!(shots.len(), 1);
+    fake.resize(42, 1280, 800);
+    fake.show(42, full);
+    let (_, shots, moved) = until_moved(&mut rx, 10_000).await;
+    assert!(moved, "the region known for full screen");
+    let (_, more) = watch(&mut rx, 300).await;
+    assert_eq!([shots, more].concat(), vec![(true, false)], "the new slide, taken once");
+}
+
+/// Final review, I3: a search that failed because the new layout had no slide yet (a gallery first) is tried
+/// again, and the slide is found once it appears.
+#[tokio::test]
+async fn a_failed_search_is_tried_again_and_finds_the_slide_when_it_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    let gallery = image::RgbaImage::from_fn(1280, 800, |x, y| if (x / 320 + y / 400) % 2 == 0 { image::Rgba([60, 70, 80, 255]) } else { image::Rgba([28, 28, 30, 255]) });
+    let (windowed, full) = (zoom_window(800, 450, (80, 60, 560, 315), 1), zoom_window(1280, 800, (160, 120, 960, 540), 1));
+    fake.add(42, "Zoom Meeting", 800, 450, windowed);
+    let mut sel = selection(&fake, 42);
+    sel.region = Region { x: 80.0 / 800.0, y: 60.0 / 450.0, w: 560.0 / 800.0, h: 315.0 / 450.0 };
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    watch(&mut rx, 200).await;
+    fake.resize(42, 1280, 800);
+    fake.show(42, gallery);
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut asked = false;
+    while !asked && tokio::time::Instant::now() < end {
+        asked = watch(&mut rx, 100).await.0.iter().any(|s| matches!(s, CaptureState::Asking { .. }));
+    }
+    assert!(asked, "no slide in the gallery: asks");
+    fake.show(42, full);
+    let (states, shots, moved) = until_moved(&mut rx, 10_000).await;
+    assert!(moved, "found once the slide is shared again");
+    assert!(shots.is_empty(), "the same slide: {shots:?}");
+    assert!(states.last().is_some_and(watching), "{states:?}");
+}
+
 /// Live evidence (M5 full-screen check): while full screen animates, the window is off screen and one capture
 /// comes back empty; like any one bad frame, that is not worth a word.
 #[tokio::test]
@@ -187,6 +257,8 @@ async fn entering_full_screen_finds_the_slide_again_and_leaving_it_needs_no_sear
     let fake = FakeWindows::default();
     let windowed = |lines| zoom_window(800, 450, (80, 60, 560, 315), lines);
     let full = |lines| zoom_window(1280, 800, (160, 120, 960, 540), lines);
+    // Drawn before each resize: drawing in a test build outlasts the samples after which the worker looks.
+    let (full_1, windowed_2) = (full(1), windowed(2));
     fake.add(42, "Zoom Meeting", 800, 450, windowed(1));
     let mut sel = selection(&fake, 42);
     sel.region = Region { x: 80.0 / 800.0, y: 60.0 / 450.0, w: 560.0 / 800.0, h: 315.0 / 450.0 };
@@ -194,7 +266,7 @@ async fn entering_full_screen_finds_the_slide_again_and_leaving_it_needs_no_sear
     let (_, shots) = watch(&mut rx, 200).await;
     assert_eq!(shots.len(), 1);
     fake.resize(42, 1280, 800);
-    fake.show(42, full(1));
+    fake.show(42, full_1);
     let (states, shots, moved) = until_moved(&mut rx, 10_000).await;
     assert!(moved, "the slide was found again in full screen");
     assert!(!states.iter().any(|s| matches!(s, CaptureState::Asking { .. } | CaptureState::Paused { .. })), "{states:?}");
@@ -203,7 +275,7 @@ async fn entering_full_screen_finds_the_slide_again_and_leaving_it_needs_no_sear
     let (_, shots) = watch(&mut rx, 300).await;
     assert_eq!(shots, vec![(true, false)], "a build in full screen, through the region found");
     fake.resize(42, 800, 450);
-    fake.show(42, windowed(2));
+    fake.show(42, windowed_2);
     let (states, shots, moved) = until_moved(&mut rx, 10_000).await;
     assert!(moved, "back to the region for the windowed size");
     assert!(!states.iter().any(|s| matches!(s, CaptureState::Asking { .. })), "{states:?}");
@@ -216,16 +288,19 @@ async fn entering_full_screen_finds_the_slide_again_and_leaving_it_needs_no_sear
 async fn a_resize_within_the_same_size_that_moves_the_slide_takes_it_once() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeWindows::default();
-    let windowed = |lines| zoom_window(1166, 720, (60, 40, 1040, 585), lines);
-    let full = |lines| zoom_window(1168, 729, (64, 48, 1040, 585), lines);
+    // The slide clears the participant video in the corner: a video drawn over the slide that moves against it
+    // at a switch is a change, as it would be at any other time (a camera over the slide is left out).
+    let windowed = |lines| zoom_window(1166, 720, (60, 40, 880, 495), lines);
+    let full = |lines| zoom_window(1168, 729, (64, 48, 880, 495), lines);
+    let full_1 = full(1); // drawn before the resize, as above
     fake.add(42, "Zoom Meeting", 1166, 720, windowed(1));
     let mut sel = selection(&fake, 42);
-    sel.region = Region { x: 60.0 / 1166.0, y: 40.0 / 720.0, w: 1040.0 / 1166.0, h: 585.0 / 720.0 };
+    sel.region = Region { x: 60.0 / 1166.0, y: 40.0 / 720.0, w: 880.0 / 1166.0, h: 495.0 / 720.0 };
     let (_h, mut rx) = start(&fake, Some(sel), dir.path());
     let (_, shots) = watch(&mut rx, 200).await;
     assert_eq!(shots.len(), 1);
     fake.resize(42, 1168, 729);
-    fake.show(42, full(1));
+    fake.show(42, full_1);
     let (states, shots, moved) = until_moved(&mut rx, 3_000).await;
     assert!(shots.is_empty(), "the same slide is not taken again: {shots:?}");
     assert!(moved, "the new size is watched through the region it already had");
@@ -355,7 +430,8 @@ async fn a_resized_window_pauses_and_asks() {
         states.extend(s);
         shots.extend(c);
     }
-    assert!(matches!(states.last(), Some(CaptureState::Asking { reason, .. }) if reason.contains("1280 × 800")), "{states:?}");
+    // Final review, I2: no window to "Watch it" through a region nobody has checked at this size.
+    assert!(matches!(states.last(), Some(CaptureState::Asking { reason, candidates, .. }) if reason.contains("1280 × 800") && candidates.is_empty()), "{states:?}");
     assert!(shots.is_empty(), "Zoom's re-laid-out window is not captured through the old region");
 }
 

@@ -499,27 +499,36 @@ captured, for as long as its app keeps drawing it there (a web page pauses its t
 animations while unseen). A missing Screen Recording grant is an error of its own, never "no windows". The app is
 named by its bundle id, or by its name outside a bundle.
 
-The person chooses a window and drags the slide region over a still of it, leaving out Zoom's
-controls and the video tiles; a speaker's camera drawn over the slide, as Zoom's recordings do, is
-left out as a part of the region that the detector never reacts to. The selection, a descriptor
+The person chooses a window and drags the slide region over a still of it (taken by id, so a window
+on another desktop has one too), leaving out Zoom's controls and the video tiles. A speaker's camera
+drawn over the slide, as Zoom's recordings do, is dragged over in the same still as a part left out,
+which the detector never reacts to; a part stays on the window where it was drawn when the region
+is redrawn, and choosing the same window again keeps the parts it has. The selection, a descriptor
 (bundle id, title, size), the region as fractions of the window, the parts left out as fractions of
 the region, and the region at each other size the window has had, is saved per course in the app's
 data folder (`capture.json`).
 
 When a lecture starts, exactly one window matching the descriptor (at a size it has had, within 2%)
-is watched. Anything else asks, in the slides strip, with the windows the person may mean. Once a
-window is watched, nothing is watched in its place without the person:
+is watched. Anything else asks, in the slides strip. "Watch it" is offered only for a window the
+selection matches, whose region at its size someone has chosen or found; any other window is chosen
+in the picker, where its region is drawn. Once a window is watched, nothing is watched in its place
+without the person:
 
 - it cannot be captured while off screen (minimised) for three samples in a row: capture pauses and
   resumes by itself when it is back. A moment off screen, as full screen animates, is not a pause;
 - it closes: capture pauses; a window matching the descriptor that opens, or is already on screen
   while the old one is off screen (a closed window's id can stay listed), is offered with "Watch it";
 - it changes size by any amount (full screen on or off, even within the 2% that names the same
-  window, moves the slide): once the new size has held for a sample, the region for that size is
-  used if it had one; otherwise the last kept slide is searched for in the new layout
-  and, when found closely, its place becomes the region for that size, saved and announced. The two
-  samples after a new region only settle the kept frame, so a switch never takes the same slide
-  twice. A slide that cannot be found asks;
+  window, moves the slide): once the new size has held for a sample, the region found or chosen at
+  exactly that size is used; otherwise the last kept slide is searched for in the new layout and,
+  when found closely, its place becomes the region for that size, saved and announced (at a size
+  within 2% of one it had, that region is used if the search finds nothing). A frame through the new
+  region that still shows the kept slide (no tile past twice the change threshold, since realigning
+  fine text moves a tile by up to about 0.06) becomes the kept frame, as do the two samples after
+  it, so a switch never takes the same slide twice; a different slide, one that changed as the
+  window did, is taken. A one-line build landing in the same second as a switch can be taken for the
+  kept slide. A slide that cannot be found asks, and is searched for again every 5 samples, since the
+  new layout may not be drawn yet;
 - captures fail (an error, a blank window, a black region): nothing is kept, and three in a row are
   shown with the reason.
 

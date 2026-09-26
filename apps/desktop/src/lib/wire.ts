@@ -54,6 +54,8 @@ export type CaptureView = { state: CaptureWord; window: string | null; detail: s
 export type Region = { x: number; y: number; w: number; h: number };
 
 export type PreviewShot = { path: string; width: number; height: number };
+/** The course's saved region, and the parts of it left out as fractions of it. */
+export type SavedRegion = { region: Region; leave_out: Region[] };
 
 export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" } & SlideView);
 

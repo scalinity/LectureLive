@@ -103,7 +103,8 @@ impl Selection {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Revalidation {
     Match(WindowInfo),
-    /// Why the saved window was not found as it was, and the windows the person may mean.
+    /// Why the saved window was not found as it was, and the windows that can be watched through the saved
+    /// region (the selection matches them); any other window is chosen in the picker.
     Ask { reason: String, candidates: Vec<WindowInfo> },
 }
 
@@ -124,7 +125,7 @@ pub fn revalidate(sel: &Selection, windows: &[WindowInfo]) -> Revalidation {
     } else {
         format!("{} has no “{}” window", d.app, d.title)
     };
-    Revalidation::Ask { reason, candidates: same_app }
+    Revalidation::Ask { reason, candidates: vec![] }
 }
 
 /// The saved selections by course, in the app's data folder (`capture.json`).
@@ -177,17 +178,19 @@ mod tests {
         assert_eq!(revalidate(&saved(), &ws), Revalidation::Match(ws[1].clone()), "within 2% is the same size");
     }
 
+    /// Final review, I4: only a window the selection matches can be watched through its saved region; any other
+    /// window is for the person to choose in the picker, where they draw its region.
     #[test]
-    fn a_mismatch_asks_with_the_app_s_windows_and_says_why() {
+    fn a_mismatch_asks_says_why_and_offers_only_matching_windows() {
         let resized = [win(42, "us.zoom.xos", "Zoom Meeting", 1280, 800)];
         let Revalidation::Ask { reason, candidates } = revalidate(&saved(), &resized) else { panic!() };
         assert!(reason.contains("1280 × 800") && reason.contains("1600 × 900"), "{reason}");
-        assert_eq!(candidates, resized.to_vec());
+        assert!(candidates.is_empty(), "a size with no region: {candidates:?}");
 
         let other_title = [win(7, "us.zoom.xos", "Zoom Workplace", 900, 600)];
         let Revalidation::Ask { reason, candidates } = revalidate(&saved(), &other_title) else { panic!() };
         assert!(reason.contains("Zoom Meeting"), "{reason}");
-        assert_eq!(candidates.len(), 1);
+        assert!(candidates.is_empty(), "Zoom's home window is not the meeting: {candidates:?}");
 
         let Revalidation::Ask { reason, candidates } = revalidate(&saved(), &[win(9, "com.google.Chrome", "Slides", 1600, 900)]) else { panic!() };
         assert!(reason.contains("zoom.us") && candidates.is_empty(), "{reason}");

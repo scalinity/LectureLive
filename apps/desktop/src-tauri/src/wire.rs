@@ -1,4 +1,5 @@
 //! What the adapter sends the frontend (spec §3.6). `src/lib/wire.ts` mirrors these types exactly.
+use lecturelive_core::capture::detect::Region;
 use lecturelive_core::capture::window::WindowInfo;
 use lecturelive_core::session::segments::{Segment, SegmentSource};
 use serde::Serialize;
@@ -148,6 +149,13 @@ pub struct CaptureView {
     pub candidates: Vec<WindowView>,
     /// A real capture has succeeded this lecture: the Capture button works (spec §7.4).
     pub captured: bool,
+}
+
+/// The course's saved region and the parts of it left out, for the picker to draw on a new still.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SavedRegion {
+    pub region: Region,
+    pub leave_out: Vec<Region>,
 }
 
 /// A still of a window for the picker, through the asset protocol.

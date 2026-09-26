@@ -382,22 +382,33 @@ export async function fullscreenCheck(session: Session, t: Transport, dir: strin
     await session.selectFolder(dir);
     const id = (await t.call<number>("check_deck", { action: "open" }))!;
     await deck("show:1");
-    log("deck window opened", await session.captureSelect(id, { x: 0.02, y: 0.06, w: 0.96, h: 0.92 }), await deck("info"));
+    // The page number's corner left out: saved through the command as the picker saves it.
+    log("deck window opened", await session.captureSelect(id, { x: 0.02, y: 0.06, w: 0.96, h: 0.92 }, [{ x: 0.9, y: 0.9, w: 0.1, h: 0.1 }]), await deck("info"));
+    const saved = await session.captureSavedRegion();
+    log("the part left out is saved", saved?.leave_out.length === 1, saved);
     const recording = t.call("check_record", { minutes: 2 });
     await sleep(5000);
     await deck("fullscreen");
     await sleep(3000);
     await deck("front");
     await sleep(8000); // the new size holds for a sample, then the slide is searched for
-    log("full screen, the app's window in front", true, await deck("info"));
+    const away = (await deck("info")) as { on_screen: boolean };
+    log("full screen, the app's window in front", !away.on_screen, away); // macOS can decline full screen
+    try {
+      log("a still for the picker while unseen", true, await t.call("capture_preview", { id }));
+    } catch (e) {
+      log("a still for the picker while unseen", false, String(e));
+    }
     for (const i of [12, 25, 40]) {
       await deck(`show:${i}`);
       await sleep(6000);
       log(`showed ${i} unseen`, true, await deck("info"));
     }
+    // A new slide as the window leaves full screen: taken, not settled into the kept frame.
+    await deck("show:45");
     await deck("windowed");
     await sleep(8000);
-    log("windowed again", true, await deck("info"));
+    log("windowed again, showing 45", true, await deck("info"));
     await deck("show:50");
     await sleep(6000);
     log("showed 50", true);

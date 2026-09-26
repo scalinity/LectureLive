@@ -3,7 +3,7 @@
 import { flushSync } from "svelte";
 import { idleStatus } from "./fixture";
 import type { Transport } from "./transport";
-import type { CaptureView, Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, PreviewShot, Region, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
+import type { CaptureView, Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, PreviewShot, Region, SavedRegion, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 import { nextWords, type Word } from "./words";
 
 type Stream = "status" | "transcript" | "notes";
@@ -178,15 +178,16 @@ export class Session {
     return this.act<PreviewShot>("capture_preview", { id });
   }
 
-  /** True when the window and region were saved for this course. */
-  async captureSelect(id: number, region: Region): Promise<boolean> {
-    await this.act("capture_select", { id, region });
+  /** True when the window and region were saved for this course. Without `leaveOut` (fractions of the
+   *  region), the same window keeps the parts already left out. */
+  async captureSelect(id: number, region: Region, leaveOut?: Region[]): Promise<boolean> {
+    await this.act("capture_select", leaveOut ? { id, region, leaveOut } : { id, region });
     return this.error === null;
   }
 
-  /** The region saved for this course, drawn on a new window's still; null when none is saved. */
-  async captureSavedRegion(): Promise<Region | null> {
-    return (await this.act<Region | null>("capture_saved_region")) ?? null;
+  /** The region saved for this course and its parts left out, drawn on a new window's still; null when none is saved. */
+  async captureSavedRegion(): Promise<SavedRegion | null> {
+    return (await this.act<SavedRegion | null>("capture_saved_region")) ?? null;
   }
 
   /** "Watch it": the window the strip asks about, through the course's saved region. */

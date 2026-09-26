@@ -130,6 +130,17 @@ describe("session store", () => {
     expect(s.segments.map((x) => x.text)).toEqual(["the rate sets"]);
   });
 
+  test("choosing a region sends its parts left out, and without them the course keeps its own (final review, C1)", async () => {
+    const { t, s, ready } = setup();
+    await ready;
+    const region = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+    const camera = [{ x: 0.8, y: 0, w: 0.2, h: 0.2 }];
+    t.calls.length = 0;
+    await s.captureSelect(42, region, camera);
+    await s.captureSelect(42, region);
+    expect(t.calls).toEqual([["capture_select", { id: 42, region, leaveOut: camera }], ["capture_select", { id: 42, region }]]);
+  });
+
   test("the command line maps to the CLI's operations and the stop button to its levels", async () => {
     const { t, s, ready, frame } = setup();
     await ready;

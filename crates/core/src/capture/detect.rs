@@ -148,6 +148,17 @@ impl<T: Clone> Detector<T> {
         self.reference.as_ref()
     }
 
+    /// Whether `frame`, through a region found again after the window changed size, shows the kept slide. The
+    /// search realigns to a fraction of a pixel, which still moves fine text by up to about 0.063 in a tile
+    /// (M5 full-screen check), so twice the change threshold applies: a new slide moves tiles by far more, and
+    /// only a one-line build landing in the same second as the switch is taken for the kept slide.
+    pub fn shows_kept(&self, frame: &GrayImage) -> bool {
+        self.reference.as_ref().is_some_and(|r| {
+            let d = tile_diffs(frame, r);
+            (0..TILES).all(|i| self.masked[i] || d[i] <= 2.0 * self.t.change)
+        })
+    }
+
     /// Tiles masked as animated.
     pub fn masked(&self) -> usize {
         self.masked.iter().filter(|&&m| m).count()
