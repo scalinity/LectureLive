@@ -3,7 +3,7 @@
   import "$lib/theme.css";
   import { isTauri } from "@tauri-apps/api/core";
   import { measure } from "$lib/bench";
-  import { captureCheck, cspCheck, deckRecordCheck, liveCheck, pageCheck, recordCheck, zoomCheck } from "$lib/checks";
+  import { captureCheck, cspCheck, deckRecordCheck, fullscreenCheck, liveCheck, pageCheck, recordCheck, zoomCheck } from "$lib/checks";
   import { burstFixture, demoWithNotes, FixtureTransport, twoHourFixture } from "$lib/fixture";
   import { session } from "$lib/session.svelte";
   import { tauriTransport, type Transport } from "$lib/transport";
@@ -72,6 +72,7 @@
     if (real && cfg?.mode === "zoom" && cfg.dir) return zoomCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "record" && cfg.dir) return recordCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "deck-record" && cfg.dir) return deckRecordCheck(session, real, cfg.dir);
+    if (real && cfg?.mode === "fullscreen" && cfg.dir) return fullscreenCheck(session, real, cfg.dir);
     if (!(await session.keyStatus())?.stored) keyDialog.show();
   }
   const started = boot();

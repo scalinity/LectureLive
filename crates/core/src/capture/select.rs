@@ -77,14 +77,17 @@ impl Selection {
         d.same_app(w) && d.title == w.title && self.at_size(w.width, w.height).is_some()
     }
 
-    /// This selection with the window at `width`×`height`: its region for that size, if the size was seen.
+    /// This selection with the window at exactly `width`×`height`: its region for that size, if the size was
+    /// seen (within 2%).
     pub fn at_size(&self, width: u32, height: u32) -> Option<Selection> {
         let probe = WindowInfo { id: 0, app: String::new(), bundle_id: None, title: String::new(), width, height, on_screen: true };
-        if self.descriptor.same_size(&probe) {
-            return Some(self.clone());
-        }
-        let s = self.sizes.iter().find(|s| Descriptor { width: s.width, height: s.height, ..self.descriptor.clone() }.same_size(&probe))?;
-        Some(self.with_size(s.width, s.height, s.region))
+        let known = if self.descriptor.same_size(&probe) {
+            self.clone()
+        } else {
+            let s = self.sizes.iter().find(|s| Descriptor { width: s.width, height: s.height, ..self.descriptor.clone() }.same_size(&probe))?;
+            self.with_size(s.width, s.height, s.region)
+        };
+        Some(Selection { descriptor: Descriptor { width, height, ..known.descriptor.clone() }, ..known })
     }
 
     /// This selection at a new size with its region there; the size it was at is remembered.

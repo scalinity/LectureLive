@@ -158,6 +158,27 @@ async fn a_window_on_another_desktop_is_still_watched() {
     assert_eq!(shots, vec![(true, false)], "the slide shown while the person works elsewhere");
 }
 
+/// Live evidence (M5 full-screen check): while full screen animates, the window is off screen and one capture
+/// comes back empty; like any one bad frame, that is not worth a word.
+#[tokio::test]
+async fn one_failed_capture_while_moving_to_another_desktop_is_not_a_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    {
+        let mut s = fake.0.lock().unwrap();
+        s.off_screen_capture = true;
+        s.fail_next = 1;
+        s.windows[0].0.on_screen = false;
+    }
+    fake.show(42, slide(2));
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(!states.iter().any(|s| matches!(s, CaptureState::Paused { .. })), "{states:?}");
+    assert_eq!(shots, vec![(true, false)], "the slide shown once the move is over");
+}
+
 /// Entering full screen re-lays out Zoom's window: the last kept slide is found again, watching goes on
 /// without a question or a duplicate, and leaving full screen goes back to the region for that size.
 #[tokio::test]
@@ -187,6 +208,48 @@ async fn entering_full_screen_finds_the_slide_again_and_leaving_it_needs_no_sear
     assert!(moved, "back to the region for the windowed size");
     assert!(!states.iter().any(|s| matches!(s, CaptureState::Asking { .. })), "{states:?}");
     assert!(shots.is_empty(), "back in the window, the same slide: {shots:?}");
+}
+
+/// Live evidence (M5 full-screen check): on a display barely larger than the window, full screen took it from
+/// 1166 × 720 to 1168 × 729, within the 2% that names the same window, yet the slide moved in it.
+#[tokio::test]
+async fn a_resize_within_the_same_size_that_moves_the_slide_takes_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    let windowed = |lines| zoom_window(1166, 720, (60, 40, 1040, 585), lines);
+    let full = |lines| zoom_window(1168, 729, (64, 48, 1040, 585), lines);
+    fake.add(42, "Zoom Meeting", 1166, 720, windowed(1));
+    let mut sel = selection(&fake, 42);
+    sel.region = Region { x: 60.0 / 1166.0, y: 40.0 / 720.0, w: 1040.0 / 1166.0, h: 585.0 / 720.0 };
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (_, shots) = watch(&mut rx, 200).await;
+    assert_eq!(shots.len(), 1);
+    fake.resize(42, 1168, 729);
+    fake.show(42, full(1));
+    let (states, shots, moved) = until_moved(&mut rx, 3_000).await;
+    assert!(shots.is_empty(), "the same slide is not taken again: {shots:?}");
+    assert!(moved, "the new size is watched through the region it already had");
+    assert!(!states.iter().any(|s| matches!(s, CaptureState::Asking { .. } | CaptureState::Paused { .. })), "{states:?}");
+    fake.show(42, full(2));
+    let (_, shots) = watch(&mut rx, 300).await;
+    assert_eq!(shots, vec![(true, false)], "a build at the new size");
+}
+
+/// A window a few pixels off its saved size is the same window at start: its first slide is taken, with no
+/// relocation, since only a change of size while watching moves the slide.
+#[tokio::test]
+async fn a_window_near_its_saved_size_at_start_takes_its_first_slide() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1168, 729, zoom_window(1168, 729, (64, 48, 1040, 585), 1));
+    let mut sel = selection(&fake, 42);
+    sel.descriptor.width = 1166;
+    sel.descriptor.height = 720;
+    sel.region = Region { x: 64.0 / 1168.0, y: 48.0 / 729.0, w: 1040.0 / 1168.0, h: 585.0 / 729.0 };
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (states, shots, moved) = until_moved(&mut rx, 500).await;
+    assert_eq!(shots, vec![(true, false)], "the first slide");
+    assert!(!moved && states.iter().any(watching), "{states:?}");
 }
 
 /// Live evidence (M5 capture check): a closed window's id can stay listed, off screen, while its app runs.
@@ -259,9 +322,11 @@ async fn a_resized_window_pauses_and_asks() {
     fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
     let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
     watch(&mut rx, 200).await;
+    // Zoom's gallery view: no slide anywhere, so the region cannot be found again. Drawn before the resize, since
+    // drawing it in a test build outlasts the two samples after which the worker searches.
+    let gallery = image::RgbaImage::from_fn(1280, 800, |x, y| if (x / 320 + y / 400) % 2 == 0 { image::Rgba([60, 70, 80, 255]) } else { image::Rgba([28, 28, 30, 255]) });
     fake.resize(42, 1280, 800);
-    // Zoom's gallery view: no slide anywhere, so the region cannot be found again.
-    fake.show(42, image::RgbaImage::from_fn(1280, 800, |x, y| if (x / 320 + y / 400) % 2 == 0 { image::Rgba([60, 70, 80, 255]) } else { image::Rgba([28, 28, 30, 255]) }));
+    fake.show(42, gallery);
     // One search for the slide at the new size first: its length depends on the machine's load.
     let (mut states, mut shots) = (Vec::new(), Vec::new());
     let end = tokio::time::Instant::now() + Duration::from_secs(10);

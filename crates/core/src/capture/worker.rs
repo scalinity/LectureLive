@@ -239,7 +239,9 @@ impl Worker {
                 CaptureState::Asking { reason: format!("a new “{window}” window opened"), window, candidates: others }
             });
         };
-        let sel = if sel.descriptor.same_size(&w) {
+        // Any change of size re-lays out the window, even one within the 2% that names the same window: full
+        // screen on a display barely larger than the window moves the slide by a few pixels.
+        let sel = if (sel.descriptor.width, sel.descriptor.height) == (w.width, w.height) {
             self.new_size = None;
             sel
         } else {
@@ -283,6 +285,11 @@ impl Worker {
                 if let Some(r) = self.recorder.as_mut() {
                     r.error(&e.to_string());
                 }
+                // Moving to or from full screen, a window is off screen and uncapturable for a moment.
+                self.failures += 1;
+                if self.failures < FAILURES_SHOWN {
+                    return;
+                }
                 return self.set(if others.is_empty() {
                     CaptureState::Paused { window, reason: "not on screen and cannot be captured (minimised?); capture resumes when it is back".into() }
                 } else {
@@ -303,7 +310,12 @@ impl Worker {
     fn resized(&mut self, id: u32, sel: &Selection, w: &WindowInfo) -> Option<Selection> {
         let window = sel.descriptor.label();
         if let Some(known) = sel.at_size(w.width, w.height) {
-            return Some(self.rebind(id, known, format!("{window} is {} × {} again; watching its slide there", w.width, w.height)));
+            let note = if sel.descriptor.same_size(w) {
+                format!("{window} is {} × {} now; watching the same region", w.width, w.height)
+            } else {
+                format!("{window} is {} × {} again; watching its slide there", w.width, w.height)
+            };
+            return Some(self.rebind(id, known, note));
         }
         if self.tried != Some((w.width, w.height)) {
             self.tried = Some((w.width, w.height)); // one search per new size, not one per second

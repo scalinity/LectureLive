@@ -495,7 +495,8 @@ A capture worker runs beside the session on its own thread, because its native c
 work block (§3.2). Windows are enumerated through CoreGraphics (`CGWindowListCopyWindowInfo`), on
 screen or not, and captured by their id (`CGWindowListCreateImage` on the window alone), so a window
 that is covered, or full screen on another desktop while the person works elsewhere, is still
-captured. A missing Screen Recording grant is an error of its own, never "no windows". The app is
+captured, for as long as its app keeps drawing it there (a web page pauses its transitions and
+animations while unseen). A missing Screen Recording grant is an error of its own, never "no windows". The app is
 named by its bundle id, or by its name outside a bundle.
 
 The person chooses a window and drags the slide region over a still of it, leaving out Zoom's
@@ -509,12 +510,13 @@ When a lecture starts, exactly one window matching the descriptor (at a size it 
 is watched. Anything else asks, in the slides strip, with the windows the person may mean. Once a
 window is watched, nothing is watched in its place without the person:
 
-- it cannot be captured while off screen (minimised): capture pauses and resumes by itself when it
-  is back;
+- it cannot be captured while off screen (minimised) for three samples in a row: capture pauses and
+  resumes by itself when it is back. A moment off screen, as full screen animates, is not a pause;
 - it closes: capture pauses; a window matching the descriptor that opens, or is already on screen
   while the old one is off screen (a closed window's id can stay listed), is offered with "Watch it";
-- it changes size (full screen on or off): once the new size has held for a sample, the region for
-  that size is used if it had one; otherwise the last kept slide is searched for in the new layout
+- it changes size by any amount (full screen on or off, even within the 2% that names the same
+  window, moves the slide): once the new size has held for a sample, the region for that size is
+  used if it had one; otherwise the last kept slide is searched for in the new layout
   and, when found closely, its place becomes the region for that size, saved and announced. The two
   samples after a new region only settle the kept frame, so a switch never takes the same slide
   twice. A slide that cannot be found asks;

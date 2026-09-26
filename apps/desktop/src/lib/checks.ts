@@ -370,3 +370,40 @@ export async function deckRecordCheck(session: Session, t: Transport, dir: strin
   }
   await finish(t, "deck-record", { dir, steps });
 }
+
+/** Capture stays on a window that is full screen on its own desktop while the app's window is in front: the
+ *  deck goes full screen, the main window comes back, and the deck changes slides where nobody sees it. Only
+ *  the detector's input is recorded; nothing is registered or sent. */
+export async function fullscreenCheck(session: Session, t: Transport, dir: string) {
+  const steps: Step[] = [];
+  const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
+  const deck = (action: string) => t.call<unknown>("check_deck", { action });
+  try {
+    await session.selectFolder(dir);
+    const id = (await t.call<number>("check_deck", { action: "open" }))!;
+    await deck("show:1");
+    log("deck window opened", await session.captureSelect(id, { x: 0.02, y: 0.06, w: 0.96, h: 0.92 }), await deck("info"));
+    const recording = t.call("check_record", { minutes: 2 });
+    await sleep(5000);
+    await deck("fullscreen");
+    await sleep(3000);
+    await deck("front");
+    await sleep(8000); // the new size holds for a sample, then the slide is searched for
+    log("full screen, the app's window in front", true, await deck("info"));
+    for (const i of [12, 25, 40]) {
+      await deck(`show:${i}`);
+      await sleep(6000);
+      log(`showed ${i} unseen`, true, await deck("info"));
+    }
+    await deck("windowed");
+    await sleep(8000);
+    log("windowed again", true, await deck("info"));
+    await deck("show:50");
+    await sleep(6000);
+    log("showed 50", true);
+    log("recorded", true, await recording);
+  } catch (e) {
+    log("failed", false, { error: String(e) });
+  }
+  await finish(t, "fullscreen", { dir, steps });
+}

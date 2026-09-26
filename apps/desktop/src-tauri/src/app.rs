@@ -767,6 +767,14 @@ pub async fn check_deck(action: String, handle: AppHandle) -> Res<Value> {
             Ok(Value::Null)
         }
         "start" => deck()?.eval("window.__deck.start()").map(|_| Value::Null).map_err(text),
+        "fullscreen" => deck()?.set_fullscreen(true).map(|_| Value::Null).map_err(text),
+        "windowed" => deck()?.set_fullscreen(false).map(|_| Value::Null).map_err(text),
+        "front" => main()?.set_focus().map(|_| Value::Null).map_err(text),
+        "info" => {
+            let ws = tauri::async_runtime::spawn_blocking(|| SystemWindows.windows()).await.map_err(text)?.map_err(|e| e.to_string())?;
+            let w = ws.into_iter().filter(|w| w.title == DECK_TITLE).max_by_key(|w| w.id).ok_or("the deck window is not listed")?;
+            Ok(serde_json::json!({ "id": w.id, "on_screen": w.on_screen, "width": w.width, "height": w.height }))
+        }
         "minimize" => deck()?.minimize().map(|_| Value::Null).map_err(text),
         "unminimize" => deck()?.unminimize().map(|_| Value::Null).map_err(text),
         "replace" => {
