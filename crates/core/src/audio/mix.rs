@@ -232,12 +232,20 @@ impl Mixer {
     /// clock has reached now, which runs ahead of what the last pull took: that sample lands where a sample
     /// captured then belongs, DELAY behind the host clock. Returns that position.
     pub fn join(&mut self, i: usize, cfg: LaneConfig, age: f64, due: u64) -> Result<u64> {
+        // A source still playing out what it delivered before it left (a moment ago: a rate change) keeps that audio in
+        // front of its new audio, so none of it goes missing without a gap.
+        let carried: VecDeque<f32> = self.lanes[i].take().filter(|l| l.draining).map(|l| l.fifo).unwrap_or_default();
+        let start = self.emitted + carried.len() as u64;
         let wanted = due as f64 + DELAY as f64 - age * RATE;
-        let origin = wanted.round().max(self.emitted as f64) as u64;
-        // Audio too old to be placed before what has already been emitted (a ring that filled while the recording
-        // waited to begin) is dropped before the recording, not played late for good.
-        let skip = ((self.emitted as f64 - wanted).max(0.0) / RATE * cfg.rate as f64).round() as u64;
-        self.lanes[i] = Some(Lane::new(cfg, origin, (origin - self.emitted) as usize, skip)?);
+        let origin = wanted.round().max(start as f64) as u64;
+        // Audio too old to be placed after what is already out or queued (a ring that filled while the recording waited
+        // to begin) is dropped before the recording, not played late for good.
+        let skip = ((start as f64 - wanted).max(0.0) / RATE * cfg.rate as f64).round() as u64;
+        let mut lane = Lane::new(cfg, origin, (origin - start) as usize, skip)?;
+        for s in carried.into_iter().rev() {
+            lane.fifo.push_front(s);
+        }
+        self.lanes[i] = Some(lane);
         Ok(origin)
     }
 
@@ -309,15 +317,18 @@ impl Mixer {
         Pulled { samples, gaps }
     }
 
-    /// Everything still waiting, for the end of a recording.
-    pub fn flush(&mut self) -> Vec<f32> {
+    /// Everything still waiting, for the end of a recording. A source that ran dry and has nothing more to play ends the
+    /// recording without its audio from where it ran dry: that stretch is a gap too.
+    pub fn flush(&mut self) -> Pulled {
         let longest = self.lanes.iter().flatten().map(|l| l.fifo.len()).max().unwrap_or(0) as u64;
+        let still_dry: Vec<(usize, u64)> = self.lanes.iter().enumerate().filter_map(|(i, l)| l.as_ref().filter(|l| l.fifo.is_empty()).and_then(|l| l.dry_since).map(|d| (i, d))).collect();
         let steering = std::mem::replace(&mut self.steering, false);
         for l in self.lanes.iter_mut().flatten() {
-            l.draining = true; // nothing more comes: running out is not a gap
+            l.draining = true; // nothing more comes: running out from here is not a gap
         }
-        let out = self.pull(self.emitted + longest).samples;
+        let mut out = self.pull(self.emitted + longest);
         self.steering = steering;
+        out.gaps.extend(still_dry.into_iter().map(|(i, from)| (i, from..self.emitted)));
         out
     }
 
@@ -572,6 +583,41 @@ mod tests {
         assert!((lost.start as i64 - 16_000).abs() <= 16 && (lost.end as i64 - 24_000).abs() <= 16, "{lost:?}");
         let out = m.pull(36_000).samples;
         assert!(out[20_000].abs() < 0.01 && out[8_000] > 0.45 && out[32_000] > 0.45);
+    }
+
+    /// Final review, M2: a source that leaves and joins again at once (a rate change) keeps what it had delivered in front
+    /// of its new audio, so none of it goes missing without a gap.
+    /// Final review, M4: a source that stops delivering without going away, and is still silent when the recording ends,
+    /// has that stretch marked as a gap.
+    #[test]
+    fn a_source_still_dry_when_the_recording_ends_is_a_gap() {
+        let mut m = Mixer::new(2);
+        let age = DELAY as f64 / RATE;
+        m.join(0, LaneConfig { rate: 16_000, channels: 1, gain: 1.0 }, age, m.emitted()).unwrap();
+        m.join(1, LaneConfig { rate: 16_000, channels: 1, gain: 1.0 }, age, m.emitted()).unwrap();
+        m.push(0, &vec![0.25; 64_000]).unwrap();
+        m.push(1, &vec![0.5; 16_000]).unwrap();
+        assert!(m.pull(32_000).gaps.is_empty(), "the stretch is still open");
+        let tail = m.flush();
+        assert!(tail.gaps.iter().any(|(i, g)| *i == 1 && (g.start as i64 - 16_000).abs() <= 16 && g.end >= 32_000), "{:?}", tail.gaps);
+        assert!(tail.samples.len() >= 30_000, "the other source's audio still flushes");
+    }
+
+    #[test]
+    fn a_source_that_rejoins_at_once_keeps_what_it_delivered() {
+        let mut m = Mixer::new(2);
+        let age = DELAY as f64 / RATE;
+        m.join(0, LaneConfig { rate: 16_000, channels: 1, gain: 1.0 }, age, m.emitted()).unwrap();
+        m.join(1, LaneConfig { rate: 16_000, channels: 1, gain: 1.0 }, age, m.emitted()).unwrap();
+        m.push(0, &vec![0.25; 64_000]).unwrap();
+        m.push(1, &vec![0.5; 16_000]).unwrap();
+        m.pull(8_000);
+        let ends = m.leave(1).unwrap(); // about 8,000 samples still to play
+        let back = m.join(1, LaneConfig { rate: 16_000, channels: 1, gain: 1.0 }, 0.0, m.emitted()).unwrap();
+        assert!(back >= ends, "its new audio comes after what it had delivered: {back} before {ends}");
+        m.push(1, &vec![0.125; 16_000]).unwrap();
+        let out = m.pull(16_000).samples; // positions 8,000..16,000
+        assert!((out[4_000] - 0.75).abs() < 0.01, "what it had delivered still plays: {}", out[4_000]);
     }
 
     #[test]

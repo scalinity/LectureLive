@@ -119,8 +119,12 @@ fn drain(l: &mut OpenLane, i: usize, mixer: &mut Mixer, rec: Uuid, emit: &mut dy
 
 fn end_recording(r: Rec, mixer: &mut Mixer, emit: &mut dyn FnMut(SourceEvent) -> Result<()>) -> Result<()> {
     let Rec { id, mut frames, .. } = r;
-    for f in frames.push(&mixer.flush()) {
+    let tail = mixer.flush();
+    for f in frames.push(&tail.samples) {
         emit(SourceEvent::Frame(f))?;
+    }
+    for (_, g) in tail.gaps {
+        emit(SourceEvent::Gap(Gap::new(id, g.start, Some(g.end), GapKind::CaptureOverflow)))?;
     }
     if let Some(f) = frames.finish() {
         emit(SourceEvent::Frame(f))?;
