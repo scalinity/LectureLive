@@ -3,7 +3,7 @@
   import "$lib/theme.css";
   import { isTauri } from "@tauri-apps/api/core";
   import { measure } from "$lib/bench";
-  import { cspCheck, liveCheck, pageCheck } from "$lib/checks";
+  import { captureCheck, cspCheck, liveCheck, pageCheck, zoomCheck } from "$lib/checks";
   import { burstFixture, demoWithNotes, FixtureTransport, twoHourFixture } from "$lib/fixture";
   import { session } from "$lib/session.svelte";
   import { tauriTransport, type Transport } from "$lib/transport";
@@ -68,6 +68,8 @@
     if (real && cfg?.mode === "csp" && cfg.dir) return cspCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "live" && cfg.dir) return liveCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "page" && cfg.dir) return pageCheck(session, real, cfg.dir);
+    if (real && cfg?.mode === "capture" && cfg.dir) return captureCheck(session, real, cfg.dir);
+    if (real && cfg?.mode === "zoom" && cfg.dir) return zoomCheck(session, real, cfg.dir);
     if (!(await session.keyStatus())?.stored) keyDialog.show();
   }
   const started = boot();

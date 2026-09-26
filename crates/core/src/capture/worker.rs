@@ -229,7 +229,14 @@ impl Worker {
             });
         };
         if !w.on_screen {
-            return self.set(CaptureState::Paused { window, reason: "not on screen (minimised or on another desktop); capture resumes when it is back".into() });
+            // A closed window's id can stay listed off screen while its app runs, so another window matching
+            // the descriptor on screen is a replacement to ask about, not a reason to wait.
+            let others: Vec<WindowInfo> = windows.iter().filter(|o| o.id != id && o.on_screen && sel.descriptor.matches(o)).cloned().collect();
+            return self.set(if others.is_empty() {
+                CaptureState::Paused { window, reason: "not on screen (minimised or on another desktop); capture resumes when it is back".into() }
+            } else {
+                CaptureState::Asking { reason: format!("a new “{window}” window opened"), window, candidates: others }
+            });
         }
         if !sel.descriptor.same_size(w) {
             let (reason, candidates) = (format!("it is {} × {} now; check the region", w.width, w.height), vec![w.clone()]);

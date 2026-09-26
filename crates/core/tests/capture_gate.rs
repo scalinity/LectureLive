@@ -120,6 +120,22 @@ async fn a_replaced_window_asks_and_nothing_is_captured_from_it_until_the_person
     assert_eq!(shots, vec![(true, false)], "the new window's slide, once it is chosen");
 }
 
+/// Live evidence (M5 capture check): a closed window's id can stay listed, off screen, while its app runs.
+#[tokio::test]
+async fn a_replacement_whose_old_window_lingers_off_screen_still_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    fake.on_screen(42, false);
+    fake.add(77, "Zoom Meeting", 1600, 900, slide(3));
+    let (states, shots) = watch(&mut rx, 300).await;
+    let Some(CaptureState::Asking { candidates, .. }) = states.last() else { panic!("{states:?}") };
+    assert_eq!(candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![77]);
+    assert!(shots.is_empty(), "no silent rebinding");
+}
+
 #[tokio::test]
 async fn no_window_at_start_asks_and_a_later_window_waits_for_the_person() {
     let dir = tempfile::tempdir().unwrap();

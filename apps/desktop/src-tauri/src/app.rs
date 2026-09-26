@@ -138,6 +138,17 @@ pub fn attach(transcript: Channel<Value>, notes: Channel<Value>, app: State<'_, 
     *app.sink.channels.lock().expect("the channel lock") = Some((transcript, notes));
 }
 
+/// The API key: from the Keychain; a check run (`LECTURELIVE_CHECK`) takes the repository's `.env` instead, so it
+/// needs no Keychain prompt after a rebuild changes the dev binary's signature.
+fn api_key() -> Res<String> {
+    if std::env::var_os("LECTURELIVE_CHECK").is_some() {
+        if let Some(k) = keychain::env_key() {
+            return Ok(k);
+        }
+    }
+    keychain::get(keychain::SERVICE).map_err(chain)?.ok_or_else(|| "No API key yet: add it with the key button in the status bar.".to_string())
+}
+
 /// How long a running lecture has to answer a state read before the file answers instead.
 const STATE_WAIT: Duration = Duration::from_secs(2);
 
@@ -239,7 +250,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         return Err("A lecture is already running.".into());
     }
     let folder = app.folder().ok_or("Choose a lecture folder first.")?;
-    let key = keychain::get(keychain::SERVICE).map_err(chain)?.ok_or("No API key yet: add it with the key button in the status bar.")?;
+    let key = api_key()?;
     if matches!(permission::microphone(), MicPermission::Denied | MicPermission::Restricted) {
         return Err("Microphone access is denied: System Settings → Privacy & Security → Microphone.".into());
     }
@@ -560,7 +571,7 @@ pub async fn open_page(app: State<'_, App>) -> Res<String> {
             if !folder.files.notes.exists() {
                 return Err("There are no notes to typeset in this folder yet.".into());
             }
-            let key = keychain::get(keychain::SERVICE).map_err(chain)?.ok_or("No API key yet: add it with the key button in the status bar.")?;
+            let key = api_key()?;
             let lock = FolderLock::acquire(&folder.files.dir).map_err(chain)?;
             let spend = Spend::open(&data_dir()?.join("spend.jsonl"), &folder.course, &folder.name, folder.files.date).map_err(chain)?;
             let chat = ChatClient::new(ChatConfig::new(key), Some(spend.clone())).map_err(chain)?;
@@ -638,13 +649,13 @@ pub fn check_config() -> Option<CheckConfig> {
     Some(CheckConfig { mode, dir: std::env::var("LECTURELIVE_CHECK_DIR").ok() })
 }
 
-/// Writes a check's report to `~/Library/Application Support/LectureLive/m4-checks/<name>.json`.
+/// Writes a check's report to `~/Library/Application Support/LectureLive/m5-checks/<name>.json`.
 #[tauri::command]
 pub fn check_report(name: String, json: String) -> Res<String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("not a report name: {name:?}"));
     }
-    let dir = data_dir()?.join("m4-checks");
+    let dir = data_dir()?.join("m5-checks");
     std::fs::create_dir_all(&dir).map_err(text)?;
     let path = dir.join(format!("{name}.json"));
     std::fs::write(&path, json).map_err(text)?;
@@ -659,6 +670,63 @@ pub async fn hide_window_for(ms: u64, handle: AppHandle) -> Res<()> {
     tokio::time::sleep(Duration::from_millis(ms)).await;
     w.show().map_err(text)?;
     w.set_focus().map_err(text)
+}
+
+/// The deck window's title: what the capture check binds to, and finds again after replacing it.
+const DECK_TITLE: &str = "LectureLive deck";
+
+/// The id of the newest on-screen deck window other than `not`, once the window server lists it.
+async fn deck_id(not: Option<u32>) -> Res<u32> {
+    for _ in 0..50 {
+        let ws = tauri::async_runtime::spawn_blocking(|| SystemWindows.windows()).await.map_err(text)?.map_err(|e| e.to_string())?;
+        if let Some(w) = ws.iter().filter(|w| w.title == DECK_TITLE && w.on_screen && Some(w.id) != not).max_by_key(|w| w.id) {
+            return Ok(w.id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("the deck window never appeared".into())
+}
+
+fn open_deck(handle: &AppHandle) -> Res<()> {
+    tauri::WebviewWindowBuilder::new(handle, "deck", tauri::WebviewUrl::App("deck".into())).title(DECK_TITLE).inner_size(1280.0, 720.0).position(60.0, 60.0).build().map(|_| ()).map_err(text)
+}
+
+/// The capture check's own window (M5 plan, Task 10): a deck it opens, steps, covers, minimises and
+/// replaces, so occlusion, minimisation and replacement are shown live without capturing anyone's window.
+#[tauri::command]
+pub async fn check_deck(action: String, handle: AppHandle) -> Res<Value> {
+    let deck = || handle.get_webview_window("deck").ok_or_else(|| "no deck window".to_string());
+    let main = || handle.get_webview_window("main").ok_or_else(|| "no main window".to_string());
+    match action.as_str() {
+        "open" => {
+            open_deck(&handle)?;
+            Ok(deck_id(None).await?.into())
+        }
+        "cover" => {
+            let at = deck()?.outer_position().map_err(text)?;
+            let m = main()?;
+            m.set_position(at).map_err(text)?;
+            m.set_focus().map_err(text)?;
+            Ok(Value::Null)
+        }
+        "uncover" => {
+            main()?.set_position(tauri::PhysicalPosition::new(1500, 60)).map_err(text)?;
+            Ok(Value::Null)
+        }
+        "minimize" => deck()?.minimize().map(|_| Value::Null).map_err(text),
+        "unminimize" => deck()?.unminimize().map(|_| Value::Null).map_err(text),
+        "replace" => {
+            let old = deck_id(None).await?;
+            deck()?.destroy().map_err(text)?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            open_deck(&handle)?;
+            Ok(deck_id(Some(old)).await?.into())
+        }
+        show => {
+            let i: u32 = show.strip_prefix("show:").and_then(|n| n.parse().ok()).ok_or_else(|| format!("unknown deck action {show:?}"))?;
+            deck()?.eval(format!("window.__deck.show({i})")).map(|_| Value::Null).map_err(text)
+        }
+    }
 }
 
 #[tauri::command]

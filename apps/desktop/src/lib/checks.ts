@@ -223,3 +223,115 @@ export async function pageCheck(session: Session, t: Transport, dir: string) {
   const path = await t.call<string>("open_page").catch((e) => `failed: ${e}`);
   await finish(t, "page", { dir, path, seconds: Math.round((Date.now() - t0) / 1000), notices: session.notices.slice(-3) });
 }
+
+/** Embeds of each slide in the notes: the last snapshot takes every slide exactly once. */
+function embeds(doc: string, n: number): number[] {
+  return Array.from({ length: n }, (_, i) => doc.split(`![Slide ${i + 1}](`).length - 1);
+}
+
+/** Slide capture in the running app, on a deck window the check opens itself (M5 plan, Task 10): the first
+ *  frame and a build captured, a cover that changes nothing, a minimised window that pauses, a replaced
+ *  window that asks and captures nothing until chosen, a manual capture and a dropped image; then the
+ *  last snapshot embeds each slide once. */
+export async function captureCheck(session: Session, t: Transport, dir: string) {
+  const steps: Step[] = [];
+  const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
+  const deck = (action: string) => t.call<number | null>("check_deck", { action });
+  const count = () => session.slides.length;
+  const last = () => session.slides.at(-1);
+  try {
+    await session.selectFolder(dir);
+    const id = (await deck("open"))!;
+    log("deck window opened", true, { id });
+    log("region chosen for the course", await session.captureSelect(id, { x: 0.02, y: 0.06, w: 0.96, h: 0.92 }), session.error);
+    await session.start("loopback");
+    log("started", session.status.phase === "running", { phase: session.status.phase, error: session.error });
+    await until("watching", () => session.capture.state === "watching", 30_000);
+    await until("the first slide", () => count() >= 1, 30_000);
+    log("watching; the first frame is slide 1, auto", last()?.auto === true && !last()?.uncertain, { capture: session.capture, slide: last() });
+
+    await deck("show:1");
+    await until("the build", () => count() >= 2, 15_000);
+    log("a build is slide 2, auto", last()?.auto === true, last());
+
+    let n = count();
+    await deck("cover");
+    await sleep(3000);
+    log("covered by the app's window: nothing new", count() === n, { slides: count() });
+    await deck("show:3");
+    await until("a slide taken while covered", () => count() > n, 15_000);
+    log("a change behind the cover is still captured (the window's own buffer)", last()?.auto === true, last());
+    await deck("uncover");
+
+    await deck("minimize");
+    await until("paused", () => session.capture.state === "paused", 15_000);
+    log("minimised: paused", true, session.capture);
+    n = count();
+    await deck("show:5");
+    await sleep(3000);
+    log("nothing captured while minimised", count() === n, { slides: count() });
+    await deck("unminimize");
+    await until("watching again", () => session.capture.state === "watching", 15_000);
+    await sleep(4000);
+    log("back on screen: the change made meanwhile, once", count() === n + 1, { slides: count(), last: last() });
+
+    n = count();
+    const replaced = (await deck("replace"))!;
+    await until("asking about the new window", () => session.capture.state === "asking" && session.capture.candidates.some((c) => c.id === replaced), 20_000);
+    await sleep(3000);
+    log("a replaced window asks, and nothing is captured from it", count() === n, { capture: session.capture, slides: count() });
+    await session.captureWatch(replaced);
+    await until("watching the new window", () => session.capture.state === "watching", 15_000);
+    await deck("show:8");
+    await until("a slide from the new window", () => count() > n, 15_000);
+    log("after Watch it, the new window is captured", last()?.auto === true, { slides: count(), last: last() });
+
+    n = count();
+    await session.captureNow();
+    await until("the manual slide", () => count() > n, 15_000);
+    log("Capture takes a manual slide", last()?.auto === false, { error: session.error, last: last() });
+
+    n = count();
+    await session.importSlides([`${dir}/drop-me.png`]);
+    await until("the dropped image", () => count() > n, 15_000);
+    log("a dropped image is a manual slide", last()?.auto === false, last());
+
+    const total = count();
+    await session.stop();
+    await until("the end", () => session.status.phase === "ended", 300_000);
+    const st = await t.state();
+    const each = embeds(st.document, total);
+    log("the last snapshot embeds every slide exactly once", each.every((e) => e === 1), { slides: total, embeds: each, notices: session.notices.slice(-4) });
+  } catch (e) {
+    log("failed", false, { error: String(e), capture: session.capture, slides: count(), notices: session.notices.slice(-6) });
+  }
+  await finish(t, "capture", { dir, steps, slides: session.slides });
+}
+
+/** The Zoom recording (M5 plan, Task 11): waits for the person to choose Zoom's window, runs a lecture
+ *  while the synthetic deck plays through Zoom, and reports every slide with its badges. */
+export async function zoomCheck(session: Session, t: Transport, dir: string) {
+  const steps: Step[] = [];
+  const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
+  try {
+    await session.selectFolder(dir);
+    await until("Zoom's window to be chosen", () => session.capture.state === "ready", 15 * 60_000);
+    log("window chosen", true, session.capture);
+    await session.start("loopback");
+    log("started", session.status.phase === "running", { phase: session.status.phase, error: session.error });
+    await until("watching Zoom", () => session.capture.state === "watching", 60_000);
+    log("watching", true, session.capture);
+    const end = Date.now() + 30 * 60_000;
+    while (Date.now() < end) {
+      await sleep(60_000);
+      log("minute", true, { slides: session.slides.length, capture: session.capture.state });
+    }
+    await session.stop();
+    await until("the end", () => session.status.phase === "ended", 300_000);
+    log("ended", true, session.notices.slice(-4));
+  } catch (e) {
+    log("failed", false, { error: String(e), capture: session.capture, notices: session.notices.slice(-6) });
+  }
+  const manual = session.slides.filter((s) => !s.auto);
+  await finish(t, "zoom", { dir, steps, slides: session.slides, manual, capture_notices: session.notices.filter((n) => n.kind === "slide" || n.label === "Capture") });
+}

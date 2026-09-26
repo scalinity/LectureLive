@@ -50,6 +50,7 @@ pub fn run() {
             app::capture_select,
             app::capture_watch,
             app::capture_saved_region,
+            app::check_deck,
             app::capture_now,
             app::import_slides,
             app::open_screen_settings,
