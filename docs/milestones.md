@@ -20,7 +20,7 @@ kickoff prompt carries this rule.
 | M2 | Streaming + recovery | done | M1 | No | [m2-streaming-recovery](superpowers/plans/2026-09-25-m2-streaming-recovery.md) |
 | M3 | Notes/session parity | done | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | [m3-notes-session-parity](superpowers/plans/2026-09-25-m3-notes-session-parity.md) |
 | M4 | Desktop app: transcript + notes panes | done | M3 | No | [m4-desktop-panes](superpowers/plans/2026-09-25-m4-desktop-panes.md) |
-| M5 | Slide automation | not started | M4 | No | written at M5 start |
+| M5 | Slide automation | done | M4 | No | [m5-slide-automation](superpowers/plans/2026-09-25-m5-slide-automation.md) |
 | M6 | Full-lecture acceptance; mixed mode; Python retired | not started | M5 | Removes `live_notes.py` | written at M6 start |
 
 The Python CLI (`live_notes.py`) stays the in-class tool until M6 passes.
@@ -725,9 +725,96 @@ Tasks:
 3. Shared registration path for auto, manual, shortcut and drag-and-drop (§7.3)
 4. Slides strip with badges; notes embeds
 
-**Gate:** on recorded Zoom fixtures, ≥95% recall of annotated stable states visible ≥3 s
-and ≤1 false capture per 10 minutes; occlusion, minimisation and window replacement
-handled without silent rebinding.
+**Gate** (checked in `cargo test` against fakes and recorded fixtures, and live in the dev app on windows it opens itself; plan Tasks 5, 10, 12 and the full-screen check):
+
+- [x] On recorded Zoom fixtures, ≥95% recall of annotated stable states visible ≥3 s and ≤1 false capture per 10 minutes
+- [x] Occlusion, minimisation and window replacement handled without silent rebinding
+
+**Findings** (acceptance run 2026-09-26; reports in `~/Library/Application Support/LectureLive/m5-checks/`, synthetic lectures in `m5-capture/`, `m5-deck/` and `m5-fullscreen/` beside it, outside the repository):
+
+*Suites.* `cargo test -p lecturelive-core`: 277 passed, 0 failed, 19 ignored (M4's 233 plus the registration, detector, selection, locate and worker tests and both gates; the ignored ones add the live window listing and capture and the fixture tools). `cargo test -p desktop`: 16 passed, 0 failed, 1 ignored (the Keychain round trip). `npx vitest run`: 26 passed in 6 files. `npx svelte-check`: 0 errors, 0 warnings. Two failures under load, never alone: the M1 test `audio::capture::tests::concurrent_overflow_keeps_every_position_exact`, four times in the milestone's full runs (see open threads); and the STT gate's three disconnect tests once, while the dev app was shutting down beside the run (M5 changed no STT or audio code; the gate passed three times alone).
+
+*New crates and packages.*
+- Rust: `tauri-plugin-global-shortcut 2.3.2` (with `global-hotkey 0.8.0`), for ⌘⇧2; `objc2 0.6.4` and `objc2-app-kit 0.3.2` (`NSRunningApplication`, `libc`) as direct dependencies at the versions `xcap` already locked, for bundle ids. `image` and `xcap` are optimised in the dev profile: a debug build spent about 0.8 s of every second shrinking a capture, optimised about 21 ms.
+- Frontend: none.
+
+*Capture as built* (spec §7 now states it).
+- A capture worker runs on its own thread beside the session. It enumerates windows through CoreGraphics on screen or not, and captures the chosen window by its id, so a covered window, or one full screen on another desktop, is still captured.
+- A selection is saved per course in `capture.json`: a descriptor (bundle id, title, size), the region as fractions of the window, parts left out as fractions of the region, and the region at each other size the window has had. Older files load unchanged.
+- The person chooses a window and drags its slide region over a still taken by id, so a window full screen on another desktop has one too, and drags over any part to leave out, such as a speaker's camera over the slide. Choosing the same window again keeps the parts it has.
+- At start exactly one window matching the descriptor binds; anything else asks in the strip. Nothing is watched in a window's place without the person: "Watch it" is offered only for a window the selection matches, and refuses a size with no region; a closed window pauses and offers its replacement; a window that cannot be captured pauses after three failed samples and resumes by itself.
+- A change of the window's size by any amount is a re-layout: the region found or chosen at exactly that size is used; otherwise the last kept slide is searched for in the new layout (`capture::locate`) and its place saved as the region for that size; otherwise, within 2% of a known size, that size's region is used; otherwise the strip asks, and the search runs again every 5 samples. A frame through the new region is kept silently only when it shows the kept slide (no tile past twice the change threshold), so a switch never takes the same slide twice and a slide that changed as the window did is taken.
+- The detector is spec §7.2's: tiles against the kept frame, a candidate confirmed when nothing unmasked moves, animated tiles masked, an unsettled change kept as uncertain after 10 samples. Parts left out are blanked before the downscale, one pixel wider for its blur.
+- Every slide, auto, the Capture button, ⌘⇧2, a dropped image or a ⌘⇧4 screenshot, goes through one registration path, which records auto and uncertain and never registers a file twice.
+
+*Fixtures and the detector's numbers*, at the calibrated thresholds (change 0.05, settle 0.03, animated 3, expiry 10):
+
+| Fixture | States (visible ≥3 s) | Recalled | False captures |
+|---|---|---|---|
+| Synthetic lecture (generated in the test) | 68 | 68 (100%) | 1 in 28.0 min (0.36 per 10 min) |
+| `deck-1`: the synthetic deck played in the app's window, recorded by the live worker (committed, 241 frames) | 53 | 51 (96.2%; two underline builds missed) | 0 in 26.0 min |
+| A recorded Zoom lecture played in Chrome, the speaker's camera left out (local only) | 43 | 43 (100%) | 0 in 36.7 min |
+| The same, with the camera inside the region as first drawn | 43 | 43 (100%) | 13 in 36.7 min (3.54 per 10 min); at 0.08, 11, every one the camera |
+
+- **Calibration.** At spec 7.2's first value, 0.08, the deck recorded from a window recalled 41 of 53: one line of real text changes its tiles by about 0.06. Across a grid of change, settle and animation values, 0.05 is the highest change threshold at which the deck keeps 95%; 0.06 gives 92.5%. No threshold made the camera-inside region pass (best 1.91 per 10 min, at a cost in recall), so a selection can now leave out a part of the region.
+- **The Zoom evidence is a cloud recording's playback**, not a live meeting (no meeting could be hosted): 39.6 minutes recorded record-only (nothing transcribed, registered or sent), played at 2x from 6:43 (confirmed by the lecture's burned-in clock), the player's setup trimmed, and annotated by still stretches with pointer moves merged, checked by eye on contact sheets. Replaying it through the detector at the thresholds it ran with reproduces its 71 live decisions exactly. Its frames stay off the repository and were deleted once measured.
+- Rejected with evidence: counting moves over the last N samples (N 4 to 8) cut the camera's false captures to 1.36 per 10 min but recall to 84.8%.
+
+*Live checks in the dev app*, on windows the app opens itself:
+- **Capture check** (`m5-checks/capture.json`, run 2, all 15 steps): the first frame; a build; covered by the app's own window, nothing new for 3 s and a change behind the cover captured; minimised, paused with nothing for 3 s while the deck changed, then exactly one slide on return; replaced, the strip asked with the new window as its candidate and nothing was captured for 3 s, then "Watch it" and a slide from the new window; Capture, a manual slide; a dropped image, a manual slide at its file time; the last snapshot embedded each of the seven slides once. Run 1 found that a closed window's id stays listed off screen, so replacement was never offered; fixed test-first.
+- **Full-screen check** (`m5-checks/fullscreen.json`, six runs): the deck went full screen on its own desktop, the main window came back in front, and slides changed unseen. Every cut was captured within about 2 s. Run 1 found a size change of 1.25% (1166 × 720 to 1168 × 729) inside the 2% that names the same window, taking the same slide twice, and a one-second pause while full screen animated; run 2 found a re-layout before the first capture swallowing the first slide; all three were fixed test-first, and run 3 was clean. After the review, run 4 was void (macOS did not enter full screen; the step now fails unless the deck is listed off screen); run 5 found that realigned fine text still differed by up to 0.063 in four tiles, taking the slide again on entering full screen (fixed test-first on its frames); run 6 passed all nine steps: a part left out saved and read back, the picker's still of the unseen deck, three cuts unseen, a new slide taken as the window left full screen, and five decisions for exactly the five slides shown.
+- A dissolve into an animated slide never painted while the deck was unseen: a web view pauses transitions and animation frames while its window is not visible. Capture reads what the window's app has drawn, so the spec says capture is live for as long as the app keeps drawing.
+
+*Screen Recording for the dev binary.* The preflight probe was true from this shell (Terminal.app is the responsible process); `./target/debug/desktop --check windows` listed other apps' windows with their titles; every live check above captured by window id without a prompt.
+
+*`/frontend-design:frontend-design` runs*, recorded in the plan and the ledger:
+- **Milestone:** the strip as a record in time; the teal rule only while watching; badge words in the gutter; a picker where the still dominates. Pass 2 dropped pill badges, a traffic-light dot, a camera icon, middle-dot meta strings and corner handles.
+- **Slides strip (Task 8):** time and badge in a hanging gutter, badge words in the transcript's italic mark, flat thumbnails with a 1 px rule, newest last and followed. Pass 2 dropped a "zoom.us, region" line.
+- **Window and region picker (Task 9):** a native dialog, list beside the still; the region is the one teal outline with the outside dimmed; "Use the whole window" for a way without a pointer. Pass 2 dropped numbered steps, check-mark icons, corner handles and a dimensions tooltip.
+- **Synthetic deck (Task 10):** an ordinary lecture deck on purpose, since realism is its job: white 16:9 slides, system sans, a university blue for titles. Pass 2 replaced a middle-dot footer with a comma.
+- **Parts left out (final review):** a part is a hole in what is watched, so it is dimmed as outside the region is, and the teal outline stays the only mark of what is watched; a toggle, one drag per part, and a × on each. Pass 2 rejected a drawing toolbar and red "excluded" boxes.
+- **Title bar (at the person's request):** the status strip is the window's top edge, with the traffic lights on its centre line and anything but a button dragging the window. Pass 2 rejected a separate transparent drag bar (it brings the title bar back) and the app's name in the strip (new copy).
+
+Each view was checked in Chromium through Playwright on the dev server, in light and dark, with large type and at its narrow widths, and the strip and title bar in the app's own window too; the checks' fixes are in the ledger. Screenshots were deleted.
+
+*Live spend:* $0.0727 of the $2 cap, all in `spend.jsonl` under course "m5-capture": notes $0.0714 (billed), transcribe $0.0013 (computed). The record-only and full-screen checks sent nothing.
+
+*Rulings during execution* (the ledger has all of them with their costs):
+- The detector's settle check covers every unmasked tile, not only the tiles changed against the kept frame: an in-place animated chart gave two false confirms with the narrower reading.
+- The Zoom evidence is a cloud recording's playback, recorded record-only; the committed fixture is the synthetic deck recorded from a window.
+- The change threshold is 0.05 (above).
+- A selection can leave out parts of its region.
+- Capture stays on the chosen window through full screen and other desktops, and finds the slide again after a resize (at the person's request, mid-run).
+- A check run reads the API key from `.env`, since the dev binary's Keychain read prompts after each relink.
+- `capture_watch` and `capture_saved_region` were added for "Watch it" and the picker's saved region.
+- `.gitignore`'s root-level `slides/` rule is anchored, so the fixture folder is tracked.
+- At a re-layout, "shows the kept slide" allows twice the change threshold: realignment moves fine text by up to 0.063, a new slide by 0.3 and more; a one-line build landing in the same second as a switch can be taken for the kept slide.
+- Gate tests that resize the fake window draw its new image first: drawing in a test build outlasts the samples after which the worker looks.
+
+*Review* (a fresh reviewer on the most capable model, over the whole branch at f20dc37): one Critical, four Important, seven Minor and four test gaps. The five Critical and Important findings were fixed test-first, and the test gaps are covered by the new tests:
+1. **Parts left out could not be set from the app, and choosing again wiped them** (Critical). The Zoom fixture met the gate only with the camera left out. The picker now draws them, and a re-choose keeps them.
+2. **A slide that changed as the window changed size was settled into the kept frame and lost**, which with Zoom going full screen as a share starts is the first slide of each share. Now only a frame showing the kept slide is kept silently.
+3. **"Watch it" on a resize question bound the unchecked old region and saved it for the new size.** A resize question offers no window, and "Watch it" refuses a size with no region.
+4. **While Zoom was full screen on another desktop, the picker could not show a still** (xcap lists only windows on screen), and a failed search was never retried. The still is taken by id, and the search runs again every 5 samples.
+5. **At start, "Watch it" was offered for Zoom's home window**, and clicking it replaced the course's selection. A question offers only windows the selection matches.
+
+*M4 threads taken:* the slides strip replaces the rail's plain list, with its empty state and the same asset scope; M4 minor M8 is fixed, so a new slide re-renders only the notes chunks that hold an image (Task 7).
+
+*Failed lines:* none. No spec §14.1 fallback applies (§14.1 covers loopback only).
+
+*Open threads.*
+- **Owner M6:**
+  - Whether Zoom's own meeting window keeps drawing while it is full screen on another desktop and the person works elsewhere: capture by id is shown live on a window the app owns, but a web view pauses animations there, and Zoom could not be measured without a meeting. Check it in the first real lecture.
+  - The detector's numbers on a live Zoom meeting window rather than a recording's playback.
+  - `audio::capture::tests::concurrent_overflow_keeps_every_position_exact` fails under parallel load (three times in this milestone's full runs): a producer that stops while the drop-marker ring is full leaves the tail drop unpublished. M1 code; the gate is zero unexplained missing audio intervals.
+  - Spec §8's sidecar slide fields and §14.3 still describe slides as before M5; they were outside what M5 could change.
+  - Deferred review minors: M1 the strip still says "Watching" after the lecture ends; M2 the Screen Recording hint says to choose again, where macOS needs the app reopened; M3 a closed window whose id lingers is described as minimised, a replacement opening off screen is never offered, and the offer waits three failed samples; M4 a search trusts any kept frame, possibly the lecture's first frame of speaker video; M5 below 1100 px the strip that holds the questions folds away; M6 ⌘⇧2 during a resize question captures through the old region; M7 the list of sizes grows without limit.
+  - Deferred from the title bar: large type at the 960 px minimum clips the strip's clock (68 px of the overflow predates the lights' inset); the traffic lights are placed once at build, centred for normal type, and sit about 7 pt high in large type.
+- **Needing the person, one sitting of a few minutes:**
+  - drag the window by the status strip, and double-click it to zoom;
+  - in a real lecture, choose Zoom's window, leave out the speaker's camera, and try full screen with another app in front.
+
+  No gate line depends on this.
 
 ## M6 — Full-lecture acceptance; mixed mode; Python retired
 
