@@ -1,0 +1,279 @@
+//! The M5 gate's window cases (docs/milestones.md): occlusion, minimisation and window replacement
+//! never rebind silently; resizes, failures and denial are said; every slide goes through one path. No network.
+mod support;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::Local;
+use lecturelive_core::capture::detect::{Region, Thresholds};
+use lecturelive_core::capture::select::{Descriptor, Selection};
+use lecturelive_core::capture::worker::{self, CaptureCmd, CaptureEvent, CaptureState, WorkerConfig};
+use lecturelive_core::notes::chat::{ChatClient, ChatConfig};
+use lecturelive_core::notes::embeds::embeds_in;
+use lecturelive_core::session::coordinator::SessionConfig;
+use lecturelive_core::session::files::LectureFiles;
+use lecturelive_core::session::folder;
+use lecturelive_core::session::lecture::{self, CaptureSetup, Command, Event, Lecture, SlideWatch};
+use lecturelive_core::session::segments;
+use lecturelive_core::session::sidecar::Sidecar;
+use lecturelive_core::session::spend::Spend;
+use lecturelive_core::stt::rest::{spawn_recovery, RestClient, RestConfig};
+use lecturelive_core::stt::stream::{self, SttConfig};
+use serde_json::Value;
+use support::fake_sse::{self, Reply};
+use support::sources::Talking;
+use support::windows::{slide, FakeWindows};
+use support::{fake_rest, fake_stt};
+use tokio::sync::mpsc;
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+fn selection(fake: &FakeWindows, id: u32) -> Selection {
+    let s = fake.0.lock().unwrap();
+    let (info, _) = s.windows.iter().find(|(i, _)| i.id == id).unwrap();
+    Selection { descriptor: Descriptor::of(info), region: Region { x: 0.05, y: 0.1, w: 0.9, h: 0.85 } }
+}
+
+fn start(fake: &FakeWindows, sel: Option<Selection>, dir: &Path) -> (worker::CaptureHandle, mpsc::UnboundedReceiver<CaptureEvent>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let cfg = WorkerConfig { slides: dir.to_path_buf(), interval: ms(20), thresholds: Thresholds::default(), record: None };
+    (worker::spawn(Box::new(fake.clone()), sel, cfg, tx), rx)
+}
+
+/// Collects events for `ms`: the states in order, and each saved slide's (auto, uncertain).
+async fn watch(rx: &mut mpsc::UnboundedReceiver<CaptureEvent>, ms: u64) -> (Vec<CaptureState>, Vec<(bool, bool)>) {
+    let (mut states, mut shots) = (Vec::new(), Vec::new());
+    let end = tokio::time::Instant::now() + Duration::from_millis(ms);
+    while let Ok(Some(e)) = tokio::time::timeout_at(end, rx.recv()).await {
+        match e {
+            CaptureEvent::State(s) => states.push(s),
+            CaptureEvent::Captured(c) => {
+                assert!(c.path.exists());
+                shots.push((c.auto, c.uncertain));
+            }
+        }
+    }
+    (states, shots)
+}
+
+fn watching(s: &CaptureState) -> bool {
+    matches!(s, CaptureState::Watching { .. })
+}
+
+#[tokio::test]
+async fn a_matching_window_binds_at_start_and_each_settled_slide_is_saved_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(states.iter().any(watching), "{states:?}");
+    assert_eq!(shots, vec![(true, false)], "the first frame of the session");
+    fake.show(42, slide(2));
+    let (_, shots) = watch(&mut rx, 300).await;
+    assert_eq!(shots, vec![(true, false)], "the build, once");
+}
+
+#[tokio::test]
+async fn occlusion_changes_nothing_minimising_pauses_and_the_same_window_resumes_without_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    // Covered by another window: the window's own buffer is unchanged (CGWindowListCreateImage, OptionIncludingWindow).
+    let (_, shots) = watch(&mut rx, 200).await;
+    assert!(shots.is_empty());
+    fake.on_screen(42, false);
+    let (states, shots) = watch(&mut rx, 200).await;
+    assert!(matches!(states.last(), Some(CaptureState::Paused { reason, .. }) if reason.contains("not on screen")), "{states:?}");
+    assert!(shots.is_empty());
+    fake.on_screen(42, true);
+    let (states, shots) = watch(&mut rx, 200).await;
+    assert!(states.last().is_some_and(watching));
+    assert!(shots.is_empty(), "the same slide is not captured again after the pause");
+}
+
+#[tokio::test]
+async fn a_replaced_window_asks_and_nothing_is_captured_from_it_until_the_person_binds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let sel = selection(&fake, 42);
+    let (h, mut rx) = start(&fake, Some(sel.clone()), dir.path());
+    watch(&mut rx, 200).await;
+    fake.close(42);
+    let (states, _) = watch(&mut rx, 150).await;
+    assert!(matches!(states.last(), Some(CaptureState::Paused { reason, .. }) if reason.contains("closed")), "{states:?}");
+    fake.add(77, "Zoom Meeting", 1600, 900, slide(3));
+    let (states, shots) = watch(&mut rx, 300).await;
+    let Some(CaptureState::Asking { candidates, .. }) = states.last() else { panic!("{states:?}") };
+    assert_eq!(candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![77]);
+    assert!(shots.is_empty(), "no silent rebinding");
+    h.send(CaptureCmd::Bind { window: 77, selection: sel });
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(states.last().is_some_and(watching));
+    assert_eq!(shots, vec![(true, false)], "the new window's slide, once it is chosen");
+}
+
+#[tokio::test]
+async fn no_window_at_start_asks_and_a_later_window_waits_for_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let sel = selection(&fake, 42);
+    fake.close(42);
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (states, _) = watch(&mut rx, 150).await;
+    assert!(matches!(states.last(), Some(CaptureState::Asking { candidates, .. }) if candidates.is_empty()), "{states:?}");
+    fake.add(50, "Zoom Meeting", 1600, 900, slide(1));
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(matches!(states.last(), Some(CaptureState::Asking { candidates, .. }) if candidates.len() == 1), "{states:?}");
+    assert!(shots.is_empty());
+}
+
+#[tokio::test]
+async fn a_resized_window_pauses_and_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    fake.resize(42, 1280, 800);
+    fake.show(42, slide(4));
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(matches!(states.last(), Some(CaptureState::Asking { reason, .. }) if reason.contains("1280 × 800")), "{states:?}");
+    assert!(shots.is_empty(), "Zoom's re-laid-out window is not captured through the old region");
+}
+
+#[tokio::test]
+async fn blank_and_failed_captures_are_not_slides() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    fake.0.lock().unwrap().blank_next = 2;
+    let (states, shots) = watch(&mut rx, 200).await;
+    assert!(shots.is_empty() && !states.iter().any(|s| matches!(s, CaptureState::Failing { .. })), "two blanks are not yet a failure: {states:?}");
+    fake.0.lock().unwrap().fail_next = 5;
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(states.iter().any(|s| matches!(s, CaptureState::Failing { .. })), "{states:?}");
+    assert!(states.last().is_some_and(watching), "and it recovers");
+    assert!(shots.is_empty(), "the slide on screen is not captured again");
+}
+
+#[tokio::test]
+async fn denial_is_said_and_manual_capture_says_why_it_cannot() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let sel = selection(&fake, 42);
+    fake.0.lock().unwrap().denied = true;
+    let (h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (states, _) = watch(&mut rx, 150).await;
+    assert_eq!(states.last(), Some(&CaptureState::Denied));
+    let (tx, reply) = tokio::sync::oneshot::channel();
+    h.send(CaptureCmd::Now(tx));
+    assert!(reply.await.unwrap().unwrap_err().contains("No window is being watched"));
+}
+
+#[tokio::test]
+async fn manual_capture_keeps_the_frame_so_auto_does_not_take_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    fake.show(42, slide(2));
+    let (tx, reply) = tokio::sync::oneshot::channel();
+    h.send(CaptureCmd::Now(tx));
+    reply.await.unwrap().unwrap();
+    let (_, shots) = watch(&mut rx, 300).await;
+    assert_eq!(shots, vec![(false, false)], "the manual slide, and no auto copy of it");
+}
+
+// A whole lecture with capture, through the fakes of the M3 gate.
+
+const TITLE: &str = "# Machine Learning — Week 01 — Optimisation — 2026-09-25";
+const NAME: &str = "Week 01 — Optimisation";
+
+fn user_text(body: &Value) -> String {
+    let c = &body["messages"][1]["content"];
+    c.as_str().map(str::to_string).unwrap_or_else(|| c[0]["text"].as_str().unwrap_or_default().to_string())
+}
+
+/// The model, played by the fake: notes that place every embed they are given.
+fn respond(body: &Value) -> Reply {
+    let embeds: Vec<String> = user_text(body).lines().filter(|l| l.starts_with("![Slide ")).map(str::to_string).collect();
+    fake_sse::answer(&format!("## Gradient descent\n- Steps against the gradient.\n{}", embeds.join("\n")), 1_000_000)
+}
+
+async fn until(events: &mut mpsc::UnboundedReceiver<Event>, what: &str, want: impl Fn(&Event) -> bool) -> Event {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let e = tokio::time::timeout_at(deadline, events.recv()).await.unwrap_or_else(|_| panic!("no {what} within 30 s")).expect("the lecture is running");
+        if let Event::SnapshotFailed(m) = &e {
+            panic!("waiting for {what}: {m}");
+        }
+        if want(&e) {
+            return e;
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_slides_and_the_watcher_share_one_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    segments::session_marker(&f.transcript, Local::now()).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let rest = fake_rest::start(None).await;
+    let sse = fake_sse::start(respond).await;
+    let spend = Spend::open(&ledger, "Machine Learning", NAME, f.date).unwrap();
+    let chat = ChatClient::new(ChatConfig { url: sse.url.clone(), idle_timeout: ms(5_000), ..ChatConfig::new("test-key".into()) }, Some(spend.clone())).unwrap();
+    let lec = Arc::new(Lecture { files: f.clone(), course: "Machine Learning".into(), name: NAME.into(), title: TITLE.into(), chat, spend: spend.clone() });
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let rest_cfg = RestConfig { url: rest.url.clone(), retry_unit: ms(1), request_timeout: ms(5_000), file_wait: ms(5_000), ..RestConfig::new("test-key".into(), vec![]) };
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), recovery: Some(spawn_recovery(RestClient::new(rest_cfg).unwrap())), spend: Some(spend), ..Default::default() };
+
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let capture = CaptureSetup { source: Box::new(fake.clone()), selection: Some(selection(&fake, 42)), interval: ms(20), thresholds: Thresholds::default(), record: None };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let source = Talking { pace: ms(2), fake: stt.state.clone() };
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(source), SlideWatch { screenshots: None, poll: ms(20) }, Some(capture), cmd_rx, ev_tx));
+
+    until(&mut ev, "the first auto slide", |e| matches!(e, Event::Slide { index: 1, auto: true, .. })).await;
+    fake.show(42, slide(2));
+    until(&mut ev, "the build", |e| matches!(e, Event::Slide { index: 2, auto: true, .. })).await;
+    let (tx, reply) = tokio::sync::oneshot::channel();
+    cmd.send(Command::CaptureNow(tx)).unwrap();
+    reply.await.unwrap().unwrap();
+    until(&mut ev, "the manual slide", |e| matches!(e, Event::Slide { index: 3, auto: false, .. })).await;
+    let outside = dir.path().join("board.png");
+    support::slides::png(&outside);
+    cmd.send(Command::Import(vec![outside.clone()])).unwrap();
+    until(&mut ev, "the dropped image", |e| matches!(e, Event::Slide { index: 4, auto: false, .. })).await;
+    tokio::time::sleep(ms(200)).await; // the watcher lists slides/ several times
+    cmd.send(Command::Stop).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run).await.expect("the lecture ends within 10 s of the stop").unwrap().unwrap();
+
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert_eq!(sc.slides.iter().map(|s| (s.index, s.auto)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false), (4, false)]);
+    let names: Vec<String> = std::fs::read_dir(&f.slides).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert!(outside.exists(), "the dropped original stays");
+    let notes = std::fs::read_to_string(&f.notes).unwrap();
+    for n in 1..=4 {
+        assert_eq!(notes.matches(&format!("![Slide {n}](slides/slide_{n:02}_")).count(), 1, "{notes}");
+    }
+    assert_eq!(embeds_in(&notes).len(), 4);
+}

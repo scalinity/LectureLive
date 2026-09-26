@@ -337,7 +337,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         }
     });
     let watch = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
-    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid }), watch, cmd_rx, ev_tx);
+    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid }), watch, None, cmd_rx, ev_tx);
     *app.running.lock().expect("the running lock") = Some(Running { commands: cmd_tx, lecture: lec, stops: 0, _lock: lock });
     app.pump.lock().await.set_status(|s| s.phase = Phase::Running);
     let h = handle.clone();

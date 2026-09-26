@@ -113,7 +113,7 @@ async fn a_whole_lecture_runs_headless_from_first_word_to_study_page() {
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev) = mpsc::unbounded_channel();
     let source = Talking { pace: ms(2), fake: stt.state.clone() };
-    let run = tokio::spawn(lecture::run(lec.clone(), session, Box::new(source), SlideWatch { screenshots: None, poll: ms(20) }, cmd_rx, ev_tx));
+    let run = tokio::spawn(lecture::run(lec.clone(), session, Box::new(source), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
 
     segments_seen(&mut ev, 2).await;
     support::slides::png(&f.slides.join("Screenshot dropped in.png"));
@@ -275,7 +275,7 @@ async fn a_second_stop_skips_queued_operations() {
     let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev) = mpsc::unbounded_channel();
-    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, cmd_rx, ev_tx));
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
     segments_seen(&mut ev, 1).await;
     cmd.send(Command::Op(Op::Snapshot(String::new()))).unwrap();
     until(&mut ev, "the snapshot in flight", |e| matches!(e, Event::Busy(m) if m.starts_with("snapshot"))).await;
@@ -307,7 +307,7 @@ async fn a_cancelled_snapshot_writes_nothing_drops_the_queue_and_its_material_go
     let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev) = mpsc::unbounded_channel();
-    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, cmd_rx, ev_tx));
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
     segments_seen(&mut ev, 1).await;
     let untouched = std::fs::read(&f.notes).unwrap();
     cmd.send(Command::Op(Op::Snapshot("first".into()))).unwrap();

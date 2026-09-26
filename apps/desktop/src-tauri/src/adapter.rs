@@ -193,6 +193,7 @@ impl Pump {
                 self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path }));
                 self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}, into the next snapshot"));
             }
+            Event::Capture(_) => {} // the capture status: Task 6
             Event::Warning(m) => self.notice(NoticeKind::Warn, "Warning", &m),
         }
         self.flush_status();

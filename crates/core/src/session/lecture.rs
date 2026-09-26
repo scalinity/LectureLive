@@ -14,6 +14,10 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::audio::source::Source;
+use crate::capture::detect::Thresholds;
+use crate::capture::select::Selection;
+use crate::capture::window::WindowSource;
+use crate::capture::worker::{self, CaptureCmd, CaptureEvent, CaptureHandle, CaptureState, WorkerConfig};
 use crate::notes::chat::{self, ChatClient, ChatRequest, Content, Image};
 use crate::notes::embeds::{clean_output, repair};
 use crate::notes::page::{self, PageOutcome};
@@ -57,6 +61,22 @@ pub enum Command {
     /// A consistent copy of the sidecar: from the session's one writer while it runs, from the file
     /// once the lecture is stopping (spec §3.6, §8).
     State(oneshot::Sender<Result<Sidecar, String>>),
+    /// Capture the watched region now, as a manual slide (spec §7.3): the button and the shortcut.
+    CaptureNow(oneshot::Sender<Result<(), String>>),
+    /// Watch this window through this region: the person's answer to the picker or to an ask.
+    Bind { window: u32, selection: Selection },
+    /// Images dropped on the app (spec §7.3).
+    Import(Vec<PathBuf>),
+}
+
+/// Slide capture for a lecture (spec §7): where windows come from, and the course's saved selection.
+pub struct CaptureSetup {
+    pub source: Box<dyn WindowSource>,
+    pub selection: Option<Selection>,
+    pub interval: Duration,
+    pub thresholds: Thresholds,
+    /// Records the detector's input as a fixture (spec §11).
+    pub record: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -76,6 +96,8 @@ pub enum Event {
     Page { outcome: PageOutcome, usd: f64 },
     PageFailed(String),
     Slide { index: u32, file: String, auto: bool, uncertain: bool, shown_at: DateTime<Local> },
+    /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
+    Capture(CaptureState),
     Warning(String),
 }
 
@@ -374,7 +396,7 @@ async fn slide_watcher(lec: Arc<Lecture>, store: Store, watch: SlideWatch, mut s
 }
 
 /// A whole lecture: runs until stopped (or until its audio ends), then the last snapshot.
-pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>, watch: SlideWatch, mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) -> Result<StopReport> {
+pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>, watch: SlideWatch, capture: Option<CaptureSetup>, mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) -> Result<StopReport> {
     let (handle, mut notes, store) = coordinator::spawn_with_store(cfg, source);
     let pages = Arc::new(Mutex::new(Vec::new()));
     let (op_tx, op_rx) = mpsc::unbounded_channel();
@@ -383,13 +405,22 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
     let worker = tokio::spawn(notes_worker(lec.clone(), store.clone(), op_rx, events.clone(), pages.clone(), hurry.clone(), generation_rx));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let watcher = tokio::spawn(slide_watcher(lec.clone(), store.clone(), watch, stop_rx, events.clone()));
+    let (mut capture, capturer) = match capture {
+        Some(c) => {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let cfg = WorkerConfig { slides: lec.files.slides.clone(), interval: c.interval, thresholds: c.thresholds, record: c.record };
+            (Some(worker::spawn(c.source, c.selection, cfg, tx)), Some(tokio::spawn(capture_task(lec.clone(), store.clone(), rx, events.clone()))))
+        }
+        None => (None, None),
+    };
     // Serves state reads until the lecture begins stopping: the session ends only once every store is dropped.
     let mut state_store = Some(store);
     let mut op_tx = Some(op_tx);
     let (mut stops, mut commands_open) = (0, true);
     let stopping = AtomicBool::new(false);
-    let begin_stop = |op_tx: &mut Option<UnboundedSender<(Op, u64)>>, state_store: &mut Option<Store>| {
+    let begin_stop = |op_tx: &mut Option<UnboundedSender<(Op, u64)>>, state_store: &mut Option<Store>, capture: &mut Option<CaptureHandle>| {
         *state_store = None;
+        *capture = None; // the worker stops; what it already saved is still registered
         if !stopping.swap(true, Ordering::Relaxed) {
             let _ = stop_tx.send(true);
             *op_tx = None; // queued operations still run; nothing new is taken
@@ -399,7 +430,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
         tokio::select! {
             n = notes.recv() => match n {
                 Some(Notification::SourceEnded) => {
-                    begin_stop(&mut op_tx, &mut state_store);
+                    begin_stop(&mut op_tx, &mut state_store, &mut capture);
                     let _ = events.send(Event::Session(Notification::SourceEnded));
                 }
                 Some(n) => { let _ = events.send(Event::Session(n)); }
@@ -418,17 +449,40 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                 Some(Command::Stop) => {
                     stops += 1;
                     handle.request_stop();
-                    begin_stop(&mut op_tx, &mut state_store);
+                    begin_stop(&mut op_tx, &mut state_store, &mut capture);
                     if stops >= 2 {
                         hurry.store(true, Ordering::Relaxed);
                     }
                 }
+                Some(Command::CaptureNow(reply)) => match &capture {
+                    Some(c) => c.send(CaptureCmd::Now(reply)),
+                    None if stopping.load(Ordering::Relaxed) => { let _ = reply.send(Err("The lecture is stopping.".into())); }
+                    None => { let _ = reply.send(Err("No window is being watched: choose one in the slides strip.".into())); }
+                },
+                Some(Command::Bind { window, selection }) => if let Some(c) = &capture { c.send(CaptureCmd::Bind { window, selection }) },
+                Some(Command::Import(paths)) => match &state_store {
+                    Some(s) => {
+                        let (lec, s, events) = (lec.clone(), s.clone(), events.clone());
+                        tokio::spawn(async move {
+                            for (_, r) in slides::import(&lec.files, &s, &paths).await {
+                                let _ = events.send(match r {
+                                    Ok(slide) => slide_event(&slide),
+                                    Err(m) => Event::Warning(m),
+                                });
+                            }
+                        });
+                    }
+                    None => { let _ = events.send(Event::Warning("The lecture is stopping; images dropped now are not added.".into())); }
+                },
                 None => commands_open = false, // input closed: the lecture runs until it is stopped or its audio ends
             },
         }
     }
-    begin_stop(&mut op_tx, &mut state_store);
+    begin_stop(&mut op_tx, &mut state_store, &mut capture);
     let _ = watcher.await;
+    if let Some(c) = capturer {
+        let _ = c.await;
+    }
     let _ = worker.await;
     let report = handle.finish().await?;
     for p in pages.lock().expect("the page list").drain(..) {
@@ -452,4 +506,26 @@ fn read_sidecar(files: &LectureFiles) -> Result<Sidecar, String> {
 
 fn slide_event(s: &SlideEntry) -> Event {
     Event::Slide { index: s.index, file: s.file.clone(), auto: s.auto, uncertain: s.uncertain, shown_at: s.shown_at }
+}
+
+/// The capture worker's results: each saved slide goes through the one registration path, and each
+/// state reaches the adapters. It ends when the worker stops, releasing its store.
+async fn capture_task(lec: Arc<Lecture>, store: Store, mut rx: UnboundedReceiver<CaptureEvent>, events: UnboundedSender<Event>) {
+    while let Some(e) = rx.recv().await {
+        match e {
+            CaptureEvent::State(s) => {
+                let _ = events.send(Event::Capture(s));
+            }
+            CaptureEvent::Captured(c) => match slides::register(&lec.files, &store, &c.path, SlideMeta { shown_at: c.shown_at, auto: c.auto, uncertain: c.uncertain }).await {
+                Ok(Some(s)) => {
+                    let _ = events.send(slide_event(&s));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = std::fs::remove_file(&c.path);
+                    let _ = events.send(Event::Warning(format!("slide capture: {e:#}")));
+                }
+            },
+        }
+    }
 }

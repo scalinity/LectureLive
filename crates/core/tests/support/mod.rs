@@ -8,3 +8,4 @@ pub mod speech;
 pub mod sources;
 pub mod fake_sse;
 pub mod slides;
+pub mod windows;

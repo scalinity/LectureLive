@@ -537,6 +537,10 @@ fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
             };
             say(p, "slide", &format!("slide {index}{how}"), &format!("{}, into the next snapshot", Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
         }
+        Event::Capture(s) => {
+            let (label, detail) = s.words();
+            say(p, "slide", &label.to_lowercase(), &detail)
+        }
         Event::Warning(m) => say(p, "warn", "warning", m),
     }
 }
@@ -694,7 +698,7 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         }
     });
     let watch_slides = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
-    let result = lecture::run(lec, session, Box::new(DeviceSource { uid }), watch_slides, cmd_rx, ev_tx).await;
+    let result = lecture::run(lec, session, Box::new(DeviceSource { uid }), watch_slides, None, cmd_rx, ev_tx).await;
     printer.await?;
     let report = result?;
     let file_name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
