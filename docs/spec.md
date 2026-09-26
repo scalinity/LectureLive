@@ -148,16 +148,45 @@ fn list_inputs()  -> Result<Vec<InputInfo>, AudioError>;
 
 ### 3.6 Notifications and UI transport
 
-Low-rate status goes over Tauri events: `SessionState`, `AudioLevel` (10/s),
-`SttState`, `SlideRegistered`, `NotesStarted`, `NotesCommitted`, `NotesFailed`,
-`PolishCommitted`, `Gap`, `Error`. High-rate ordered streams go over a Tauri 2
-`Channel` per stream: transcript updates and notes deltas. Every notification carries
-`session_id`, a sequence number and, where relevant, `op_id` and document revision.
+The desktop adapter runs one lecture per window: at most one `session::lecture::run`, spawned on
+Tauri's runtime, drives the session; a lecture folder can be open without one, and its notes and
+transcript are then shown from the files. A `Pump` turns each lecture event into one message on one
+of three streams:
 
-- Transcript updates: `OpenUtterance { utterance_id, stable: Vec<Word>, tentative: Vec<Word> }` and `UtteranceClosed { utterance_id, segment_id }`. Words carry explicit IDs (§9.3).
-- `NotesCommitted { op_id, revision, block }` carries the canonical verified block that replaces the preview.
-- `PolishCommitted { revision }` tells the UI to re-fetch the document.
-- `get_session_state()` returns a coherent snapshot (document revision, recent transcript, open utterance, slides, pending counts, status) so a reloaded frontend reconstructs itself without replaying history.
+- **status**, a Tauri event: the whole status (phase, folder, source, input level once a second, STT
+  state, the notes operation running, open transcript gaps, start time, this lecture's spend today,
+  the loopback silence warning), sent whenever any part of it changes; notices, the CLI's event lines
+  in its words and marks; registered slides.
+- **transcript**, a Tauri `Channel`: `open {utterance, stable, tentative}` for what is being said;
+  `closed {utterance, segment}` when a live segment closes it; `segment {segment}` for a recovered one,
+  which closes nothing. A segment carries its segment-log id and its time.
+- **notes**, a Tauri `Channel`: `delta {op, text}`; `committed {op, revision, block}`, the verified
+  block that replaces the preview; `ended {op, outcome, message}` for nothing new, a failure or a
+  cancel; `polished {revision}`, after which the document is read again. Deltas and the result that
+  ends them share an `op` and a channel, so their order holds.
+
+Every message carries `session`, an id per opened folder or started lecture, and `seq`, one counter
+across the three streams, assigned under the pump's lock. The lecture's `Committed` and `Polished`
+events carry the notes revision their commit produced.
+
+`get_session_state()` holds the pump's lock while it reads, so its `seq` is the watermark of
+everything it returns: the sidecar (from the session's one writer while it runs, through
+`Command::State`; from its file, which that writer saves atomically, once the lecture is stopping or
+when none runs); the whole segment log; the notes file, read until its length and SHA-256 are the
+sidecar's revision; and the pump's mirror of the live view: the open utterance, the preview so far,
+the last 50 notices, the status. A reloaded frontend rebuilds itself from it without replaying
+history.
+
+The frontend drops a message whose session is not its own (a status message from a new session
+makes it read the state again), whose `seq` is at or below the watermark, or at or below the last on
+its stream. It appends a committed block only at the next revision and ignores one it already holds;
+a revision jump, `polished`, or a hole in segment ids (the coordinator's notification channel can drop
+under load) makes it read the state again.
+
+Commands: `attach(transcript, notes)` on every page load, replacing the previous page's channels;
+`get_session_state`; `select_folder`; `inputs`; `loopback_status`; `start_lecture(source)`; `stop`,
+which answers the stop level; `snapshot(hint)`; `polish`; `cancel`; `open_page`; `spend_summary`;
+`key_status`, `save_key` and `import_key_from_env`, none of which returns the key.
 
 ## 4. Audio
 
@@ -561,29 +590,78 @@ read, and the next line starts on a line of its own.
 
 ### 9.1 Layout
 
-- **Transcript** (left): utterances as paragraphs with times; stable words full opacity, tentative tail reduced; newly stable words fade in (~180 ms). Closed utterances collapse to plain paragraph text. Auto-scroll pins to bottom until the user scrolls up; "jump to live" returns.
-- **Notes** (centre): committed document rendered once per revision and frozen; the streaming preview renders below it with the same fade-in and is replaced by the committed block.
-- **Slides** (right strip): thumbnails with time and auto/manual/uncertain badges; window and region picker on top.
-- **Control bar**: source picker with level meter and route status, Start/Stop, hint field + Snapshot, Polish, Open study page (in the default browser; typesets first when the page is missing or stale, §6.4), capture Auto/Manual and Capture-now, status (STT, capture, gaps, elapsed, this lecture's spend today from the ledger, §8).
-- **Spend** (menu): totals by month and course, recent lectures broken down by kind, and the share of the total that is computed rather than billed.
+- **Transcript** (left): closed utterances as plain paragraphs, each with its time in a hanging
+  gutter; a recovered one is marked there. The utterance being said sits below them, one step
+  larger, on a teal rule: stable words in ink, the tentative tail in graphite. A new word fades in
+  (~180 ms); a tentative word turning stable changes colour without remounting. The pane follows the
+  newest words while the reader is at its end; scrolling up stops it and shows "Jump to live".
+- **Notes** (centre): the committed document, split at its snapshot markers, each part rendered once
+  and frozen, with its time in the same gutter. The streaming preview renders below it on the teal
+  rule, marked "writing"; each finished block fades in once, and the committed block replaces it.
+  The pane follows the newest writing while the reader is at its end.
+- **Slides** (right strip): thumbnails with time and auto/manual/uncertain badges; window and region
+  picker on top. Below 1100 px the strip folds away.
+- **Status strip** (top): the phase in one word (Ready, Starting, Listening, Stopping, Stopped) with
+  what it means while it lasts; a static red dot while recording; course › lecture; the source with a
+  level meter (−60 to 0 dBFS, once a second, red while ten silent seconds on loopback last); elapsed
+  time; STT state; open transcript gaps; this lecture's spend today from the ledger (§8), which opens
+  the spend view; a large-type toggle; the API key.
+- **Command line** (bottom), in the CLI's grammar: an empty ⏎ takes a snapshot, a hint then ⏎ a hinted
+  snapshot, `polish` ⏎ a polish. Snapshot; Cancel, only while a snapshot or polish runs; Polish; Study
+  page (typesets first when the page is missing or stale, §6.4, then opens it in the default browser);
+  Stop. The latest notice sits above the prompt in the CLI's marks (◆ notes, ▣ slide, ✦ page, ✓ done,
+  ▲ warning) and opens the last eight; a command that fails shows the backend's message there. Before
+  a lecture the same bar holds the folder picker, the source (the inputs, and Zoom through "LectureLive
+  Loopback" when BlackHole is present, else the install hint) and Start.
+- **Stop** has the CLI's three levels. Stop finishes the transcript and recovery, then takes the last
+  snapshot; while that runs the button becomes Stop waiting, which stops waiting for recovery and drops
+  queued requests; quitting the app is the third level, and the next session in the folder repairs,
+  recovers and notes what is left.
+- **Cancel** stops the notes request in flight and the requests queued behind it: nothing is written,
+  the batch stays pending, and the next snapshot sends the same material (§6.2). The study page is not
+  cancellable.
+- **Spend** (from the strip): a sheet beside the lecture with the CLI's `lecture spend` figures: all
+  time, the last three months by course with bars, the eight most recent lectures by kind, and the
+  share estimated from published rates rather than billed.
+- **API key**: a dialog that stores the key in the Keychain (or moves the CLI's `GROK_API_KEY` there),
+  opened at start when none is stored.
 
 ### 9.2 State and lifecycle
 
-One `session.svelte.ts` rune store. Initialisation awaits listener and channel
-attachment, then calls `get_session_state()`, then allows Start. Unlisten handles are
-kept and disposed on hot reload. Out-of-order or stale-session messages are dropped by
-sequence number and session id. Preview work is bounded; when the window is hidden,
-queued preview updates are discarded and the store rehydrates on return.
+One `session.svelte.ts` rune store. Initialisation registers the status listener and both channels
+before it awaits anything, then calls `get_session_state()` (§3.6); messages that arrive meanwhile wait
+and are replayed above its watermark. Messages are applied once per animation frame: the frame applies
+its queue, flushes the DOM, then runs the panes' hooks (pinning), so they measure what is on screen.
+Unlisten handles are kept and disposed on hot reload. When the window is hidden (`visibilitychange`,
+which WKWebView fires when a Tauri window hides and shows), the store stops applying messages and
+discards them; on return it reads the state again. Commands go through the store; the key never
+reaches it.
 
 ### 9.3 Rendering
 
-Words carry explicit IDs: an unchanged prefix keeps its IDs, replacements get new ones,
-promotion from tentative to stable does not remount. SSE deltas are assembled into
-words for display, keeping the unfinished trailing word across deltas. Markdown of the
-preview is parsed at most every 100 ms; committed blocks are parsed once. Output of
-`marked` is sanitised with DOMPurify (no scripts, frames, event handlers, remote URLs);
-images resolve only for registered slide files through Tauri's asset protocol scoped to
-the lecture's `slides/`. CSP forbids remote loads.
+Words carry explicit IDs: an unchanged prefix keeps its IDs, replacements get new ones, promotion from
+tentative to stable does not remount. The preview accumulates deltas as text and is shown at most
+every 100 ms, up to its last whitespace, so an unfinished trailing word waits for the next delta; it is
+split into top-level Markdown blocks, all but the last finished and parsed once. Committed parts are
+parsed once. Closed transcript paragraphs use `content-visibility: auto`, so a two-hour transcript lays
+out only what is on screen.
+
+Markdown goes through `marked`, then DOMPurify (no scripts, frames, forms, SVG, MathML, styles, event
+handlers or `srcset`), then one pass that decides every URL: an image renders only when its path
+resolves under the notes folder to a registered slide, through Tauri's asset protocol; a link keeps
+only an in-page anchor; every other URL attribute is removed. The asset protocol's scope is empty until
+a lecture folder is opened, which allows that lecture's `slides/`, not recursively.
+
+The CSP is `default-src 'self'; script-src 'self'` with a nonce, `style-src 'self' 'unsafe-inline'`
+(Svelte and Vite inject styles), `img-src 'self' asset: http://asset.localhost`, `connect-src 'self'
+ipc: http://ipc.localhost` and the dev server's websocket, `font-src 'self'`, and `'none'` for
+objects, frames, `base-uri` and form actions. SvelteKit's `kit.csp` sends it (a header in development,
+where the webview loads the dev server directly; a meta tag in a built page), and `tauri.conf.json`
+gives the custom protocol of a built app the same directives.
+
+Frame work, the time to apply a frame's messages, flush the DOM and read the panes' layout, stays under
+16.7 ms at the 95th percentile on a 500-delta/s burst and on a two-hour lecture streaming live,
+measured in the app's WKWebView.
 
 ### 9.4 Visual design
 
@@ -593,6 +671,13 @@ the desktop app (`apps/desktop/src/`), the study page template (`notes_template.
 existing view, not only new ones. The design is readable at arm's length, light and
 dark, has a large-type toggle, and has no decorative motion beyond the fade-ins that
 carry meaning.
+
+The app takes the study page's own palette (paper, ink, graphite, rule, plate, signal red, teal), in
+light and dark after the system, so the app and the page are one family. Type is Atkinson Hyperlegible
+Next when installed, else the system face, on an 18 px base with a 1.2 ratio; the large-type toggle
+scales it by 125%. Times and money use tabular figures in the same face. Panes are flat columns divided
+by rules, with no cards or shadows. A hanging gutter holds when things happened, and a teal rule marks
+what is live. The command line is the one bold element.
 
 ## 10. Errors and robustness
 
