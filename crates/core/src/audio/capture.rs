@@ -23,6 +23,8 @@ pub struct StreamFlags {
     pub invalidated: AtomicBool,
     pub errors: AtomicU64,
     first_ms: AtomicU64,
+    ended: AtomicBool,
+    end_frame: AtomicU64,
 }
 
 impl StreamFlags {
@@ -84,6 +86,15 @@ impl CaptureProducer {
     }
 }
 
+impl Drop for CaptureProducer {
+    /// A drop still pending (its event ring was full) is published through the end position, so the
+    /// consumer places it: a stream's last stretch is never lost without a mark.
+    fn drop(&mut self) {
+        self.flags.end_frame.store(self.pos, Ordering::Relaxed);
+        self.flags.ended.store(true, Ordering::Release);
+    }
+}
+
 pub enum Chunk<'a> {
     Audio(&'a [f32]),
     /// Input frames lost to overflow, to be replaced by silence.
@@ -96,12 +107,21 @@ pub struct CaptureConsumer {
     channels: usize,
     pos: u64,
     scratch: Vec<f32>,
+    flags: Arc<StreamFlags>,
 }
 
 impl CaptureConsumer {
+    /// Input frames waiting to be drained.
+    pub fn available(&self) -> u64 {
+        (self.data.slots() / self.channels) as u64
+    }
+
     /// Delivers everything captured so far, in input order, with drops in place.
     pub fn drain(&mut self, mut f: impl FnMut(Chunk<'_>) -> Result<()>) -> Result<()> {
         loop {
+            // Whether the stream has ended, read first: every push came before the end was marked, so
+            // once it is seen the audio length below counts all of it.
+            let ended = self.flags.ended.load(Ordering::Acquire);
             // Read the audio length before looking for drops: a drop published after this
             // read lies beyond the audio counted here, because it was published before any
             // audio that follows it.
@@ -126,6 +146,13 @@ impl CaptureConsumer {
                 Err(_) => available,
             };
             if limit == 0 {
+                // The stream has ended and everything published is delivered: what is left of its
+                // count is the drop it could not publish.
+                let end = self.flags.end_frame.load(Ordering::Relaxed);
+                if ended && end > self.pos && self.drops.is_empty() {
+                    f(Chunk::Silence(end - self.pos))?;
+                    self.pos = end;
+                }
                 return Ok(());
             }
             let chunk = self.data.read_chunk(limit as usize * self.channels)?;
@@ -158,7 +185,7 @@ fn ring_with_capacity(channels: u16, rate: u32, frames: usize) -> (CaptureProduc
         pending: None,
         flags: flags.clone(),
     };
-    let consumer = CaptureConsumer { data: data_c, drops: drops_c, channels: channels as usize, pos: 0, scratch: Vec::with_capacity(frames * channels as usize) };
+    let consumer = CaptureConsumer { data: data_c, drops: drops_c, channels: channels as usize, pos: 0, scratch: Vec::with_capacity(frames * channels as usize), flags: flags.clone() };
     (producer, consumer, flags)
 }
 
@@ -209,6 +236,20 @@ mod tests {
         p.push(&[1.0; 8]); // 4 frames
         p.push(&[2.0; 4]); // 2 frames dropped
         assert_eq!(collect(&mut c), ["audio 8x1", "silence 2"]);
+    }
+
+    /// M5 open thread: a drop still pending when the stream ends (its event ring was full) reaches the
+    /// consumer as silence at its exact place, so the recording's last stretch is never lost unmarked.
+    #[test]
+    fn a_drop_still_pending_when_the_stream_ends_reaches_the_consumer() {
+        let (mut p, mut c, _) = small_ring(1, 8);
+        p.push(&[1.0; 8]); // the ring is full
+        for _ in 0..DROP_EVENTS + 1 {
+            p.push(&[2.0; 1]); // one event per overflow; the last finds the event ring full
+        }
+        drop(p); // the stream ends with that drop still pending
+        assert_eq!(collect(&mut c), ["audio 8x1".to_string(), format!("silence {DROP_EVENTS}"), "silence 1".to_string()]);
+        assert_eq!(c.available(), 0);
     }
 
     #[test]
