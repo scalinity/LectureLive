@@ -63,7 +63,7 @@
         <button class="outline" onclick={() => session.openScreenSettings()}>Open Settings</button>
         <button class="quiet" onclick={onChoose}>Choose…</button>
       </div>
-      <p class="note">Allow LectureLive there, then choose the window again.</p>
+      <p class="note">Allow LectureLive there, then quit and reopen LectureLive.</p>
     {:else if c.state === "failing"}
       <p class="ask">{c.window} could not be captured: {c.detail}.</p>
       <div class="actions"><button class="quiet" onclick={onChoose}>Choose…</button></div>

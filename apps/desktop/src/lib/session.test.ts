@@ -217,4 +217,64 @@ describe("session store", () => {
     expect(s.dragging).toBe(false);
     expect(t.calls.at(-1)).toEqual(["import_slides", { paths: ["/Desktop/board.png"] }]);
   });
+
+  test("when the single input goes, the other inputs are offered, and the one chosen is sent", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.answers.inputs = [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "Wireless Mic Rx", uid: "Rx" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }];
+    t.answers.loopback_status = { present: true, blackhole_present: true, mixed: true };
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running", source: "Wireless Mic Rx", input_gone: "Rx" });
+    frame();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(s.fallbacks).toEqual([{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "Zoom through LectureLive Loopback", uid: "BlackHole2ch_UID" }]);
+    await s.useInput("BuiltInMicrophoneDevice");
+    expect(t.calls.at(-1)).toEqual(["use_input", { uid: "BuiltInMicrophoneDevice" }]);
+  });
+
+  test("the microphone's state is read for the fix-it", async () => {
+    const { t, s, ready } = setup();
+    await ready;
+    t.answers.microphone = "denied";
+    expect(await s.microphone()).toBe("denied");
+    await s.openMicrophoneSettings();
+    expect(t.calls.at(-1)).toEqual(["open_microphone_settings", undefined]);
+  });
+
+  test("Stop is not offered while the lecture is starting (M4 minor M6)", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "starting" });
+    frame();
+    expect(s.stopLabel).toBeNull();
+  });
+
+  test("a state that cannot be read shows as the error, not an unhandled rejection (M4 minor M11)", async () => {
+    const t = new FixtureTransport(emptyState("s1"));
+    t.failState = "the sidecar could not be read";
+    const s = new Session();
+    await s.init(t, { schedule: () => {}, now: () => 0 });
+    expect(s.error).toContain("the sidecar could not be read");
+  });
+
+  test("a reload while the input is gone still offers the other inputs", async () => {
+    const st = emptyState("s1");
+    st.status = { ...st.status, phase: "running", source: "Wireless Mic Rx", input_gone: "Rx" };
+    const t = new FixtureTransport(st);
+    t.answers.inputs = [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "Wireless Mic Rx", uid: "Rx" }];
+    t.answers.loopback_status = { present: true, blackhole_present: false, mixed: false };
+    const s = new Session();
+    await s.init(t, { schedule: () => {}, now: () => 0 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(s.fallbacks.map((i) => i.uid)).toEqual(["BuiltInMicrophoneDevice"]);
+  });
+
+  test("a command asked before the store is attached waits for it instead of failing", async () => {
+    const t = new FixtureTransport(emptyState("s1"));
+    t.answers.inputs = [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }];
+    const s = new Session();
+    const early = s.inputs(); // the bar before the lecture asks as it appears, before the page has attached the store
+    await s.init(t, { schedule: () => {}, now: () => 0 });
+    expect(await early).toEqual([{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }]);
+    expect(s.error).toBeNull();
+  });
 });

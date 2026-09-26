@@ -418,3 +418,39 @@ export async function fullscreenCheck(session: Session, t: Transport, dir: strin
   }
   await finish(t, "fullscreen", { dir, steps });
 }
+
+/** The error table live (M6, Task 10): a loopback lecture on a synthetic folder that records what the person would
+ *  see (phase, STT state, gaps, the offer, each notice) while the shell takes the network away, kills the app and
+ *  fills the disk. It stops itself after `minutes`; a relaunch in the same folder writes a report of its own. */
+export async function faultsCheck(session: Session, t: Transport, dir: string, minutes: number) {
+  const name = `faults-${new Date().toISOString().slice(11, 19).replaceAll(":", "")}`;
+  const rows: { at: string; phase: string; stt: string; gaps: number; input_gone: string | null; notice?: string }[] = [];
+  let seen = "";
+  const look = () => {
+    const s = session.status;
+    const n = session.notices.at(-1);
+    const notice = n ? `${n.at} ${n.label}: ${n.detail}` : undefined;
+    const key = JSON.stringify([s.phase, s.stt, s.gaps, s.input_gone, notice]);
+    if (key !== seen) {
+      seen = key;
+      rows.push({ at: stamp(), phase: s.phase, stt: s.stt, gaps: s.gaps, input_gone: s.input_gone, notice });
+    }
+  };
+  const write = () => t.call("check_report", { name, json: JSON.stringify({ dir, minutes, error: session.error, rows }, null, 2) });
+  await session.selectFolder(dir);
+  await session.start("loopback");
+  const end = Date.now() + minutes * 60_000;
+  let wrote = Date.now();
+  while (Date.now() < end && session.status.phase !== "ended") {
+    look();
+    if (Date.now() - wrote > 5000) {
+      await write();
+      wrote = Date.now();
+    }
+    await sleep(500);
+  }
+  if (session.status.phase === "running") await session.stop();
+  await until("the lecture to end", () => { look(); return session.status.phase === "ended"; }, 600_000).catch(() => {});
+  look();
+  await finish(t, name, { dir, minutes, error: session.error, rows });
+}

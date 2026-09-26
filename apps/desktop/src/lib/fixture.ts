@@ -4,7 +4,7 @@ import type { DropEvent, Transport } from "./transport";
 import type { Envelope, NotesMsg, SessionState, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 
 export function idleStatus(): Status {
-  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
+  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, input_gone: null, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
 }
 
 export function emptyState(session: string): SessionState {
@@ -22,6 +22,8 @@ export class FixtureTransport implements Transport {
   /** The order the store reached the backend in. */
   order: string[] = [];
   stateReads = 0;
+  /** When set, a state read fails with this message. */
+  failState: string | null = null;
   private held: (() => void)[] | null = null;
   private last: (() => void) | null = null;
   private onStatus: Handler<StatusMsg>[] = [];
@@ -57,6 +59,7 @@ export class FixtureTransport implements Transport {
     this.order.push("state");
     this.stateReads++;
     if (this.held) await new Promise<void>((r) => this.held!.push(r));
+    if (this.failState) throw new Error(this.failState);
     return structuredClone(this.state_);
   }
 
@@ -324,4 +327,23 @@ export function twoHourFixture(): Fixture {
       }, 4);
     },
   };
+}
+
+/** The browser preview in one of M6's states, for looking at its views (`?look=`): `idle-mic-off` (before a
+ *  lecture, the microphone denied, mixed mode on), `gone` (the single input unplugged mid-lecture), `gone-alone`
+ *  (and no other input), `denied` (Screen Recording off). */
+export function demoLook(t: FixtureTransport, look: string | null): FixtureTransport {
+  if (look === "idle-mic-off") {
+    t.state_.status = { ...t.state_.status, phase: "idle", source: null, started_at: null, level_dbfs: null, stt: "not started", stt_ok: false };
+    t.answers.microphone = "denied";
+    t.answers.loopback_status = { present: true, blackhole_present: true, mixed: true };
+    t.answers.inputs = [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "Wireless Mic Rx", uid: "Rx" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }];
+  } else if (look === "gone" || look === "gone-alone") {
+    t.state_.status = { ...t.state_.status, source: "Wireless Mic Rx", level_dbfs: null, input_gone: "Rx" };
+    t.answers.inputs = look === "gone" ? [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "Wireless Mic Rx", uid: "Rx" }] : [{ name: "Wireless Mic Rx", uid: "Rx" }];
+    t.answers.loopback_status = { present: true, blackhole_present: false, mixed: false };
+  } else if (look === "denied") {
+    t.state_.status = { ...t.state_.status, capture: { state: "denied", window: null, detail: "Screen Recording is off for LectureLive", candidates: [], captured: false } };
+  }
+  return t;
 }

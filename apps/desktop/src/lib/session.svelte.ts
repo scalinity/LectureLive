@@ -42,6 +42,9 @@ export class Session {
   onDrain: ((ms: number) => void) | null = null;
 
   private t: Transport | null = null;
+  /** Resolves once `init` has the transport: a command asked earlier (the bar before a lecture, as it appears) waits for it. */
+  private attach!: () => void;
+  private attached = new Promise<void>((r) => (this.attach = r));
   private session = "";
   private lastSeq: Record<Stream, number> = { status: 0, transcript: 0, notes: 0 };
   private queue: Queued[] = [];
@@ -66,8 +69,12 @@ export class Session {
   /** The stop button's label at each level (spec §9.1): null when there is nothing left to stop. */
   get stopLabel(): "Stop" | "Stop waiting" | null {
     const p = this.status.phase;
-    return p === "running" || p === "starting" ? "Stop" : p === "stopping" ? "Stop waiting" : null;
+    // Not while starting: the backend has no lecture to stop until it runs.
+    return p === "running" ? "Stop" : p === "stopping" ? "Stop waiting" : null;
   }
+
+  /** While a single input is gone: the other inputs the person may record from instead (spec §4.1). */
+  fallbacks = $state.raw<InputView[]>([]);
 
   /** Snapshots and polish are asked for only while the lecture runs: once it stops, the last snapshot takes what is left. */
   get canSnapshot(): boolean {
@@ -105,6 +112,7 @@ export class Session {
   private clockNow = $state(Date.now());
 
   private async act<T>(cmd: string, args?: Record<string, unknown>): Promise<T | undefined> {
+    if (!this.t) await this.attached;
     try {
       const r = await this.t!.call<T>(cmd, args);
       this.error = null;
@@ -217,6 +225,7 @@ export class Session {
   /** Attaches the listener and both channels, then hydrates; messages meanwhile wait (spec §9.2). */
   async init(t: Transport, opts: Options = {}): Promise<void> {
     this.t = t;
+    this.attach();
     if (opts.schedule) this.schedule = opts.schedule;
     if (opts.now) this.now = opts.now;
     // Both are registered before the first await, so nothing sent while the state is read is lost.
@@ -251,10 +260,33 @@ export class Session {
     return () => this.frameHooks.delete(cb);
   }
 
-  /** Replaces everything from `get_session_state`, then replays what arrived meanwhile above its watermark. */
+  /** The inputs to offer while `gone` is away: every other one, BlackHole named as Zoom through the loopback. */
+  private async readFallbacks(gone: string) {
+    const [inputs, loop] = await Promise.all([this.inputs(), this.loopback()]);
+    this.fallbacks = inputs
+      .filter((i) => i.uid !== gone && (i.uid !== "BlackHole2ch_UID" || loop?.blackhole_present))
+      .map((i) => (i.uid === "BlackHole2ch_UID" ? { name: "Zoom through LectureLive Loopback", uid: i.uid } : i));
+  }
+
+  /** Records from this input while the lecture's own is gone. */
+  async useInput(uid: string) {
+    await this.act("use_input", { uid });
+  }
+
+  /** Whether macOS lets LectureLive record: "granted", "denied", "restricted" or "undetermined". */
+  async microphone(): Promise<string> {
+    return (await this.act<string>("microphone")) ?? "undetermined";
+  }
+
+  async openMicrophoneSettings() {
+    await this.act("open_microphone_settings");
+  }
+
+  /** Replaces everything from `get_session_state`, then replays what arrived meanwhile above its watermark. A
+   *  state that cannot be read is shown as the error. */
   hydrate(): Promise<void> {
     if (!this.hydrating) {
-      this.hydrating = this.readState().finally(() => {
+      this.hydrating = this.readState().catch((e) => { this.error = String(e); }).finally(() => {
         this.hydrating = null;
         this.hydrated = true;
         const later = this.pending.splice(0);
@@ -270,6 +302,7 @@ export class Session {
     this.session = st.session;
     this.lastSeq = { status: st.seq, transcript: st.seq, notes: st.seq };
     this.status = st.status;
+    if (st.status.input_gone) void this.readFallbacks(st.status.input_gone); // a reload while the input is away
     this.notices = st.notices;
     this.segments = st.segments;
     this.open = st.open ? { utterance: st.open.utterance, words: nextWords([], st.open.stable, st.open.tentative, () => ++this.wordIds) } : null;
@@ -348,7 +381,9 @@ export class Session {
   private applyStatus(m: Envelope<StatusMsg>): boolean {
     if (m.type === "status") {
       const { type: _t, session: _s, seq: _q, ...status } = m;
+      const gone = status.input_gone && status.input_gone !== this.status.input_gone ? status.input_gone : null;
       this.status = status;
+      if (gone) void this.readFallbacks(gone);
     } else if (m.type === "notice") {
       const { type: _t, session: _s, seq: _q, ...notice } = m;
       this.notices = [...this.notices, notice].slice(-NOTICES);

@@ -33,6 +33,8 @@ export type Status = {
   started_at: string | null;
   spend_usd: number;
   silence: boolean;
+  /** The single input that went, while it is away: the fallback offer. */
+  input_gone: string | null;
   capture: CaptureView;
 };
 
@@ -80,7 +82,7 @@ export type SessionState = {
 };
 
 export type InputView = { name: string; uid: string };
-export type LoopbackView = { present: boolean; blackhole_present: boolean };
+export type LoopbackView = { present: boolean; blackhole_present: boolean; mixed: boolean };
 
 /** core spend::Summary: the spend view's figures (spec §9.1). */
 export type SpendSummary = {

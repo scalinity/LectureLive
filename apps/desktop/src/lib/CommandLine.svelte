@@ -12,6 +12,9 @@
   const MARK: Record<NoticeKind, string> = { notes: "◆", slide: "▣", page: "✦", done: "✓", warn: "▲" };
   const live = $derived(session.status.phase !== "idle" && session.status.phase !== "ended");
   const latest = $derived(session.notices[session.notices.length - 1]);
+  // The fallback offer (spec §4.1): the first other input unless the person picked one.
+  let pick = $state("");
+  const chosen = $derived(session.fallbacks.some((i) => i.uid === pick) ? pick : (session.fallbacks[0]?.uid ?? ""));
 
   async function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -28,7 +31,22 @@
 </script>
 
 <footer class="command">
-  {#if session.error}
+  {#if live && session.status.input_gone}
+    <div class="offer" role="alert">
+      <p><span class="mark warn">▲</span> <strong>{session.status.source ?? session.status.input_gone}</strong> is unplugged. LectureLive waits for it and records nothing meanwhile.</p>
+      {#if session.fallbacks.length}
+        <label class="from">
+          Record from
+          <select value={chosen} onchange={(e) => (pick = e.currentTarget.value)}>
+            {#each session.fallbacks as i (i.uid)}<option value={i.uid}>{i.name}</option>{/each}
+          </select>
+        </label>
+        <button class="outline" type="button" onclick={() => session.useInput(chosen)}>Record from it</button>
+      {:else}
+        <p>No other input is connected.</p>
+      {/if}
+    </div>
+  {:else if session.error}
     <p class="line error" role="alert">▲ {session.error}</p>
   {:else if latest}
     <button class="line" onclick={() => (history = !history)} aria-expanded={history}>
@@ -102,6 +120,41 @@
     color: var(--signal);
     cursor: default;
     white-space: normal;
+  }
+
+  /* The fallback offer: a question in ink, not an alarm; it stays until the input returns or one is chosen. */
+  .offer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.8rem;
+    margin: 0 0 0.55rem;
+    font-size: var(--step--1);
+    color: var(--ink);
+  }
+
+  .offer p {
+    margin: 0;
+  }
+
+  .offer strong {
+    font-weight: 700;
+  }
+
+  .offer .from {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--graphite);
+  }
+
+  .offer select {
+    font: inherit;
+    padding: 0.25rem 0.45rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--ink);
   }
 
   .mark {
