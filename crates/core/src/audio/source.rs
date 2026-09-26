@@ -111,7 +111,9 @@ fn supervise<D>(
             }
             Outcome::Ended(SegmentEnd::Gone) => started = true,
             Outcome::OpenFailed(e) if !started => return Err(e),
-            Outcome::OpenFailed(_) => {} // listed but not usable yet: wait as if gone
+            // Listed but not usable yet: wait as if gone. A fallback the person chose that will not open sends the wait
+            // back to their own device, so the source is never stuck on neither.
+            Outcome::OpenFailed(_) => current = uid.to_string(),
         }
         event(SourceEvent::DeviceGone { uid: current.clone() })?;
         device = loop {
@@ -334,6 +336,33 @@ mod tests {
         r.unwrap();
         assert_eq!(events, ["gone", "back BuiltInMicrophoneDevice"]);
         assert_eq!(opened, [(7, "Receiver_UID".to_string()), (9, "BuiltInMicrophoneDevice".to_string())], "the chosen input records under its own UID");
+    }
+
+    /// Final review, I1 (Review Focus 3's other half): a fallback that is listed but cannot be opened sends the wait
+    /// back to the original, never leaving the source stuck on neither.
+    #[test]
+    fn a_fallback_that_cannot_be_opened_keeps_the_wait_for_the_original() {
+        let fallback = Fallback::default();
+        let f = fallback.clone();
+        let mut polls = 0;
+        let (r, events, opened) = drive_with(
+            &fallback,
+            |uid| match uid {
+                "Receiver_UID" => {
+                    polls += 1;
+                    if polls == 2 {
+                        f.offer("Broken_UID");
+                    }
+                    Ok(if polls == 1 || polls == 3 { Some(7) } else { None })
+                }
+                "Broken_UID" => Ok(Some(9)),
+                other => panic!("looked for {other}"),
+            },
+            vec![Ok(Outcome::Ended(SegmentEnd::Gone)), open_failed(), Ok(Outcome::Ended(SegmentEnd::Stopped))],
+        );
+        r.unwrap();
+        assert_eq!(events, ["gone", "back Broken_UID", "gone", "back Receiver_UID"]);
+        assert_eq!(opened, [(7, "Receiver_UID".to_string()), (9, "Broken_UID".to_string()), (7, "Receiver_UID".to_string())]);
     }
 
     /// Review Focus 3.
