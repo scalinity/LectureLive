@@ -303,7 +303,7 @@ LECTURELIVE_API_ADDR=127.0.0.1:8443 \
       <p class="what">Unplug the Wireless Mic Rx, wait 30 seconds, and plug it back in. The Python tool records BlackHole, so it does not notice. If LectureLive runs on Zoom alone, skip this and do V15 at the desk instead.</p>
       <details class="how"><summary>What to expect</summary>
         <ul>
-          <li>A notice: “Wireless Mic Rx; Zoom goes on, and the gap is marked”. The transcript keeps coming from Zoom.</li>
+          <li>A notice “Input gone”, naming the receiver by its long device id (it starts <code>AppleUSBAudioEngine:DJI</code>), then “Zoom goes on, and the gap is marked”. The transcript keeps coming from Zoom.</li>
           <li>When it is back: “Input back”, and its sound is in the transcript again.</li>
         </ul>
       </details>
