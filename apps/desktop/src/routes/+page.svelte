@@ -8,6 +8,7 @@
   import CommandLine from "$lib/CommandLine.svelte";
   import KeyDialog from "$lib/KeyDialog.svelte";
   import Notes from "$lib/Notes.svelte";
+  import SpendView from "$lib/SpendView.svelte";
   import StatusStrip from "$lib/StatusStrip.svelte";
   import Transcript from "$lib/Transcript.svelte";
 
@@ -24,6 +25,7 @@
   }
 
   let keyDialog: KeyDialog;
+  let spendView: SpendView;
   const t = transport();
   const started = session.init(t).then(async () => {
     if (!(await session.keyStatus())?.stored) keyDialog.show();
@@ -31,7 +33,7 @@
 </script>
 
 <div class="window">
-  <StatusStrip onSpend={() => {}} onKey={() => keyDialog.show()} />
+  <StatusStrip onSpend={() => spendView.show()} onKey={() => keyDialog.show()} />
   <main class="panes">
     <Transcript />
     <Notes toUrl={(p) => t.assetUrl(p)} />
@@ -48,6 +50,7 @@
   <CommandLine />
 </div>
 <KeyDialog bind:this={keyDialog} />
+<SpendView bind:this={spendView} />
 {#await started catch e}
   <p class="fatal" role="alert">The app could not reach its backend: {String(e)}</p>
 {/await}

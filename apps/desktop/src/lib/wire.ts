@@ -65,3 +65,12 @@ export type SessionState = {
 
 export type InputView = { name: string; uid: string };
 export type LoopbackView = { present: boolean; blackhole_present: boolean };
+
+/** core spend::Summary: the spend view's figures (spec §9.1). */
+export type SpendSummary = {
+  total: number;
+  estimated: number;
+  calls: number;
+  months: { key: string; label: string; total: number; courses: [string, number][] }[];
+  recent: { day: string; label: string; course: string; lecture: string; total: number; kinds: [string, number][] }[];
+};

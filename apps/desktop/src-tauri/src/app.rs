@@ -446,3 +446,30 @@ pub fn import_key_from_env() -> Res<()> {
     let key = keychain::env_key().ok_or("GROK_API_KEY is not in the environment or the repository's .env.")?;
     keychain::set(keychain::SERVICE, &key).map_err(chain)
 }
+
+/// The spend view's figures (spec §9.1): the CLI's new lines are taken over first, so both tools' spend shows.
+fn spend_summary_at(app_ledger: &Path, cli_ledger: &Path) -> anyhow::Result<spend::Summary> {
+    spend::take_over(app_ledger, cli_ledger)?;
+    Ok(spend::summary(&spend::read(app_ledger)?))
+}
+
+#[tauri::command]
+pub fn spend_summary() -> Res<spend::Summary> {
+    spend_summary_at(&data_dir()?.join("spend.jsonl"), Path::new(CLI_LEDGER)).map_err(chain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_spend_view_takes_over_the_cli_ledger_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, cli) = (dir.path().join("app/spend.jsonl"), dir.path().join("spend.jsonl"));
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap().and_hms_opt(10, 0, 0).unwrap();
+        std::fs::write(&cli, spend::line(at, "ML", "Week 01", spend::SpendKind::Page, 0.25, true, None)).unwrap();
+        let s = spend_summary_at(&app, &cli).unwrap();
+        assert_eq!((s.calls, s.months.len()), (1, 1));
+        assert_eq!(s.recent[0].lecture, "Week 01");
+    }
+}

@@ -38,6 +38,7 @@ pub fn run() {
             app::key_status,
             app::save_key,
             app::import_key_from_env,
+            app::spend_summary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

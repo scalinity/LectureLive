@@ -2,7 +2,7 @@
 // the state, once per animation frame. Runes only; no effects: every update comes from an event.
 import { idleStatus } from "./fixture";
 import type { Transport } from "./transport";
-import type { Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, SegmentView, SlideView, Status, StatusMsg, TranscriptMsg } from "./wire";
+import type { Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg } from "./wire";
 import { nextWords, type Word } from "./words";
 
 type Stream = "status" | "transcript" | "notes";
@@ -125,6 +125,10 @@ export class Session {
   async selectFolder(dir: string) {
     await this.act("select_folder", { dir });
     await this.hydrate();
+  }
+
+  spendSummary(): Promise<SpendSummary | undefined> {
+    return this.act<SpendSummary>("spend_summary");
   }
 
   async openPage() {
