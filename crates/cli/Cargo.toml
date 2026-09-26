@@ -20,6 +20,7 @@ hound = "3.5.1"
 lecturelive-core = { path = "../core" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 rustix = { version = "1.1.5", features = ["process", "pty", "termios"] }

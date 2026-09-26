@@ -2,7 +2,7 @@
 //! ladder of five shapes — wide, normal, stacked, narrow, too small — and the chrome drawn into it:
 //! the two header rows, the pane headings and tabs, the rules, the notice line, the prompt line and
 //! the keys. Border depth 0: one `│` between columns and dim `─` rules. The panes themselves hold
-//! placeholders until Tasks 8, 9 and 11 fill them.
+//! placeholders until Tasks 9 and 11 fill them; the transcript is `panes.rs`'s (Task 8).
 //!
 //! Tokens (plan §H): ink and paper are the terminal's own colours, never set; graphite is `DIM`;
 //! teal and signal are truecolour when the terminal says so, else ANSI cyan and red, and nothing at
@@ -22,6 +22,7 @@ use lecturelive_core::session::spend::{self, Paint};
 
 use crate::stop::Stage;
 
+use super::panes::{self, Scroll};
 use super::state::View;
 
 pub(crate) const SUSPEND: &str = "Suspending would stop the recording. Stop the lecture first (Ctrl-C).";
@@ -203,10 +204,12 @@ pub(crate) struct Glyphs {
     chevron: &'static str,
     meter_on: &'static str,
     meter_off: &'static str,
+    /// The live edge: the open utterance's rows.
+    edge: &'static str,
 }
 
-const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□" };
-const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-" };
+const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□", edge: "▎" };
+const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-", edge: "|" };
 
 /// Whether the effective locale is UTF-8: the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set
 /// and not empty decides, as the C library's own lookup does.
@@ -270,12 +273,14 @@ fn phase(stage: Stage) -> Span<'static> {
     }
 }
 
-/// What a stopping stage means for the lecture (plan §G's words), in the header's first row.
-fn meaning(stage: Stage) -> Option<&'static str> {
+/// What a stopping stage means for the lecture (plan §G's words), in the header's first row: the
+/// full sentence, then shorter phrasings of the same meaning, longest first. The row takes the
+/// first that fits and never cuts one mid-sentence; where none fits, the phase and clock say it.
+fn meaning(stage: Stage) -> &'static [&'static str] {
     match stage {
-        Stage::Listening => None,
-        Stage::Stopping => Some("finishing the transcript and recovery, then a last snapshot"),
-        Stage::StopWaiting => Some("no longer waiting for recovery or queued requests; what runs now and the last snapshot still finish"),
+        Stage::Listening => &[],
+        Stage::Stopping => &["finishing the transcript and recovery, then a last snapshot", "finishing transcript + recovery, then last snapshot", "finishing transcript + recovery"],
+        Stage::StopWaiting => &["no longer waiting for recovery or queued requests; what runs now and the last snapshot still finish", "not waiting for recovery or queued requests; the last snapshot still finishes", "not waiting for recovery; last snapshot finishes", "not waiting for recovery"],
     }
 }
 
@@ -297,6 +302,14 @@ fn stop_key(stage: Stage) -> &'static str {
 
 /// Typing does nothing yet (the hint line is Task 10's), and the line says so rather than offering it.
 const PROMPT: &str = "hints and snapshots are not taken here yet";
+
+/// The spend as the header says it. A sum over nothing is `-0.0`, which `{:.2}` prints as "-0.00":
+/// anything that rounds to zero cents from at or below zero is zero. A real negative amount keeps
+/// its sign, and a positive fraction of a cent keeps its "<$0.01".
+fn today(usd: f64) -> String {
+    let usd = if usd <= 0.0 && usd > -0.005 { 0.0 } else { usd };
+    format!("{} today", spend::money(usd))
+}
 
 fn clock(elapsed: Duration) -> String {
     let s = elapsed.as_secs();
@@ -349,19 +362,24 @@ fn clip(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> Vec<Span<'stat
 // Drawing.
 
 /// What the frame shows besides the session view: the reactor's clock and refused-stop notice, the
-/// focused pane, the theme.
+/// focused pane, the reader's place in the transcript, the theme.
 pub(crate) struct Chrome<'a> {
     pub(crate) elapsed: Duration,
     pub(crate) refused: Option<&'a str>,
     pub(crate) focus: Pane,
+    pub(crate) transcript: &'a Scroll,
     pub(crate) theme: &'a Theme,
 }
 
-pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) {
+/// Draws the frame. Returns the transcript's body when it was drawn, so reading moves count rows
+/// in the pane as the person sees it.
+pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Option<Rect> {
     let l = layout(frame.area());
     if l.variant == Variant::TooSmall {
-        return too_small(frame, v, c);
+        too_small(frame, v, c);
+        return None;
     }
+    let mut reading = None;
     let g = c.theme.glyphs;
     frame.render_widget(Line::from(first_row(v, c, l.header[0].width as usize)), l.header[0]);
     frame.render_widget(Line::from(clock(c.elapsed)).right_aligned(), l.header[0]);
@@ -379,12 +397,19 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) {
         }
     }
     for col in &l.columns {
-        frame.render_widget(Line::from(heading(col, v, c)), col.heading);
-        if col.body.height > 0 {
+        let tabs = heading(col, v, c);
+        let room = (col.heading.width as usize).saturating_sub(width(&tabs) + 2);
+        frame.render_widget(Line::from(tabs), col.heading);
+        if col.shown(c.focus) == Pane::Transcript {
+            if let Some(lane) = c.transcript.unseen(v).and_then(|n| reading_lane(n, room, c.theme)) {
+                frame.render_widget(Line::from(lane).right_aligned(), col.heading);
+            }
+            panes::transcript(frame.buffer_mut(), col.body, v, c.transcript, g.edge, c.theme.teal());
+            reading = Some(col.body);
+        } else if col.body.height > 0 {
             let text = match col.shown(c.focus) {
-                Pane::Transcript => "The transcript shows here.",
                 Pane::Notes => "The notes show here.",
-                Pane::Slides => "Slides show here.",
+                Pane::Transcript | Pane::Slides => "Slides show here.",
             };
             frame.render_widget(Span::styled(fit(text, col.body.width as usize, g.ellipsis), DIM), Rect { height: 1, ..col.body });
         }
@@ -392,6 +417,25 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) {
     frame.render_widget(Line::from(notice(v, c, l.notice.width as usize)), l.notice);
     frame.render_widget(Line::from(vec![Span::styled(g.notes, c.theme.teal()), Span::raw(" "), Span::styled(PROMPT, DIM)]), l.prompt);
     frame.render_widget(Line::from(keys(v.phase, c.theme)), l.keys);
+    reading
+}
+
+/// The scrolled transcript's heading lane, right of its tabs: what arrived below and how to get
+/// back, in the footer's chord vocabulary. Shorter forms as the heading narrows; nothing when even
+/// the count does not fit.
+fn reading_lane(new: usize, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
+    let back = [Span::raw("   "), Span::styled("Esc", BOLD), Span::raw(" "), Span::styled("live", DIM)];
+    let forms: Vec<Vec<Span<'static>>> = if new == 0 {
+        vec![back[1..].to_vec()]
+    } else {
+        let count = |words: String| Span::styled(words, t.teal());
+        vec![
+            [vec![count(format!("{new} new below"))], back.to_vec()].concat(),
+            [vec![count(format!("{new} new"))], back.to_vec()].concat(),
+            vec![count(format!("{new} new"))],
+        ]
+    };
+    forms.into_iter().find(|f| width(f) <= room)
 }
 
 /// Header row 1: the recording dot, the phase, then the course and lecture — or, while stopping,
@@ -401,13 +445,14 @@ fn first_row(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
     let g = c.theme.glyphs;
     let dot = if v.phase == Stage::Listening { c.theme.signal() } else { DIM };
     let mut spans = vec![Span::styled(g.dot, dot), Span::raw(" "), phase(v.phase)];
-    let middle = match meaning(v.phase) {
-        Some(m) => m.to_string(),
-        None => format!("{} {} {}", v.identity.course, g.chevron, v.identity.lecture),
-    };
     let room = max.saturating_sub(width(&spans) + 3 + 2 + clock(c.elapsed).len());
-    if room >= 8 {
-        spans.extend([Span::raw("   "), Span::styled(fit(&middle, room, g.ellipsis), DIM)]);
+    let middle = match meaning(v.phase) {
+        [] if room >= 8 => Some(fit(&format!("{} {} {}", v.identity.course, g.chevron, v.identity.lecture), room, g.ellipsis)),
+        [] => None,
+        phrasings => phrasings.iter().find(|m| Span::raw(**m).width() <= room).map(|m| m.to_string()),
+    };
+    if let Some(m) = middle {
+        spans.extend([Span::raw("   "), Span::styled(m, DIM)]);
     }
     spans
 }
@@ -442,7 +487,7 @@ fn second_row(v: &View, t: &Theme, max: usize) -> (Vec<Span<'static>>, Option<Ve
     };
     let n = v.gaps();
     let gaps = Span::styled(format!("{n} gap{}", if n == 1 { "" } else { "s" }), if n > 0 { t.signal() } else { DIM });
-    let spend = v.spend.map(|usd| vec![Span::styled(format!("{} today", spend::money(usd)), DIM)]);
+    let spend = v.spend.map(|usd| vec![Span::styled(today(usd), DIM)]);
     let row = |name: bool, stt: &Span<'static>| {
         let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
         if name {
@@ -579,6 +624,7 @@ mod tests {
     use chrono::Local;
     use lecturelive_core::session::coordinator::Notification;
     use lecturelive_core::session::lecture::Event;
+    use lecturelive_core::session::segments::{Segment, SegmentSource};
     use lecturelive_core::session::sidecar::{Gap, GapKind};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -611,9 +657,16 @@ mod tests {
     }
 
     fn drawn_with(width: u16, height: u16, v: &View, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
+        drawn_scrolled(width, height, v, &Scroll::default(), refused, theme)
+    }
+
+    fn drawn_scrolled(width: u16, height: u16, v: &View, scroll: &Scroll, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus: Pane::Transcript, theme };
-        terminal.draw(|f| render(f, v, &chrome)).unwrap();
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus: Pane::Transcript, transcript: scroll, theme };
+        terminal.draw(|f| {
+            render(f, v, &chrome);
+        })
+        .unwrap();
         terminal
     }
 
@@ -798,6 +851,47 @@ mod tests {
         assert!(l[0].starts_with(" ● Stop waiting   no longer waiting for recovery"), "{:?}", l[0]);
     }
 
+    /// Seen in Apple Terminal at 80×25: the stopping sentence was cut into "…then a last snap…".
+    /// Each narrower header takes a whole shorter phrasing instead; the phase and the clock stay.
+    #[test]
+    fn stopping_prose_degrades_to_whole_phrases() {
+        for (w, h, stage, want) in [
+            (140, 40, Stage::Stopping, "finishing the transcript and recovery, then a last snapshot"),
+            (80, 25, Stage::Stopping, "finishing transcript + recovery, then last snapshot"),
+            (80, 24, Stage::Stopping, "finishing transcript + recovery, then last snapshot"),
+            (72, 45, Stage::Stopping, "finishing transcript + recovery"),
+            (60, 16, Stage::Stopping, "finishing transcript + recovery"),
+            (140, 40, Stage::StopWaiting, "no longer waiting for recovery or queued requests; what runs now and the last snapshot still finish"),
+            (110, 32, Stage::StopWaiting, "not waiting for recovery or queued requests; the last snapshot still finishes"),
+            (80, 25, Stage::StopWaiting, "not waiting for recovery; last snapshot finishes"),
+            (60, 16, Stage::StopWaiting, "not waiting for recovery"),
+        ] {
+            let l = lines(&drawn(w, h, &view(stage), None));
+            let phase = if stage == Stage::Stopping { "Stopping" } else { "Stop waiting" };
+            assert_eq!(l[0], format!(" ● {phase}   {want}{}0:42:18", " ".repeat(w as usize - 1 - 7 - 6 - phase.len() - want.chars().count())), "{w}×{h}");
+            assert!(!l[0].contains('…'), "{w}×{h}: a whole phrase, never a cut one: {:?}", l[0]);
+        }
+        // too narrow for any phrasing: the phase and the clock alone, no fragment
+        let mut b = Buffer::empty(Rect::new(0, 0, 30, 1));
+        let theme = Theme::new(TRUE, true);
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: None, focus: Pane::Transcript, theme: &theme, transcript: &Scroll::default() };
+        ratatui::widgets::Widget::render(Line::from(first_row(&view(Stage::StopWaiting), &chrome, 30)), b.area, &mut b);
+        assert_eq!(lines(&b)[0], "● Stop waiting");
+    }
+
+    /// Seen in Apple Terminal: "$-0.00 today" for an empty ledger. A sum over nothing is -0.0.
+    #[test]
+    fn zero_spend_never_renders_negative_zero() {
+        for (usd, want) in [(-0.0, "$0.00 today"), (0.0, "$0.00 today"), (-0.004, "$0.00 today"), (0.004, "<$0.01 today"), (0.18, "$0.18 today"), (-0.25, "$-0.25 today"), (1234.5, "$1,234.50 today")] {
+            assert_eq!(today(usd), want, "{usd:?}");
+        }
+        let mut v = view(Stage::Listening);
+        v.spend = Some([0.0f64; 0].iter().sum());
+        assert!(v.spend.unwrap().is_sign_negative(), "the empty ledger's own sum");
+        let l = lines(&drawn(140, 40, &v, None));
+        assert!(l[1].ends_with(" $0.00 today"), "{:?}", l[1]);
+    }
+
     /// The footer offers only what this build does, generated from its key table.
     #[test]
     fn the_footer_follows_the_stop_stage() {
@@ -974,6 +1068,158 @@ mod tests {
         }
         let want = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}; write it with LECTURELIVE_GOLDENS=update and review it", path.display()));
         assert!(got == want, "{name} differs from its golden; if the change is meant, LECTURELIVE_GOLDENS=update and review the diff\n--- golden\n{want}--- drawn\n{got}");
+    }
+
+    // ---- the transcript pane (Task 8) ---------------------------------------------------------
+
+    /// The live-transcript sizes: the golden sizes, and 80×25, the person's Apple Terminal at the
+    /// end of the Task-7 sitting.
+    const TRANSCRIPT_SIZES: [(u16, u16); 8] = [(140, 40), (110, 32), (127, 36), (80, 24), (80, 25), (72, 45), (60, 16), (40, 8)];
+
+    fn said(id: u64, hms: (u32, u32, u32), text: &str, source: SegmentSource) -> Event {
+        let t = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, hms.0, hms.1, hms.2).unwrap();
+        Event::Session(Notification::Segment(Segment { id, recording_id: Default::default(), start_sample: id * 80_000, end_sample: (id + 1) * 80_000, said_at: t, start: t, end: t, text: text.into(), words: Vec::new(), source }))
+    }
+
+    /// A lecture in progress: closed segments, some wrapping; one recovered after a dropped
+    /// connection (its time earlier than the segment before it: the log's order is the order it
+    /// was written); the open utterance, settled and tentative.
+    fn live() -> View {
+        let mut v = view(Stage::Listening);
+        for (id, (hms, text, source)) in [
+            ((10, 38, 40), "Right, let's pick up where we stopped on Tuesday.", SegmentSource::Live),
+            ((10, 38, 46), "We had a population, and one sample from it, and we computed a mean.", SegmentSource::Live),
+            ((10, 38, 58), "The question I left you with was how far that one number could be from the truth.", SegmentSource::Live),
+            ((10, 39, 14), "Several of you said it depends on the sample, which is exactly right, and exactly the problem.", SegmentSource::Live),
+            ((10, 39, 31), "A different sample gives a different mean.", SegmentSource::Live),
+            ((10, 39, 40), "So the mean is itself a random quantity, with a distribution we can reason about.", SegmentSource::Live),
+            ((10, 39, 58), "That shift in view, from one number to a distribution of numbers, is the whole of today.", SegmentSource::Live),
+            ((10, 40, 20), "Keep the picture of the histogram from the lab in mind.", SegmentSource::Live),
+            ((10, 40, 52), "Last week we saw how a single sample can mislead, so today is about what happens when we repeat the experiment.", SegmentSource::Live),
+            ((10, 41, 5), "Imagine drawing a hundred samples of size n from one population and taking the mean of each.", SegmentSource::Live),
+            ((10, 41, 19), "Those means have a distribution of their own: the sampling distribution of the mean.", SegmentSource::Live),
+            ((10, 41, 12), "Its centre sits on the population mean.", SegmentSource::Recovered),
+            ((10, 41, 44), "The spread is the interesting part.", SegmentSource::Live),
+            ((10, 42, 3), "We distinguish the sample statistic from the population parameter.", SegmentSource::Live),
+            ((10, 42, 11), "Increasing the sample size reduces that variability, and the formula says by how much: σ/√n.", SegmentSource::Live),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            v.reduce(&said(id as u64, hms, text, source), Local::now());
+        }
+        v.reduce(&Event::Session(Notification::Open { stable: "The denominator changes with the square root of n,".into(), tentative: " so quadrupling the sample only halves".into() }), Local::now());
+        v
+    }
+
+    /// `v` scrolled up `rows` in the transcript's body at `w`×`h`, then `arrivals` more segments.
+    fn scrolled(mut v: View, w: u16, h: u16, rows: usize, arrivals: u64) -> (View, Scroll) {
+        let body = layout(Rect::new(0, 0, w, h)).columns[0].body;
+        let mut s = Scroll::default();
+        assert!(s.apply(panes::Move::Up(rows), &v, body), "{w}×{h}: something to scroll");
+        let next = v.closed.len() as u64;
+        for k in 0..arrivals {
+            v.reduce(&said(next + k, (10, 42, 20 + k as u32 * 6), &format!("A later sentence, number {k}, arrived while the reader was up there."), SegmentSource::Live), Local::now());
+        }
+        (v, s)
+    }
+
+    /// Plan Task 8's goldens: the live transcript at every size (the safety view shows none of it),
+    /// and scrolled with arrivals below.
+    #[test]
+    fn goldens_for_the_live_transcript() {
+        let theme = Theme::new(TRUE, true);
+        for (w, h) in TRANSCRIPT_SIZES {
+            let name = if variant(w, h) == Variant::TooSmall { format!("too_small_transcript_{w}x{h}") } else { format!("transcript_{w}x{h}") };
+            golden(&name, &drawn_with(w, h, &live(), None, &theme));
+        }
+        for (w, h) in [(140, 40), (110, 32), (80, 25)] {
+            let (v, s) = scrolled(live(), w, h, 4, 2);
+            golden(&format!("transcript_scrolled_{w}x{h}"), &drawn_scrolled(w, h, &v, &s, None, &theme));
+        }
+        golden("transcript_ascii_80x25", &drawn_with(80, 25, &live(), None, &Theme::new(OFF, false)));
+    }
+
+    #[test]
+    fn the_transcript_fills_its_pane_in_every_layout() {
+        for (w, h) in TRANSCRIPT_SIZES {
+            let l = lines(&drawn(w, h, &live(), None));
+            let text = l.join("\n");
+            if variant(w, h) == Variant::TooSmall {
+                assert!(!text.contains("denominator") && !text.contains('▎') && !text.contains("10:4"), "{w}×{h}: no transcript in the safety view");
+                continue;
+            }
+            let body = layout(Rect::new(0, 0, w, h)).columns[0].body;
+            let last = (body.bottom() - 1) as usize;
+            assert!(l[last].contains("▎"), "{w}×{h}: following ends on the live edge: {:?}", l[last]);
+            assert!(text.contains("10:42:11") || h < 20, "{w}×{h}");
+            assert!(!text.contains("The transcript shows here"), "{w}×{h}");
+        }
+    }
+
+    /// The pane's styles: the gutter and `recovered` dim; the live edge teal on every open row;
+    /// settled words in ink, tentative dim; the focused heading keeps its accent; no background.
+    #[test]
+    fn the_transcript_styles() {
+        let b = drawn(140, 40, &live(), None);
+        let l = lines(&b);
+        let row = |needle: &str| l.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("{needle:?} in {l:?}")) as u16;
+        let (x, y) = at(&b, row("10:42:03"), "10:42:03");
+        assert!((x..x + 8).all(|x| b[(x, y)].modifier == Modifier::DIM && b[(x, y)].fg == Color::Reset), "the gutter is dim");
+        let (tx, ty) = at(&b, y, "We distinguish");
+        assert_eq!((b[(tx, ty)].modifier, b[(tx, ty)].fg, tx - x), (Modifier::empty(), Color::Reset, 10), "text in ink, two cells after the gutter");
+        let (rx, ry) = at(&b, row("recovered"), "recovered");
+        assert_eq!((b[(rx, ry)].modifier, rx), (Modifier::DIM, x), "the mark dim, in the time's lane");
+        let edges: Vec<u16> = (4..36).filter(|&y| b[(x + 8, y)].symbol() == "▎").collect();
+        assert_eq!(edges.len(), 4, "the open utterance wraps onto four rows of the 140-column transcript: {l:?}");
+        for &y in &edges {
+            assert_eq!(b[(x + 8, y)].fg, TEAL, "every open row carries the teal edge");
+            assert!((x..x + 8).all(|x| b[(x, y)].symbol() == " "), "and no time");
+        }
+        let (sx, sy) = at(&b, edges[0], "The denominator");
+        assert_eq!(b[(sx, sy)].modifier, Modifier::empty(), "settled words in ink");
+        let (qx, qy) = at(&b, *edges.last().unwrap(), "halves");
+        assert_eq!(b[(qx, qy)].modifier, Modifier::DIM, "tentative words dim");
+        let (hx, hy) = at(&b, 3, "Transcript");
+        assert_eq!((b[(hx, hy)].fg, b[(hx, hy)].modifier), (TEAL, Modifier::BOLD), "the heading keeps Task 7's accent");
+        for (w, h) in TRANSCRIPT_SIZES {
+            assert!(drawn(w, h, &live(), None).content.iter().all(|c| c.bg == Color::Reset), "{w}×{h}: no background");
+        }
+    }
+
+    /// `NO_COLOR`: no colour anywhere, and the live edge is still drawn — the glyph and its place
+    /// carry the meaning. ASCII: the edge is `|`; the lecture's own words stay as spoken.
+    #[test]
+    fn the_live_edge_without_colour_and_in_ascii() {
+        let b = drawn_with(80, 25, &live(), None, &Theme::new(OFF, true)).backend().buffer().clone();
+        assert!(b.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        let l = lines(&b);
+        assert!(l.iter().filter(|r| r.starts_with("         ▎ ")).count() >= 2, "{l:?}");
+        let l = lines(drawn_with(80, 25, &live(), None, &Theme::new(OFF, false)).backend().buffer());
+        assert!(l.iter().filter(|r| r.starts_with("         | ")).count() >= 2, "{l:?}");
+        assert!(l.iter().any(|r| r.contains("σ/√n")), "the transcript is never transliterated: {l:?}");
+        assert!(!l.join("").contains('▎'));
+    }
+
+    /// Scrolled, the heading says what arrived below and how to get back; the lane shortens with
+    /// the column and never pushes the tabs.
+    #[test]
+    fn the_scrolled_heading_counts_what_is_new_below() {
+        for (w, h, want) in [(140, 40, " Transcript         2 new below   Esc live │ Notes"), (110, 32, " Transcript   Slides       2 new   Esc live │ Notes"), (80, 25, " Transcript   Notes   Slides                             2 new below   Esc live")] {
+            let (v, s) = scrolled(live(), w, h, 4, 2);
+            let b = drawn_scrolled(w, h, &v, &s, None, &Theme::new(TRUE, true)).backend().buffer().clone();
+            let row = if variant(w, h) == Variant::Narrow { 2 } else { 3 };
+            assert!(lines(&b)[row].starts_with(want), "{w}×{h}: {:?}", lines(&b)[row]);
+            let (x, y) = at(&b, row as u16, "2 new");
+            assert_eq!(b[(x, y)].fg, TEAL);
+            let (x, y) = at(&b, row as u16, "Esc");
+            assert_eq!(b[(x, y)].modifier, Modifier::BOLD);
+        }
+        let (v, s) = scrolled(live(), 140, 40, 4, 1);
+        assert!(lines(&drawn_scrolled(140, 40, &v, &s, None, &Theme::new(TRUE, true)).backend().buffer().clone())[3].contains("1 new below   Esc live"));
+        let (v, s) = scrolled(live(), 140, 40, 4, 0);
+        let l = lines(&drawn_scrolled(140, 40, &v, &s, None, &Theme::new(TRUE, true)).backend().buffer().clone());
+        assert!(l[3].contains("Esc live") && !l[3].contains("new"), "{:?}", l[3]);
     }
 
     /// Every stage at every golden size; 40×8 is the safety view. Unicode chrome, colour on (the

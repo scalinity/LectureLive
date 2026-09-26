@@ -5,6 +5,7 @@
 //! Every way out goes through [`leave`], which gives the terminal back before anything is printed.
 
 pub(crate) mod hydrate;
+mod panes;
 pub(crate) mod state;
 pub(crate) mod terminal;
 mod view;
@@ -20,7 +21,8 @@ use lecturelive_core::session::coordinator::{Notification, StopReport};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::lecture::{Command, Event};
 use lecturelive_core::session::spend::Spend;
-use ratatui::crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use ratatui::crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinError;
@@ -54,6 +56,12 @@ struct Ui {
     notice: Option<&'static str>,
     /// The reading pane the frame shows in a tabbed column: the transcript until Task 10's keys move it.
     focus: view::Pane,
+    /// The reader's place in the transcript: following, or held at an anchor. Kept whatever the
+    /// layout, so a pane that is hidden and shown again is where it was left.
+    transcript: panes::Scroll,
+    /// The transcript's body as last drawn; none while it is not on screen, when reading keys
+    /// leave its place alone.
+    reading: Option<Rect>,
     view: View,
 }
 
@@ -68,7 +76,7 @@ enum Act {
 
 impl Ui {
     fn new(view: View) -> Ui {
-        Ui { stop: StopController::default(), events: 0, notice: None, focus: view::Pane::Transcript, view }
+        Ui { stop: StopController::default(), events: 0, notice: None, focus: view::Pane::Transcript, transcript: panes::Scroll::default(), reading: None, view }
     }
 
     /// One stop request through the shared controller; the view's phase follows the stage it reached.
@@ -94,17 +102,50 @@ impl Ui {
         (step, effect.hydrate)
     }
 
-    /// Captured, so the terminal reports it here instead of scrolling the viewport, and ignored:
-    /// wheel, press, release and drag all mean nothing until Task 8 scrolls with the wheel. Taking
-    /// `&mut self` keeps the reactor's one decision shape; nothing is changed through it.
-    fn mouse(&mut self, _mouse: MouseEvent) -> Act {
-        Act::Nothing
+    /// Captured, so the terminal reports it here instead of scrolling its own viewport. The wheel
+    /// reads the transcript, [`panes::WHEEL`] rows a notch, as the arrow keys do; press, release,
+    /// drag and motion are consumed and mean nothing.
+    fn mouse(&mut self, mouse: MouseEvent) -> Act {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.read(panes::Move::Up(panes::WHEEL)),
+            MouseEventKind::ScrollDown => self.read(panes::Move::Down(panes::WHEEL)),
+            _ => Act::Nothing,
+        }
     }
 
-    /// In raw mode Ctrl-C, Ctrl-Z and Ctrl-L are keys, not signals. Everything else waits for later tasks.
-    fn key(&mut self, key: KeyEvent, now: std::time::Instant) -> Act {
-        if key.kind == KeyEventKind::Release || !key.modifiers.contains(KeyModifiers::CONTROL) {
+    /// A reading move in the focused pane, the transcript while it is the only one that scrolls.
+    /// Only the reader's place moves: nothing is sent and nothing is read.
+    fn read(&mut self, m: panes::Move) -> Act {
+        if self.focus != view::Pane::Transcript {
             return Act::Nothing;
+        }
+        let moved = match self.reading {
+            Some(body) => self.transcript.apply(m, &self.view, body),
+            None if m == panes::Move::Live => self.transcript.apply(m, &self.view, Rect::default()),
+            None => false,
+        };
+        if moved {
+            Act::Redraw
+        } else {
+            Act::Nothing
+        }
+    }
+
+    /// In raw mode Ctrl-C, Ctrl-Z and Ctrl-L are keys, not signals; the arrows, the page keys and Esc
+    /// read the transcript. Everything else, printable keys included, waits for later tasks.
+    fn key(&mut self, key: KeyEvent, now: std::time::Instant) -> Act {
+        if key.kind == KeyEventKind::Release {
+            return Act::Nothing;
+        }
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Up => self.read(panes::Move::Up(1)),
+                KeyCode::Down => self.read(panes::Move::Down(1)),
+                KeyCode::PageUp => self.read(panes::Move::PageUp),
+                KeyCode::PageDown => self.read(panes::Move::PageDown),
+                KeyCode::Esc => self.read(panes::Move::Live),
+                _ => Act::Nothing,
+            };
         }
         match key.code {
             KeyCode::Char('c') => Act::Stop(self.stop(Origin::Key, now)),
@@ -255,10 +296,11 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
                 // The next draw lays out `frame.area()` at the new size; nothing else keeps one.
                 Some(Ok(TermEvent::Resize(..))) => dirty = true,
                 // The lease captures the mouse so scrolls and drags reach the TUI instead of moving
-                // the viewport; every one is consumed here and changes nothing — no dirty, no redraw.
+                // the viewport; every one is consumed here. The wheel reads the transcript.
                 Some(Ok(TermEvent::Mouse(mouse))) => match ui.mouse(mouse) {
                     Act::Nothing => {}
-                    Act::Redraw | Act::Clear | Act::Stop(_) => unreachable!("the mouse is captured and ignored"),
+                    Act::Redraw => dirty = true,
+                    Act::Clear | Act::Stop(_) => unreachable!("the mouse only reads"),
                 },
                 // A paste is text, never keys; Task 10 inserts it into the hint.
                 Some(Ok(_)) => {}
@@ -313,10 +355,12 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
             _ = sleep_until(drawn_at + FRAME), if dirty => {}
         }
         if dirty && Instant::now() >= drawn_at + FRAME {
-            let chrome = view::Chrome { elapsed: started.elapsed(), refused: ui.notice, focus: ui.focus, theme: &theme };
-            if let Err(e) = terminal::draw(&mut io.screen, |f| view::render(f, &ui.view, &chrome)) {
+            let chrome = view::Chrome { elapsed: started.elapsed(), refused: ui.notice, focus: ui.focus, transcript: &ui.transcript, theme: &theme };
+            let mut reading = ui.reading;
+            if let Err(e) = terminal::draw(&mut io.screen, |f| reading = view::render(f, &ui.view, &chrome)) {
                 return Exit::DrawFailed(e);
             }
+            ui.reading = reading;
             (dirty, drawn_at) = (false, Instant::now());
         }
     }
@@ -441,16 +485,141 @@ mod tests {
         assert_eq!(ui.view.phase, Stage::Listening);
     }
 
-    #[test]
-    fn mouse_input_is_captured_and_changes_nothing() {
-        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    /// A lecture `n` segments long, each a sentence or two, five seconds apart.
+    fn lecture(n: u64) -> Ui {
+        use lecturelive_core::session::segments::{Segment, SegmentSource};
         let mut ui = ui();
-        let held = (ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone());
-        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::ScrollUp, MouseEventKind::ScrollDown, MouseEventKind::ScrollLeft, MouseEventKind::ScrollRight, MouseEventKind::Moved] {
-            assert_eq!(ui.mouse(MouseEvent { kind, column: 40, row: 12, modifiers: KeyModifiers::NONE }), Act::Nothing, "{kind:?} asks for nothing: no command, no stop, no redraw");
+        let start = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 9, 0, 0).unwrap();
+        for id in 0..n {
+            let t = start + chrono::Duration::seconds(id as i64 * 5);
+            let text = format!("Segment {id}: the gradient points uphill, so each step goes against it{}", ", scaled by the learning rate and checked against the validation loss".repeat(id as usize % 3));
+            let source = if id % 97 == 13 { SegmentSource::Recovered } else { SegmentSource::Live };
+            ui.event(&Event::Session(Notification::Segment(Segment { id, recording_id: Default::default(), start_sample: id * 80_000, end_sample: (id + 1) * 80_000, said_at: t, start: t, end: t, text, words: Vec::new(), source })), Instant::now());
         }
-        assert_eq!((ui.view.phase, ui.notice, ui.events), (Stage::Listening, None, 0), "no stop transition, no notice, no event counted");
-        assert_eq!((ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone()), held, "no hydration and no state moved");
+        ui
+    }
+
+    /// Draws as the reactor does, keeping where the transcript went; returns the frame's rows.
+    fn frame(ui: &mut Ui, width: u16, height: u16) -> Vec<String> {
+        let theme = view::Theme::new(lecturelive_core::session::spend::Paint { color: true, truecolor: true }, true);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let chrome = view::Chrome { elapsed: Duration::from_secs(60), refused: None, focus: ui.focus, transcript: &ui.transcript, theme: &theme };
+        let mut reading = None;
+        terminal.draw(|f| reading = view::render(f, &ui.view, &chrome)).unwrap();
+        ui.reading = reading;
+        let b = terminal.backend().buffer();
+        (0..height).map(|y| (0..width).map(|x| b[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent { kind, column: 40, row: 12, modifiers: KeyModifiers::NONE }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The wheel now reads the transcript — the terminal's viewport never moves, since the mouse is
+    /// captured — and everything else the mouse does is consumed and changes nothing. Scrolling
+    /// sends nothing and reads nothing: no event counted, no hydration, no stop.
+    #[test]
+    fn the_wheel_reads_the_transcript_and_the_rest_of_the_mouse_does_nothing() {
+        use ratatui::crossterm::event::MouseButton;
+        let mut ui = lecture(60);
+        let live = frame(&mut ui, 110, 32);
+        let held = (ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone(), ui.events);
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::ScrollLeft, MouseEventKind::ScrollRight, MouseEventKind::Moved] {
+            assert_eq!(ui.mouse(wheel(kind)), Act::Nothing, "{kind:?}: consumed, and nothing more");
+        }
+        assert!(ui.transcript.following());
+        assert_eq!(ui.mouse(wheel(MouseEventKind::ScrollDown)), Act::Nothing, "already at the live end");
+        assert_eq!(ui.mouse(wheel(MouseEventKind::ScrollUp)), Act::Redraw);
+        assert!(!ui.transcript.following(), "up leaves the live end");
+        let up = frame(&mut ui, 110, 32);
+        let left = |rows: &[String]| rows.iter().map(|r| r.chars().take(44).collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(left(&up[4 + panes::WHEEL..28]), left(&live[4..28 - panes::WHEEL]), "one notch is {} rows", panes::WHEEL);
+        assert!(up[3].starts_with(" Transcript   Slides               Esc live │ Notes"), "the lane ends at the column's edge: {:?}", up[3]);
+        assert_eq!(ui.mouse(wheel(MouseEventKind::ScrollDown)), Act::Redraw);
+        assert!(ui.transcript.following(), "down to the end follows again");
+        assert_eq!(frame(&mut ui, 110, 32), live);
+        assert_eq!((ui.view.closed.clone(), ui.view.gaps(), ui.view.notes.revision, ui.view.stt.clone(), ui.view.open.clone(), ui.events), held, "no state moved, no hydration, no event");
+        assert_eq!((ui.view.phase, ui.notice), (Stage::Listening, None), "no stop");
+    }
+
+    /// The reading keys: ↑/↓ a row, PgUp/PgDn a page less two rows, Esc back to live. Printable
+    /// keys still do nothing, and while the transcript is not on screen its place is left alone.
+    #[test]
+    fn reading_keys_scroll_the_transcript() {
+        let mut ui = lecture(60);
+        let live = frame(&mut ui, 80, 25);
+        assert_eq!(ui.key(key(KeyCode::Esc), Instant::now()), Act::Nothing, "Esc while live changes nothing");
+        assert_eq!(ui.key(key(KeyCode::Up), Instant::now()), Act::Redraw);
+        let up = frame(&mut ui, 80, 25);
+        assert_eq!(up[4..21], live[3..20], "one row");
+        assert_eq!(up[2].trim_end(), format!(" Transcript   Notes   Slides{}Esc live", " ".repeat(79 - 28 - 8)), "narrow: the lane beside the tabs");
+        ui.key(key(KeyCode::PageUp), Instant::now());
+        ui.key(key(KeyCode::PageDown), Instant::now());
+        assert_eq!(frame(&mut ui, 80, 25), up, "a page and back");
+        for c in ['k', 'j', ' ', 'q'] {
+            assert_eq!(ui.key(key(KeyCode::Char(c)), Instant::now()), Act::Nothing, "{c:?}");
+        }
+        assert_eq!(ui.key(key(KeyCode::Down), Instant::now()), Act::Redraw);
+        assert!(ui.transcript.following(), "down to the end");
+        ui.key(key(KeyCode::PageUp), Instant::now());
+        assert_eq!(ui.key(key(KeyCode::Esc), Instant::now()), Act::Redraw);
+        assert!(ui.transcript.following());
+        assert_eq!(frame(&mut ui, 80, 25), live, "the live bottom again");
+        // too small: nothing on screen, nothing moves
+        frame(&mut ui, 40, 8);
+        assert_eq!(ui.reading, None);
+        assert_eq!(ui.key(key(KeyCode::Up), Instant::now()), Act::Nothing);
+        assert!(ui.transcript.following());
+    }
+
+    /// Plan Task 8: a two-hour lecture, 1,440 segments. A frame wraps only what it shows, following
+    /// or scrolled; the reader's place survives 140 → 80 → 140 and arrivals below. The frame time
+    /// is informational (Task 13 owns the target): `--nocapture` prints it.
+    #[test]
+    fn a_two_hour_transcript_scrolls_by_what_is_on_screen() {
+        let mut ui = lecture(1_440);
+        let wrapped = |ui: &mut Ui, w, h| {
+            panes::WRAPPED.with(|n| n.set(0));
+            let rows = frame(ui, w, h);
+            (rows, panes::WRAPPED.with(|n| n.get()))
+        };
+        let (live, n) = wrapped(&mut ui, 140, 40);
+        assert!(live[4..36].iter().any(|r| r.contains("Segment 1439")) && !live[35].is_empty(), "the live end at the bottom: {live:?}");
+        assert!(n <= 2 * 30, "following wraps the visible segments (twice at most), not 1,440: {n}");
+        // scroll well back: a frame still wraps only what it shows
+        for _ in 0..200 {
+            ui.key(key(KeyCode::PageUp), Instant::now());
+        }
+        let (back, n) = wrapped(&mut ui, 140, 40);
+        assert!(n <= 30, "scrolled: {n}");
+        let anchor = ui.transcript.anchor().unwrap();
+        assert!(anchor.id < 1_000, "{anchor:?}");
+        let (_, n) = wrapped(&mut ui, 80, 24);
+        assert!(n <= 30);
+        assert_eq!(ui.transcript.anchor(), Some(anchor), "a resize moves no anchor");
+        assert_eq!(frame(&mut ui, 140, 40), back, "140 → 80 → 140: the same rows");
+        // arrivals while scrolled
+        let mut more = lecture(1_443);
+        more.transcript = ui.transcript.clone();
+        let rows = frame(&mut more, 140, 40);
+        assert_eq!(rows[4..36], back[4..36], "the place held while three more arrived");
+        assert!(rows[3].contains("3 new below   Esc live"), "{:?}", rows[3]);
+        // informational timing at 140×40
+        let (runs, t0) = (200, std::time::Instant::now());
+        for _ in 0..runs {
+            frame(&mut ui, 140, 40);
+        }
+        let scrolled = t0.elapsed() / runs;
+        ui.key(key(KeyCode::Esc), Instant::now());
+        let t0 = std::time::Instant::now();
+        for _ in 0..runs {
+            frame(&mut ui, 140, 40);
+        }
+        eprintln!("two-hour transcript, 140×40 full frame on TestBackend (dev profile): following {:?}, scrolled {scrolled:?} a frame", t0.elapsed() / runs);
     }
 
     #[test]

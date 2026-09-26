@@ -266,8 +266,9 @@ fn the_session_view_shows_the_scripted_lecture_live() {
     let mut l = tui("quiet", &["--secs", "8"], 110, 30);
     let listening = l.listening();
     let stt = l.pty.wait_for("transcribing", listening, SOON);
-    // An empty day's ledger renders as $-0.00, as the plain end summary's own golden pins it.
-    let spend = l.pty.wait_for("$-0.00 today", stt, SOON);
+    // An empty day's ledger sums to -0.0; the header says $0.00 (the plain end summary's golden
+    // keeps its own bytes).
+    let spend = l.pty.wait_for("$0.00 today", stt, SOON);
     let gap = l.pty.wait_for("gap", spend, SOON); // t ≈ 2 s: a transcript gap opens, then recovery resolves it
     let recovered = l.pty.wait_for("recovered", gap, SOON);
     l.pty.wait_for("reconnect", recovered, SOON); // t ≈ 4 s: the connection dips and comes back

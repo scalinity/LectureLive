@@ -18,6 +18,10 @@ use tokio::time::{interval, interval_at, Instant};
 pub(crate) enum Scenario {
     /// Transcribing: a level every 100 ms, a segment each second; each operation commits a block.
     Quiet,
+    /// As quiet, but the transcript is a lecture's: a backlog to scroll from the start, then speech a few
+    /// words at a time on the open utterance until each sentence closes, and now and then a recovered
+    /// segment while someone is still speaking (plan Task 8's manual check).
+    Transcript,
     /// As quiet, but stopping takes as long as core's can: after the first `Stop` the transcript and recovery
     /// drain until a second `Stop`, and the last snapshot then takes a minute. Only stage 3 ends it at once.
     SlowStop,
@@ -38,16 +42,32 @@ impl Scenario {
     pub(crate) fn parse(name: &str) -> Result<Scenario> {
         match name {
             "quiet" => Ok(Scenario::Quiet),
+            "transcript" => Ok(Scenario::Transcript),
             "slow-stop" => Ok(Scenario::SlowStop),
             "panic" => Ok(Scenario::Panic),
             "init-fail-raw" => Ok(Scenario::InitFailRaw),
             "init-fail-mouse" => Ok(Scenario::InitFailMouse),
             "init-fail" => Ok(Scenario::InitFail),
             "draw-fail" => Ok(Scenario::DrawFail),
-            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\" and \"draw-fail\""),
+            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\" and \"draw-fail\""),
         }
     }
 }
+
+/// Segments already in the lecture when the `transcript` scenario starts: enough to scroll.
+const BACKLOG: usize = 60;
+
+/// What the `transcript` scenario's lecturer says, in turn.
+const SENTENCES: [&str; 8] = [
+    "Right, so where we stopped last time was the sampling distribution of the mean.",
+    "Each sample gives a different mean, and those means have a spread of their own.",
+    "That spread shrinks as the sample grows, but only with the square root of n.",
+    "So to halve the standard error you need four times the data, which is expensive.",
+    "Keep that trade-off in mind when we get to the confidence intervals after the break.",
+    "A question from the chat: does this assume the population is normal?",
+    "Not for the mean with a reasonable sample, and that is the central limit theorem.",
+    "Let's check it with the simulation from the lab rather than take my word for it.",
+];
 
 /// The release build's abort on panic, in a dev build: a panic cannot unwind out of an `extern "C"` function,
 /// so the panic hook runs and the process aborts, with no destructor between.
@@ -68,6 +88,20 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     let mut step = 0u32;
     let mut gapped: Option<Gap> = None;
     let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected)));
+    let lecture = scenario == Scenario::Transcript;
+    // The lecture's backlog: an hour of sentences said before this session's first frame.
+    let segment_at = |id: u64, said_at, text: String, source| Segment { id, recording_id: Default::default(), start_sample: id * 16_000, end_sample: (id + 1) * 16_000, said_at, start: said_at, end: said_at, text, words: Vec::new(), source };
+    if lecture {
+        for k in 0..BACKLOG {
+            let said_at = Local::now() - chrono::Duration::seconds((BACKLOG - k) as i64 * 7);
+            let _ = events.send(Event::Session(Notification::Segment(segment_at(next, said_at, SENTENCES[k % SENTENCES.len()].to_string(), SegmentSource::Live))));
+            next += 1;
+        }
+    }
+    // Speech: a word every 300 ms on the open utterance, its last two still tentative, until the
+    // sentence closes as a live segment; every fourth sentence, a recovered one lands mid-speech.
+    let (mut spoken, mut said) = (0usize, BACKLOG);
+    let mut speech = interval_at(Instant::now() + Duration::from_millis(300), Duration::from_millis(300));
     let mut level = interval(Duration::from_millis(100));
     let mut segment = interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     let panic_at = tokio::time::sleep(Duration::from_secs(1));
@@ -95,7 +129,26 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                     _ => {}
                 }
             }
-            _ = segment.tick() => {
+            _ = speech.tick(), if lecture => {
+                let sentence: Vec<&str> = SENTENCES[said % SENTENCES.len()].split(' ').collect();
+                spoken += 1;
+                if spoken < sentence.len() {
+                    let settled = spoken.saturating_sub(2);
+                    let tentative = sentence[settled..spoken].iter().map(|w| format!(" {w}")).collect::<String>();
+                    let _ = events.send(Event::Session(Notification::Open { stable: sentence[..settled].join(" "), tentative: if settled == 0 { tentative.trim_start().to_string() } else { tentative } }));
+                    if spoken == 3 && said % 4 == 0 {
+                        let earlier = Local::now() - chrono::Duration::seconds(95);
+                        let _ = events.send(Event::Session(Notification::Segment(segment_at(next, earlier, "Words from the minute the connection dropped, recovered from the recording.".into(), SegmentSource::Recovered))));
+                        next += 1;
+                    }
+                } else {
+                    let text = sentence.join(" ");
+                    words += sentence.len();
+                    let _ = events.send(Event::Session(Notification::Segment(segment_at(next, Local::now(), text, SegmentSource::Live))));
+                    (next, said, spoken) = (next + 1, said + 1, 0);
+                }
+            }
+            _ = segment.tick(), if !lecture => {
                 let now = Local::now();
                 let text = format!("scripted line {next}");
                 // the open utterance the line is about to finalise, as the live display opens and closes it

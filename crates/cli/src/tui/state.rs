@@ -200,6 +200,10 @@ pub(crate) struct View {
     pub(crate) activity: Ring,
     /// The notice line (plan §H): the input that is gone, while it is gone; else the latest notice.
     pub(crate) notice: Option<Notice>,
+    /// The notice line holds a transcription-connection notice (interrupted, server, stopped,
+    /// refused): a real `Connected` makes it untrue, so that one clears the line — and only then.
+    /// Set from the event's type as the notice is recorded, never read back from its words.
+    stt_notice: bool,
 }
 
 impl View {
@@ -233,6 +237,7 @@ impl View {
             spend: None,
             activity: Ring::default(),
             notice: None,
+            stt_notice: false,
         };
         // An empty projection merging its first read: one reconciliation rule for every hydration.
         v.merge(h);
@@ -268,6 +273,7 @@ impl View {
         // The wording both frontends share: the ring always; the notice line when no input is gone.
         if let Some(n) = plain::notice(e, WORDS) {
             self.record(n, at);
+            self.stt_notice = self.input_gone.is_none() && matches!(e, Event::Session(Notification::Stt(_)));
         }
         effect
     }
@@ -296,6 +302,7 @@ impl View {
                     self.input_gone = Some(plain::clean(uid));
                     // The top-priority notice holds the line until the input returns (plan §H).
                     self.notice = Some(plain::input_gone(&plain::clean(uid)));
+                    self.stt_notice = false;
                 }
             }
             Notification::DeviceBack { .. } => {
@@ -306,7 +313,15 @@ impl View {
                     self.notice = None;
                 }
             }
-            Notification::Stt(s) => self.stt = Some(stt_cleaned(s)),
+            Notification::Stt(s) => {
+                // The connection is back: a notice saying it is not no longer holds. The activity
+                // keeps the record of the interruption; any other notice stays where it is.
+                if matches!(s, SttStatus::Connected) && self.stt_notice {
+                    self.notice = None;
+                    self.stt_notice = false;
+                }
+                self.stt = Some(stt_cleaned(s));
+            }
             Notification::Open { stable, tentative } => {
                 self.open = Some(OpenUtterance { stable: plain::clean(stable), tentative: plain::clean(tentative) });
             }
@@ -464,6 +479,7 @@ impl View {
         self.activity.push(Activity { at, kind: n.kind, label: n.label.clone(), detail: n.detail.clone() });
         if self.input_gone.is_none() {
             self.notice = Some(n);
+            self.stt_notice = false;
         }
     }
 }
@@ -681,6 +697,43 @@ mod tests {
         v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
         assert_eq!(v.stt, Some(SttStatus::Connected));
         assert_eq!((v.phase, v.closed.len(), v.gaps(), v.notes.revision, v.slides.len(), v.spend), before, "recording state untouched");
+    }
+
+    /// Seen in Apple Terminal at Task 7: the header said "transcribing" while the notice line still
+    /// said "transcription interrupted … reconnecting in 1 s". A real `Connected` clears a notice
+    /// the connection itself raised; the activity keeps the interruption, and a notice anything else
+    /// raised stays.
+    #[test]
+    fn connected_stt_clears_the_stale_transcription_notice() {
+        let retrying = || Event::Session(Notification::Stt(SttStatus::Retrying { after: std::time::Duration::from_secs(1), reason: "socket closed".into() }));
+        let connected = Event::Session(Notification::Stt(SttStatus::Connected));
+        let mut v = view();
+        v.reduce(&retrying(), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("transcription interrupted"));
+        v.reduce(&connected, at());
+        assert_eq!(v.notice, None, "the line no longer claims an interruption");
+        assert!(v.activity.records().iter().any(|a| a.label == "transcription interrupted" && a.detail == "socket closed; reconnecting in 1 s"), "the history keeps it");
+        // every connection notice core can follow with a real Connected
+        for s in [SttStatus::ServerError("500".into()), SttStatus::Stopped("the worker stopped".into()), SttStatus::Refused("bad key".into())] {
+            v.reduce(&Event::Session(Notification::Stt(s)), at());
+            assert!(v.notice.as_ref().is_some_and(|n| n.label.starts_with("transcription")));
+            v.reduce(&connected, at());
+            assert_eq!(v.notice, None);
+        }
+        // an interruption followed by an unrelated notice: Connected leaves that one alone
+        v.reduce(&retrying(), at());
+        v.reduce(&Event::SnapshotFailed("timed out".into()), at());
+        v.reduce(&connected, at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot failed"));
+        // and a Connected with no connection notice showing changes nothing
+        v.reduce(&connected, at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot failed"));
+        // a gone input holds the line through a reconnect
+        let mut w = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
+        w.reduce(&retrying(), at());
+        w.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
+        w.reduce(&connected, at());
+        assert_eq!(w.notice.as_ref().map(|n| n.label.as_str()), Some("input gone"));
     }
 
     /// Plan §J: a refusal stays a refusal — semantically, not as a string — until a real later event
