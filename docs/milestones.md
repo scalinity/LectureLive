@@ -19,7 +19,7 @@ kickoff prompt carries this rule.
 | M1 | Recording + loopback foundation | done | M0 | Creates the "LectureLive Loopback" device; changes the system output only in the canary-route restore check, which restores it | [m1-recording-loopback](superpowers/plans/2026-09-25-m1-recording-loopback.md) |
 | M2 | Streaming + recovery | done | M1 | No | [m2-streaming-recovery](superpowers/plans/2026-09-25-m2-streaming-recovery.md) |
 | M3 | Notes/session parity | done | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | [m3-notes-session-parity](superpowers/plans/2026-09-25-m3-notes-session-parity.md) |
-| M4 | Desktop app: transcript + notes panes | not started | M3 | No | written at M4 start |
+| M4 | Desktop app: transcript + notes panes | done | M3 | No | [m4-desktop-panes](superpowers/plans/2026-09-25-m4-desktop-panes.md) |
 | M5 | Slide automation | not started | M4 | No | written at M5 start |
 | M6 | Full-lecture acceptance; mixed mode; Python retired | not started | M5 | Removes `live_notes.py` | written at M6 start |
 
@@ -549,9 +549,169 @@ Tasks:
 6. Keychain storage of the API key
 7. Spend view from the ledger (§9.1)
 
-**Gate:** reload and hidden-window rehydration restore the full view; hint, cancel and
-polish behave as in the CLI; 500-delta/s burst and two-hour transcript fixtures keep p95
-frame work under 16.7 ms; rendered Markdown cannot run script or load remote content.
+**Gate** (checked in `cargo test` and `vitest` against fakes and fixtures, in the running dev app's WKWebView, and live on synthetic lectures; plan Tasks 10, 11 and 13):
+
+- [x] Reload and hidden-window rehydration restore the full view
+- [x] Hint, cancel and polish behave as in the CLI
+- [x] 500-delta/s burst and two-hour transcript fixtures keep p95 frame work under 16.7 ms
+- [x] Rendered Markdown cannot run script or load remote content
+
+**Findings** (acceptance run 2026-09-25; reports in `~/Library/Application Support/LectureLive/m4-checks/`, synthetic lectures in `~/Library/Application Support/LectureLive/m4-live/`, outside the repository):
+
+*Suites.* `cargo test -p lecturelive-core`: 233 passed, 0 failed, 9 ignored (M3's 229 plus four: the cancel-and-state gate test, `course_from_path`, `prepare`, `spend::summary`). `cargo test -p desktop`: 9 passed, 0 failed, 1 ignored (the Keychain round trip, run by hand against the login Keychain: passed, no prompt). `npx vitest run`: 21 passed in 5 files. `npx svelte-check`: 0 errors, 0 warnings. The `coordinator` test that flaked about once in ten at M3 did not fail in any M4 run.
+
+*New crates and packages.*
+- Rust: `tauri-plugin-dialog 2.7.3` (which brings `tauri-plugin-fs 2.5.2`, `tauri-plugin 2.6.3` and `rfd 0.16.0`); `tauri 2.11.6` gains `protocol-asset` (`http-range 0.1.5`). The Keychain is reached through `security-framework 3.7.0`, already compiled into the build through `rustls-platform-verifier`. `keyring` (spec §13) is at a new major line, 4.2.0, built on `keyring-core` and per-platform store crates, so it was not added. The desktop crate gains `dotenvy`, `anyhow`, `uuid` and `tokio` (`sync`, `time`), all already in `Cargo.lock`.
+- Frontend: `marked 18.0.14`, `dompurify 3.4.15` (pinned exactly, as spec §13 names it; 3.4.16 is out), `@tauri-apps/plugin-dialog 2.7.3`; dev `vitest 5.0.2`, `jsdom 30.1.1`. Unchanged: `svelte 5.57.1`, `@sveltejs/kit 2.70.3`, `vite 8.3.1`, `@tauri-apps/api 2.11.1`.
+
+*The adapter as built* (spec §3.6 now states it).
+- One lecture per window. At most one `lecture::run` runs, on Tauri's runtime; a folder can be open without one.
+- A pure `Pump` maps each lecture event to one message on one of three streams:
+  - the `status` event: the whole status, sent whenever it changes; notices; slides;
+  - a transcript `Channel`: `open`, `closed`, `segment`;
+  - a notes `Channel`: `delta`, `committed`, `ended`, `polished`. Deltas and their result share an `op` and the channel, so their order holds.
+- Every message carries the session id and one `seq` counter, assigned under the pump's lock.
+- Core added:
+  - `Command::Cancel`: generation-tagged; it stops the request in flight and drops the queue; only the request is raced, never the commit;
+  - `Command::State`: served through the session's store until stopping, then from the file;
+  - revisions on `Committed` and `Polished`, and `Event::Cancelled`;
+  - `session::start::prepare`, the CLI's start-up, now shared.
+- `get_session_state` holds the pump's lock, so its `seq` is exact. It reads:
+  - the sidecar: through `Command::State` with a 2 s limit, or from the file once stopping (a finding of the final review);
+  - the segment log;
+  - the notes, until their SHA-256 is the sidecar's.
+- The frontend drops messages from another session, at or below the watermark, or repeated on their stream. A status message from a new session makes it rehydrate, and so do a revision jump, `polished`, or a hole in segment ids.
+- Stop has three levels in the UI: Stop, then Stop waiting, then quitting the app. Cancel covers snapshot and polish, not the page. Once stopping, the command line takes nothing new, and the backend says so (spec §9.1).
+
+*Frame work* (plan Task 10). Measured per animation frame as apply + `flushSync` + the panes' layout reads, in the dev app's WKWebView (AppleWebKit/605.1.15, 60 Hz), driven through the real store by fixtures. Reports: `m4-checks/bench-*-run{1,2,3}.json`.
+
+| Fixture | p95 (ms), runs 1/2/3 | Max (ms) | Frames | Over 16.7 ms |
+|---|---|---|---|---|
+| 5,000 notes deltas at 500/s over 10 s, speech every 500 ms | 6 / 4 / 4 | 9 / 6 / 10 | 600 each | 0 |
+| 1,440 segments and a 6,671-word document hydrated, then 30 s live (speech, 900 deltas at 60/s, one commit) | 4 / 2 / 2 | 11 / 4 / 6 | 913–928 | 0 |
+
+- Hydrating the two-hour state took 39–40 ms.
+- WebKit coarsens `performance.now()` to 1 ms, so the WKWebView figures have 1 ms resolution.
+- For comparison, Chromium 153 at 120 Hz gave p95 4.7 ms (burst) and 2.2 ms (two-hour).
+- Defining the measurement exposed a real ordering bug: the pin-to-bottom hooks ran before Svelte flushed the frame. The drain now flushes first.
+
+*Sanitiser and CSP.*
+- **Unit** (`markdown.test.ts`, jsdom), with 14 hostile inputs: script, handler, `javascript:`, remote and `data:` images, iframe/object/embed, SVG and MathML, a stylesheet and `@import`, a style attribute, meta refresh and `<base>`, a form with `formaction`, video and `poster`, `srcset`, a path climbing out of `slides/`, and `ping` and `ontoggle`. The render was inert: no remote `src` or `href`, and no image. Only a registered slide renders, through `asset://`.
+- **The URL pass is load-bearing.** With it removed, the test failed on `IMG src https://evil.example/a.png`: DOMPurify alone keeps remote images.
+- **In the running app** (WKWebView, `m4-checks/csp.json`):
+  - violations: `img-src` on `http://192.0.2.1/m4.png`, `connect-src` on `http://192.0.2.1/m4`, and `script-src-attr` on an inline handler written without the sanitiser. The handler did not run.
+  - The hostile Markdown rendered with no problems and no images.
+  - The registered slide loaded through the asset protocol; `outside.png`, one folder up, was refused.
+- **In development the CSP comes from SvelteKit's `kit.csp`.** On macOS, Tauri loads the dev URL directly and never applies its own `csp` there. `curl -sI localhost:1420` showed `script-src 'self' 'nonce-…'` with no `unsafe-inline`.
+- **A built app's CSP is not checked:** no build was authorised. That is an open thread.
+
+*Rehydration and the CLI's operations* (plan Task 11, `m4-checks/live-run{1..5}.json`). These are live runs of the dev app on synthetic folders, with speech from `say -a "BlackHole 2ch"` and a PNG dropped into `slides/` mid-lecture.
+
+Run 4 (Week 03) passed every step, and so did run 5 (Week 04), after the review fixes:
+1. key from `.env` into the Keychain;
+2. start;
+3. three segments;
+4. hinted snapshot (revision 2);
+5. cancel after the first delta: revision unchanged, "Cancelled: the snapshot; nothing was written…";
+6. snapshot after the cancel (revision 3);
+7. **reload**: 8 (run 5: 16) segments before, after, in the state and in the pane; the revision equal;
+8. **hidden window**: `visibilitychange` fired on hide and show (4 s apart), and afterwards the pane equalled a fresh state (15 = 15, run 5: 23 = 23 segments; the revision equal);
+9. polish: revision + 2 (its snapshot, then the replace), backup `.live_notes/…_2040NN.md`;
+10. Stop, then Stop waiting (`stopping_now`);
+11. ended with a last snapshot.
+
+The sidecar ended with cursor 30 of 30 segments, and the dropped slide was embedded exactly once. The default output was "MacBook Pro Speakers" before and after every run.
+
+Runs 1–3 are evidence too:
+- Run 1 exposed a check that waited on material the model had already written.
+- Run 2 caught a race in the check.
+- Run 3 was invalid: a previous `say` loop was still playing into BlackHole.
+
+In the gate test (`lecture_gate::a_cancelled_snapshot_writes_nothing_drops_the_queue_and_its_material_goes_again`), Cancel stops a stalled request, the queued polish never sends, the notes are unchanged, and the next snapshot sends the cancelled material. The Ops are the CLI's (`Snapshot(hint)`, `Polish`, `Stop`); `polish ⏎` in the command line is the CLI's `polish ⏎`.
+
+*The study page from the app.* Typeset in 213 s, $0.104546 billed (`m4-checks/page.json`). A check never opens the default browser (the page loads KaTeX and fonts from the web), so the open itself is left for a person to see.
+
+*`/frontend-design:frontend-design` runs*, recorded in the plan and the ledger:
+- **Milestone:** the study page's palette, Atkinson Hyperlegible Next falling back to the system face, 18 px at a 1.2 ratio, flat ruled columns, the command line as the one bold element. Pass 2 dropped a monospace face for data labels and card panes.
+- **Transcript pane and layout (Task 6):** a hanging time gutter; the live utterance one step larger on a teal rule; no pane headings. Pass 2 dropped a pulsing live dot.
+- **Notes pane (Task 7):** snapshot times in the same gutter; the preview on the teal rule, marked "writing"; slides fill the measure.
+- **Control bar (Task 8):** the phase as one word with a static recording dot; the command line in the CLI's grammar and marks; the native `<dialog>` key.
+- **Spend view (Task 9):** a sheet with the CLI's layout, dates in the gutter. Pass 2 dropped a big-total hero.
+
+Each view was checked in Chromium through Playwright on the dev server, in light and dark, with large type and at 960 px. The checks found and fixed a strip that wrapped, a layout-driven unpin, and the notes pane not following the preview. The screenshots were deleted. The app itself (WKWebView) has not yet been looked at by a person.
+
+*Live spend:* $0.5429 of the $2 cap, all in `spend.jsonl` under course "m4-live":
+- notes $0.2900 (billed), polish $0.1013 (billed), page $0.1045 (billed), transcribe $0.0471 (computed);
+- two of the notes requests ($0.009 and $0.012) were billed empty answers, described below.
+
+*Settled while planning* (the plan's header has the reasons):
+- one lecture per window;
+- the three streams and one `seq`;
+- the revision rule and hash-matched document;
+- Cancel as a new command;
+- the stop levels;
+- state from the file once stopping;
+- start-up shared through `prepare`;
+- the Keychain through `security-framework`;
+- fonts local-or-system;
+- frame work measured in WKWebView.
+
+*M3 deferred minors taken:* other days' recovery now announces each day before it runs (CLI and app); polish's ledger warning reaches the notices. Not taken, because their code was not touched: the page's ledger warning, the lone `-` after an inline embed. The coordinator flake did not reappear.
+
+*Rulings during execution* (the ledger has all of them with their costs):
+- The cancel gate test waits for the stalled request to reach the fake server.
+- The pin hooks run after `flushSync`.
+- A status message from a new session makes the store rehydrate.
+- The store buffers everything until its first hydration.
+- `screenshot_dir` moved into core.
+- `dompurify` pinned exactly.
+- A check never opens the default browser.
+- The checks wait for status-driven state rather than reading it right after a command.
+
+*Review* (a fresh reviewer on the most capable model, over the whole branch): no Critical, three Important, eleven Minor.
+
+The three Important findings, and one Minor re-graded to Important for its effect, were fixed test-first:
+1. **State reads hung through the final snapshot.** The lecture no longer reads its commands then, and the pump stayed locked for minutes. Once stopping, the file answers, and a running lecture has 2 s.
+2. **A committed revision the state already held did not end its preview,** so the last block showed twice.
+3. **A closed segment the state already held left the live line showing** (re-graded from Minor).
+4. **Snapshot, a hint and Polish were offered while stopping, and core dropped them.** Now they are only offered while running, and the backend refuses with "The lecture is stopping; the last snapshot takes what is left."
+
+The ten remaining Minors are deferred; their owners are listed under open threads.
+
+*Failed lines:* none. No spec §14.1 fallback applies (§14.1 covers loopback only).
+
+*Observations.*
+- `grok-4.7` answered two snapshots with empty content, both billed, when the new material repeated what the notes already held: the synthetic speech looped one passage. The material stayed pending, as spec §6.2 requires.
+- Stopping aborts the study page that polish starts, as in the CLI.
+- After a relink of the debug binary, one start took 92 s. That is consistent with a Keychain access prompt for the new signature being answered on screen; the executor did not observe it.
+
+*Open threads.*
+- **Owner M5:**
+  - The slides strip replaces the plain list in the right-hand rail. It carries the rail's "Screenshots you take during the lecture become slides" state and takes its thumbnails through the same asset scope.
+  - Deferred review minor M8: a new slide re-renders the whole committed document, because `slides.size` is in every chunk's key. The strip's work touches that code.
+- **Owner M6:**
+  - The built app's CSP: SvelteKit's meta tag together with Tauri's header (unverified, since no build was authorised).
+  - Spec §13 names `keyring`, but the app uses `security-framework`.
+  - Whether a real lecture draws empty snapshot answers.
+  - Keychain prompts after each dev rebuild.
+  - Polish after a lecture has ended: a decision, since the CLI also polishes only inside a lecture.
+  - A dropped `SourceEnded` (predates M4).
+  - Deferred review minors:
+    - M1: the hash retries have no pause;
+    - M3: the page shares the busy line with snapshot and polish;
+    - M4: a late `SourceEnded` re-shows "Stop waiting";
+    - M5: a start that fails late stays in "starting";
+    - M6: "Stop" is offered while starting;
+    - M7: a hydration begun before hiding is reused on return;
+    - M9: the gap count starts at zero each session;
+    - M10: the CLI's start-up line order;
+    - M11: unhandled `hydrate()` rejections.
+- **Needing the person, one sitting of a few minutes:**
+  - look at the app in the dev build, light and dark and with large type;
+  - click Study page once, to see it open in the browser;
+  - answer "Always Allow" if the Keychain asks.
+
+  No gate line depends on this.
 
 ## M5 — Slide automation
 
