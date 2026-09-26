@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use chrono::Local;
 use lecturelive_core::audio::level::{dbfs, SilenceWatch};
+use lecturelive_core::capture::worker::CaptureState;
 use lecturelive_core::session::coordinator::{Notification, SttStatus};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::lecture::Event;
@@ -16,7 +17,7 @@ use lecturelive_core::session::spend::{money, Spend};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::wire::{Envelope, NoticeKind, NotesMsg, Notice, OpenView, Outcome, PreviewView, SegmentView, SessionState, SlideView, Status, StatusMsg, TranscriptMsg};
+use crate::wire::{CaptureView, CaptureWord, Envelope, NoticeKind, NotesMsg, Notice, OpenView, Outcome, PreviewView, SegmentView, SessionState, SlideView, Status, StatusMsg, TranscriptMsg, WindowView};
 pub use crate::wire::Phase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,16 +188,41 @@ impl Pump {
                 self.notice(NoticeKind::Page, "Study page", &detail);
             }
             Event::PageFailed(m) => self.failed("Study page failed", &m),
-            Event::Slide { index, file, .. } => {
+            Event::Slide { index, file, auto, uncertain, shown_at } => {
                 let path = self.slide_path(&file);
                 let name = Path::new(&file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path }));
-                self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}, into the next snapshot"));
+                let how = match (auto, uncertain) {
+                    (true, true) => ", taken while it was still changing: check it",
+                    (true, false) => ", taken automatically",
+                    _ => "",
+                };
+                self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path, at: shown_at.format("%H:%M:%S").to_string(), auto, uncertain }));
+                self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}{how}, into the next snapshot"));
             }
-            Event::Capture(_) => {} // the capture status: Task 6
+            Event::Capture(s) => self.capture_state(s),
             Event::Warning(m) => self.notice(NoticeKind::Warn, "Warning", &m),
         }
         self.flush_status();
+    }
+
+    /// The capture worker's state into the status; a changed state is also a notice.
+    fn capture_state(&mut self, s: CaptureState) {
+        let (label, detail) = s.words();
+        let (state, window, why, candidates) = match &s {
+            CaptureState::Unbound => (CaptureWord::Unbound, None, None, vec![]),
+            CaptureState::Watching { window } => (CaptureWord::Watching, Some(window.clone()), None, vec![]),
+            CaptureState::Paused { window, reason } => (CaptureWord::Paused, Some(window.clone()), Some(reason.clone()), vec![]),
+            CaptureState::Asking { window, reason, candidates } => (CaptureWord::Asking, Some(window.clone()), Some(reason.clone()), candidates.iter().map(WindowView::from).collect()),
+            CaptureState::Denied => (CaptureWord::Denied, None, Some(detail.clone()), vec![]),
+            CaptureState::Failing { window, reason } => (CaptureWord::Failing, Some(window.clone()), Some(reason.clone()), vec![]),
+        };
+        let c = &mut self.mirror.status.capture;
+        let captured = c.captured || state == CaptureWord::Watching; // watching follows a successful capture
+        let view = CaptureView { state, window, detail: why, candidates, captured };
+        if *c != view {
+            *c = view;
+            self.notice(if state == CaptureWord::Watching { NoticeKind::Slide } else { NoticeKind::Warn }, label, &detail);
+        }
     }
 
     fn ended(&mut self, outcome: Outcome, kind: NoticeKind, label: &str, message: String) {
@@ -279,7 +305,7 @@ impl Pump {
                 sc.notes.revision,
                 (segments.len() as u64).saturating_sub(sc.notes.segment_cursor),
                 sc.slides.iter().filter(|s| s.index > sc.notes.slide_index).count(),
-                sc.slides.iter().map(|s| SlideView { index: s.index, file: s.file.clone(), path: files.map_or_else(|| s.file.clone(), |f| f.dir.join(&s.file).to_string_lossy().into_owned()) }).collect(),
+                sc.slides.iter().map(|s| SlideView { index: s.index, file: s.file.clone(), path: files.map_or_else(|| s.file.clone(), |f| f.dir.join(&s.file).to_string_lossy().into_owned()), at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain }).collect(),
             ),
             None => (0, 0, 0, Vec::new()),
         };
@@ -462,5 +488,23 @@ mod tests {
         assert_eq!(read_document(&files, &notes).as_deref(), Some("# T\n"));
         std::fs::write(&files.notes, "# T\n\n<!-- 10:00:00 -->\n## A\n").unwrap(); // a commit landed after the sidecar was read
         assert_eq!(read_document(&files, &notes), None);
+    }
+
+    #[test]
+    fn capture_states_reach_the_status_with_a_notice_and_slides_carry_their_badges() {
+        use lecturelive_core::capture::worker::CaptureState;
+        let (mut p, sink) = pump();
+        p.apply(Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }));
+        p.apply(Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }));
+        let at = Local.with_ymd_and_hms(2026, 9, 25, 10, 2, 51).unwrap();
+        p.apply(Event::Slide { index: 1, file: "slides/slide_01_100251.png".into(), auto: true, uncertain: true, shown_at: at });
+        p.apply(Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "a new “Zoom Meeting” window opened".into(), candidates: vec![] }));
+        let msgs = sink.on(Stream::Status);
+        let notices: Vec<&str> = msgs.iter().filter(|m| m["type"] == "notice").map(|m| m["label"].as_str().unwrap()).collect();
+        assert_eq!(notices, ["Watching", "Slide 1", "Asking"], "an unchanged state is not announced twice");
+        let slide = msgs.iter().find(|m| m["type"] == "slide").unwrap();
+        assert_eq!((slide["auto"].as_bool(), slide["uncertain"].as_bool(), slide["at"].as_str()), (Some(true), Some(true), Some("10:02:51")));
+        let status = msgs.iter().rev().find(|m| m["type"] == "status").unwrap();
+        assert_eq!((status["capture"]["state"].as_str(), status["capture"]["captured"].as_bool()), (Some("asking"), Some(true)));
     }
 }

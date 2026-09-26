@@ -8,13 +8,16 @@ use chrono::Local;
 use lecturelive_core::audio::permission::{self, MicPermission};
 use lecturelive_core::audio::source::DeviceSource;
 use lecturelive_core::audio::{input, loopback};
+use lecturelive_core::capture::detect::{Region, Thresholds};
+use lecturelive_core::capture::select::{Descriptor, Selection, Selections};
+use lecturelive_core::capture::window::{self, SystemWindows, WindowInfo, WindowSource};
 use lecturelive_core::notes::chat::{ChatClient, ChatConfig};
 use lecturelive_core::notes::{page, prompts};
 use lecturelive_core::session::coordinator::SessionConfig;
 use lecturelive_core::session::files::{course_from_path, LectureFiles};
 use lecturelive_core::session::folder::How;
 use lecturelive_core::session::launch::{self, Retention};
-use lecturelive_core::session::lecture::{self, Command, Event, Lecture, Op, SlideWatch};
+use lecturelive_core::session::lecture::{self, CaptureSetup, Command, Event, Lecture, Op, SlideWatch};
 use lecturelive_core::session::lock::FolderLock;
 use lecturelive_core::session::notesfile::Recovered;
 use lecturelive_core::session::segments;
@@ -26,11 +29,12 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::adapter::{read_document, Phase, Pump, Sink, Stream};
 use crate::keychain;
-use crate::wire::{FolderView, NoticeKind, SessionState};
+use crate::wire::{CaptureView, CaptureWord, FolderView, NoticeKind, PreviewShot, SessionState, WindowView};
 
 /// The Python CLI's ledger, taken over by the app's at each start (spec §8).
 const CLI_LEDGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../spend.jsonl");
@@ -192,11 +196,15 @@ pub async fn select_folder(dir: String, app: State<'_, App>, handle: AppHandle) 
     handle.asset_protocol_scope().allow_directory(&files.slides, false).map_err(text)?;
     let folder = OpenFolder { title: prompts::title(&course, &name, today), files, course, name };
     let view = folder_view(&folder);
+    let capture = ready_view(&selections_path()?, &folder.course);
     *app.folder.lock().expect("the folder lock") = Some(folder);
     let mut pump = app.pump.lock().await;
     *pump = Pump::new(uuid::Uuid::new_v4().to_string(), app.sink.clone(), None, false);
     let v = view.clone();
-    pump.set_status(move |s| s.folder = Some(v));
+    pump.set_status(move |s| {
+        s.folder = Some(v);
+        s.capture = capture;
+    });
     Ok(view)
 }
 
@@ -259,12 +267,14 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         let mut pump = app.pump.lock().await;
         *pump = Pump::new(session.clone(), app.sink.clone(), Some(spend.clone()), uid == loopback::BLACKHOLE_UID);
         let (view, name) = (folder_view(&folder), source_name.clone());
+        let capture_view = ready_view(&selections_path()?, &folder.course);
         pump.set_status(move |s| {
             s.phase = Phase::Starting;
             s.folder = Some(view);
             s.source = Some(name);
             s.stt = "connecting".into();
             s.started_at = Some(Local::now().to_rfc3339());
+            s.capture = capture_view;
         });
         if let Ok(Some(restored)) = launch::restore_abandoned_route(&data.join("route.json")) {
             pump.notice(NoticeKind::Done, "Route restored", &format!("undid a canary route left behind; default output restored: {restored}"));
@@ -337,14 +347,22 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         }
     });
     let watch = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
-    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid }), watch, None, cmd_rx, ev_tx);
+    // Spec §7: the course's saved window, revalidated by the worker as the lecture starts.
+    let selection = Selections::load(&selections_path()?).ok().and_then(|s| s.get(&folder.course).cloned());
+    let capture = CaptureSetup { source: Box::new(SystemWindows), selection, interval: Duration::from_secs(1), thresholds: Thresholds::default(), record: std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from) };
+    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid }), watch, Some(capture), cmd_rx, ev_tx);
     *app.running.lock().expect("the running lock") = Some(Running { commands: cmd_tx, lecture: lec, stops: 0, _lock: lock });
     app.pump.lock().await.set_status(|s| s.phase = Phase::Running);
+    // ⌘⇧2 captures the slide from anywhere, only while a lecture runs: it takes the keys from every other app.
+    if let Err(e) = handle.global_shortcut().register(SHORTCUT) {
+        app.pump.lock().await.notice(NoticeKind::Warn, "Shortcut", &format!("⌘⇧2 could not be registered ({e}); use the Capture button"));
+    }
     let h = handle.clone();
     tauri::async_runtime::spawn(async move {
         let result = run.await;
         let _ = forward.await;
         let app = h.state::<App>();
+        let _ = h.global_shortcut().unregister(SHORTCUT);
         let running = app.running.lock().expect("the running lock").take(); // the folder lock goes with it
         drop(running);
         let mut pump = app.pump.lock().await;
@@ -392,6 +410,115 @@ pub fn polish(app: State<'_, App>) -> Res<()> {
 #[tauri::command]
 pub fn cancel(app: State<'_, App>) -> Res<()> {
     app.send(Command::Cancel)
+}
+
+/// The global shortcut for Capture (spec §7.3): away from Zoom's and macOS's own combinations.
+pub const SHORTCUT: &str = "CommandOrControl+Shift+Digit2";
+
+/// Saved windows and regions, by course (spec §7.1).
+fn selections_path() -> Res<PathBuf> {
+    Ok(data_dir()?.join("capture.json"))
+}
+
+/// Keeps the window and region the person chose for a course.
+fn save_selection(path: &Path, course: &str, w: &WindowInfo, region: Region) -> anyhow::Result<Selection> {
+    anyhow::ensure!(region.is_valid(), "The region must lie inside the window.");
+    let sel = Selection { descriptor: Descriptor::of(w), region };
+    let mut all = Selections::load(path)?;
+    all.set(course, sel.clone());
+    all.save(path)?;
+    Ok(sel)
+}
+
+/// Before a lecture: the course's saved window, or none yet.
+fn ready_view(path: &Path, course: &str) -> CaptureView {
+    match Selections::load(path).ok().and_then(|s| s.get(course).cloned()) {
+        Some(sel) => CaptureView { state: CaptureWord::Ready, window: Some(sel.descriptor.label()), ..CaptureView::default() },
+        None => CaptureView::default(),
+    }
+}
+
+/// The windows the picker offers; missing Screen Recording is an error, never an empty list (spec §7.1).
+#[tauri::command]
+pub async fn capture_windows() -> Res<Vec<WindowView>> {
+    tauri::async_runtime::spawn_blocking(|| SystemWindows.windows().map(|ws| ws.iter().map(WindowView::from).collect()).map_err(|e| e.to_string())).await.map_err(text)?
+}
+
+/// A still of one window for the picker, fitted to 1600 px, readable only through the asset protocol.
+#[tauri::command]
+pub async fn capture_preview(id: u32, handle: AppHandle) -> Res<PreviewShot> {
+    let dir = data_dir()?.join("picker");
+    let (path, (width, height)) = tauri::async_runtime::spawn_blocking(move || -> Res<(PathBuf, (u32, u32))> {
+        std::fs::create_dir_all(&dir).map_err(text)?;
+        for e in std::fs::read_dir(&dir).map_err(text)?.flatten() {
+            let _ = std::fs::remove_file(e.path()); // only the latest still is kept
+        }
+        let path = dir.join(format!("window-{id}-{}.png", Local::now().timestamp_millis()));
+        let size = window::capture_window(id, &path).map_err(chain)?;
+        Ok((path, size))
+    })
+    .await
+    .map_err(text)??;
+    handle.asset_protocol_scope().allow_file(&path).map_err(text)?;
+    Ok(PreviewShot { path: path.to_string_lossy().into_owned(), width, height })
+}
+
+/// The person chose a window and region: saved for the course, and watched at once if a lecture runs.
+#[tauri::command]
+pub async fn capture_select(id: u32, region: Region, app: State<'_, App>) -> Res<()> {
+    let folder = app.folder().ok_or("Choose a lecture folder first.")?;
+    let windows = tauri::async_runtime::spawn_blocking(|| SystemWindows.windows()).await.map_err(text)?.map_err(|e| e.to_string())?;
+    let w = windows.into_iter().find(|w| w.id == id).ok_or("That window is no longer open.")?;
+    let path = selections_path()?;
+    let selection = save_selection(&path, &folder.course, &w, region).map_err(chain)?;
+    match app.commands() {
+        Some(c) => c.send(Command::Bind { window: id, selection }).map_err(|_| "The lecture has ended.".to_string()),
+        None => {
+            let view = ready_view(&path, &folder.course);
+            app.pump.lock().await.set_status(move |s| s.capture = view);
+            Ok(())
+        }
+    }
+}
+
+/// The Capture button: the watched region now, as a manual slide.
+#[tauri::command]
+pub async fn capture_now(app: State<'_, App>) -> Res<()> {
+    let (tx, rx) = oneshot::channel();
+    app.send(Command::CaptureNow(tx))?;
+    rx.await.map_err(|_| "The lecture has ended.".to_string())?
+}
+
+/// ⌘⇧2: as the Capture button; a refusal becomes a notice, since no button was pressed to show it.
+pub fn shortcut(handle: &AppHandle) {
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let app = handle.state::<App>();
+        let (tx, rx) = oneshot::channel();
+        let result = match app.send(Command::CaptureNow(tx)) {
+            Ok(()) => rx.await.unwrap_or_else(|_| Err("The lecture has ended.".into())),
+            Err(e) => Err(e),
+        };
+        if let Err(m) = result {
+            app.pump.lock().await.notice(NoticeKind::Warn, "Capture", &m);
+        }
+    });
+}
+
+/// Images dropped on the window (spec §7.3).
+#[tauri::command]
+pub fn import_slides(paths: Vec<String>, app: State<'_, App>) -> Res<()> {
+    if app.commands().is_none() {
+        return Err("Start the lecture to add slides.".into());
+    }
+    app.send(Command::Import(paths.into_iter().map(PathBuf::from).collect()))
+}
+
+/// The fix-it for a missing Screen Recording grant (spec §10).
+#[tauri::command]
+pub fn open_screen_settings() -> Res<()> {
+    std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").status().map_err(text)?;
+    Ok(())
 }
 
 /// Spec §9.1: the study page, typeset first when it is missing or stale (from its cache otherwise),
@@ -546,5 +673,19 @@ mod tests {
         let s = spend_summary_at(&app, &cli).unwrap();
         assert_eq!((s.calls, s.months.len()), (1, 1));
         assert_eq!(s.recent[0].lecture, "Week 01");
+    }
+
+    #[test]
+    fn a_selection_is_saved_per_course_and_the_status_names_it() {
+        use lecturelive_core::capture::detect::Region;
+        use lecturelive_core::capture::window::WindowInfo;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.json");
+        let w = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
+        save_selection(&path, "Machine Learning", &w, Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }).unwrap();
+        assert_eq!(ready_view(&path, "Machine Learning").state, CaptureWord::Ready);
+        assert_eq!(ready_view(&path, "Machine Learning").window.as_deref(), Some("Zoom Meeting"));
+        assert_eq!(ready_view(&path, "Statistics").state, CaptureWord::Unbound);
+        assert!(save_selection(&path, "Machine Learning", &w, Region { x: 0.5, y: 0.5, w: 0.9, h: 0.9 }).is_err(), "a region outside the window is refused");
     }
 }

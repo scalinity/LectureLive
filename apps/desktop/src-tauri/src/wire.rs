@@ -1,4 +1,5 @@
 //! What the adapter sends the frontend (spec §3.6). `src/lib/wire.ts` mirrors these types exactly.
+use lecturelive_core::capture::window::WindowInfo;
 use lecturelive_core::session::segments::{Segment, SegmentSource};
 use serde::Serialize;
 
@@ -101,6 +102,60 @@ pub struct Status {
     pub spend_usd: f64,
     /// Ten silent seconds on loopback.
     pub silence: bool,
+    /// Slide capture: the watched window and its state (spec §7).
+    pub capture: CaptureView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureWord {
+    /// No window chosen for this course.
+    #[default]
+    Unbound,
+    /// A window is chosen; watching starts with the lecture.
+    Ready,
+    Watching,
+    Paused,
+    Asking,
+    Denied,
+    Failing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WindowView {
+    pub id: u32,
+    pub app: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub on_screen: bool,
+}
+
+impl From<&WindowInfo> for WindowView {
+    fn from(w: &WindowInfo) -> Self {
+        Self { id: w.id, app: w.app.clone(), title: w.title.clone(), width: w.width, height: w.height, on_screen: w.on_screen }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct CaptureView {
+    pub state: CaptureWord,
+    /// The watched window, as the person calls it.
+    pub window: Option<String>,
+    /// Why it is paused, asking or failing.
+    pub detail: Option<String>,
+    /// The windows the person may mean, while asking.
+    pub candidates: Vec<WindowView>,
+    /// A real capture has succeeded this lecture: the Capture button works (spec §7.4).
+    pub captured: bool,
+}
+
+/// A still of a window for the picker, through the asset protocol.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PreviewShot {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -129,6 +184,12 @@ pub struct SlideView {
     /// Relative to the lecture folder.
     pub file: String,
     pub path: String,
+    /// When it was first on screen, `HH:MM:SS`.
+    pub at: String,
+    /// Taken by the change detector.
+    pub auto: bool,
+    /// Kept after 10 s of change: it may show a transition.
+    pub uncertain: bool,
 }
 
 /// The status stream (a Tauri event).

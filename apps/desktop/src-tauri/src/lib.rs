@@ -5,12 +5,14 @@ mod keychain;
 mod wire;
 
 use tauri::Manager;
+use tauri_plugin_global_shortcut::ShortcutState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let check: Vec<String> = std::env::args().skip_while(|a| a.as_str() != "--check").skip(1).collect();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, e| if e.state == ShortcutState::Pressed { app::shortcut(app) }).build())
         .setup(move |a| {
             a.manage(app::App::new(a.handle().clone()));
             if !check.is_empty() {
@@ -43,6 +45,12 @@ pub fn run() {
             app::check_report,
             app::exit_app,
             app::hide_window_for,
+            app::capture_windows,
+            app::capture_preview,
+            app::capture_select,
+            app::capture_now,
+            app::import_slides,
+            app::open_screen_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

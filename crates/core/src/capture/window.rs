@@ -168,7 +168,9 @@ pub fn capture_window(id: u32, out: &Path) -> Result<(u32, u32)> {
         bail!("capture of window {id} is blank (permission missing or window hidden)");
     }
     let (w, h) = fit_within(img.width(), img.height(), MAX_PX);
-    let img = if (w, h) == (img.width(), img.height()) { img } else { image::imageops::resize(&img, w, h, FilterType::Lanczos3) };
+    // DynamicImage's own method: compiled (and optimised) inside `image`, not here.
+    let img = image::DynamicImage::ImageRgba8(img);
+    let img = if (w, h) == (img.width(), img.height()) { img } else { img.resize_exact(w, h, FilterType::Lanczos3) };
     let tmp = out.with_extension("png.tmp");
     img.save_with_format(&tmp, image::ImageFormat::Png)?;
     std::fs::rename(&tmp, out)?;
