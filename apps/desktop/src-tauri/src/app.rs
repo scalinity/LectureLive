@@ -456,9 +456,40 @@ pub fn snapshot(hint: String, app: State<'_, App>) -> Res<()> {
     app.send(Command::Op(Op::Snapshot(hint)))
 }
 
+/// A polish inside the lecture; once it has ended (decision D1), on the chosen folder, with the page after it.
 #[tauri::command]
-pub fn polish(app: State<'_, App>) -> Res<()> {
-    app.send(Command::Op(Op::Polish))
+pub async fn polish(app: State<'_, App>) -> Res<()> {
+    if app.commands().is_some() {
+        return app.send(Command::Op(Op::Polish));
+    }
+    let folder = app.folder().ok_or("Choose a lecture folder first.")?;
+    let (lec, _lock) = idle_lecture(&folder)?;
+    let (tx, forward) = forward_events(&app);
+    let done = lec.polish_after(&tx).await;
+    drop(tx);
+    let _ = forward.await;
+    done
+}
+
+/// The chosen folder's lecture while none runs, with the folder lock held for as long as it is kept.
+fn idle_lecture(folder: &OpenFolder) -> Res<(Arc<Lecture>, FolderLock)> {
+    let key = api_key()?;
+    let lock = FolderLock::acquire(&folder.files.dir).map_err(chain)?;
+    let spend = Spend::open(&data_dir()?.join("spend.jsonl"), &folder.course, &folder.name, folder.files.date).map_err(chain)?;
+    let chat = ChatClient::new(ChatConfig::new(key), Some(spend.clone())).map_err(chain)?;
+    Ok((Arc::new(Lecture { files: folder.files.clone(), course: folder.course.clone(), name: folder.name.clone(), title: folder.title.clone(), chat, spend }), lock))
+}
+
+/// Core's events from an operation outside a lecture, applied to the pump as a lecture's are.
+fn forward_events(app: &App) -> (mpsc::UnboundedSender<Event>, tauri::async_runtime::JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+    let pump = app.pump.clone();
+    let forward = tauri::async_runtime::spawn(async move {
+        while let Some(e) = rx.recv().await {
+            pump.lock().await.apply(e);
+        }
+    });
+    (tx, forward)
 }
 
 #[tauri::command]
@@ -667,20 +698,11 @@ pub async fn open_page(app: State<'_, App>) -> Res<String> {
             if !folder.files.notes.exists() {
                 return Err("There are no notes to typeset in this folder yet.".into());
             }
-            let key = api_key()?;
-            let lock = FolderLock::acquire(&folder.files.dir).map_err(chain)?;
-            let spend = Spend::open(&data_dir()?.join("spend.jsonl"), &folder.course, &folder.name, folder.files.date).map_err(chain)?;
-            let chat = ChatClient::new(ChatConfig::new(key), Some(spend.clone())).map_err(chain)?;
-            (Arc::new(Lecture { files: folder.files.clone(), course: folder.course, name: folder.name, title: folder.title, chat, spend }), Some(lock))
+            let (lec, lock) = idle_lecture(&folder)?;
+            (lec, Some(lock))
         }
     };
-    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
-    let pump = app.pump.clone();
-    let forward = tauri::async_runtime::spawn(async move {
-        while let Some(e) = rx.recv().await {
-            pump.lock().await.apply(e);
-        }
-    });
+    let (tx, forward) = forward_events(&app);
     let outcome = lec.page(&tx).await;
     drop(tx);
     let _ = forward.await;

@@ -81,6 +81,12 @@ export class Session {
     return this.status.phase === "running";
   }
 
+  /** Polish runs inside the lecture, and after it on the chosen folder's notes (decision D1), one operation at a time. */
+  get canPolish(): boolean {
+    const p = this.status.phase;
+    return p === "running" || ((p === "idle" || p === "ended") && !!this.folder && this.document !== "" && !this.status.busy);
+  }
+
   /** Files are being dragged over the window (spec §7.3). */
   dragging = $state(false);
 

@@ -103,9 +103,10 @@
     font-size: var(--step--1);
   }
 
-  /* Sized to fit the row with Start at 1,168 px in large type; a long label is cut in the closed select, whole in its list. */
+  /* Sized to fit the row with Start, Polish and Study page at 1,168 px in large type; a long label is cut in the closed
+     select, whole in its list. */
   :global(:root.large) .picker select {
-    max-width: 17rem;
+    max-width: 12rem;
   }
 
   select {

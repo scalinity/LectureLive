@@ -25,6 +25,7 @@ use crate::notes::timeline::{embed_line, timeline, Batch};
 use crate::notes::{context, polish, prompts};
 use crate::session::coordinator::{self, Notification, SessionConfig, StopReport, Store};
 use crate::session::files::LectureFiles;
+use crate::session::folder;
 
 use crate::session::notesfile::{self, sha256_hex};
 use crate::session::segments;
@@ -296,6 +297,21 @@ impl Lecture {
                 false
             }
         }
+    }
+
+    /// Polish after the lecture has ended (decision D1). The folder is opened as a lecture opens it, so a commit a
+    /// crash interrupted is finished or undone and an edit made after class is accepted before anything reads the
+    /// notes; then the polish, and the page after it as during a lecture. The caller holds the folder lock.
+    pub async fn polish_after(&self, events: &UnboundedSender<Event>) -> Result<(), String> {
+        // Opening a folder migrates the Python CLI's state one way, and the Python CLI is still the in-class tool.
+        if !self.files.sidecar().exists() {
+            return Err("Polish works on a lecture LectureLive recorded, and this folder has none yet. It is left as it is, so the Python CLI can still use it.".into());
+        }
+        let (sc, _) = folder::open(&self.files, &self.title, false).map_err(|e| format!("{e:#}"))?;
+        if self.polish(&Store::offline(sc, self.files.sidecar()), events).await {
+            let _ = self.page(events).await;
+        }
+        Ok(())
     }
 
     /// Spec §6.4: the study page from the notes as they are, without polishing again.

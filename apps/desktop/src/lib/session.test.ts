@@ -240,6 +240,20 @@ describe("session store", () => {
     expect(t.calls.at(-1)).toEqual(["open_microphone_settings", undefined]);
   });
 
+  test("after the lecture, Polish is offered on the folder's notes while nothing else runs (decision D1)", async () => {
+    const st = emptyState("s1");
+    st.status = { ...st.status, phase: "ended", folder: { dir: "/L/Week 01", course: "ML", name: "Week 01", notes_dir: "/L/Week 01", page: null } };
+    st.document = "# ML — Week 01\n\n## Gradients\n- They point uphill.\n";
+    const { t, s, ready, frame } = setup(st);
+    await ready;
+    expect(s.canPolish).toBe(true);
+    await s.polish();
+    expect(t.calls.at(-1)).toEqual(["polish", undefined]);
+    t.emitStatus({ type: "status", ...t.state_.status, busy: "polishing 9 words" });
+    frame();
+    expect(s.canPolish).toBe(false);
+  });
+
   test("Stop is not offered while the lecture is starting (M4 minor M6)", async () => {
     const { t, s, ready, frame } = setup();
     await ready;

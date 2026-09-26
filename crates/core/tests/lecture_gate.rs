@@ -414,3 +414,52 @@ async fn a_last_snapshot_that_fails_is_in_the_stop_report() {
     assert!(report.last_snapshot.is_some(), "the failure is reported: {:?}", report.last_snapshot);
     assert_eq!(Sidecar::load(&f.sidecar()).unwrap().unwrap().notes.segment_cursor, 0, "nothing was written; everything stays pending");
 }
+
+/// Decision D1: Polish after the lecture has ended opens the folder as a lecture does, so a commit a crash
+/// interrupted is undone and an edit made after class is kept before the notes are polished; the page follows.
+#[tokio::test]
+async fn a_polish_after_the_lecture_repairs_the_folder_first_then_polishes_and_typesets() {
+    use lecturelive_core::session::notesfile::{sha256_hex, Journal};
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    folder::open(&f, TITLE, false).unwrap();
+    let edited = format!("{TITLE}\n\n## Intro\n- Gradients point uphill.\n");
+    std::fs::write(&f.notes, &edited).unwrap(); // typed after class
+    let block = "\n<!-- 10:05:00 -->\n## Momentum\n- Half a block that never finished.\n";
+    let journal = Journal { op_id: uuid::Uuid::nil(), segments: [0, 0], slides: [0, 0], before_len: edited.len() as u64, before_sha256: sha256_hex(edited.as_bytes()), block_len: block.len() as u64, block_sha256: sha256_hex(block.as_bytes()), block: block.into() };
+    std::fs::write(f.journal(), serde_json::to_vec(&journal).unwrap()).unwrap();
+    std::fs::write(&f.notes, format!("{edited}{}", &block[..30])).unwrap(); // the crash tore the append
+    let sse = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+
+    lec.polish_after(&ev_tx).await.unwrap();
+
+    until(&mut ev, "the polish", |e| matches!(e, Event::Polished { .. })).await;
+    until(&mut ev, "the page", |e| matches!(e, Event::Page { .. })).await;
+    let sent = sse.state.bodies().into_iter().find(|b| b["messages"][0]["content"].as_str().unwrap_or_default().starts_with("You turn raw")).expect("a polish request");
+    assert!(user_text(&sent).contains("Gradients point uphill."), "the edit made after class is polished");
+    assert!(!user_text(&sent).contains("## Momentum"), "the torn block is removed before the polish");
+    assert!(!f.journal().exists());
+    assert!(std::fs::read_to_string(&f.notes).unwrap().contains("The lecture covered gradient descent."));
+}
+
+/// Decision D1: a folder only the Python CLI has used is refused, not migrated: migration is one-way, and the Python
+/// CLI stays the in-class tool until LectureLive has passed a real lecture.
+#[tokio::test]
+async fn a_polish_after_the_lecture_leaves_a_python_cli_folder_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    std::fs::create_dir_all(f.state_dir()).unwrap();
+    std::fs::write(&f.notes, format!("{TITLE}\n\n<!-- 10:00:12 -->\n## Intro\n- one, two\n")).unwrap();
+    std::fs::write(f.legacy_state(), serde_json::json!({"transcript_offset": 0, "slide_index": 0}).to_string()).unwrap();
+    let sse = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let (ev_tx, _ev) = mpsc::unbounded_channel();
+
+    let refused = lec.polish_after(&ev_tx).await.unwrap_err();
+
+    assert!(refused.contains("Python"), "{refused}");
+    assert!(!f.sidecar().exists(), "the folder is not migrated");
+    assert!(sse.state.bodies().is_empty(), "nothing is sent");
+}

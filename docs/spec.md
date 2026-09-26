@@ -452,6 +452,11 @@ written: an edit is never overwritten from memory. Otherwise the previous docume
 `.live_notes/<stem>_HHMMSS.md` (`_2`, `_3` … when that name exists) and fsynced, the result is
 written to a temp file and atomically renamed over the notes file, and the revision advances.
 
+Polish also runs after the lecture, from the app, on the chosen folder under its lock: the folder is
+opened as a lecture opens it (an interrupted commit finished or undone, an outside edit accepted),
+then the snapshot and polish above, then the study page (§6.4). A folder with no sidecar is left
+alone, because opening it would migrate the Python CLI's state one way.
+
 ### 6.4 Study page
 
 A successful polish distils the polished notes into an HTML study page beside them, named
@@ -685,8 +690,9 @@ read, and the next line starts on a line of its own.
   page (typesets first when the page is missing or stale, §6.4, then opens it in the default browser);
   Stop. The latest notice sits above the prompt in the CLI's marks (◆ notes, ▣ slide, ✦ page, ✓ done,
   ▲ warning) and opens the last eight; a command that fails shows the backend's message there. Before
-  a lecture the same bar holds the folder picker, the source (the inputs, and Zoom through "LectureLive
-  Loopback" when BlackHole is present, else the install hint) and Start.
+  and after a lecture the same bar holds the folder picker, the source (the inputs, and Zoom through
+  "LectureLive Loopback" when BlackHole is present, else the install hint) and Start, with Polish (§6.3)
+  and Study page once the folder has notes, one at a time.
 - **Stop** has the CLI's three levels. Stop finishes the transcript and recovery, then takes the last
   snapshot; while that runs the button becomes Stop waiting, which stops waiting for recovery and drops
   queued requests; quitting the app is the third level, and the next session in the folder repairs,

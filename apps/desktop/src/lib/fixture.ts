@@ -331,7 +331,7 @@ export function twoHourFixture(): Fixture {
 
 /** The browser preview in one of M6's states, for looking at its views (`?look=`): `idle-mic-off` (before a
  *  lecture, the microphone denied, mixed mode on), `gone` (the single input unplugged mid-lecture), `gone-alone`
- *  (and no other input), `denied` (Screen Recording off). */
+ *  (and no other input), `denied` (Screen Recording off), `ended` (after the lecture, its notes still open). */
 export function demoLook(t: FixtureTransport, look: string | null): FixtureTransport {
   if (look === "idle-mic-off") {
     t.state_.status = { ...t.state_.status, phase: "idle", source: null, started_at: null, level_dbfs: null, stt: "not started", stt_ok: false };
@@ -342,6 +342,8 @@ export function demoLook(t: FixtureTransport, look: string | null): FixtureTrans
     t.state_.status = { ...t.state_.status, source: "Wireless Mic Rx", level_dbfs: null, input_gone: "Rx" };
     t.answers.inputs = look === "gone" ? [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "Wireless Mic Rx", uid: "Rx" }] : [{ name: "Wireless Mic Rx", uid: "Rx" }];
     t.answers.loopback_status = { present: true, blackhole_present: false, mixed: false };
+  } else if (look === "ended") {
+    t.state_.status = { ...t.state_.status, phase: "ended", source: null, started_at: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null };
   } else if (look === "denied") {
     t.state_.status = { ...t.state_.status, capture: { state: "denied", window: null, detail: "Screen Recording is off for LectureLive", candidates: [], captured: false } };
   }

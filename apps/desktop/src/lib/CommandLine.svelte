@@ -69,7 +69,7 @@
       </label>
       <button class="primary" type="submit" disabled={!session.canSnapshot}>Snapshot</button>
       {#if session.busyOp}<button class="cancel" type="button" onclick={() => session.cancel()}>Cancel</button>{/if}
-      <button class="outline" type="button" onclick={() => session.polish()} disabled={!session.canSnapshot}>Polish</button>
+      <button class="outline" type="button" onclick={() => session.polish()} disabled={!session.canPolish}>Polish</button>
       <button class="outline" type="button" onclick={page} disabled={pageRunning}>{pageRunning ? "Typesetting" : "Study page"}</button>
       {#if session.stopLabel}
         <button class={session.stopLabel === "Stop" ? "stop" : "stop waiting"} type="button" onclick={() => session.stop()}>{session.stopLabel}</button>
@@ -79,7 +79,11 @@
     <div class="idle">
       <FolderPicker />
       {#if session.folder && session.document}
-        <button class="outline" onclick={page} disabled={pageRunning}>{pageRunning ? "Typesetting" : "Study page"}</button>
+        <!-- After class (decision D1): one operation holds the folder at a time, so each waits for the other. -->
+        <div class="after">
+          <button class="outline" onclick={() => session.polish()} disabled={!session.canPolish || pageRunning}>Polish</button>
+          <button class="outline" onclick={page} disabled={pageRunning || !!session.status.busy}>{pageRunning ? "Typesetting" : "Study page"}</button>
+        </div>
       {/if}
     </div>
   {/if}
@@ -225,6 +229,10 @@
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
+  }
+  .after {
+    display: flex;
+    gap: 0.6rem;
   }
 
   /* Buttons: one filled action per state; the rest outlined. */
