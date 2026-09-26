@@ -115,3 +115,14 @@ async fn a_refused_recovery_ends_recovery_for_the_session() {
     assert!(link.events.recv().await.is_none(), "the worker has ended");
     assert_eq!(fake.state.requests.load(SeqCst), 1);
 }
+
+/// M6, network loss for LectureLive alone: a connect address carries recovery requests.
+#[tokio::test]
+async fn a_connect_address_carries_recovery_requests() {
+    let fake = fake_rest::start(None).await;
+    let addr: std::net::SocketAddr = fake.url.trim_start_matches("http://").split('/').next().unwrap().parse().unwrap();
+    let mut c = cfg(&fake.url.replace(&addr.to_string(), "lecturelive.invalid"));
+    c.connect_to = Some(addr);
+    let t = RestClient::new(c).unwrap().transcribe(&synthetic(0..20)).await.unwrap();
+    assert!(!t.words.is_empty());
+}

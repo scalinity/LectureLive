@@ -104,7 +104,7 @@ impl Reply {
                 return None;
             }
         };
-        if let Some(e) = v.get("error") {
+        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
             self.error.get_or_insert(e.get("message").and_then(Value::as_str).map_or_else(|| e.to_string(), str::to_string));
             return None;
         }
@@ -197,11 +197,13 @@ pub struct ChatConfig {
     pub model: String,
     /// Longest silence inside a stream; reasoning deltas keep a healthy one talking.
     pub idle_timeout: Duration,
+    /// Connect here for the URL's host (TLS still for that host): a check's forwarder (`net::API_ADDR_VAR`).
+    pub connect_to: Option<std::net::SocketAddr>,
 }
 
 impl ChatConfig {
     pub fn new(api_key: String) -> Self {
-        Self { url: CHAT_URL.into(), api_key, model: MODEL.into(), idle_timeout: Duration::from_secs(180) }
+        Self { url: CHAT_URL.into(), api_key, model: MODEL.into(), idle_timeout: Duration::from_secs(180), connect_to: crate::net::api_addr() }
     }
 }
 
@@ -240,7 +242,7 @@ impl ChatClient {
     pub fn new(cfg: ChatConfig, spend: Option<Spend>) -> Result<Self> {
         // reqwest is built without a TLS provider of its own; rustls uses ring (M2 Findings).
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder().build().context("build the HTTP client")?;
+        let http = crate::net::resolved(reqwest::Client::builder(), &cfg.url, cfg.connect_to).build().context("build the HTTP client")?;
         Ok(Self { http, cfg, spend })
     }
 

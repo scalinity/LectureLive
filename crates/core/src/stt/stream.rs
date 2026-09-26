@@ -47,6 +47,8 @@ pub struct SttConfig {
     pub finalize_wait: Duration,
     /// After `audio.done`, the wait for `transcript.done`.
     pub done_wait: Duration,
+    /// Connect here for the URL's host (TLS still for that host): a check's forwarder (`net::API_ADDR_VAR`).
+    pub connect_to: Option<std::net::SocketAddr>,
 }
 
 impl SttConfig {
@@ -61,6 +63,7 @@ impl SttConfig {
             idle_timeout: Duration::from_secs(5),
             finalize_wait: Duration::from_secs(3),
             done_wait: Duration::from_secs(5),
+            connect_to: crate::net::api_addr(),
         }
     }
 
@@ -234,9 +237,9 @@ impl Worker {
         if self.refused || self.rec.is_none() || self.epoch.is_some() || self.connecting.is_some() {
             return;
         }
-        let (url, key, limit) = (self.url.clone(), self.cfg.api_key.clone(), self.cfg.connect_timeout);
+        let (url, key, limit, to) = (self.url.clone(), self.cfg.api_key.clone(), self.cfg.connect_timeout, self.cfg.connect_to);
         self.connecting = Some(tokio::spawn(async move {
-            match tokio::time::timeout(limit, open(&url, &key)).await {
+            match tokio::time::timeout(limit, open(&url, &key, to)).await {
                 Ok(r) => r,
                 Err(_) => Err(ConnectError::Transient(format!("no transcript.created within {limit:?}"))),
             }
@@ -494,11 +497,19 @@ impl Worker {
     }
 }
 
-async fn open(url: &str, key: &str) -> Result<Ws, ConnectError> {
+async fn open(url: &str, key: &str, connect_to: Option<std::net::SocketAddr>) -> Result<Ws, ConnectError> {
     let mut req = url.into_client_request().map_err(|e| ConnectError::Refused(format!("bad STT URL: {e}")))?;
     let auth = format!("Bearer {key}").parse().map_err(|_| ConnectError::Refused("the API key is not a valid header value".into()))?;
     req.headers_mut().insert("Authorization", auth);
-    let mut ws = match tokio_tungstenite::connect_async(req).await {
+    let connected = match connect_to {
+        // A forwarder in between: TCP to it, TLS and the upgrade for the URL's host.
+        Some(addr) => match TcpStream::connect(addr).await {
+            Ok(tcp) => tokio_tungstenite::client_async_tls_with_config(req, tcp, None, None).await,
+            Err(e) => return Err(ConnectError::Transient(e.to_string())),
+        },
+        None => tokio_tungstenite::connect_async(req).await,
+    };
+    let mut ws = match connected {
         Ok((ws, _)) => ws,
         Err(tungstenite::Error::Http(resp)) => {
             let status = resp.status();

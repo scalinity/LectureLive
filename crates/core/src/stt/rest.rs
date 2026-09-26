@@ -33,11 +33,13 @@ pub struct RestConfig {
     pub request_timeout: Duration,
     /// How long a job waits for the recorder to write its interval.
     pub file_wait: Duration,
+    /// Connect here for the URL's host (TLS still for that host): a check's forwarder (`net::API_ADDR_VAR`).
+    pub connect_to: Option<std::net::SocketAddr>,
 }
 
 impl RestConfig {
     pub fn new(api_key: String, keyterms: Vec<String>) -> Self {
-        Self { url: REST_URL.into(), api_key, keyterms, retry_unit: Duration::from_secs(1), request_timeout: Duration::from_secs(60), file_wait: Duration::from_secs(10) }
+        Self { url: REST_URL.into(), api_key, keyterms, retry_unit: Duration::from_secs(1), request_timeout: Duration::from_secs(60), file_wait: Duration::from_secs(10), connect_to: crate::net::api_addr() }
     }
 }
 
@@ -76,7 +78,7 @@ impl RestClient {
     pub fn new(cfg: RestConfig) -> Result<Self> {
         // reqwest is built without a TLS provider of its own; rustls uses ring, as the websocket does.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder().timeout(cfg.request_timeout).build().context("build the HTTP client")?;
+        let http = crate::net::resolved(reqwest::Client::builder().timeout(cfg.request_timeout), &cfg.url, cfg.connect_to).build().context("build the HTTP client")?;
         Ok(Self { http, cfg })
     }
 

@@ -426,3 +426,22 @@ async fn the_audio_a_recording_streamed_is_reported_before_it_ends() {
     let ev = until_ended(&mut link).await;
     assert_eq!(ev[ev.len() - 2], SttEvent::Streamed { recording_id: id, samples: 48_000 }, "for the spend ledger (spec §8)");
 }
+
+/// M6, network loss for LectureLive alone: a connect address carries the stream while the URL keeps its host.
+#[tokio::test]
+async fn a_connect_address_carries_the_stream_while_the_url_keeps_its_host() {
+    let fake = fake_stt::start(Config::default()).await;
+    let addr: std::net::SocketAddr = fake.url.trim_start_matches("ws://").split('/').next().unwrap().parse().unwrap();
+    let mut c = cfg(&fake);
+    c.url = fake.url.replace(&addr.to_string(), "lecturelive.invalid");
+    c.connect_to = Some(addr);
+    let mut link = spawn(c).unwrap();
+    let id = Uuid::new_v4();
+    link.input.send(SttInput::Begin { recording_id: id }).await.unwrap();
+    feed(&link, &fake, (0..3).map(|k| speech_frame(id, k))).await;
+    loop {
+        if let SttEvent::Connected { .. } = next_event(&mut link).await {
+            break; // lecturelive.invalid never resolves: only the address can have carried it
+        }
+    }
+}

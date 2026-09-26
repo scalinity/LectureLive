@@ -128,3 +128,23 @@ async fn requests_carry_the_python_clis_messages_and_ask_for_the_cost() {
     assert_eq!(body["messages"][1]["content"][1], serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K", "detail": "high"}}));
     assert_eq!(spend::read(&dir.path().join("spend.jsonl")).unwrap()[0].what, "page");
 }
+
+/// M6, network loss for LectureLive alone: a connect address carries chat requests.
+#[tokio::test]
+async fn a_connect_address_carries_chat_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_sse::start(|_| fake_sse::answer("ok", 1_000)).await;
+    let addr: std::net::SocketAddr = fake.url.trim_start_matches("http://").split('/').next().unwrap().parse().unwrap();
+    let c = ChatClient::new(ChatConfig { url: fake.url.replace(&addr.to_string(), "lecturelive.invalid"), connect_to: Some(addr), ..ChatConfig::new("test-key".into()) }, None).unwrap();
+    let (out, _) = ask(&c, &request()).await;
+    assert_eq!(out.unwrap().text, "ok");
+    drop(dir);
+}
+
+/// M3 minor: an `"error": null` key is no error.
+#[tokio::test]
+async fn an_error_key_that_is_null_is_not_an_error() {
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"fine\"},\"finish_reason\":null}],\"error\":null}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"cost_in_usd_ticks\":1000}}\n\ndata: [DONE]\n\n".to_vec();
+    let (out, _, _) = once(move || Reply::Stream(vec![body.clone()])).await;
+    assert_eq!(out.unwrap().text, "fine");
+}
