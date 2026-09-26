@@ -96,7 +96,7 @@ pub struct Thresholds {
 
 impl Default for Thresholds {
     fn default() -> Self {
-        Self { change: 0.08, settle: 0.03, animated: 3, expire: 10 }
+        Self { change: 0.05, settle: 0.03, animated: 3, expire: 10 }
     }
 }
 
@@ -239,6 +239,22 @@ mod tests {
         let b = with_bar(a.clone(), 16, 32, 120, 6, 40); // one bullet line
         let got = run(&mut Detector::new(Thresholds::default()), &[a.clone(), a.clone(), b.clone(), b.clone(), b.clone()]);
         assert_eq!(got, vec![(0, Decision { shown_at: 0, uncertain: false }), (3, Decision { shown_at: 2, uncertain: false })]);
+    }
+
+    /// Calibration (M5, the deck recorded from a window): one line of real text is about 3 px tall at 256×144
+    /// and changes its tiles by about 0.06–0.075, below spec 7.2's first 0.08; a pointer (0.02) stays below.
+    #[test]
+    fn a_one_line_text_build_is_caught_at_the_calibrated_threshold() {
+        let a = page();
+        // Text strokes, not a solid bar: a line 3 px tall with every other column inked.
+        let mut line = a.clone();
+        for x in (16..160).step_by(2) {
+            for y in 40..43 {
+                line.put_pixel(x, y, Luma([40]));
+            }
+        }
+        let got = run(&mut Detector::new(Thresholds::default()), &[a.clone(), line.clone(), line]);
+        assert_eq!(got.len(), 2, "the first frame and the text line: {got:?}");
     }
 
     #[test]

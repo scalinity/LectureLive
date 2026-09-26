@@ -493,31 +493,40 @@ hashes; offline the page stays readable with math shown as TeX.
 
 A capture worker runs beside the session on its own thread, because its native calls and image
 work block (§3.2). Windows are enumerated through CoreGraphics (`CGWindowListCopyWindowInfo`), on
-screen or not, and captured through `xcap` (`CGWindowListCreateImage` on the window alone, so windows
-covering it do not appear). A missing Screen Recording grant is an error of its own, never "no
-windows". The app is named by its bundle id, or by its name outside a bundle.
+screen or not, and captured by their id (`CGWindowListCreateImage` on the window alone), so a window
+that is covered, or full screen on another desktop while the person works elsewhere, is still
+captured. A missing Screen Recording grant is an error of its own, never "no windows". The app is
+named by its bundle id, or by its name outside a bundle.
 
 The person chooses a window and drags the slide region over a still of it, leaving out Zoom's
-controls and the video tiles. The selection, a descriptor (bundle id, title, size) and the region
-as fractions of the window, is saved per course in the app's data folder (`capture.json`).
+controls and the video tiles; a speaker's camera drawn over the slide, as Zoom's recordings do, is
+left out as a part of the region that the detector never reacts to. The selection, a descriptor
+(bundle id, title, size), the region as fractions of the window, the parts left out as fractions of
+the region, and the region at each other size the window has had, is saved per course in the app's
+data folder (`capture.json`).
 
-When a lecture starts, exactly one window matching the descriptor (the same size within 2%) is
-watched. Anything else asks, in the slides strip, with the windows the person may mean. Once a
+When a lecture starts, exactly one window matching the descriptor (at a size it has had, within 2%)
+is watched. Anything else asks, in the slides strip, with the windows the person may mean. Once a
 window is watched, nothing is watched in its place without the person:
 
-- it is off screen (minimised, or on another desktop): capture pauses and resumes by itself when it
+- it cannot be captured while off screen (minimised): capture pauses and resumes by itself when it
   is back;
 - it closes: capture pauses; a window matching the descriptor that opens, or is already on screen
   while the old one is off screen (a closed window's id can stay listed), is offered with "Watch it";
-- it changes size: capture pauses and asks, since the slide may no longer sit in the region;
+- it changes size (full screen on or off): once the new size has held for a sample, the region for
+  that size is used if it had one; otherwise the last kept slide is searched for in the new layout
+  and, when found closely, its place becomes the region for that size, saved and announced. The two
+  samples after a new region only settle the kept frame, so a switch never takes the same slide
+  twice. A slide that cannot be found asks;
 - captures fail (an error, a blank window, a black region): nothing is kept, and three in a row are
   shown with the reason.
 
 ### 7.2 Change detection
 
-Every 1.0 s: capture, crop to the region, downscale to 256×144 grayscale, divide into 16×16 tiles
-(144 tiles). A tile has changed when its mean absolute difference from the last kept frame exceeds
-0.08, and it is moving when it differs from the previous sample by more than 0.03.
+Every 1.0 s: capture, crop to the region, blank the parts left out, downscale to 256×144 grayscale,
+divide into 16×16 tiles (144 tiles). A tile has changed when its mean absolute difference from the
+last kept frame exceeds 0.05, and it is moving when it differs from the previous sample by more than
+0.03.
 
 - **Candidate**: at least one changed tile outside the mask. Its image and first-observed time are kept.
 - **Confirm**: on a later sample in which no tile outside the mask moved since the candidate, the
@@ -529,11 +538,13 @@ Every 1.0 s: capture, crop to the region, downscale to 256×144 grayscale, divid
 - The first valid frame of a lecture is kept unconditionally.
 - A manual capture becomes the kept frame, so auto capture does not take the same slide again.
 
-The thresholds are calibrated on a recording of Zoom showing a synthetic lecture deck with builds,
-dissolves, an animated chart and a blinking caret, annotated from the deck's schedule. The measures
-are recall of states visible for at least 3 s and false captures per 10 minutes (M5 Findings).
+The thresholds are calibrated on two recordings of the detector's input made by the worker itself: a
+synthetic lecture deck with builds, dissolves, animated charts and a blinking caret, played in a
+window and annotated from its schedule, and a recorded Zoom lecture, annotated by its still stretches
+and checked by eye. The measures are recall of states visible for at least 3 s and false captures per
+10 minutes (M5 Findings). A line of text on a slide changes its tiles by about 0.06, hence 0.05.
 Content shown for less than one sample interval can be missed, and marks thinner than about 1% of
-the slide's height change too little of a tile to count; manual capture covers both.
+the slide's height (an underline) change too little of a tile to count; manual capture covers both.
 
 ### 7.3 Manual and imported
 

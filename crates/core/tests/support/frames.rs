@@ -353,3 +353,104 @@ pub fn write_states(dir: &Path, plan: &[(State, bool)], offset: u64, end: u64) {
     }
     std::fs::write(dir.join("states.json"), serde_json::to_vec_pretty(&States { states }).unwrap()).unwrap();
 }
+
+/// Mean absolute difference of each tile, 0–1.
+pub fn tile_diffs(a: &GrayImage, b: &GrayImage) -> Vec<f64> {
+    let (a, b) = (a.as_raw(), b.as_raw());
+    let cols = (W / TILE) as usize;
+    let mut sums = [0u32; TILES];
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let (px, py) = (i % W as usize, i / W as usize);
+        sums[(py / TILE as usize) * cols + px / TILE as usize] += x.abs_diff(*y) as u32;
+    }
+    sums.iter().map(|&s| s as f64 / (TILE * TILE) as f64 / 255.0).collect()
+}
+
+/// Largest tile difference between two frames outside `ignore`, and how many such tiles differ by more than `over`.
+pub fn tile_change(a: &GrayImage, b: &GrayImage, over: f64, ignore: &[bool]) -> (f64, usize) {
+    let d: Vec<f64> = tile_diffs(a, b).into_iter().enumerate().map(|(i, v)| if ignore.get(i).copied().unwrap_or(false) { 0.0 } else { v }).collect();
+    (d.iter().cloned().fold(0.0, f64::max), d.iter().filter(|&&v| v > over).count())
+}
+
+/// Tiles that move in more than half of all samples: a camera thumbnail or a clock drawn over the slide.
+pub fn busy_tiles(samples: &[Sample], still: f64) -> Vec<bool> {
+    let frames: Vec<&GrayImage> = samples.iter().filter_map(|s| s.frame.as_ref()).collect();
+    let mut moved = vec![0usize; TILES];
+    for w in frames.windows(2) {
+        for (i, v) in tile_diffs(w[0], w[1]).into_iter().enumerate() {
+            if v >= still {
+                moved[i] += 1;
+            }
+        }
+    }
+    moved.iter().map(|&m| m * 2 > frames.len().saturating_sub(1)).collect()
+}
+
+/// A proposed stable state of a recording: samples in which no tile outside the busy ones moved by more than `still`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Run {
+    pub from: u64,
+    pub to: u64,
+    /// The sample index whose frame shows it.
+    pub sample: usize,
+    /// Against the previous run: largest tile difference and tiles over 0.02, busy tiles left out.
+    pub diff: f64,
+    pub tiles: usize,
+}
+
+/// Still runs of a recording, neighbours with the same content merged (spec §11 annotation of a lecture
+/// with no schedule; each run is then checked by eye).
+/// `ignore` marks tiles that are not the slide (a camera thumbnail); runs whose difference is at most two tiles under
+/// `pointer` are the same slide (a pointer moved: gone from one tile, arrived in another).
+pub fn still_runs(samples: &[Sample], still: f64, ignore: &[bool], pointer: f64) -> (Vec<Run>, Vec<bool>) {
+    let busy: Vec<bool> = busy_tiles(samples, still).iter().zip(ignore).map(|(b, i)| *b || *i).collect();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut prev: Option<&GrayImage> = None;
+    let mut open: Option<(u64, usize)> = None; // (from, the run's latest sample)
+    let close = |runs: &mut Vec<Run>, from: u64, to: u64, sample: usize| {
+        let f = samples[sample].frame.as_ref().unwrap();
+        if let Some(last) = runs.last_mut() {
+            let (d, n) = tile_change(samples[last.sample].frame.as_ref().unwrap(), f, 0.02, &busy);
+            if (d < still || (n <= 2 && d < pointer)) && last.to + 2000 >= from {
+                last.to = to; // the same content again: one state
+                return;
+            }
+            runs.push(Run { from, to, sample, diff: d, tiles: n });
+        } else {
+            runs.push(Run { from, to, sample, diff: 1.0, tiles: TILES });
+        }
+    };
+    for (i, s) in samples.iter().enumerate() {
+        let Some(f) = &s.frame else { continue };
+        let moved = prev.is_none_or(|p| tile_change(p, f, still, &busy).0 >= still);
+        match (moved, open) {
+            (true, Some((from, k))) => {
+                close(&mut runs, from, s.t, k);
+                open = Some((s.t, i));
+            }
+            (false, Some((from, _))) => open = Some((from, i)),
+            (_, None) => open = Some((s.t, i)),
+        }
+        prev = Some(f);
+    }
+    if let (Some((from, k)), Some(last)) = (open, samples.last()) {
+        close(&mut runs, from, last.t + 1000, k);
+    }
+    // A slide, a flip of under 2 s, then the same slide again is one state: the flip reverted before it
+    // settled, and nothing new was shown (spec §7.2).
+    let same = |a: &Run, b: &Run| {
+        let (d, n) = tile_change(samples[a.sample].frame.as_ref().unwrap(), samples[b.sample].frame.as_ref().unwrap(), 0.02, &busy);
+        d < still || (n <= 2 && d < pointer)
+    };
+    let mut merged: Vec<Run> = Vec::new();
+    for r in runs {
+        let n = merged.len();
+        if n >= 2 && merged[n - 1].to - merged[n - 1].from < 2000 && same(&merged[n - 2], &r) {
+            merged.pop();
+            merged[n - 2].to = r.to;
+        } else {
+            merged.push(r);
+        }
+    }
+    (merged, busy)
+}
