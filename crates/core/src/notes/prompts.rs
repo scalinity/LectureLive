@@ -120,6 +120,20 @@ mod tests {
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../live_notes.py")).expect("live_notes.py stays until M6; M6 freezes these goldens before removing it")
     }
 
+    /// What the goldens read: live_notes.py's prompts and user-message lines, verbatim, frozen before its removal (M6).
+    fn excerpt() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/prompts/live_notes_excerpt.txt")).expect("the frozen excerpt of live_notes.py")
+    }
+
+    /// The excerpt is live_notes.py verbatim, block by block, while live_notes.py exists (removed with it in M6 Task 17).
+    #[test]
+    fn the_frozen_excerpt_is_live_notes_py_verbatim() {
+        let py = live_notes_source();
+        for block in excerpt().split("\n\n").skip(1) {
+            assert!(py.contains(block.trim_end_matches('\n')), "not in live_notes.py:\n{block}");
+        }
+    }
+
     /// The body of `def name(…)`'s `return f"""…"""`, evaluated as Python evaluates it for these arguments.
     fn python_fstring(src: &str, name: &str, args: &[(&str, &str)]) -> String {
         let def = src.find(&format!("def {name}(")).unwrap_or_else(|| panic!("def {name} in live_notes.py"));
@@ -159,7 +173,7 @@ mod tests {
 
     #[test]
     fn system_prompts_are_live_notes_py_literals() {
-        let src = live_notes_source();
+        let src = excerpt();
         for course in ["Machine Learning", "Statistik für KI — Grundlagen"] {
             assert_eq!(notes_system(course), python_fstring(&src, "notes_system", &[("course", course)]));
             assert_eq!(polish_system(course), python_fstring(&src, "polish_system", &[("course", course)]));
@@ -204,7 +218,7 @@ mod tests {
     /// Every fixed fragment of the user messages is still written that way in live_notes.py.
     #[test]
     fn user_message_fragments_appear_in_live_notes_py() {
-        let src = live_notes_source();
+        let src = excerpt();
         for fragment in [
             "Notes document so far:\\n<<<\\n",
             "New material since the last snapshot, in chronological order:\\n<<<\\n",
