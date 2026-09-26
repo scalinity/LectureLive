@@ -51,7 +51,7 @@ impl CaptureState {
         match self {
             Self::Unbound => ("No window", "choose the window with the slides in the slides strip".into()),
             Self::Watching { window } => ("Watching", window.clone()),
-            Self::Paused { window, reason } => ("Paused", format!("{window}: {reason}; capture resumes when it is back")),
+            Self::Paused { window, reason } => ("Paused", format!("{window}: {reason}")),
             Self::Asking { window, reason, .. } => ("Asking", format!("{reason}; choose in the slides strip which window to watch for {window}")),
             Self::Denied => ("Screen Recording", CaptureError::Denied.to_string()),
             Self::Failing { window, reason } => ("Capture failing", format!("{window}: {reason}")),
@@ -223,13 +223,13 @@ impl Worker {
         let Some(w) = windows.iter().find(|w| w.id == id) else {
             let others: Vec<WindowInfo> = windows.into_iter().filter(|w| sel.descriptor.matches(w)).collect();
             return self.set(if others.is_empty() {
-                CaptureState::Paused { window, reason: "its window closed".into() }
+                CaptureState::Paused { window, reason: "the window closed; a new one is offered here when it opens".into() }
             } else {
                 CaptureState::Asking { reason: format!("a new “{window}” window opened"), window, candidates: others }
             });
         };
         if !w.on_screen {
-            return self.set(CaptureState::Paused { window, reason: "not on screen (minimised or on another desktop)".into() });
+            return self.set(CaptureState::Paused { window, reason: "not on screen (minimised or on another desktop); capture resumes when it is back".into() });
         }
         if !sel.descriptor.same_size(w) {
             let (reason, candidates) = (format!("it is {} × {} now; check the region", w.width, w.height), vec![w.clone()]);

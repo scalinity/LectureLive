@@ -184,6 +184,11 @@ export class Session {
     return this.error === null;
   }
 
+  /** "Watch it": the window the strip asks about, through the course's saved region. */
+  async captureWatch(id: number) {
+    await this.act("capture_watch", { id });
+  }
+
   async openScreenSettings() {
     await this.act("open_screen_settings");
   }

@@ -10,6 +10,7 @@
   import CommandLine from "$lib/CommandLine.svelte";
   import KeyDialog from "$lib/KeyDialog.svelte";
   import Notes from "$lib/Notes.svelte";
+  import SlidesStrip from "$lib/SlidesStrip.svelte";
   import SpendView from "$lib/SpendView.svelte";
   import StatusStrip from "$lib/StatusStrip.svelte";
   import Transcript from "$lib/Transcript.svelte";
@@ -28,6 +29,8 @@
 
   let keyDialog: KeyDialog;
   let spendView: SpendView;
+  /** The window and region picker (Task 9). */
+  let picker: { show: () => void } | undefined;
 
   /** A check asked for by the environment (the app) or the URL (`?bench=burst`, the browser preview). */
   async function checkConfig(): Promise<CheckConfig | null> {
@@ -74,15 +77,7 @@
   <main class="panes">
     <Transcript />
     <Notes toUrl={(p) => current.assetUrl(p)} />
-    <aside class="slides" aria-label="Slides">
-      {#if session.slides.length === 0}
-        <p class="quiet">Screenshots you take during the lecture become slides.</p>
-      {:else}
-        <ol>
-          {#each session.slides as s (s.index)}<li class="num">Slide {s.index}</li>{/each}
-        </ol>
-      {/if}
-    </aside>
+    <SlidesStrip toUrl={(p) => current.assetUrl(p)} onChoose={() => picker?.show()} />
   </main>
   <CommandLine />
 </div>
@@ -102,7 +97,7 @@
 
   .panes {
     display: grid;
-    grid-template-columns: minmax(20rem, 34fr) minmax(28rem, 56fr) 10rem;
+    grid-template-columns: minmax(20rem, 34fr) minmax(28rem, 56fr) 18rem;
     min-height: 0;
   }
 
@@ -115,28 +110,18 @@
     border-right: 0;
   }
 
-  .slides {
-    padding: 1.25rem 1rem;
-    font-size: var(--step--1);
-    overflow-y: auto;
+  @media (max-width: 1280px) {
+    .panes {
+      grid-template-columns: minmax(18rem, 36fr) minmax(24rem, 64fr) 16rem;
+    }
   }
 
-  .slides ol {
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  .quiet {
-    margin: 0;
-    color: var(--graphite);
-  }
-
+  /* Below 1100 px the strip folds away. */
   @media (max-width: 1100px) {
     .panes {
       grid-template-columns: minmax(18rem, 38fr) minmax(24rem, 62fr);
     }
-    .slides {
+    .panes > :global(.strip) {
       display: none;
     }
   }

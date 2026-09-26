@@ -430,6 +430,12 @@ fn save_selection(path: &Path, course: &str, w: &WindowInfo, region: Region) -> 
     Ok(sel)
 }
 
+/// The person's "Watch it" on an ask: this window, through the region already saved for the course.
+fn watch_saved(path: &Path, course: &str, w: &WindowInfo) -> anyhow::Result<Selection> {
+    let region = Selections::load(path)?.get(course).map(|s| s.region).ok_or_else(|| anyhow::anyhow!("No window is chosen for {course} yet: choose one."))?;
+    save_selection(path, course, w, region)
+}
+
 /// Before a lecture: the course's saved window, or none yet.
 fn ready_view(path: &Path, course: &str) -> CaptureView {
     match Selections::load(path).ok().and_then(|s| s.get(course).cloned()) {
@@ -479,6 +485,16 @@ pub async fn capture_select(id: u32, region: Region, app: State<'_, App>) -> Res
             Ok(())
         }
     }
+}
+
+/// "Watch it": the window the strip asks about, through the course's saved region.
+#[tauri::command]
+pub async fn capture_watch(id: u32, app: State<'_, App>) -> Res<()> {
+    let folder = app.folder().ok_or("Choose a lecture folder first.")?;
+    let windows = tauri::async_runtime::spawn_blocking(|| SystemWindows.windows()).await.map_err(text)?.map_err(|e| e.to_string())?;
+    let w = windows.into_iter().find(|w| w.id == id).ok_or("That window is no longer open.")?;
+    let selection = watch_saved(&selections_path()?, &folder.course, &w).map_err(chain)?;
+    app.commands().ok_or("No lecture is running.")?.send(Command::Bind { window: id, selection }).map_err(|_| "The lecture has ended.".to_string())
 }
 
 /// The Capture button: the watched region now, as a manual slide.
@@ -687,5 +703,20 @@ mod tests {
         assert_eq!(ready_view(&path, "Machine Learning").window.as_deref(), Some("Zoom Meeting"));
         assert_eq!(ready_view(&path, "Statistics").state, CaptureWord::Unbound);
         assert!(save_selection(&path, "Machine Learning", &w, Region { x: 0.5, y: 0.5, w: 0.9, h: 0.9 }).is_err(), "a region outside the window is refused");
+    }
+
+    #[test]
+    fn watching_a_new_window_keeps_the_course_s_region() {
+        use lecturelive_core::capture::detect::Region;
+        use lecturelive_core::capture::window::WindowInfo;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.json");
+        let old = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
+        let region = Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+        save_selection(&path, "Machine Learning", &old, region).unwrap();
+        let new = WindowInfo { id: 77, width: 1280, height: 800, ..old };
+        let sel = watch_saved(&path, "Machine Learning", &new).unwrap();
+        assert_eq!((sel.region, sel.descriptor.width, sel.descriptor.height), (region, 1280, 800));
+        assert!(watch_saved(&path, "Statistics", &new).is_err(), "a course with no saved window must choose one");
     }
 }
