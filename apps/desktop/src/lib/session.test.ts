@@ -190,4 +190,20 @@ describe("session store", () => {
     frame();
     expect(s.canSnapshot).toBe(false);
   });
+
+  test("slides keep their badges, capture status arrives whole, and a drop imports its paths", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.emitStatus({ type: "slide", index: 1, file: "slides/slide_01_100251.png", path: "/l/slides/slide_01_100251.png", at: "10:02:51", auto: true, uncertain: false });
+    t.emitStatus({ type: "status", ...emptyState("s1").status, phase: "running", capture: { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true } });
+    frame();
+    expect(s.slides[0].auto).toBe(true);
+    expect(s.canCapture).toBe(true);
+    t.emitDrop({ type: "enter", paths: ["/Desktop/board.png"] });
+    expect(s.dragging).toBe(true);
+    t.emitDrop({ type: "drop", paths: ["/Desktop/board.png"] });
+    await Promise.resolve();
+    expect(s.dragging).toBe(false);
+    expect(t.calls.at(-1)).toEqual(["import_slides", { paths: ["/Desktop/board.png"] }]);
+  });
 });

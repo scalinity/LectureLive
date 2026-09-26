@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { chunks, previewBlocks, render, resolve } from "./markdown";
+import { chunkKey, chunks, hasImage, previewBlocks, render, resolve } from "./markdown";
 
 const ctx = { notesDir: "/L/Week 1", slides: new Set(["/L/Week 1/slides/slide_01_100203.png"]), toUrl: (p: string) => "asset://localhost/" + encodeURIComponent(p) };
 const REMOTE = /^(https?:|\/\/|javascript:|data:|vbscript:|file:)/i;
@@ -63,5 +63,13 @@ describe("rendered markdown", () => {
     expect(resolve("/L/Week 1", "../x/../Week 1/slides/a.png")).toBe("/L/Week 1/slides/a.png");
     expect(resolve("/L/Week 1", "slides/slide%2001.png")).toBe("/L/Week 1/slides/slide 01.png");
     for (const u of ["https://a/b.png", "//a/b.png", "data:x", "asset://localhost/x"]) expect(resolve("/L", u)).toBeNull();
+  });
+
+  test("a new slide changes the key of chunks with an image only (M4 minor M8)", () => {
+    const text = "## Momentum\n- keeps rolling\n";
+    const img = "## Chart\n![Slide 1](slides/slide_01_100251.png)\n";
+    expect(chunkKey("r2", "d1", text, 1)).toBe(chunkKey("r2", "d1", text, 2));
+    expect(chunkKey("r2", "d2", img, 1)).not.toBe(chunkKey("r2", "d2", img, 2));
+    expect(hasImage('<img src="slides/a.png">')).toBe(true);
   });
 });

@@ -1,10 +1,10 @@
 // A scripted backend: the store's tests, the frame-time bench and the browser preview drive the real
 // store through it, with the adapter's session and sequence rules.
-import type { Transport } from "./transport";
-import type { Envelope, NotesMsg, SessionState, Status, StatusMsg, TranscriptMsg } from "./wire";
+import type { DropEvent, Transport } from "./transport";
+import type { Envelope, NotesMsg, SessionState, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 
 export function idleStatus(): Status {
-  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false };
+  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
 }
 
 export function emptyState(session: string): SessionState {
@@ -27,6 +27,7 @@ export class FixtureTransport implements Transport {
   private onStatus: Handler<StatusMsg>[] = [];
   private onTranscript: Handler<TranscriptMsg> | null = null;
   private onNotes: Handler<NotesMsg> | null = null;
+  private onDrop: ((e: DropEvent) => void) | null = null;
 
   constructor(state: SessionState) {
     this.state_ = state;
@@ -83,6 +84,18 @@ export class FixtureTransport implements Transport {
   async call<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     this.calls.push([cmd, args]);
     return this.answers[cmd] as T;
+  }
+
+  async listenDrops(cb: (e: DropEvent) => void) {
+    this.onDrop = cb;
+    return () => {
+      this.onDrop = null;
+    };
+  }
+
+  /** A file drag over the window, as the webview reports it. */
+  emitDrop(e: DropEvent) {
+    this.onDrop?.(e);
   }
 
   assetUrl(path: string) {
@@ -159,6 +172,14 @@ export function demoTransport(): FixtureTransport {
 }
 
 const DEMO_DIR = "/Lectures/Machine Learning/Weeks/Week 06 — Optimisation";
+
+/** What the picker lists in the browser preview. */
+const DEMO_WINDOWS: WindowView[] = [
+  { id: 2621, app: "zoom.us", title: "Zoom Meeting", width: 1600, height: 900, on_screen: true },
+  { id: 2598, app: "zoom.us", title: "Zoom Workplace", width: 960, height: 640, on_screen: false },
+  { id: 69, app: "Google Chrome", title: "Week 6 slides", width: 1440, height: 900, on_screen: true },
+  { id: 1433, app: "Terminal", title: "lecture", width: 900, height: 600, on_screen: true },
+];
 const DEMO_NOTES = `# Machine Learning — Week 06 — Optimisation — 2026-09-25
 
 <!-- 10:04:12 -->
@@ -188,9 +209,14 @@ export function demoWithNotes(): FixtureTransport {
   t.state_.status.folder = { dir: DEMO_DIR, course: "Machine Learning", name: "Week 06 — Optimisation", notes_dir: DEMO_DIR, page: null };
   t.state_.document = DEMO_NOTES;
   t.state_.revision = 2;
-  t.state_.slides = [{ index: 1, file: "slides/slide_01_100251.png", path: `${DEMO_DIR}/slides/slide_01_100251.png` }];
+  t.state_.slides = [
+    { index: 1, file: "slides/slide_01_100251.png", path: `${DEMO_DIR}/slides/slide_01_100251.png`, at: "10:02:51", auto: true, uncertain: false },
+    { index: 2, file: "slides/slide_02_100418.png", path: `${DEMO_DIR}/slides/slide_02_100418.png`, at: "10:04:18", auto: false, uncertain: false },
+    { index: 3, file: "slides/slide_03_100633.png", path: `${DEMO_DIR}/slides/slide_03_100633.png`, at: "10:06:33", auto: true, uncertain: true },
+  ];
+  t.state_.status.capture = { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true };
   t.assetUrl = () => "/demo-slide.svg";
-  t.answers = { key_status: { stored: true, env_available: true }, inputs: [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }], loopback_status: { present: true, blackhole_present: true }, spend_summary: { total: 3.8412, estimated: 0.4071, calls: 57, months: [{ key: "2026-08", label: "August 2026", total: 1.2033, courses: [["Machine Learning", 0.9021], ["Statistics", 0.3012]] }, { key: "2026-09", label: "September 2026", total: 2.6379, courses: [["Machine Learning", 1.9112], ["Statistics", 0.6021], ["Biology", 0.1246]] }], recent: [{ day: "2026-09-25", label: "25 Sep", course: "Machine Learning", lecture: "Week 06 — Optimisation", total: 0.4402, kinds: [["page", 0.2727], ["notes", 0.1021], ["transcribe", 0.0533], ["polish", 0.0121]] }, { day: "2026-09-24", label: "24 Sep", course: "Statistics", lecture: "Week 05 — Hypothesis tests", total: 0.3104, kinds: [["notes", 0.1902], ["transcribe", 0.1202]] }, { day: "2026-09-22", label: "22 Sep", course: "Biology", lecture: "Week 02", total: 0.004, kinds: [["notes", 0.004]] }] } };
+  t.answers = { capture_windows: DEMO_WINDOWS, capture_preview: { path: "/demo-slide.svg", width: 1600, height: 900 }, capture_select: null, capture_now: null, import_slides: null, key_status: { stored: true, env_available: true }, inputs: [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }], loopback_status: { present: true, blackhole_present: true }, spend_summary: { total: 3.8412, estimated: 0.4071, calls: 57, months: [{ key: "2026-08", label: "August 2026", total: 1.2033, courses: [["Machine Learning", 0.9021], ["Statistics", 0.3012]] }, { key: "2026-09", label: "September 2026", total: 2.6379, courses: [["Machine Learning", 1.9112], ["Statistics", 0.6021], ["Biology", 0.1246]] }], recent: [{ day: "2026-09-25", label: "25 Sep", course: "Machine Learning", lecture: "Week 06 — Optimisation", total: 0.4402, kinds: [["page", 0.2727], ["notes", 0.1021], ["transcribe", 0.0533], ["polish", 0.0121]] }, { day: "2026-09-24", label: "24 Sep", course: "Statistics", lecture: "Week 05 — Hypothesis tests", total: 0.3104, kinds: [["notes", 0.1902], ["transcribe", 0.1202]] }, { day: "2026-09-22", label: "22 Sep", course: "Biology", lecture: "Week 02", total: 0.004, kinds: [["notes", 0.004]] }] } };
   (globalThis as { __fixture?: FixtureTransport }).__fixture = t; // the preview's checks drive states through it
   const words = DEMO_SNAPSHOT.match(/\S+\s*/g) ?? [];
   setTimeout(() => {

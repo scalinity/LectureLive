@@ -3,7 +3,7 @@
 import { flushSync } from "svelte";
 import { idleStatus } from "./fixture";
 import type { Transport } from "./transport";
-import type { Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg } from "./wire";
+import type { CaptureView, Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, PreviewShot, Region, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 import { nextWords, type Word } from "./words";
 
 type Stream = "status" | "transcript" | "notes";
@@ -72,6 +72,20 @@ export class Session {
   /** Snapshots and polish are asked for only while the lecture runs: once it stops, the last snapshot takes what is left. */
   get canSnapshot(): boolean {
     return this.status.phase === "running";
+  }
+
+  /** Files are being dragged over the window (spec §7.3). */
+  dragging = $state(false);
+
+  /** Slide capture: the watched window and its state (spec §7). */
+  get capture(): CaptureView {
+    return this.status.capture;
+  }
+
+  /** Capture works once a real capture has succeeded, while the lecture runs and the window is watched (spec §7.4). */
+  get canCapture(): boolean {
+    const c = this.status.capture;
+    return this.status.phase === "running" && c.captured && c.state === "watching";
   }
 
   /** A snapshot or a polish is running: the one thing Cancel stops. */
@@ -146,6 +160,34 @@ export class Session {
     return this.act<LoopbackView>("loopback_status");
   }
 
+  /** The Capture button: the watched region now, as a manual slide. */
+  async captureNow() {
+    await this.act("capture_now");
+  }
+
+  async importSlides(paths: string[]) {
+    await this.act("import_slides", { paths });
+  }
+
+  /** The windows the picker offers; undefined when they could not be listed (the error says why). */
+  captureWindows(): Promise<WindowView[] | undefined> {
+    return this.act<WindowView[]>("capture_windows");
+  }
+
+  capturePreview(id: number): Promise<PreviewShot | undefined> {
+    return this.act<PreviewShot>("capture_preview", { id });
+  }
+
+  /** True when the window and region were saved for this course. */
+  async captureSelect(id: number, region: Region): Promise<boolean> {
+    await this.act("capture_select", { id, region });
+    return this.error === null;
+  }
+
+  async openScreenSettings() {
+    await this.act("open_screen_settings");
+  }
+
   keyStatus(): Promise<{ stored: boolean; env_available: boolean } | undefined> {
     return this.act("key_status");
   }
@@ -169,8 +211,13 @@ export class Session {
     // Both are registered before the first await, so nothing sent while the state is read is lost.
     const listening = t.listenStatus((m) => this.accept("status", m));
     const attached = t.attach((m) => this.accept("transcript", m), (m) => this.accept("notes", m));
+    const drops = t.listenDrops((e) => {
+      this.dragging = e.type === "enter" || e.type === "over";
+      if (e.type === "drop" && e.paths.length) void this.importSlides(e.paths);
+    });
     this.disposers.push(await listening);
     await attached;
+    this.disposers.push(await drops);
     const tick = setInterval(() => (this.clockNow = Date.now()), 1000);
     this.disposers.push(() => clearInterval(tick));
     if (typeof document !== "undefined") {

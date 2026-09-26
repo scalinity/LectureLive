@@ -33,13 +33,27 @@ export type Status = {
   started_at: string | null;
   spend_usd: number;
   silence: boolean;
+  capture: CaptureView;
 };
 
 export type NoticeKind = "notes" | "slide" | "page" | "done" | "warn";
 
 export type Notice = { kind: NoticeKind; label: string; detail: string; at: string };
 
-export type SlideView = { index: number; file: string; path: string };
+/** `at` is when it was first on screen (HH:MM:SS); `auto` when the detector took it; `uncertain` when it was still changing. */
+export type SlideView = { index: number; file: string; path: string; at: string; auto: boolean; uncertain: boolean };
+
+export type CaptureWord = "unbound" | "ready" | "watching" | "paused" | "asking" | "denied" | "failing";
+
+export type WindowView = { id: number; app: string; title: string; width: number; height: number; on_screen: boolean };
+
+/** Slide capture (spec §7): the watched window, its state, and the windows to choose from while asking. */
+export type CaptureView = { state: CaptureWord; window: string | null; detail: string | null; candidates: WindowView[]; captured: boolean };
+
+/** The slide's rectangle as fractions of the window. */
+export type Region = { x: number; y: number; w: number; h: number };
+
+export type PreviewShot = { path: string; width: number; height: number };
 
 export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" } & SlideView);
 

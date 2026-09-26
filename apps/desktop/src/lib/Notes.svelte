@@ -1,7 +1,7 @@
 <script lang="ts">
   // The notes (spec §9.1, §9.3): the committed document rendered once per chunk and frozen, each
   // snapshot's time in the gutter; the preview below it on the teal rule, finished blocks fading in.
-  import { chunks, previewBlocks, render, type SlideCtx } from "./markdown";
+  import { chunkKey, chunks, previewBlocks, render, type SlideCtx } from "./markdown";
   import { session } from "./session.svelte";
 
   let { toUrl }: { toUrl: (abs: string) => string } = $props();
@@ -22,10 +22,11 @@
   type Part = { key: string; time: string | null; html: string };
 
   const committed: Part[] = $derived.by(() => {
-    // The document as last read, then each block committed since; keys change when the document is read again.
-    const base = `${session.revision - session.committed.length}:${session.document.length}:${ctx.slides.size}`;
-    const parts = chunks(session.document).map((c, i) => ({ key: `${base}:d${i}`, time: c.time, md: c.md }));
-    session.committed.forEach((block, b) => chunks(block).forEach((c, i) => parts.push({ key: `${base}:b${b}:${i}`, time: c.time, md: c.md })));
+    // The document as last read, then each block committed since; keys change when the document is read
+    // again, and a chunk with an image also when a slide arrives, since only it can show the new slide.
+    const base = `${session.revision - session.committed.length}:${session.document.length}`;
+    const parts = chunks(session.document).map((c, i) => ({ key: chunkKey(base, `d${i}`, c.md, ctx.slides.size), time: c.time, md: c.md }));
+    session.committed.forEach((block, b) => chunks(block).forEach((c, i) => parts.push({ key: chunkKey(base, `b${b}:${i}`, c.md, ctx.slides.size), time: c.time, md: c.md })));
     return parts.filter((p) => p.md.trim() !== "").map((p) => ({ key: p.key, time: p.time, html: html(p.key, p.md) }));
   });
 
@@ -47,7 +48,7 @@
     const blocks = previewBlocks(session.previewShown);
     const op = session.preview?.op ?? 0;
     // Finished blocks are cached; only the last, still growing, is rendered again.
-    return blocks.map((md, i) => (i < blocks.length - 1 ? { key: `p${op}:${i}`, time: null, html: html(`p${op}:${i}:${ctx.slides.size}`, md) } : { key: `p${op}:last`, time: null, html: render(md, ctx) }));
+    return blocks.map((md, i) => (i < blocks.length - 1 ? { key: `p${op}:${i}`, time: null, html: html(chunkKey(`p${op}`, `${i}`, md, ctx.slides.size), md) } : { key: `p${op}:last`, time: null, html: render(md, ctx) }));
   });
 </script>
 

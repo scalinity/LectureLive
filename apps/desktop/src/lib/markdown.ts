@@ -85,3 +85,13 @@ export function previewBlocks(text: string): string[] {
   }
   return out;
 }
+
+/** Markdown or HTML that shows an image: the only chunks a newly registered slide can change. */
+export function hasImage(md: string): boolean {
+  return /!\[[^\]]*\]\(|<img\b/i.test(md);
+}
+
+/** A rendered chunk's cache key: a new slide re-renders only the chunks that hold an image (M4 minor M8). */
+export function chunkKey(base: string, part: string, md: string, slides: number): string {
+  return hasImage(md) ? `${base}:${part}:s${slides}` : `${base}:${part}`;
+}
