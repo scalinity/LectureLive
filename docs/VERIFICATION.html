@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>LectureLive checks for you</title>
+<!--
+  ==========================================================================================
+  FOR THE SESSION THAT UPDATES THIS PAGE
+  ==========================================================================================
+  This is the one list of what LectureLive needs from the person: checks that automation cannot
+  do (a real Zoom lecture, a pointer on the window, macOS prompts) and decisions only they can
+  make. Every item comes from docs/milestones.md; say which line in "closes" or "from".
+
+  To add an item:
+  1. Copy an <article class="item"> in the right occasion (<section class="occasion">), or add
+     an occasion. Give it the next free id: V10, V11 … for checks, D3, D4 … for decisions.
+     Never renumber or reuse an id: saved results are keyed by it.
+  2. Set data-kind="check" or "decision", data-from="M6" (the milestone that asks for it) and
+     data-rev="r1". When the instructions change materially, bump data-rev (r2 …): a result
+     saved against the old revision is then shown as stale, kept in history and not reused.
+  3. Commands go in <pre class="cmd"><code>…</code></pre>, with <, > and & escaped. Write
+     paths as $HOME/…, never a user's home folder: the repository is public.
+  4. Add nothing to the <script>: status controls, notes, history, the strip and the counts
+     are built from the markup. Update the "Last updated" line under the title.
+  5. When an item's evidence is recorded in docs/milestones.md (a gate line ticked), leave the
+     item here: its status is the person's record of having done it.
+  Statuses live in this browser's localStorage under "lecturelive.verification/state@1";
+  Export keeps a copy.
+  ==========================================================================================
+-->
+<style>
+:root{
+  --paper:#f4f6f8; --sheet:#fbfcfd; --ink:#14213d; --graphite:#5a6478; --rule:#d6dce4;
+  --plate:#e7ecf1; --teal:#1d6b72; --teal-soft:#d9eaeb; --signal:#b3261e; --signal-soft:#f3dedc;
+  --code:#eef2f6;
+  --text:"Atkinson Hyperlegible Next","Atkinson Hyperlegible",-apple-system,system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,monospace;
+  --step--1:.8333rem; --step-0:1rem; --step-1:1.2rem; --step-2:1.44rem; --step-3:1.728rem; --step-4:2.074rem;
+  --gutter:10.5rem; --measure:72ch; --radius:6px;
+  color-scheme:light dark;
+  font-size:18px;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0e1522; --sheet:#121b2b; --ink:#e3e8f0; --graphite:#98a3b5; --rule:#263247;
+    --plate:#172235; --teal:#5db8c0; --teal-soft:#16333a; --signal:#f2766b; --signal-soft:#3a1f24;
+    --code:#141e30;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0e1522; --sheet:#121b2b; --ink:#e3e8f0; --graphite:#98a3b5; --rule:#263247;
+  --plate:#172235; --teal:#5db8c0; --teal-soft:#16333a; --signal:#f2766b; --signal-soft:#3a1f24;
+  --code:#141e30;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:1.5rem}
+body{margin:0;background:var(--paper);color:var(--ink);font:var(--step-0)/1.55 var(--text);
+  font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+a{color:var(--teal);text-underline-offset:.18em}
+:focus-visible{outline:3px solid var(--teal);outline-offset:2px;border-radius:3px}
+code{font-family:var(--mono);font-size:.84em;background:var(--code);padding:.05em .3em;border-radius:3px}
+.skip{position:absolute;left:-999px}
+.skip:focus{left:1rem;top:1rem;background:var(--sheet);padding:.4rem .7rem;z-index:9}
+
+.page{max-width:calc(var(--gutter) + var(--measure) + 6rem);margin:0 auto;padding:2.2rem 1.5rem 5rem}
+
+/* ---- top ---- */
+.top{display:grid;grid-template-columns:var(--gutter) minmax(0,1fr);column-gap:1.5rem;
+  padding-bottom:1.6rem;border-bottom:2px solid var(--ink)}
+.top .mark{grid-column:1;color:var(--graphite);font-size:var(--step--1);line-height:1.3;padding-top:.55rem}
+.top .mark b{display:block;color:var(--ink);font-size:var(--step-0)}
+.top h1{grid-column:2;margin:0;font-size:var(--step-4);line-height:1.1;font-weight:700;letter-spacing:-.01em;max-width:18ch}
+.top .lede{grid-column:2;margin:.8rem 0 0;max-width:var(--measure);color:var(--graphite)}
+.top .updated{grid-column:2;margin:.4rem 0 0;font-size:var(--step--1);color:var(--graphite)}
+.tally{grid-column:2;margin-top:1.4rem;display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1.2rem}
+.squares{display:flex;flex-wrap:wrap;gap:4px}
+.sq{width:1.3rem;height:.95rem;border-radius:2px;border:1.5px solid var(--graphite);background:transparent;
+  padding:0;cursor:pointer;opacity:.75}
+.sq:hover{opacity:1}
+.sq[data-s="passed"],.sq[data-s="decided"]{background:var(--teal);border-color:var(--teal);opacity:1}
+.sq[data-s="failed"]{background:var(--signal);border-color:var(--signal);opacity:1}
+.sq[data-s="follow-up"]{border-color:var(--signal);border-width:2.5px;opacity:1}
+.sq[data-s="blocked"]{background:repeating-linear-gradient(135deg,var(--graphite) 0 2px,transparent 2px 5px);opacity:1}
+.sq.decision{border-radius:50%;width:.95rem}
+.sq.stale{outline:2px dashed var(--signal);outline-offset:1px}
+.count{font-size:var(--step--1);color:var(--graphite)}
+.count b{color:var(--ink)}
+.tools{margin-left:auto;display:flex;gap:.4rem}
+.btn{font:inherit;font-size:var(--step--1);color:var(--ink);background:transparent;border:1px solid var(--rule);
+  border-radius:var(--radius);padding:.3rem .7rem;cursor:pointer}
+.btn:hover{border-color:var(--graphite)}
+.banner{display:none;margin:1rem 0 0;padding:.6rem .8rem;border-left:3px solid var(--signal);background:var(--signal-soft);font-size:var(--step--1)}
+.banner.show{display:block}
+
+/* ---- occasions ---- */
+.occasion{margin-top:3rem}
+.occ-head{display:grid;grid-template-columns:var(--gutter) minmax(0,1fr);column-gap:1.5rem;align-items:baseline}
+.occ-head .count{grid-column:1;text-align:right}
+.occ-head h2{grid-column:2;margin:0;font-size:var(--step-3);line-height:1.15;font-weight:700}
+.occ-head .why{grid-column:2;margin:.5rem 0 0;max-width:var(--measure);color:var(--graphite)}
+
+/* A row: the hanging gutter (when, or id and origin) and the item. */
+.row{display:grid;grid-template-columns:var(--gutter) minmax(0,1fr);column-gap:1.5rem;
+  border-top:1px solid var(--rule);padding:1.1rem 0 1.2rem}
+.occ-head + .row{margin-top:1.2rem}
+.gut{text-align:right;color:var(--graphite);font-size:var(--step--1);line-height:1.35;padding-top:.2rem}
+.gut .when{display:block;color:var(--ink);font-weight:700;font-size:var(--step-0);margin-bottom:.25rem}
+.gut .id{display:inline-flex;align-items:center;gap:.4rem;color:var(--ink);font-weight:700}
+.gut .id::after{content:"";width:.8rem;height:.6rem;border-radius:2px;border:1.5px solid var(--graphite)}
+.item[data-kind="decision"] .gut .id::after{border-radius:50%;width:.6rem}
+.item[data-s="passed"] .gut .id::after,.item[data-s="decided"] .gut .id::after{background:var(--teal);border-color:var(--teal)}
+.item[data-s="failed"] .gut .id::after{background:var(--signal);border-color:var(--signal)}
+.item[data-s="follow-up"] .gut .id::after{border-color:var(--signal);border-width:2.5px}
+.item[data-s="blocked"] .gut .id::after{background:repeating-linear-gradient(135deg,var(--graphite) 0 2px,transparent 2px 4px)}
+.gut .from{display:block}
+
+/* The class run sheet: the teal rule is the app's mark for what is live. */
+/* One unbroken rule through the class: the rows carry no padding of their own. */
+.lecture .row{position:relative;padding:0;border-top:0}
+.lecture .row .gut{border-right:3px solid var(--teal);padding:1.1rem 1rem 1.2rem 0;margin-right:-.75rem}
+.lecture .row .body{padding:1.1rem 0 1.2rem}
+.lecture .row + .row .body{border-top:1px solid var(--rule)}
+.lecture .row .gut::after{content:"";position:absolute;left:calc(var(--gutter) + .75rem - 9px);top:calc(1.88rem - 7.5px);
+  width:.55rem;height:.55rem;border-radius:50%;background:var(--paper);border:2.5px solid var(--teal)}
+
+.body{min-width:0;max-width:var(--measure)}
+.head{display:flex;flex-wrap:wrap;align-items:flex-start;gap:.4rem 1rem}
+.head h3{flex:1 1 20rem;margin:0;font-size:var(--step-1);line-height:1.3;font-weight:700}
+.status{display:flex;flex-direction:column;align-items:flex-end;gap:.2rem}
+select.pick{font:inherit;font-size:var(--step--1);color:var(--ink);background:var(--sheet);border:1px solid var(--rule);
+  border-radius:var(--radius);padding:.25rem .5rem;cursor:pointer}
+.item[data-s="passed"] select.pick,.item[data-s="decided"] select.pick{border-color:var(--teal);color:var(--teal)}
+.item[data-s="failed"] select.pick,.item[data-s="follow-up"] select.pick{border-color:var(--signal);color:var(--signal)}
+.stamp{font-size:.72rem;color:var(--graphite)}
+.closes{margin:.35rem 0 0;font-size:var(--step--1);color:var(--graphite)}
+.closes b{color:var(--ink);font-weight:700}
+.body > p.what{margin:.6rem 0 0}
+.stale-note{margin:.6rem 0 0;padding:.45rem .7rem;font-size:var(--step--1);border-left:3px dashed var(--signal);background:var(--signal-soft)}
+details.how{margin-top:.7rem}
+details.how > summary{cursor:pointer;width:max-content;color:var(--teal);font-size:var(--step--1);list-style:none}
+details.how > summary::-webkit-details-marker{display:none}
+details.how > summary::before{content:"";display:inline-block;margin-right:.45rem;border:.3rem solid transparent;
+  border-left:.42rem solid currentColor;transform-origin:.2rem 50%;transition:transform .15s}
+details.how[open] > summary::before{transform:rotate(90deg)}
+.how h4{margin:1rem 0 .3rem;font-size:var(--step-0);font-weight:700}
+.how p,.how li{font-size:var(--step-0)}
+.how ul,.how ol{margin:.2rem 0;padding-left:1.2rem}
+.how li{margin:.2rem 0}
+.cmdwrap{position:relative;margin:.4rem 0}
+pre.cmd{margin:0;padding:.75rem 4.2rem .75rem .9rem;background:var(--code);border-radius:var(--radius);overflow:auto;
+  font:.74rem/1.6 var(--mono);color:var(--ink)}
+pre.cmd code{background:none;padding:0;font-size:inherit}
+.copy{position:absolute;top:.35rem;right:.35rem;font:inherit;font-size:.72rem;color:var(--graphite);background:var(--sheet);
+  border:1px solid var(--rule);border-radius:4px;padding:.15rem .45rem;cursor:pointer}
+.copy:hover{color:var(--ink)}
+.copy.done{color:var(--teal);border-color:var(--teal)}
+textarea.note{display:block;width:100%;margin-top:.8rem;min-height:2.2rem;resize:vertical;font:inherit;font-size:var(--step--1);
+  color:var(--ink);background:transparent;border:1px dashed var(--rule);border-radius:var(--radius);padding:.4rem .6rem}
+textarea.note:focus{border-style:solid}
+.history{margin-top:.3rem;font-size:.72rem;color:var(--graphite)}
+
+.step{color:var(--graphite)}
+.step .body > p{margin:.3rem 0 0}
+.step h3{color:var(--ink)}
+.later{border:1px dashed var(--rule);border-radius:var(--radius);padding:.9rem 1rem;color:var(--graphite)}
+footer{margin-top:4rem;padding-top:1rem;border-top:1px solid var(--rule);color:var(--graphite);font-size:var(--step--1)}
+footer p{max-width:var(--measure);margin:.3rem 0}
+
+@media (max-width:760px){
+  :root{--gutter:0}
+  .page{padding:1.4rem 1rem 4rem}
+  .top,.occ-head,.row{grid-template-columns:minmax(0,1fr);column-gap:0}
+  .top .mark,.top h1,.top .lede,.top .updated,.tally,.occ-head h2,.occ-head .why,.occ-head .count{grid-column:1}
+  .top h1{font-size:var(--step-3)}
+  .occ-head .count{text-align:left;order:2}
+  .gut{text-align:left;padding:0 0 .4rem;margin:0}
+  .gut .when{display:inline;margin-right:.5rem}
+  .lecture .row .gut{border-right:0;border-left:3px solid var(--teal);padding:1.1rem 0 .4rem .7rem;margin:0}
+  .lecture .row .body{border-left:3px solid var(--teal);padding:0 0 1.2rem .7rem}
+  .lecture .row + .row .body{border-top:0}
+  .lecture .row + .row .gut{border-top:1px solid var(--rule)}
+  .lecture .row .gut::after{display:none}
+  .tools{margin-left:0}
+}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}details.how>summary::before{transition:none}}
+@media print{
+  .tools,.copy,.squares,textarea.note:placeholder-shown{display:none}
+  details.how{display:block}
+  .row{break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#lecture">Skip to the Zoom lecture</a>
+<div class="page">
+
+<header class="top">
+  <p class="mark"><b>LectureLive</b>checks for you</p>
+  <h1>What LectureLive still needs from you</h1>
+  <p class="lede">Everything the automated runs could not do: a real Zoom lecture, a pointer on the window, a prompt only macOS shows you, and two choices that are yours to make. Each item names the line of <code>docs/milestones.md</code> it comes from. Statuses and notes save in this browser; Export keeps a copy.</p>
+  <p class="updated">Last updated 26 September 2026, after M5 (<code>main</code> at 394bd13).</p>
+  <div class="tally">
+    <div class="squares" id="squares" aria-label="Every item, in page order"></div>
+    <p class="count" id="count"></p>
+    <div class="tools">
+      <button class="btn" id="export" type="button">Export</button>
+      <button class="btn" id="import" type="button">Import</button>
+      <button class="btn" id="theme" type="button">Theme: auto</button>
+      <input type="file" id="importfile" accept="application/json" hidden>
+    </div>
+  </div>
+  <div class="banner" id="banner" role="alert"></div>
+</header>
+
+<!-- ======================================================================================= -->
+<section class="occasion lecture" id="lecture" aria-labelledby="lecture-h">
+  <div class="occ-head">
+    <p class="count" data-count-for="lecture"></p>
+    <h2 id="lecture-h">At your next Zoom lecture</h2>
+    <p class="why">Four checks, done in the order of a class. They close the three gate lines left open since M0 and M1, and answer the one question M5 could not: whether Zoom keeps drawing while it is full screen and you work elsewhere. Nothing here is transcribed or sent, so it costs nothing, and you keep taking notes the way you do now.</p>
+  </div>
+
+  <div class="row step">
+    <div class="gut"><span class="when">Before class</span>about 5 minutes</div>
+    <div class="body">
+      <div class="head"><h3>Set up three Terminal windows and Zoom's speaker</h3></div>
+      <p>In Zoom, open Settings, Audio, and set <b>Speaker</b> to “LectureLive Loopback”. Keep the Mac's own output on your speakers or headphones. If the tool you take notes with stops hearing Zoom after this, set Zoom's speaker back and leave V01 for another lecture.</p>
+      <details class="how"><summary>Commands</summary>
+        <h4>Terminal 1: the app's page server (leave it running)</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive/apps/desktop" &amp;&amp; npm run dev</code></pre></div>
+        <h4>Terminal 2: the app in record-only mode (it waits until you choose a window)</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive"
+D="$HOME/Library/Application Support/LectureLive/m5-recording/Weeks/Week 01 — Recording"
+mkdir -p "$D"
+LECTURELIVE_CHECK=record LECTURELIVE_CHECK_DIR="$D" \
+  LECTURELIVE_RECORD="$HOME/Library/Application Support/LectureLive/m5-fixtures/zoom-live-$(date +%Y%m%d)" \
+  ./target/debug/desktop</code></pre></div>
+        <h4>Terminal 3: kept free for V01 and V03</h4>
+        <p>Record-only mode starts no lecture: it records what the slide detector sees from the window you choose, for 40 minutes, then closes the app. The frames stay on this Mac in <code>m5-fixtures/</code>.</p>
+      </details>
+    </div>
+  </div>
+
+  <article class="row item" id="V01" data-kind="check" data-from="M1" data-rev="r1">
+    <div class="gut"><span class="when">As it starts</span><span class="id">V01</span><span class="from">M1 gate</span></div>
+    <div class="body">
+      <div class="head"><h3>Record 30 minutes of the lecture's sound with no unexplained gaps</h3><div class="status"></div></div>
+      <p class="closes">Closes M1's gate line <b>“A 30-minute Zoom recording with no unexplained captured-audio gaps”</b>.</p>
+      <p class="what">Proves the loopback path carries a real Zoom lecture for half an hour without losing any of it. Every automated run used synthetic sound.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <h4>In Terminal 3, once the lecturer is speaking</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>L=$HOME/Documents/Tools/LectureLive/target/debug/lecturelive
+$L loopback check --secs 15          # while Zoom plays; pass above −60 dBFS
+$L record --loopback --secs 1800 --dir "$HOME/Library/Application Support/LectureLive/m1-zoom"</code></pre></div>
+        <h4>After class</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>cat "$HOME/Library/Application Support/LectureLive/m1-zoom/.live_notes/lecture_notes_$(date +%Y%m%d).v2.json"   # "gaps": []</code></pre></div>
+        <h4>Expected</h4>
+        <ul>
+          <li>The level check passes above −60 dBFS.</li>
+          <li>The recording stops by itself after 1,800 seconds.</li>
+          <li>The file shows <code>"gaps": []</code>, or only gaps with a stated cause (the receiver unplugged, for instance).</li>
+        </ul>
+        <h4>If it fails</h4>
+        <p>A gap with no stated cause: mark Failed, keep the <code>m1-zoom</code> folder and note the time. M6's gate is zero unexplained missing audio, so it starts there.</p>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V02" data-kind="check" data-from="M5" data-rev="r1">
+    <div class="gut"><span class="when">As it starts</span><span class="id">V02</span><span class="from">M5</span></div>
+    <div class="body">
+      <div class="head"><h3>Watch Zoom's window in the app, with the speaker's camera left out</h3><div class="status"></div></div>
+      <p class="closes">From M5's list <b>“Needing the person”</b>. The Zoom gate held only with the camera left out, and this is its first use on a live meeting.</p>
+      <p class="what">In the app from Terminal 2, click <b>Choose window</b>, pick Zoom's meeting window, and drag over the shared slide without Zoom's controls. Then click <b>Leave out a part</b> and drag over the speaker's camera wherever Zoom draws it on the slide. Finish with <b>Watch this region</b>. Recording starts at once and runs for 40 minutes.</p>
+      <details class="how"><summary>What to expect, and after class</summary>
+        <h4>Expected</h4>
+        <ul>
+          <li>The camera shows dimmed, like everything outside the region. The strip reads “Watching”.</li>
+          <li>After class the report lists a decision near each slide change, and none when only the camera moved.</li>
+        </ul>
+        <div class="cmdwrap"><pre class="cmd"><code>cat "$HOME/Library/Application Support/LectureLive/m5-checks/record.json"</code></pre></div>
+        <h4>Keep</h4>
+        <p>The folder <code>m5-fixtures/zoom-live-&lt;date&gt;</code>. M6 measures the detector on it, a live meeting rather than a recording's playback. It never leaves this Mac and is deleted once measured.</p>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V03" data-kind="check" data-from="M0" data-rev="r1">
+    <div class="gut"><span class="when">While a slide is shared</span><span class="id">V03</span><span class="from">M0 and M1 gates</span></div>
+    <div class="body">
+      <div class="head"><h3>The packaged canary captures Zoom's meeting window, and the image shows the slide</h3><div class="status"></div></div>
+      <p class="closes">Closes M0's deferred gate line, repeated in M1: <b>“the packaged .app captures the Zoom meeting window with a shared slide, and the image shows the slide”</b>.</p>
+      <p class="what">Proves a packaged, signed app gets Screen Recording and captures a real meeting window, not only windows the checks opened. It takes a minute, any time a slide is on screen.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <div class="cmdwrap"><pre class="cmd"><code>APP="$HOME/Documents/Tools/LectureLive/target/release/bundle/macos/LectureLive Canary.app"
+open -W -n "$APP" --args --check windows; tail -n 40 "$HOME/Library/Application Support/LectureLive/canary/checks.log"
+open -W -n "$APP" --args --check capture &lt;ID of the zoom.us meeting window&gt;</code></pre></div>
+        <h4>Expected</h4>
+        <ul>
+          <li>The listing has a <code>zoom.us</code> “Zoom Meeting” line; its first number is the ID.</li>
+          <li>The capture line in <code>checks.log</code> names <code>canary/window_&lt;ID&gt;.png</code>. Open it: the shared slide is there.</li>
+        </ul>
+        <h4>If it fails</h4>
+        <p>“not granted”: allow LectureLive Canary in System Settings, Privacy &amp; Security, Screen &amp; System Audio Recording, then run the capture again.</p>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V04" data-kind="check" data-from="M5" data-rev="r1">
+    <div class="gut"><span class="when">About 10 minutes in</span><span class="id">V04</span><span class="from">M5 open thread</span></div>
+    <div class="body">
+      <div class="head"><h3>Zoom full screen, with another app in front for five minutes</h3><div class="status"></div></div>
+      <p class="closes">Answers M5's open thread: <b>whether Zoom keeps drawing while it is full screen on another desktop</b>. Capture itself was shown working there, on a window the app owns.</p>
+      <p class="what">While V02 records, put Zoom's meeting window in full screen. Then switch to another app or desktop and stay there five minutes or more while the slides change. Come back, and note roughly when you left and when you returned.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>In <code>record.json</code>, “Found again” around the switch, and no “Asking”.</li>
+          <li>Decisions with times inside the minutes Zoom was out of sight.</li>
+        </ul>
+        <h4>If no decision arrived while Zoom was out of sight</h4>
+        <p>Zoom stops drawing when hidden. Capture only reads what an app has drawn, and a web page behaved the same way at M5. Mark Needs follow-up: M6 then decides whether Zoom must stay visible, and the app says so.</p>
+      </details>
+    </div>
+  </article>
+
+  <div class="row step">
+    <div class="gut"><span class="when">After class</span></div>
+    <div class="body">
+      <div class="head"><h3>Read the two files, set the statuses above</h3></div>
+      <p>V01's <code>cat</code> and V02's <code>record.json</code> answer V01, V02 and V04. Nothing needs stopping: the recording and the app both end by themselves.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================================================= -->
+<section class="occasion" id="desk" aria-labelledby="desk-h">
+  <div class="occ-head">
+    <p class="count" data-count-for="desk"></p>
+    <h2 id="desk-h">A few minutes at the Mac, no lecture needed</h2>
+    <p class="why">From the M4 and M5 lists “Needing the person”. No gate line depends on them, but they are the only checks of the app as you see and touch it.</p>
+  </div>
+
+  <div class="row step">
+    <div class="gut"><span class="when">First</span></div>
+    <div class="body">
+      <div class="head"><h3>Open the app</h3></div>
+      <details class="how"><summary>Commands</summary>
+        <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive/apps/desktop" &amp;&amp; npm run dev
+# then, in a second Terminal window
+cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/desktop</code></pre></div>
+      </details>
+    </div>
+  </div>
+
+  <article class="row item" id="V05" data-kind="check" data-from="M5" data-rev="r1">
+    <div class="gut"><span class="id">V05</span><span class="from">M5, title bar</span></div>
+    <div class="body">
+      <div class="head"><h3>Move the window by its top strip, and double-click it to zoom</h3><div class="status"></div></div>
+      <p class="what">The grey title bar is gone: the status strip is the window's top edge, with the traffic lights at its left. No pointer automation could try it.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>Dragging anywhere in the strip that is not a button moves the window, words included.</li>
+          <li>The strip's buttons (today's spend, Aa, Key) still just click.</li>
+          <li>A double-click zooms the window, and another restores it.</li>
+          <li>The traffic lights sit level with “Ready”.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V06" data-kind="check" data-from="M4" data-rev="r1">
+    <div class="gut"><span class="id">V06</span><span class="from">M4, M5</span></div>
+    <div class="body">
+      <div class="head"><h3>Look at the app in light and dark, and with large type</h3><div class="status"></div></div>
+      <p class="what">Every view was checked in a browser engine and in screenshots. This is you reading it at arm's length. Switch macOS between Light and Dark, and press <b>Aa</b> in the strip for large type.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>Everything is readable, and nothing overlaps the traffic lights.</li>
+          <li>The window and region picker (Choose…) shows parts left out as dimmed boxes with a × each.</li>
+          <li>Known and deferred to M6: at the narrowest window (960 px) with large type, the strip's clock is cut off, and the traffic lights sit a little high.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V07" data-kind="check" data-from="M4" data-rev="r1">
+    <div class="gut"><span class="id">V07</span><span class="from">M4</span></div>
+    <div class="body">
+      <div class="head"><h3>Study page opens in your browser</h3><div class="status"></div></div>
+      <p class="what">The study page was typeset from the app at M4, but a check never opens the default browser, so the opening itself is yours to see. With a lecture folder that has notes, click <b>Study page</b> once. It typesets for a few minutes (the M4 run took 213 s and cost $0.10), then opens.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul><li>The page opens in your default browser, and its maths is typeset.</li></ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V08" data-kind="check" data-from="M4" data-rev="r1">
+    <div class="gut"><span class="id">V08</span><span class="from">M4</span></div>
+    <div class="body">
+      <div class="head"><h3>Answer the Keychain once with Always Allow</h3><div class="status"></div></div>
+      <p class="what">After each rebuild of the development app, macOS may ask whether LectureLive can read its key from the Keychain. Choose <b>Always Allow</b>.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul><li>The app starts and the next launch does not ask again, until the next rebuild. The prompt after each rebuild is an M6 open thread.</li></ul>
+      </details>
+    </div>
+  </article>
+</section>
+
+<!-- ======================================================================================= -->
+<section class="occasion" id="python" aria-labelledby="python-h">
+  <div class="occ-head">
+    <p class="count" data-count-for="python"></p>
+    <h2 id="python-h">Before M6 removes the Python tool</h2>
+    <p class="why">Optional, with a deadline. M6's last task deletes <code>live_notes.py</code>. After that, this comparison can never be made.</p>
+  </div>
+
+  <article class="row item" id="V09" data-kind="check" data-from="M3" data-rev="r1">
+    <div class="gut"><span class="id">V09</span><span class="from">M3, optional</span></div>
+    <div class="body">
+      <div class="head"><h3>The Python tool and the Rust CLI write the same files</h3><div class="status"></div></div>
+      <p class="closes">From M3's list <b>“Optional, needing the person”</b>: a Python CLI run on a synthetic folder, byte-compared with the Rust CLI's output.</p>
+      <p class="what">Nothing depends on it. The Rust side was built to match the Python tool's formats, and golden tests hold them. It is the one direct side-by-side, and it has to happen before the Python tool is gone.</p>
+      <details class="how"><summary>How</summary>
+        <p>Ask the M6 session to prepare a synthetic folder and the two commands before it removes the Python tool. It sets them up in one sitting with M6's other steps. Mark Blocked if you decide to skip it.</p>
+      </details>
+    </div>
+  </article>
+</section>
+
+<!-- ======================================================================================= -->
+<section class="occasion" id="decide" aria-labelledby="decide-h">
+  <div class="occ-head">
+    <p class="count" data-count-for="decide"></p>
+    <h2 id="decide-h">Decisions only you can make</h2>
+    <p class="why">Open threads that need an answer, not a check. Write the answer in the note, then set the status to Decided.</p>
+  </div>
+
+  <article class="row item" id="D1" data-kind="decision" data-from="M4" data-rev="r1">
+    <div class="gut"><span class="id">D1</span><span class="from">M4 open thread</span></div>
+    <div class="body">
+      <div class="head"><h3>May Polish run after a lecture has ended?</h3><div class="status"></div></div>
+      <p class="what">Today Polish runs only inside a lecture, in the app as in the Python tool. Allowing it afterwards would let you tidy a lecture's notes later, and that is work M6 would add.</p>
+    </div>
+  </article>
+
+  <article class="row item" id="D2" data-kind="decision" data-from="M4" data-rev="r1">
+    <div class="gut"><span class="id">D2</span><span class="from">M4 open thread</span></div>
+    <div class="body">
+      <div class="head"><h3>Allow a production build, so the built app's security policy is checked</h3><div class="status"></div></div>
+      <p class="what">In development the page's content security policy comes from SvelteKit. In a built app it is SvelteKit's tag together with Tauri's header, and no run has checked that pair, because builds wait for your go-ahead. Say yes to let M6 build once and check it.</p>
+    </div>
+  </article>
+</section>
+
+<!-- ======================================================================================= -->
+<section class="occasion" id="m6" aria-labelledby="m6-h">
+  <div class="occ-head">
+    <p class="count"></p>
+    <h2 id="m6-h">Coming with M6</h2>
+  </div>
+  <div class="row">
+    <div class="gut"></div>
+    <div class="body"><p class="later">M6's two-hour real lecture, with a forced restart, the receiver removed, a permission denied, a full disk and the network lost (M6, task 3), is added here as its own occasion when M6's plan is written.</p></div>
+  </div>
+</section>
+
+<footer>
+  <p>Statuses and notes are saved in this browser under <code>lecturelive.verification/state@1</code>, and nowhere else. Export a copy before clearing the browser's data, and Import it to merge: the newer record wins and both histories are kept.</p>
+  <p id="orphans"></p>
+</footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const KEY = "lecturelive.verification/state@1";
+  const THEME_KEY = "lecturelive.verification/theme";
+  const STATUSES = {
+    check: [["not-run", "Not done"], ["passed", "Passed"], ["failed", "Failed"], ["blocked", "Blocked"], ["follow-up", "Needs follow-up"]],
+    decision: [["open", "Open"], ["decided", "Decided"]],
+  };
+  const LABEL = Object.fromEntries([...STATUSES.check, ...STATUSES.decision]);
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const banner = $("#banner");
+  const warn = (msg) => { banner.textContent = msg; banner.classList.add("show"); };
+
+  // ---- persistence: a record is never silently discarded -------------------------------
+  let storageOK = true;
+  function load() {
+    try { return JSON.parse(localStorage.getItem(KEY) || "{}") || {}; }
+    catch (e) { storageOK = false; return {}; }
+  }
+  let state = load();
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); }
+    catch (e) {
+      if (storageOK) warn("This browser is not keeping the statuses. Export a copy before closing the page.");
+      storageOK = false;
+    }
+  }
+  if (!storageOK) warn("This browser is not keeping the statuses. Export a copy before closing the page.");
+
+  const items = $$("article.item");
+  const blank = (item) => (item.dataset.kind === "decision" ? "open" : "not-run");
+
+  // A result saved against other instructions is stale: shown, kept in history, not reused.
+  function effective(item) {
+    const rec = state[item.id];
+    if (!rec || !rec.status || rec.status === blank(item)) return { status: blank(item), stale: null, rec };
+    if (rec.rev !== item.dataset.rev) return { status: blank(item), stale: rec, rec };
+    return { status: rec.status, stale: null, rec };
+  }
+  function setStatus(item, status) {
+    const prev = state[item.id] || {};
+    const history = (prev.history || []).concat(prev.status ? [{ status: prev.status, rev: prev.rev, at: prev.at }] : []);
+    state[item.id] = { status, rev: item.dataset.rev, at: new Date().toISOString(), note: prev.note || "", history };
+    save(); render();
+  }
+
+  // ---- controls, built from the markup -----------------------------------------------------
+  items.forEach((item) => {
+    const slot = $(".status", item);
+    const sel = document.createElement("select");
+    sel.className = "pick";
+    sel.setAttribute("aria-label", `Status of ${item.id}: ${$("h3", item).textContent}`);
+    STATUSES[item.dataset.kind].forEach(([v, l]) => sel.add(new Option(l, v)));
+    sel.addEventListener("change", () => setStatus(item, sel.value));
+    const stamp = document.createElement("span");
+    stamp.className = "stamp";
+    slot.append(sel, stamp);
+    item.tabIndex = -1;
+
+    const note = document.createElement("textarea");
+    note.className = "note";
+    note.rows = 1;
+    note.placeholder = item.dataset.kind === "decision" ? "What you decided, and why" : "Note: what you saw, when, anything odd";
+    note.setAttribute("aria-label", `Note for ${item.id}`);
+    note.value = (state[item.id] || {}).note || "";
+    note.addEventListener("change", () => {
+      const rec = state[item.id] || { status: blank(item), rev: item.dataset.rev, history: [] };
+      rec.note = note.value; state[item.id] = rec; save();
+    });
+    const hist = document.createElement("div");
+    hist.className = "history";
+    $(".body", item).append(note, hist);
+  });
+
+  $$("pre.cmd").forEach((pre) => {
+    const b = document.createElement("button");
+    b.className = "copy"; b.type = "button"; b.textContent = "Copy";
+    b.setAttribute("aria-label", "Copy these commands");
+    b.addEventListener("click", () => copy(pre.innerText, b));
+    pre.parentElement.append(b);
+  });
+  function copy(text, btn) {
+    const done = () => { btn.textContent = "Copied"; btn.classList.add("done");
+      setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("done"); }, 1400); };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, () => fallback(text) && done());
+    else if (fallback(text)) done();
+  }
+  function fallback(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.append(ta); ta.select();
+    let ok = false; try { ok = document.execCommand("copy"); } catch (e) {}
+    ta.remove(); return ok;
+  }
+
+  // ---- render --------------------------------------------------------------------------------
+  const when = (iso) => (iso ? iso.slice(0, 16).replace("T", " ") : "");
+  function render() {
+    const squares = $("#squares"); squares.replaceChildren();
+    let checks = 0, done = 0, decisions = 0, decided = 0, attention = 0;
+    const perOcc = {};
+    items.forEach((item) => {
+      const eff = effective(item);
+      item.dataset.s = eff.status;
+      $("select.pick", item).value = eff.status;
+      const rec = eff.rec;
+      $(".stamp", item).textContent = rec && rec.at && !eff.stale && eff.status !== blank(item) ? when(rec.at) : "";
+      let sn = $(".stale-note", item);
+      if (eff.stale) {
+        if (!sn) { sn = document.createElement("p"); sn.className = "stale-note"; $(".head", item).after(sn); }
+        sn.textContent = `Stale: “${LABEL[eff.stale.status]}” was saved ${(eff.stale.at || "").slice(0, 10)} against instructions ${eff.stale.rev || "?"}; these are ${item.dataset.rev}. Do it again: the old result stays in the history below.`;
+      } else if (sn) sn.remove();
+      const h = (rec && rec.history) || [];
+      $(".history", item).textContent = h.length ? "Before: " + h.slice(-4).map((x) => `${LABEL[x.status] || x.status} (${x.rev}, ${(x.at || "").slice(0, 10)})`).join(", ") : "";
+
+      const isDecision = item.dataset.kind === "decision";
+      if (isDecision) { decisions++; if (eff.status === "decided") decided++; }
+      else { checks++; if (eff.status === "passed") done++; if (["failed", "blocked", "follow-up"].includes(eff.status)) attention++; }
+      const occ = item.closest("section.occasion").id;
+      perOcc[occ] = perOcc[occ] || { open: 0, total: 0 };
+      perOcc[occ].total++;
+      if (!["passed", "decided"].includes(eff.status)) perOcc[occ].open++;
+
+      const sq = document.createElement("button");
+      sq.type = "button";
+      sq.className = "sq" + (isDecision ? " decision" : "") + (eff.stale ? " stale" : "");
+      sq.dataset.s = eff.status;
+      sq.title = `${item.id}: ${$("h3", item).textContent} (${LABEL[eff.status]}${eff.stale ? ", stale" : ""})`;
+      sq.setAttribute("aria-label", sq.title);
+      sq.addEventListener("click", () => { location.hash = item.id; item.focus({ preventScroll: true }); });
+      squares.append(sq);
+    });
+    $("#count").innerHTML = `<b>${done} of ${checks}</b> checks passed, <b>${decided} of ${decisions}</b> decisions made` +
+      (attention ? `, <b>${attention}</b> need${attention === 1 ? "s" : ""} another look` : "");
+    $$("[data-count-for]").forEach((p) => {
+      const o = perOcc[p.dataset.countFor];
+      p.textContent = !o ? "" : o.open ? `${o.open} of ${o.total} open` : "All done";
+    });
+    const known = new Set(items.map((i) => i.id));
+    const orphans = Object.keys(state).filter((id) => !known.has(id));
+    $("#orphans").textContent = orphans.length ? `Kept, for items no longer on this page: ${orphans.join(", ")}.` : "";
+  }
+
+  // ---- export and import (merge: the newer record wins, histories are kept) ---------------
+  $("#export").addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify({ format: KEY, exported_utc: new Date().toISOString(), state }, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `lecturelive-checks-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.append(a); a.click(); a.remove();
+  });
+  $("#import").addEventListener("click", () => $("#importfile").click());
+  $("#importfile").addEventListener("change", async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const doc = JSON.parse(await f.text());
+      const incoming = doc.state || doc;
+      Object.entries(incoming).forEach(([id, rec]) => {
+        const mine = state[id];
+        const seen = new Set();
+        const hist = [...((mine && mine.history) || []), ...(rec.history || [])].filter((h) => {
+          const k = JSON.stringify(h); if (seen.has(k)) return false; seen.add(k); return true; });
+        const newer = !mine || (rec.at || "") > (mine.at || "");
+        const winner = newer ? rec : mine, loser = newer ? mine : rec;
+        if (loser && loser.status && loser.at && !hist.some((h) => h.at === loser.at)) hist.push({ status: loser.status, rev: loser.rev, at: loser.at });
+        state[id] = { ...winner, history: hist.sort((a, b) => (a.at || "").localeCompare(b.at || "")) };
+      });
+      save(); render();
+      items.forEach((i) => { $("textarea.note", i).value = (state[i.id] || {}).note || ""; });
+    } catch (err) { warn(`That file is not an export of this page (${err.message}). Nothing was changed.`); }
+    e.target.value = "";
+  });
+
+  // ---- theme ----------------------------------------------------------------------------------
+  const themes = ["auto", "light", "dark"];
+  function applyTheme(t) { document.documentElement.dataset.theme = t; $("#theme").textContent = "Theme: " + t; }
+  let theme = "auto"; try { theme = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) {}
+  applyTheme(theme);
+  $("#theme").addEventListener("click", () => {
+    theme = themes[(themes.indexOf(theme) + 1) % themes.length]; applyTheme(theme);
+    try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
+  });
+
+  window.addEventListener("storage", (e) => { if (e.key === KEY) { state = load(); render(); } });
+  render();
+})();
+</script>
+</body>
+</html>
