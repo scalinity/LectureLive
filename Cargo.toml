@@ -18,3 +18,11 @@ strip = true
 # (E0463 for ctor_proc_macro) on rustc 1.96.1 with Xcode 27.0 beta.
 [profile.release.build-override]
 strip = false
+
+# The capture worker shrinks a window capture every second (spec §7.2). Unoptimised, `image` and
+# `xcap` take about 0.8 s of each second in a debug build; optimised, about 21 ms (M5 plan research).
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.xcap]
+opt-level = 3
