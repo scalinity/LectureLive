@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use lecturelive_core::audio::level::{self, SilenceWatch};
 use lecturelive_core::audio::permission::{self, MicPermission};
 use lecturelive_core::audio::mixed::{MixedSource, MIXED_MODE};
-use lecturelive_core::audio::source::{DeviceSource, Source};
+use lecturelive_core::audio::source::{DeviceSource, Fallback, Source};
 use lecturelive_core::audio::{input, loopback, recorder, routing};
 use lecturelive_core::capture::window;
 use lecturelive_core::session::coordinator::{self, Notification, SessionConfig, SttStatus};
@@ -323,8 +323,9 @@ async fn record(use_loopback: bool, mixed: Option<String>, device: Option<String
                 }
                 Some(Notification::Gap(g)) => println!("gap: {:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id),
                 Some(Notification::DeviceGone { uid }) => println!(
-                    "input {uid} disappeared at {}; waiting for it to return (no other input is used). Ctrl-C stops.",
-                    chrono::Local::now().format("%H:%M:%S")
+                    "input {uid} disappeared at {}; waiting for it to return, and nothing switches by itself. {}",
+                    chrono::Local::now().format("%H:%M:%S"),
+                    other_inputs(&uid)
                 ),
                 Some(Notification::DeviceBack { uid }) => println!("input {uid} is back at {}; recording continues in a new file", chrono::Local::now().format("%H:%M:%S")),
                 Some(Notification::Failed(msg)) => eprintln!("session failed: {msg}"),
@@ -471,6 +472,15 @@ fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, Stri
         .with_context(|| format!("No audio input matches {want:?}. Inputs now: {}.", inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
+/// The fallback the CLI offers while an input is gone (spec §4.1): the other inputs, to start again with.
+fn other_inputs(gone: &str) -> String {
+    let others: Vec<String> = input::list_inputs().unwrap_or_default().into_iter().filter(|i| i.uid != gone).map(|i| format!("{} ({})", i.name, i.uid)).collect();
+    if others.is_empty() {
+        return "No other input is connected; Ctrl-C stops.".into();
+    }
+    format!("To record from another input, stop (Ctrl-C) and start again with --device <UID>: {}.", others.join(", "))
+}
+
 /// `--mixed <input>`: Zoom through BlackHole and that input together, once mixed mode has passed its drift test.
 /// Returns the source as `mixed:<input UID>` and its name.
 fn resolve_mixed(want: &str) -> Result<(String, String)> {
@@ -484,7 +494,7 @@ fn resolve_mixed(want: &str) -> Result<(String, String)> {
 fn source_for(uid: &str) -> Box<dyn Source> {
     match uid.strip_prefix("mixed:") {
         Some(input) => Box::new(MixedSource::new(loopback::BLACKHOLE_UID, input)),
-        None => Box::new(DeviceSource { uid: uid.to_string() }),
+        None => Box::new(DeviceSource { uid: uid.to_string(), fallback: Fallback::default() }),
     }
 }
 
@@ -503,7 +513,7 @@ fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
             }
             Notification::Recording { path } => println!("{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])),
             Notification::Gap(g) => say(p, "warn", "gap", &format!("{:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id)),
-            Notification::DeviceGone { uid } => say(p, "warn", "input gone", &format!("{uid}; waiting for it to return (no other input is used). Ctrl-C stops.")),
+            Notification::DeviceGone { uid } => say(p, "warn", "input gone", &format!("{uid}; waiting for it to return, and nothing switches by itself. {}", other_inputs(uid))),
             Notification::DeviceBack { uid } => say(p, "done", "input back", &format!("{uid}; recording continues in a new file")),
             Notification::Failed(m) => say(p, "warn", "session failed", m),
             Notification::Stt(s) => match s {

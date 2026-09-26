@@ -40,11 +40,27 @@ pub trait Source: Send + 'static {
 
 pub struct DeviceSource {
     pub uid: String,
+    /// Another input the person may choose while this one is gone (spec §4.1, §10).
+    pub fallback: Fallback,
+}
+
+/// An input the person chose while theirs is gone (spec §4.1, §10): read once by the waiting source.
+#[derive(Clone, Default)]
+pub struct Fallback(Arc<std::sync::Mutex<Option<String>>>);
+
+impl Fallback {
+    pub fn offer(&self, uid: &str) {
+        *self.0.lock().expect("the fallback lock") = Some(uid.to_string());
+    }
+
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().expect("the fallback lock").take()
+    }
 }
 
 impl Source for DeviceSource {
     fn run(self: Box<Self>, out: Sender<SourceEvent>, stop: Arc<AtomicBool>) {
-        if let Err(e) = run_device(&self.uid, &out, &stop) {
+        if let Err(e) = run_device(&self.uid, &self.fallback, &out, &stop) {
             let _ = out.blocking_send(SourceEvent::Failed(format!("{e:#}")));
         }
     }
@@ -66,25 +82,28 @@ enum Outcome {
     OpenFailed(anyhow::Error),
 }
 
-fn run_device(uid: &str, out: &Sender<SourceEvent>, stop: &AtomicBool) -> Result<()> {
-    supervise(uid, stop, REAPPEAR_POLL, || find_input(uid), |d| run_segment(d, uid, out, stop), |e| send(out, e))
+fn run_device(uid: &str, fallback: &Fallback, out: &Sender<SourceEvent>, stop: &AtomicBool) -> Result<()> {
+    supervise(uid, stop, REAPPEAR_POLL, fallback, find_input, |d, u| run_segment(d, u, out, stop), |e| send(out, e))
 }
 
 /// Keeps one device recording across disappearance and rate changes. A device that cannot
 /// be found or opened at the start fails the session; later it is waited for, and only the
-/// same UID is ever opened again: never a switch to another source (spec §4.1).
+/// same UID is opened again unless the person chooses another input while it is away: never a
+/// switch by itself (spec §4.1).
 fn supervise<D>(
     uid: &str,
     stop: &AtomicBool,
     poll: Duration,
-    mut find: impl FnMut() -> Result<Option<D>>,
-    mut segment: impl FnMut(&D) -> Result<Outcome>,
+    fallback: &Fallback,
+    mut find: impl FnMut(&str) -> Result<Option<D>>,
+    mut segment: impl FnMut(&D, &str) -> Result<Outcome>,
     mut event: impl FnMut(SourceEvent) -> Result<()>,
 ) -> Result<()> {
-    let mut device = find()?.with_context(|| format!("input {uid} not found; `lecturelive inputs` lists them"))?;
+    let mut current = uid.to_string();
+    let mut device = find(&current)?.with_context(|| format!("input {uid} not found; `lecturelive inputs` lists them"))?;
     let mut started = false;
     loop {
-        match segment(&device)? {
+        match segment(&device, &current)? {
             Outcome::Ended(SegmentEnd::Stopped) => return Ok(()),
             Outcome::Ended(SegmentEnd::Invalidated) => {
                 started = true; // same device, new configuration: rebuild at once
@@ -94,18 +113,26 @@ fn supervise<D>(
             Outcome::OpenFailed(e) if !started => return Err(e),
             Outcome::OpenFailed(_) => {} // listed but not usable yet: wait as if gone
         }
-        event(SourceEvent::DeviceGone { uid: uid.into() })?;
+        event(SourceEvent::DeviceGone { uid: current.clone() })?;
         device = loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
             std::thread::sleep(poll);
+            // Another input only when the person chose it. One that cannot be found is dropped, and the wait
+            // for the original goes on.
+            if let Some(other) = fallback.take() {
+                if let Ok(Some(d)) = find(&other) {
+                    current = other;
+                    break d;
+                }
+            }
             // A lookup error while the device is away means "not yet", not the end of the session.
-            if let Ok(Some(d)) = find() {
+            if let Ok(Some(d)) = find(&current) {
                 break d;
             }
         };
-        event(SourceEvent::DeviceBack { uid: uid.into() })?;
+        event(SourceEvent::DeviceBack { uid: current.clone() })?;
     }
 }
 
@@ -251,6 +278,14 @@ mod tests {
     /// sent and the devices it opened. Lookup script entries: Some(Ok(dev)), Some(Err) or None.
     fn drive(lookups: Vec<Result<Option<u32>>>, outcomes: Vec<Result<Outcome>>) -> (Result<()>, Vec<String>, Vec<u32>) {
         let mut lookups: VecDeque<_> = lookups.into();
+        let (r, events, opened) = drive_with(&Fallback::default(), |_| lookups.pop_front().unwrap_or(Ok(None)), outcomes);
+        let events = events.into_iter().map(|e| if e.starts_with("back") { "back".to_string() } else { e }).collect();
+        (r, events, opened.into_iter().map(|(d, _)| d).collect())
+    }
+
+    /// As `drive`, with lookups by UID and the fallback the person may choose; records `back <uid>` and each
+    /// device with the UID it was opened as.
+    fn drive_with(fallback: &Fallback, find: impl FnMut(&str) -> Result<Option<u32>>, outcomes: Vec<Result<Outcome>>) -> (Result<()>, Vec<String>, Vec<(u32, String)>) {
         let mut outcomes: VecDeque<_> = outcomes.into();
         let (mut events, mut opened) = (Vec::new(), Vec::new());
         let stop = AtomicBool::new(false);
@@ -258,21 +293,73 @@ mod tests {
             "Receiver_UID",
             &stop,
             Duration::ZERO,
-            || lookups.pop_front().unwrap_or(Ok(None)),
-            |d: &u32| {
-                opened.push(*d);
+            fallback,
+            find,
+            |d: &u32, uid: &str| {
+                opened.push((*d, uid.to_string()));
                 outcomes.pop_front().expect("no more scripted segments")
             },
             |e| {
                 events.push(match e {
                     SourceEvent::DeviceGone { .. } => "gone".to_string(),
-                    SourceEvent::DeviceBack { .. } => "back".to_string(),
+                    SourceEvent::DeviceBack { uid } => format!("back {uid}"),
                     other => format!("{other:?}"),
                 });
                 Ok(())
             },
         );
         (r, events, opened)
+    }
+
+    #[test]
+    fn while_a_gone_device_is_waited_for_the_person_may_choose_another_input() {
+        let fallback = Fallback::default();
+        let f = fallback.clone();
+        let mut polls = 0;
+        let (r, events, opened) = drive_with(
+            &fallback,
+            |uid| match uid {
+                "Receiver_UID" => {
+                    polls += 1;
+                    if polls == 3 {
+                        f.offer("BuiltInMicrophoneDevice"); // chosen while waiting
+                    }
+                    Ok(if polls == 1 { Some(7) } else { None })
+                }
+                "BuiltInMicrophoneDevice" => Ok(Some(9)),
+                other => panic!("looked for {other}"),
+            },
+            vec![Ok(Outcome::Ended(SegmentEnd::Gone)), Ok(Outcome::Ended(SegmentEnd::Stopped))],
+        );
+        r.unwrap();
+        assert_eq!(events, ["gone", "back BuiltInMicrophoneDevice"]);
+        assert_eq!(opened, [(7, "Receiver_UID".to_string()), (9, "BuiltInMicrophoneDevice".to_string())], "the chosen input records under its own UID");
+    }
+
+    /// Review Focus 3.
+    #[test]
+    fn a_fallback_that_cannot_be_found_keeps_the_wait_for_the_original() {
+        let fallback = Fallback::default();
+        let f = fallback.clone();
+        let mut polls = 0;
+        let (r, events, opened) = drive_with(
+            &fallback,
+            |uid| match uid {
+                "Receiver_UID" => {
+                    polls += 1;
+                    if polls == 2 {
+                        f.offer("Unplugged_UID");
+                    }
+                    Ok(if polls == 1 || polls == 4 { Some(7) } else { None })
+                }
+                "Unplugged_UID" => Ok(None),
+                other => panic!("looked for {other}"),
+            },
+            vec![Ok(Outcome::Ended(SegmentEnd::Gone)), Ok(Outcome::Ended(SegmentEnd::Stopped))],
+        );
+        r.unwrap();
+        assert_eq!(events, ["gone", "back Receiver_UID"]);
+        assert_eq!(opened.iter().map(|o| o.0).collect::<Vec<_>>(), [7, 7], "the original, when it returned");
     }
 
     fn open_failed() -> Result<Outcome> {
@@ -322,7 +409,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
-        let t = std::thread::spawn(move || Box::new(DeviceSource { uid: BLACKHOLE_UID.into() }).run(tx, s));
+        let t = std::thread::spawn(move || Box::new(DeviceSource { uid: BLACKHOLE_UID.into(), fallback: Fallback::default() }).run(tx, s));
         let mut events = vec![rx.blocking_recv().expect("the source sends Begin once audio arrives")];
         std::thread::sleep(Duration::from_secs(2)); // two seconds of audio, timed from the first sample
         stop.store(true, Ordering::Relaxed);

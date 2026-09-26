@@ -368,7 +368,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     // Spec §7: the course's saved window, revalidated by the worker as the lecture starts.
     let selection = Selections::load(&selections_path()?).ok().and_then(|s| s.get(&folder.course).cloned());
     let capture = CaptureSetup { source: Box::new(SystemWindows), selection, interval: Duration::from_secs(1), thresholds: Thresholds::default(), record: std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from) };
-    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid }), watch, Some(capture), cmd_rx, ev_tx);
+    let run = lecture::run(lec.clone(), cfg, Box::new(DeviceSource { uid, fallback: Default::default() }), watch, Some(capture), cmd_rx, ev_tx);
     *app.running.lock().expect("the running lock") = Some(Running { commands: cmd_tx, lecture: lec, stops: 0, _lock: lock });
     app.pump.lock().await.set_status(|s| s.phase = Phase::Running);
     // ⌘⇧2 captures the slide from anywhere, only while a lecture runs: it takes the keys from every other app.
