@@ -49,6 +49,7 @@ pub fn run() {
             app::capture_preview,
             app::capture_select,
             app::capture_watch,
+            app::capture_saved_region,
             app::capture_now,
             app::import_slides,
             app::open_screen_settings,

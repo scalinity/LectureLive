@@ -184,6 +184,11 @@ export class Session {
     return this.error === null;
   }
 
+  /** The region saved for this course, drawn on a new window's still; null when none is saved. */
+  async captureSavedRegion(): Promise<Region | null> {
+    return (await this.act<Region | null>("capture_saved_region")) ?? null;
+  }
+
   /** "Watch it": the window the strip asks about, through the course's saved region. */
   async captureWatch(id: number) {
     await this.act("capture_watch", { id });

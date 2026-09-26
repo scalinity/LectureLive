@@ -11,6 +11,7 @@
   import KeyDialog from "$lib/KeyDialog.svelte";
   import Notes from "$lib/Notes.svelte";
   import SlidesStrip from "$lib/SlidesStrip.svelte";
+  import WindowPicker from "$lib/WindowPicker.svelte";
   import SpendView from "$lib/SpendView.svelte";
   import StatusStrip from "$lib/StatusStrip.svelte";
   import Transcript from "$lib/Transcript.svelte";
@@ -29,8 +30,8 @@
 
   let keyDialog: KeyDialog;
   let spendView: SpendView;
-  /** The window and region picker (Task 9). */
-  let picker: { show: () => void } | undefined;
+  /** The window and region picker; from an ask it opens with the reason. */
+  let picker: WindowPicker;
 
   /** A check asked for by the environment (the app) or the URL (`?bench=burst`, the browser preview). */
   async function checkConfig(): Promise<CheckConfig | null> {
@@ -77,12 +78,13 @@
   <main class="panes">
     <Transcript />
     <Notes toUrl={(p) => current.assetUrl(p)} />
-    <SlidesStrip toUrl={(p) => current.assetUrl(p)} onChoose={() => picker?.show()} />
+    <SlidesStrip toUrl={(p) => current.assetUrl(p)} onChoose={() => picker.show(session.capture.state === "asking" ? session.capture.detail : null)} />
   </main>
   <CommandLine />
 </div>
 <KeyDialog bind:this={keyDialog} />
 <SpendView bind:this={spendView} />
+<WindowPicker bind:this={picker} toUrl={(p) => current.assetUrl(p)} />
 {#await started catch e}
   <p class="fatal" role="alert">The app could not reach its backend: {String(e)}</p>
 {/await}

@@ -436,6 +436,17 @@ fn watch_saved(path: &Path, course: &str, w: &WindowInfo) -> anyhow::Result<Sele
     save_selection(path, course, w, region)
 }
 
+/// The region saved for a course, so the picker can draw it on a new window's still.
+fn saved_region(path: &Path, course: &str) -> Option<Region> {
+    Selections::load(path).ok()?.get(course).map(|s| s.region)
+}
+
+#[tauri::command]
+pub fn capture_saved_region(app: State<'_, App>) -> Res<Option<Region>> {
+    let folder = app.folder().ok_or("Choose a lecture folder first.")?;
+    Ok(saved_region(&selections_path()?, &folder.course))
+}
+
 /// Before a lecture: the course's saved window, or none yet.
 fn ready_view(path: &Path, course: &str) -> CaptureView {
     match Selections::load(path).ok().and_then(|s| s.get(course).cloned()) {
@@ -718,5 +729,18 @@ mod tests {
         let sel = watch_saved(&path, "Machine Learning", &new).unwrap();
         assert_eq!((sel.region, sel.descriptor.width, sel.descriptor.height), (region, 1280, 800));
         assert!(watch_saved(&path, "Statistics", &new).is_err(), "a course with no saved window must choose one");
+    }
+
+    #[test]
+    fn the_picker_reads_the_course_s_saved_region() {
+        use lecturelive_core::capture::detect::Region;
+        use lecturelive_core::capture::window::WindowInfo;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.json");
+        assert_eq!(saved_region(&path, "Machine Learning"), None);
+        let w = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: None, title: "Zoom Meeting".into(), width: 1600, height: 900, on_screen: true };
+        let region = Region { x: 0.1, y: 0.2, w: 0.7, h: 0.6 };
+        save_selection(&path, "Machine Learning", &w, region).unwrap();
+        assert_eq!(saved_region(&path, "Machine Learning"), Some(region));
     }
 }
