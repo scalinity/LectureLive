@@ -52,6 +52,8 @@ struct Ui {
     events: u64,
     /// A stop the controller refused (a held key): UI-local, shown above the view's own notices.
     notice: Option<&'static str>,
+    /// The reading pane the frame shows in a tabbed column: the transcript until Task 10's keys move it.
+    focus: view::Pane,
     view: View,
 }
 
@@ -66,7 +68,7 @@ enum Act {
 
 impl Ui {
     fn new(view: View) -> Ui {
-        Ui { stop: StopController::default(), events: 0, notice: None, view }
+        Ui { stop: StopController::default(), events: 0, notice: None, focus: view::Pane::Transcript, view }
     }
 
     /// One stop request through the shared controller; the view's phase follows the stage it reached.
@@ -213,6 +215,8 @@ fn want_hydration(io: &Io, hydrating: &mut bool, again: &mut bool) {
 /// is the fence after which it never draws again.
 async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> Exit {
     let mut ui = Ui::new(view);
+    // Colour and glyphs are the terminal's for the whole session: read once, as the plain CLI reads them.
+    let theme = view::Theme::detect();
     let mut timer = secs.map(|s| started + Duration::from_secs(s));
     let mut clock = interval_at(started + Duration::from_secs(1), Duration::from_secs(1));
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -296,8 +300,8 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
             _ = sleep_until(drawn_at + FRAME), if dirty => {}
         }
         if dirty && Instant::now() >= drawn_at + FRAME {
-            let elapsed = started.elapsed();
-            if let Err(e) = terminal::draw(&mut io.screen, |f| view::render(f, &ui.view, elapsed, ui.notice)) {
+            let chrome = view::Chrome { elapsed: started.elapsed(), refused: ui.notice, focus: ui.focus, theme: &theme };
+            if let Err(e) = terminal::draw(&mut io.screen, |f| view::render(f, &ui.view, &chrome)) {
                 return Exit::DrawFailed(e);
             }
             (dirty, drawn_at) = (false, Instant::now());

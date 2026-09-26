@@ -1,0 +1,8 @@
+" ● Stop waiting  0:42:18                "
+" Too small for the lecture view (40×8). "
+" 60×16 needed. Recording goes on.       "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+" ^L redraw   ^C quit at once            "

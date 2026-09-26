@@ -1,26 +1,28 @@
-//! The Task-6 view: Task 5's minimal screen grown a live header row, enough to prove the session
-//! view is real — the phase, the clock, the course, the input and its level, the connection's words,
-//! the gaps waiting, the spend sample, the current notice. Task 7's responsive frame replaces it
-//! (plan §K): no layout ladder, panes, theme or goldens live here yet. Modifiers only (no colour
-//! yet), no borders; the phase row and the keys row win when the terminal is tiny.
+//! The responsive frame (M7 plan §H): one pure [`layout`] of `frame.area()` on every draw into a
+//! ladder of five shapes — wide, normal, stacked, narrow, too small — and the chrome drawn into it:
+//! the two header rows, the pane headings and tabs, the rules, the notice line, the prompt line and
+//! the keys. Border depth 0: one `│` between columns and dim `─` rules. The panes themselves hold
+//! placeholders until Tasks 8, 9 and 11 fill them.
+//!
+//! Tokens (plan §H): ink and paper are the terminal's own colours, never set; graphite is `DIM`;
+//! teal and signal are truecolour when the terminal says so, else ANSI cyan and red, and nothing at
+//! all under `NO_COLOR`, where words, glyphs, bold, dim and reverse still carry every meaning.
+//! Chrome glyphs fall back to ASCII when the locale is not UTF-8; lecture text never changes.
 
 use std::time::Duration;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
 use lecturelive_core::audio::level::dbfs;
 use lecturelive_core::session::coordinator::SttStatus;
-use lecturelive_core::session::spend;
+use lecturelive_core::session::spend::{self, Paint};
 
 use crate::stop::Stage;
 
 use super::state::View;
-
-const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 pub(crate) const SUSPEND: &str = "Suspending would stop the recording. Stop the lecture first (Ctrl-C).";
 
@@ -32,6 +34,233 @@ pub(crate) fn not_yet(stage: Stage) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Layout: pure, from the area alone.
+
+/// The smallest terminal the lecture view is drawn in; below it, the safety view.
+pub(crate) const MIN_WIDTH: u16 = 60;
+pub(crate) const MIN_HEIGHT: u16 = 16;
+/// The wide shape's slides column.
+const SLIDES_WIDTH: u16 = 28;
+/// Between two columns: a space, the `│`, a space.
+const GAP: u16 = 3;
+
+/// The layout ladder (plan §H), chosen from the terminal's size alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Variant {
+    /// ≥132 × ≥28: transcript, notes and slides side by side.
+    Wide,
+    /// ≥100 × ≥20: transcript and slides tabbed on the left, notes on the right.
+    Normal,
+    /// 60–99 × ≥36: transcript and slides tabbed above, notes below — a half-screen window.
+    Stacked,
+    /// 60–99 × 16–35, and ≥100 × 16–19: one pane at a time, tabbed.
+    Narrow,
+    /// <60 or <16: the safety view.
+    TooSmall,
+}
+
+pub(crate) fn variant(width: u16, height: u16) -> Variant {
+    if width < MIN_WIDTH || height < MIN_HEIGHT {
+        Variant::TooSmall
+    } else if width >= 132 && height >= 28 {
+        Variant::Wide
+    } else if width >= 100 && height >= 20 {
+        Variant::Normal
+    } else if height >= 36 {
+        Variant::Stacked // width is 60–99 here: 100 and over at this height is normal
+    } else {
+        Variant::Narrow
+    }
+}
+
+/// A reading pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pane {
+    Transcript,
+    Notes,
+    Slides,
+}
+
+/// One column of the body: its heading row, its body, and the panes it can show — tabs when there
+/// is more than one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Column {
+    pub(crate) heading: Rect,
+    pub(crate) body: Rect,
+    pub(crate) tabs: &'static [Pane],
+    /// Its heading is drawn as a rule (stacked's notes): the heading divides the two panes.
+    pub(crate) ruled: bool,
+}
+
+impl Column {
+    /// The pane this column shows: the focused one if it is among its tabs, else its first.
+    pub(crate) fn shown(&self, focus: Pane) -> Pane {
+        if self.tabs.contains(&focus) {
+            focus
+        } else {
+            self.tabs[0]
+        }
+    }
+}
+
+/// Every rectangle of one frame. Nothing outside this decides where anything is drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub(crate) variant: Variant,
+    pub(crate) area: Rect,
+    pub(crate) header: [Rect; 2],
+    /// Full-width dim rules (wide and normal: under the header and above the notice).
+    pub(crate) rules: Vec<Rect>,
+    pub(crate) columns: Vec<Column>,
+    /// One-cell-wide vertical rules between columns, heading row and body.
+    pub(crate) separators: Vec<Rect>,
+    pub(crate) notice: Rect,
+    pub(crate) prompt: Rect,
+    pub(crate) keys: Rect,
+}
+
+impl Layout {
+    /// Rows that are not a pane's body: the chrome the clutter budget counts (plan §H).
+    #[cfg(test)]
+    pub(crate) fn chrome_rows(&self) -> u16 {
+        let mut rows: Vec<u16> = self.columns.iter().flat_map(|c| c.body.rows().map(|r| r.y)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        self.area.height - rows.len() as u16
+    }
+}
+
+/// The frame's rectangles for `area` (plan §H). A one-cell gutter left and right; rows from the top:
+/// the two header rows, a rule (wide and normal), the heading or tab row, the body, a rule (wide and
+/// normal), the notice, the prompt, the keys. Stacked divides its body with the notes heading
+/// instead of rules, and narrow has none.
+pub(crate) fn layout(area: Rect) -> Layout {
+    let variant = variant(area.width, area.height);
+    let mut l = Layout { variant, area, header: [Rect::default(); 2], rules: Vec::new(), columns: Vec::new(), separators: Vec::new(), notice: Rect::default(), prompt: Rect::default(), keys: Rect::default() };
+    if variant == Variant::TooSmall {
+        return l;
+    }
+    let (x, w, h) = (area.x + 1, area.width - 2, area.height);
+    let row = |y: u16| Rect::new(x, area.y + y, w, 1);
+    l.header = [row(0), row(1)];
+    l.notice = row(h - 3);
+    l.prompt = row(h - 2);
+    l.keys = row(h - 1);
+    let ruled = matches!(variant, Variant::Wide | Variant::Normal);
+    let (heading, end) = if ruled {
+        l.rules = vec![row(2), row(h - 4)];
+        (3, h - 4)
+    } else {
+        (2, h - 3)
+    };
+    let (body_y, body_h) = (area.y + heading + 1, end - heading - 1);
+    let column = |x: u16, w: u16, tabs: &'static [Pane]| Column { heading: Rect::new(x, area.y + heading, w, 1), body: Rect::new(x, body_y, w, body_h), tabs, ruled: false };
+    let separator = |x: u16| Rect::new(x, area.y + heading, 1, body_h + 1);
+    match variant {
+        Variant::Wide => {
+            let rest = w - SLIDES_WIDTH - 2 * GAP;
+            let (t, n) = (rest * 2 / 5, rest - rest * 2 / 5);
+            let (xn, xs) = (x + t + GAP, x + t + GAP + n + GAP);
+            l.columns = vec![column(x, t, &[Pane::Transcript]), column(xn, n, &[Pane::Notes]), column(xs, SLIDES_WIDTH, &[Pane::Slides])];
+            l.separators = vec![separator(xn - 2), separator(xs - 2)];
+        }
+        Variant::Normal => {
+            let left = (w - GAP) * 2 / 5;
+            let xn = x + left + GAP;
+            l.columns = vec![column(x, left, &[Pane::Transcript, Pane::Slides]), column(xn, w - GAP - left, &[Pane::Notes])];
+            l.separators = vec![separator(xn - 2)];
+        }
+        Variant::Stacked => {
+            let top = (body_h - 1) * 2 / 5;
+            l.columns = vec![
+                Column { heading: row(heading), body: Rect::new(x, body_y, w, top), tabs: &[Pane::Transcript, Pane::Slides], ruled: false },
+                Column { heading: Rect::new(x, body_y + top, w, 1), body: Rect::new(x, body_y + top + 1, w, body_h - top - 1), tabs: &[Pane::Notes], ruled: true },
+            ];
+        }
+        Variant::Narrow => l.columns = vec![column(x, w, &[Pane::Transcript, Pane::Notes, Pane::Slides])],
+        Variant::TooSmall => unreachable!("returned above"),
+    }
+    l
+}
+
+// ---------------------------------------------------------------------------------------------
+// Theme and glyphs.
+
+/// The chrome's characters: Unicode where the locale is UTF-8, ASCII otherwise.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Glyphs {
+    dot: &'static str,
+    warn: &'static str,
+    notes: &'static str,
+    slide: &'static str,
+    page: &'static str,
+    done: &'static str,
+    ellipsis: &'static str,
+    rule: &'static str,
+    bar: &'static str,
+    times: &'static str,
+    chevron: &'static str,
+    meter_on: &'static str,
+    meter_off: &'static str,
+}
+
+const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□" };
+const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-" };
+
+/// Whether the effective locale is UTF-8: the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set
+/// and not empty decides, as the C library's own lookup does.
+pub(crate) fn utf8_locale(lc_all: Option<&str>, lc_ctype: Option<&str>, lang: Option<&str>) -> bool {
+    [lc_all, lc_ctype, lang].into_iter().flatten().find(|v| !v.is_empty()).is_some_and(|v| {
+        let v = v.to_ascii_uppercase();
+        v.contains("UTF-8") || v.contains("UTF8")
+    })
+}
+
+/// The frame's semantic styles and glyphs (plan §H tokens).
+#[derive(Debug)]
+pub(crate) struct Theme {
+    paint: Paint,
+    glyphs: &'static Glyphs,
+}
+
+const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
+const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+const INK: Style = Style::new();
+
+impl Theme {
+    /// Colour as the plain CLI decides it (`NO_COLOR`, `COLORTERM`), glyphs from the locale.
+    pub(crate) fn detect() -> Theme {
+        let var = |k: &str| std::env::var(k).ok();
+        Theme::new(crate::plain::paint(), utf8_locale(var("LC_ALL").as_deref(), var("LC_CTYPE").as_deref(), var("LANG").as_deref()))
+    }
+
+    pub(crate) fn new(paint: Paint, unicode: bool) -> Theme {
+        Theme { paint, glyphs: if unicode { &UNICODE } else { &ASCII } }
+    }
+
+    fn colour(&self, rgb: (u8, u8, u8), ansi: Color) -> Style {
+        match (self.paint.color, self.paint.truecolor) {
+            (false, _) => INK,
+            (true, true) => INK.fg(Color::Rgb(rgb.0, rgb.1, rgb.2)),
+            (true, false) => INK.fg(ansi),
+        }
+    }
+
+    /// Live and focus: the selected pane or tab, the marks of good news.
+    fn teal(&self) -> Style {
+        self.colour((93, 184, 192), Color::Cyan)
+    }
+
+    /// Recording and attention: the recording dot, a failure, a gap waiting.
+    fn signal(&self) -> Style {
+        self.colour((242, 118, 107), Color::Red)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Words.
+
 /// The stage as one word or phrase. Stop waiting is reversed: the next Ctrl-C ends the process at once.
 fn phase(stage: Stage) -> Span<'static> {
     match stage {
@@ -41,109 +270,303 @@ fn phase(stage: Stage) -> Span<'static> {
     }
 }
 
-/// What the stage means for the lecture (plan §G's words).
-fn meaning(stage: Stage) -> &'static str {
+/// What a stopping stage means for the lecture (plan §G's words), in the header's first row.
+fn meaning(stage: Stage) -> Option<&'static str> {
     match stage {
-        Stage::Listening => "Recording the lecture.",
-        Stage::Stopping => "Finishing the transcript and recovery, then a last snapshot.",
-        Stage::StopWaiting => "No longer waiting for recovery or queued requests; they wait for the next session. What is running now, and the last snapshot, still finish.",
+        Stage::Listening => None,
+        Stage::Stopping => Some("finishing the transcript and recovery, then a last snapshot"),
+        Stage::StopWaiting => Some("no longer waiting for recovery or queued requests; what runs now and the last snapshot still finish"),
     }
 }
 
-fn keys(stage: Stage) -> &'static str {
+/// The keys this build acts on, in footer order: `^C` sits last, where it stays as later tasks add
+/// keys before it. The footer is generated from this table, so it cannot offer what does nothing.
+const KEYS: [(&str, fn(Stage) -> &'static str); 2] = [("^L", redraw), ("^C", stop_key)];
+
+fn redraw(_: Stage) -> &'static str {
+    "redraw"
+}
+
+fn stop_key(stage: Stage) -> &'static str {
     match stage {
-        Stage::Listening => "^C stop   ^L redraw",
-        Stage::Stopping => "^C stop waiting   ^L redraw",
-        Stage::StopWaiting => "^C quit at once   ^L redraw",
+        Stage::Listening => "stop",
+        Stage::Stopping => "stop waiting",
+        Stage::StopWaiting => "quit at once",
     }
 }
+
+/// Typing does nothing yet (the hint line is Task 10's), and the line says so rather than offering it.
+const PROMPT: &str = "hints and snapshots are not taken here yet";
 
 fn clock(elapsed: Duration) -> String {
     let s = elapsed.as_secs();
     format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// The connection's words, as the desktop says them (plan §F): the typed state in a few words,
-/// never parsed back.
-fn stt_words(s: &SttStatus) -> String {
-    match s {
-        SttStatus::Connected => "transcribing".into(),
-        SttStatus::Retrying { after, reason } => format!("reconnecting in {} s ({reason})", after.as_secs()),
-        SttStatus::Refused(m) => format!("refused: {m}"),
-        SttStatus::ServerError(m) => format!("server: {m}"),
-        SttStatus::Stopped(m) => format!("stopped: {m}"),
-    }
+fn width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
 }
 
-/// One notice as the notice line shows it: its mark, what it is, what happened — the plain CLI's own
-/// characters, already cleaned at the projection's boundary.
-fn notice_line(kind: &str, label: &str, detail: &str) -> String {
-    let mark = match kind {
-        "notes" => "◆",
-        "slide" => "▣",
-        "page" => "✦",
-        "done" => "✓",
-        "dim" => "…",
-        _ => "▲",
-    };
-    format!("{mark} {label}  {detail}")
-}
-
-fn dim(text: String) -> Line<'static> {
-    Line::from(vec![Span::raw(" "), Span::styled(text, DIM)])
-}
-
-/// The header's live row (plan §H's second row, restrained): the input, its level or the silence
-/// warning, the connection, the gaps waiting, the spend so far.
-fn live_row(v: &View) -> Line<'static> {
-    let mut spans = vec![Span::raw(" "), Span::raw(v.identity.input.clone())];
-    match (v.level, v.silence) {
-        (_, true) => spans.extend([Span::raw("  "), Span::styled("no signal", BOLD)]),
-        (Some(l), false) => spans.extend([Span::raw("  "), Span::styled(format!("{} {:.0} dB", spend::bar((l.clamp(0.0, 1.0)) as f64, 4), dbfs(l)), DIM)]),
-        (None, false) => {}
+/// `text` cut to `max` cells with the ellipsis, when it does not fit.
+fn fit(text: &str, max: usize, ellipsis: &str) -> String {
+    if Span::raw(text).width() <= max {
+        return text.to_string();
     }
-    if let Some(s) = &v.stt {
-        spans.extend([Span::raw("  "), Span::styled(stt_words(s), DIM)]);
-    }
-    spans.extend([Span::raw("  "), Span::styled(format!("{} gap{}", v.gaps(), if v.gaps() == 1 { "" } else { "s" }), DIM)]);
-    if let Some(usd) = v.spend {
-        spans.extend([Span::raw("  "), Span::styled(format!("{} today", spend::money(usd)), DIM)]);
-    }
-    Line::from(spans)
-}
-
-pub(crate) fn render(frame: &mut Frame, v: &View, elapsed: Duration, refused: Option<&str>) {
-    let rows: Vec<Rect> = frame.area().rows().collect();
-    let h = rows.len();
-    // Keys on the last row from 2 rows up, the notice above them from 4; the top rows take what is left.
-    let bottom = match h {
-        0..=1 => 0,
-        2..=3 => 1,
-        _ => 2,
-    };
-    let header = Line::from(vec![
-        Span::raw(" "),
-        phase(v.phase),
-        Span::raw("  "),
-        Span::raw(clock(elapsed)),
-        Span::raw("  "),
-        Span::styled(format!("{} › {}", v.identity.course, v.identity.lecture), DIM),
-    ]);
-    for (line, row) in [header, live_row(v), dim(meaning(v.phase).into())].into_iter().zip(&rows[..h - bottom]) {
-        frame.render_widget(line, *row);
-    }
-    if bottom >= 1 {
-        frame.render_widget(dim(keys(v.phase).into()), rows[h - 1]);
-    }
-    if bottom == 2 {
-        // A refused stop first — it is about the keys just below it — else the view's current notice.
-        let text = match refused {
-            Some(n) => format!(" {n}"),
-            None => v.notice.as_ref().map(|n| format!(" {}", notice_line(n.kind, &n.label, &n.detail))).unwrap_or_default(),
-        };
-        if !text.is_empty() {
-            frame.render_widget(Line::from(Span::raw(text)), rows[h - 2]);
+    let room = max.saturating_sub(Span::raw(ellipsis).width());
+    let (mut out, mut used) = (String::new(), 0);
+    let mut buf = [0u8; 4];
+    for c in text.chars() {
+        let w = Span::raw(&*c.encode_utf8(&mut buf)).width();
+        if used + w > room {
+            break;
         }
+        out.push(c);
+        used += w;
+    }
+    if max >= Span::raw(ellipsis).width() {
+        out.push_str(ellipsis);
+    }
+    out
+}
+
+/// Spans cut to `max` cells: the first span that overflows ends, with the ellipsis, and nothing after it is drawn.
+fn clip(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for s in spans {
+        if used + s.width() <= max {
+            used += s.width();
+            out.push(s);
+        } else {
+            out.push(Span::styled(fit(&s.content, max - used, ellipsis), s.style));
+            break;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drawing.
+
+/// What the frame shows besides the session view: the reactor's clock and refused-stop notice, the
+/// focused pane, the theme.
+pub(crate) struct Chrome<'a> {
+    pub(crate) elapsed: Duration,
+    pub(crate) refused: Option<&'a str>,
+    pub(crate) focus: Pane,
+    pub(crate) theme: &'a Theme,
+}
+
+pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) {
+    let l = layout(frame.area());
+    if l.variant == Variant::TooSmall {
+        return too_small(frame, v, c);
+    }
+    let g = c.theme.glyphs;
+    frame.render_widget(Line::from(first_row(v, c, l.header[0].width as usize)), l.header[0]);
+    frame.render_widget(Line::from(clock(c.elapsed)).right_aligned(), l.header[0]);
+    let (left, right) = second_row(v, c.theme, l.header[1].width as usize);
+    frame.render_widget(Line::from(left), l.header[1]);
+    if let Some(right) = right {
+        frame.render_widget(Line::from(right).right_aligned(), l.header[1]);
+    }
+    for r in &l.rules {
+        frame.render_widget(Span::styled(g.rule.repeat(r.width as usize), DIM), *r);
+    }
+    for s in &l.separators {
+        for row in s.rows() {
+            frame.render_widget(Span::styled(g.bar, DIM), row);
+        }
+    }
+    for col in &l.columns {
+        frame.render_widget(Line::from(heading(col, v, c)), col.heading);
+        if col.body.height > 0 {
+            let text = match col.shown(c.focus) {
+                Pane::Transcript => "The transcript shows here.",
+                Pane::Notes => "The notes show here.",
+                Pane::Slides => "Slides show here.",
+            };
+            frame.render_widget(Span::styled(fit(text, col.body.width as usize, g.ellipsis), DIM), Rect { height: 1, ..col.body });
+        }
+    }
+    frame.render_widget(Line::from(notice(v, c, l.notice.width as usize)), l.notice);
+    frame.render_widget(Line::from(vec![Span::styled(g.notes, c.theme.teal()), Span::raw(" "), Span::styled(PROMPT, DIM)]), l.prompt);
+    frame.render_widget(Line::from(keys(v.phase, c.theme)), l.keys);
+}
+
+/// Header row 1: the recording dot, the phase, then the course and lecture — or, while stopping,
+/// what the stage is doing — cut to what is left beside the clock (drawn right-aligned over it).
+/// The dot is red only while recording; stopping, it is dim, and the word says the rest.
+fn first_row(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
+    let g = c.theme.glyphs;
+    let dot = if v.phase == Stage::Listening { c.theme.signal() } else { DIM };
+    let mut spans = vec![Span::styled(g.dot, dot), Span::raw(" "), phase(v.phase)];
+    let middle = match meaning(v.phase) {
+        Some(m) => m.to_string(),
+        None => format!("{} {} {}", v.identity.course, g.chevron, v.identity.lecture),
+    };
+    let room = max.saturating_sub(width(&spans) + 3 + 2 + clock(c.elapsed).len());
+    if room >= 8 {
+        spans.extend([Span::raw("   "), Span::styled(fit(&middle, room, g.ellipsis), DIM)]);
+    }
+    spans
+}
+
+/// Header row 2: the input and its health, the connection, the gaps waiting — and the spend, drawn
+/// at the right. As the row narrows (plan §H): the spend goes, then the input's name, then the
+/// connection's words shorten. The health, the connection's state and the gap count never go.
+fn second_row(v: &View, t: &Theme, max: usize) -> (Vec<Span<'static>>, Option<Vec<Span<'static>>>) {
+    let g = t.glyphs;
+    let health: Vec<Span<'static>> = match (&v.input_gone, v.silence, v.level) {
+        (Some(_), _, _) => vec![Span::styled(format!("{} input gone", g.warn), t.signal().add_modifier(Modifier::BOLD))],
+        (None, true, _) => vec![Span::styled("no signal", t.signal().add_modifier(Modifier::BOLD))],
+        (None, false, Some(l)) => {
+            let on = (((dbfs(l) + 60.0) / 60.0 * 8.0).round().clamp(0.0, 8.0)) as usize;
+            vec![Span::raw(g.meter_on.repeat(on)), Span::styled(g.meter_off.repeat(8 - on), DIM)]
+        }
+        (None, false, None) => Vec::new(),
+    };
+    let (full, short) = match &v.stt {
+        None => (Span::styled("connecting", DIM), Span::styled(format!("STT {}", g.ellipsis), DIM)),
+        Some(SttStatus::Connected) => (Span::styled("transcribing", DIM), Span::styled("STT ok", DIM)),
+        Some(s) => {
+            let words = match s {
+                SttStatus::Retrying { after, reason } => format!("reconnecting in {} s ({reason})", after.as_secs()),
+                SttStatus::Refused(m) => format!("refused: {m}"),
+                SttStatus::ServerError(m) => format!("server: {m}"),
+                SttStatus::Stopped(m) => format!("stopped: {m}"),
+                SttStatus::Connected => unreachable!("matched above"),
+            };
+            (Span::styled(words, t.signal()), Span::styled(format!("STT {}", g.warn), t.signal()))
+        }
+    };
+    let n = v.gaps();
+    let gaps = Span::styled(format!("{n} gap{}", if n == 1 { "" } else { "s" }), if n > 0 { t.signal() } else { DIM });
+    let spend = v.spend.map(|usd| vec![Span::styled(format!("{} today", spend::money(usd)), DIM)]);
+    let row = |name: bool, stt: &Span<'static>| {
+        let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
+        if name {
+            parts.push(vec![Span::raw(v.identity.input.clone())]);
+        }
+        if !health.is_empty() {
+            parts.push(health.clone());
+        }
+        parts.push(vec![stt.clone()]);
+        parts.push(vec![gaps.clone()]);
+        let mut spans = Vec::new();
+        for (i, p) in parts.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.extend(p);
+        }
+        spans
+    };
+    let fits = |s: &[Span], right: usize| width(s) + if right > 0 { right + 2 } else { 0 } <= max;
+    let left = row(true, &full);
+    if let Some(r) = &spend {
+        if fits(&left, width(r)) {
+            return (left, spend);
+        }
+    }
+    for candidate in [left, row(false, &full)] {
+        if fits(&candidate, 0) {
+            return (candidate, None);
+        }
+    }
+    (clip(row(false, &short), max, g.ellipsis), None)
+}
+
+/// A column's heading: the pane's name, or its tabs with the one shown bold in teal and the others
+/// dim. Slides carry their count once there is one. Stacked's notes heading is a rule with its name in it.
+fn heading(col: &Column, v: &View, c: &Chrome) -> Vec<Span<'static>> {
+    let t = c.theme;
+    let name = |p: Pane| match p {
+        Pane::Transcript => "Transcript".to_string(),
+        Pane::Notes => "Notes".to_string(),
+        Pane::Slides if v.slides.is_empty() => "Slides".to_string(),
+        Pane::Slides => format!("Slides {}", v.slides.len()),
+    };
+    let shown = col.shown(c.focus);
+    let style = |p: Pane| match (p == shown, p == c.focus, col.tabs.len() > 1) {
+        (true, true, _) => t.teal().add_modifier(Modifier::BOLD),
+        (true, false, true) => BOLD,
+        (true, false, false) => INK,
+        (false, _, _) => DIM,
+    };
+    let mut spans = Vec::new();
+    if col.ruled {
+        spans.push(Span::styled(format!("{}{} ", t.glyphs.rule, t.glyphs.rule), DIM));
+    }
+    for (i, &p) in col.tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(name(p), style(p)));
+    }
+    if col.ruled {
+        let rest = (col.heading.width as usize).saturating_sub(width(&spans) + 1);
+        spans.push(Span::styled(format!(" {}", t.glyphs.rule.repeat(rest)), DIM));
+    }
+    spans
+}
+
+/// The notice line: a refused stop first — it is about the keys just below — else the view's
+/// current notice, its mark red for a warning and teal otherwise, its label bold. One line, cut to
+/// fit; it never moves anything else.
+fn notice(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
+    let (t, g) = (c.theme, c.theme.glyphs);
+    let spans = if let Some(r) = c.refused {
+        vec![Span::raw(r.to_string())]
+    } else if let Some(n) = &v.notice {
+        let (mark, style) = match n.kind {
+            "notes" => (g.notes, t.teal()),
+            "slide" => (g.slide, t.teal()),
+            "page" => (g.page, t.teal()),
+            "done" => (g.done, t.teal()),
+            "dim" => (g.ellipsis, DIM),
+            _ => (g.warn, t.signal()),
+        };
+        vec![Span::styled(mark, style), Span::raw(" "), Span::styled(n.label.clone(), BOLD), Span::raw("  "), Span::raw(n.detail.clone())]
+    } else {
+        Vec::new()
+    };
+    clip(spans, max, g.ellipsis)
+}
+
+fn keys(stage: Stage, t: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (chord, action)) in KEYS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let style = if stage == Stage::StopWaiting && *chord == "^C" { t.signal() } else { DIM };
+        spans.extend([Span::styled(*chord, BOLD), Span::raw(" "), Span::styled(action(stage), style)]);
+    }
+    spans
+}
+
+/// The safety view below 60×16: the phase and the clock first, so it is plain the lecture goes on,
+/// then why nothing else is drawn and what size is needed, then the keys on the last row. Rows go
+/// in that priority when even this does not fit; every line is clipped to the cells there are.
+fn too_small(frame: &mut Frame, v: &View, c: &Chrome) {
+    let area = frame.area();
+    let (t, g) = (c.theme, c.theme.glyphs);
+    let head = Line::from(vec![Span::raw(" "), Span::styled(g.dot, if v.phase == Stage::Listening { t.signal() } else { DIM }), Span::raw(" "), phase(v.phase), Span::raw("  "), Span::raw(clock(c.elapsed))]);
+    let mut keys_line = vec![Span::raw(" ")];
+    keys_line.extend(keys(v.phase, t));
+    let middle = [
+        Some(Line::from(format!(" Too small for the lecture view ({}{}{}).", area.width, g.times, area.height))),
+        Some(Line::from(format!(" {MIN_WIDTH}{}{MIN_HEIGHT} needed. Recording goes on.", g.times))),
+        c.refused.map(|r| Line::from(format!(" {r}"))),
+    ];
+    let rows: Vec<Rect> = area.rows().collect();
+    let Some((&first, rest)) = rows.split_first() else { return };
+    frame.render_widget(head, first);
+    let Some((&last, between)) = rest.split_last() else { return };
+    frame.render_widget(Line::from(keys_line), last);
+    for (line, row) in middle.into_iter().flatten().zip(between) {
+        frame.render_widget(line, *row);
     }
 }
 
@@ -153,9 +576,22 @@ mod tests {
     use crate::plain;
     use crate::tui::hydrate::Hydration;
     use crate::tui::state::{Identity, SourceKind};
+    use chrono::Local;
+    use lecturelive_core::session::coordinator::Notification;
+    use lecturelive_core::session::lecture::Event;
+    use lecturelive_core::session::sidecar::{Gap, GapKind};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
+
+    const TRUE: Paint = Paint { color: true, truecolor: true };
+    const ANSI: Paint = Paint { color: true, truecolor: false };
+    const OFF: Paint = Paint { color: false, truecolor: false };
+    const TEAL: Color = Color::Rgb(93, 184, 192);
+    const SIGNAL: Color = Color::Rgb(242, 118, 107);
+
+    /// The golden sizes (plan §J), with the person's own Terminal window, 127×36, measured in Task 5.
+    const SIZES: [(u16, u16); 7] = [(140, 40), (110, 32), (80, 24), (72, 45), (60, 16), (40, 8), (127, 36)];
 
     fn identity() -> Identity {
         Identity { course: "Machine Learning".into(), lecture: "Week 03 — Optimisation".into(), input: "BlackHole 2ch".into(), kind: SourceKind::Loopback, notes_file: "lecture_notes_20260926.md".into(), transcript_file: "lecture_transcript_20260926.txt".into() }
@@ -166,103 +602,390 @@ mod tests {
         v.phase = stage;
         v.level = Some(0.05);
         v.stt = Some(SttStatus::Connected);
-        v.spend = Some(0.0);
+        v.spend = Some(0.18);
         v
     }
 
-    fn drawn(width: u16, height: u16, v: &View, refused: Option<&str>) -> Buffer {
+    fn gap(v: &mut View, start: u64) {
+        v.reduce(&Event::Session(Notification::Gap(Gap::new(Default::default(), start, None, GapKind::SttOffline))), Local::now());
+    }
+
+    fn drawn_with(width: u16, height: u16, v: &View, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| render(f, v, Duration::from_secs(3725), refused)).unwrap();
-        terminal.backend().buffer().clone()
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus: Pane::Transcript, theme };
+        terminal.draw(|f| render(f, v, &chrome)).unwrap();
+        terminal
+    }
+
+    fn drawn(width: u16, height: u16, v: &View, refused: Option<&str>) -> Buffer {
+        drawn_with(width, height, v, refused, &Theme::new(TRUE, true)).backend().buffer().clone()
     }
 
     fn lines(b: &Buffer) -> Vec<String> {
         (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect()
     }
 
-    /// The header proves the projection live: the phase and the clock, then the input, its level,
-    /// the connection's words, the gaps waiting and the spend sample.
-    #[test]
-    fn renders_the_projection_at_a_normal_size() {
-        let v = view(Stage::Listening);
-        let l = lines(&drawn(110, 24, &v, None));
-        assert_eq!(l[0], " Listening  1:02:05  Machine Learning › Week 03 — Optimisation");
-        assert_eq!(l[1], format!(" BlackHole 2ch  {} -26 dB  transcribing  0 gaps  $0.00 today", spend::bar(0.05, 4)));
-        assert_eq!(l[2], " Recording the lecture.");
-        assert_eq!(l[23], " ^C stop   ^L redraw");
-        assert!(l[3..22].iter().all(String::is_empty), "{l:#?}");
+    /// The cell where `text` starts on row `y`.
+    fn at(b: &Buffer, y: u16, text: &str) -> (u16, u16) {
+        let row: Vec<&str> = (0..b.area.width).map(|x| b[(x, y)].symbol()).collect();
+        let first = text.chars().next().unwrap().to_string();
+        let x = (0..row.len()).find(|&x| row[x] == first && row[x..].concat().starts_with(text)).unwrap_or_else(|| panic!("{text:?} not on row {y}: {:?}", row.concat()));
+        (x as u16, y)
     }
 
-    /// The live row follows the latest values: silence outranks the meter, a reconnect replaces the
-    /// words, a gap count over one is marked red later (Task 7); here, only the truth of it.
+    // ---- layout ---------------------------------------------------------------------------
+
+    /// Plan §H's ladder at its edges, and the person's measured Terminal window.
     #[test]
-    fn the_live_row_shows_the_latest_telemetry() {
-        let mut v = view(Stage::Listening);
-        v.silence = true;
-        assert!(lines(&drawn(110, 24, &v, None))[1].contains("no signal"), "silence outranks the meter");
-        v.silence = false;
-        v.stt = Some(SttStatus::Retrying { after: Duration::from_secs(1), reason: "socket closed".into() });
-        let row = lines(&drawn(110, 24, &v, None))[1].clone();
-        assert!(row.contains("reconnecting in 1 s (socket closed)"), "{row}");
-        let gap = lecturelive_core::session::sidecar::Gap::new(Default::default(), 0, None, lecturelive_core::session::sidecar::GapKind::SttOffline);
-        v.reduce(&lecturelive_core::session::lecture::Event::Session(lecturelive_core::session::coordinator::Notification::Gap(gap)), chrono::Local::now());
-        v.notice = None;
-        assert!(lines(&drawn(110, 24, &v, None))[1].contains("1 gap"), "the singular count");
-        v.level = None;
-        v.stt = None;
-        v.spend = None;
-        assert_eq!(lines(&drawn(110, 24, &v, None))[1], " BlackHole 2ch  1 gap", "absent values are not faked");
+    fn the_ladder_turns_at_its_breakpoints() {
+        for ((w, h), want) in [
+            ((132, 28), Variant::Wide),
+            ((131, 28), Variant::Normal),
+            ((132, 27), Variant::Normal),
+            ((100, 20), Variant::Normal),
+            ((99, 36), Variant::Stacked),
+            ((99, 35), Variant::Narrow),
+            ((60, 36), Variant::Stacked),
+            ((60, 16), Variant::Narrow),
+            ((59, 16), Variant::TooSmall),
+            ((60, 15), Variant::TooSmall),
+            ((127, 36), Variant::Normal),
+            ((300, 100), Variant::Wide),
+            ((100, 36), Variant::Normal),
+            ((100, 19), Variant::Narrow),
+            ((200, 16), Variant::Narrow),
+            ((80, 24), Variant::Narrow),
+            ((72, 45), Variant::Stacked),
+            ((0, 0), Variant::TooSmall),
+        ] {
+            assert_eq!(variant(w, h), want, "{w}×{h}");
+            assert_eq!(layout(Rect::new(0, 0, w, h)).variant, want, "{w}×{h}");
+        }
     }
 
-    /// The current notice sits above the keys, in the plain CLI's characters; a refused stop outranks
-    /// it, being about the keys themselves.
+    /// The Task-5 measurement: 127×36 is normal, transcript and slides tabbed left, notes right.
     #[test]
-    fn the_notice_line_sits_above_the_keys() {
-        let mut v = view(Stage::Listening);
-        v.notice = Some(plain::input_gone("Receiver_UID"));
-        let l = lines(&drawn(110, 24, &v, None));
-        assert_eq!(l[22], " ▲ input gone  Receiver_UID; waiting for it to return, and nothing switches by itself");
-        let l = lines(&drawn(110, 24, &v, Some(SUSPEND)));
-        assert_eq!(l[22], format!(" {SUSPEND}"), "a refused stop outranks the notice");
-        let l = lines(&drawn(110, 3, &v, Some(SUSPEND)));
-        assert!(!l.iter().any(|r| r.contains("Suspending")), "below 4 rows the header and keys win: {l:?}");
+    fn the_measured_terminal_is_normal() {
+        let l = layout(Rect::new(0, 0, 127, 36));
+        assert_eq!(l.variant, Variant::Normal);
+        assert_eq!(l.columns.iter().map(|c| c.tabs).collect::<Vec<_>>(), vec![&[Pane::Transcript, Pane::Slides][..], &[Pane::Notes][..]]);
+        assert_eq!((l.columns[0].body.width, l.columns[1].body.width), (48, 74), "40% and 60% of the 122 cells between the gutters and the gap");
+    }
+
+    /// Every rectangle lies inside the area and no two overlap, at every size the lecture view is
+    /// drawn in: nothing a pane draws can land on another pane or on the chrome.
+    #[test]
+    fn rects_stay_inside_the_area_and_never_overlap() {
+        for w in (60..=220).step_by(7).chain([99, 100, 131, 132]) {
+            for h in (16..=70).step_by(3).chain([19, 20, 27, 28, 35, 36]) {
+                let area = Rect::new(0, 0, w, h);
+                let l = layout(area);
+                let mut rects: Vec<Rect> = l.header.to_vec();
+                rects.extend(&l.rules);
+                rects.extend(&l.separators);
+                for c in &l.columns {
+                    rects.extend([c.heading, c.body]);
+                }
+                rects.extend([l.notice, l.prompt, l.keys]);
+                for (i, a) in rects.iter().enumerate() {
+                    assert!(area.contains(a.as_position()) && a.right() <= area.right() && a.bottom() <= area.bottom(), "{w}×{h}: {a:?} outside");
+                    for b in &rects[i + 1..] {
+                        assert!(a.is_empty() || b.is_empty() || !a.intersects(*b), "{w}×{h}: {a:?} overlaps {b:?}");
+                    }
+                }
+                assert!(l.columns.iter().all(|c| c.body.height >= 1), "{w}×{h}: every pane has a body row");
+            }
+        }
+    }
+
+    /// Plan §H's row budget: the notice, prompt and keys are the last three rows in every shape, and
+    /// the chrome stays within the clutter budget (8 of 40 wide; 6 of 16 at the minimum).
+    #[test]
+    fn the_bottom_rows_and_the_chrome_budget() {
+        for (w, h) in [(140, 40), (110, 32), (127, 36), (80, 24), (72, 45), (60, 16), (99, 36), (132, 28)] {
+            let l = layout(Rect::new(0, 0, w, h));
+            assert_eq!((l.notice.y, l.prompt.y, l.keys.y), (h - 3, h - 2, h - 1), "{w}×{h}");
+            assert_eq!((l.header[0].y, l.header[1].y), (0, 1));
+            let budget = match l.variant {
+                Variant::Wide | Variant::Normal => 8,
+                Variant::Stacked => 7,
+                _ => 6,
+            };
+            assert_eq!(l.chrome_rows(), budget, "{w}×{h} {:?}", l.variant);
+            assert!(l.rules.is_empty() == !matches!(l.variant, Variant::Wide | Variant::Normal), "rules only where there is room for them");
+        }
+        assert_eq!(layout(Rect::new(0, 0, 140, 40)).chrome_rows(), 8);
+        assert_eq!(layout(Rect::new(0, 0, 60, 16)).chrome_rows(), 6);
+    }
+
+    /// A long notice is cut to its one row; no body row moves, whatever the notice holds.
+    #[test]
+    fn a_long_notice_is_cut_to_its_line_and_moves_nothing() {
+        let quiet = view(Stage::Listening);
+        let mut loud = view(Stage::Listening);
+        loud.notice = Some(plain::Notice { kind: "warn", label: "snapshot failed".into(), detail: "the model said something very long ".repeat(20) });
+        for (w, h) in SIZES {
+            let (a, b) = (lines(&drawn(w, h, &quiet, None)), lines(&drawn(w, h, &loud, None)));
+            if variant(w, h) == Variant::TooSmall {
+                continue;
+            }
+            let notice_row = (h - 3) as usize;
+            for y in 0..h as usize {
+                if y != notice_row {
+                    assert_eq!(a[y], b[y], "{w}×{h} row {y}");
+                }
+            }
+            assert!(b[notice_row].ends_with('…') && b[notice_row].contains("snapshot failed"), "{w}×{h}: {:?}", b[notice_row]);
+            assert!(Span::raw(b[notice_row].as_str()).width() <= w as usize - 1);
+        }
     }
 
     #[test]
-    fn tiny_terminals_draw_what_fits_without_panicking() {
-        for (w, h) in [(0, 0), (1, 1), (0, 5), (5, 0), (2, 1), (9, 2), (12, 3), (40, 8), (1, 24), (200, 1), (60, 4), (60, 2)] {
+    fn nothing_panics_at_any_size() {
+        for (w, h) in [(0, 0), (1, 1), (0, 5), (5, 0), (1, 24), (200, 1), (40, 8), (59, 100), (1000, 3), (60, 15), (3, 2), (12, 3), (60, 16), (100, 19), (132, 28), (500, 200)] {
             for stage in [Stage::Listening, Stage::Stopping, Stage::StopWaiting] {
                 let mut v = view(stage);
                 v.notice = Some(plain::input_gone("UID"));
-                let b = drawn(w, h, &v, Some(SUSPEND));
-                if h >= 1 {
-                    let shown = format!(" {}", phase(stage).content);
-                    assert!(lines(&b)[0].starts_with(shown.trim_end().get(..shown.len().min(w as usize)).unwrap().trim_end()), "{w}×{h}: {:?}", lines(&b));
+                for theme in [Theme::new(TRUE, true), Theme::new(OFF, false)] {
+                    let _ = drawn_with(w, h, &v, Some(SUSPEND), &theme);
                 }
             }
         }
-        let l = lines(&drawn(40, 2, &view(Stage::Stopping), None));
-        assert_eq!(l[0], " Stopping  1:02:05  Machine Learning › W", "two rows: the header (clipped) and the keys");
-        assert_eq!(l[1], " ^C stop waiting   ^L redraw");
     }
 
+    // ---- words and degradation ------------------------------------------------------------
+
+    /// Plan §H's header at full width: phase, course › lecture and clock; input, meter,
+    /// connection, gaps, and the spend at the right.
     #[test]
-    fn the_phase_is_shown_and_stop_waiting_stands_out() {
-        for (stage, word) in [(Stage::Listening, "Listening"), (Stage::Stopping, "Stopping"), (Stage::StopWaiting, "Stop waiting")] {
-            let b = drawn(110, 24, &view(stage), None);
-            assert!(lines(&b)[0].starts_with(&format!(" {word}  1:02:05")), "{:?}", lines(&b)[0]);
-            let reversed = b[(1, 0)].modifier.contains(Modifier::REVERSED);
-            assert_eq!(reversed, stage == Stage::StopWaiting, "{word}");
-            assert!(b[(1, 0)].modifier.contains(Modifier::BOLD));
-            assert!(!b[(1, 0)].modifier.contains(Modifier::DIM), "the dim course leaves the phase alone");
-            assert_eq!(b[(word.len() as u16 + 3, 0)].modifier, Modifier::empty(), "the clock is plain");
+    fn the_header_at_full_width() {
+        let l = lines(&drawn(140, 40, &view(Stage::Listening), None));
+        assert!(l[0].starts_with(" ● Listening   Machine Learning › Week 03 — Optimisation") && l[0].ends_with("0:42:18"), "{:?}", l[0]);
+        assert!(l[1].starts_with(" BlackHole 2ch  ■■■■■□□□  transcribing  0 gaps") && l[1].ends_with("$0.18 today"), "{:?}", l[1]);
+    }
+
+    /// As the header narrows, lower-priority fields go first — spend, then the input's name, then
+    /// the connection's words shorten — and the phase, the clock, the health and the gaps stay.
+    #[test]
+    fn the_header_degrades_by_priority() {
+        let mut v = view(Stage::Listening);
+        gap(&mut v, 0);
+        gap(&mut v, 16_000);
+        v.stt = Some(SttStatus::Retrying { after: Duration::from_secs(12), reason: "the socket closed after 30 s without data".into() });
+        let row = |w: u16| lines(&drawn(w, 24, &v, None))[1].clone();
+        let wide = lines(&drawn(160, 40, &v, None))[1].clone();
+        assert!(wide.contains("BlackHole 2ch") && wide.contains("reconnecting in 12 s") && wide.ends_with("$0.18 today"), "{wide}");
+        let mid = row(90);
+        assert!(!mid.contains("today") && mid.contains("reconnecting in 12 s") && mid.contains("2 gaps"), "the spend goes first: {mid}");
+        let narrow = row(60);
+        assert!(!narrow.contains("BlackHole") && narrow.contains("STT ▲") && narrow.contains("2 gaps") && narrow.contains("■"), "{narrow}");
+        for w in [60, 70, 80, 90, 99, 100, 127, 140] {
+            let l = lines(&drawn(w, 24, &v, None));
+            assert!(l[0].contains("Listening") && l[0].ends_with("0:42:18"), "{w}: {:?}", l[0]);
+            assert!(l[1].contains("2 gaps"), "{w}: {:?}", l[1]);
+        }
+        let row1 = |w: u16| lines(&drawn(w, 24, &view(Stage::Listening), None))[0].clone();
+        assert!(row1(80).contains("Machine Learning › Week 03 —"), "{}", row1(80));
+        assert!(row1(60).contains("Machine Learning ›") && row1(60).contains('…'), "the course and lecture are cut, not the clock: {}", row1(60));
+    }
+
+    /// The stopping stages say what they do in the header's first row, in place of the course.
+    #[test]
+    fn stopping_says_what_it_is_doing() {
+        let l = lines(&drawn(140, 40, &view(Stage::Stopping), None));
+        assert!(l[0].starts_with(" ● Stopping   finishing the transcript and recovery, then a last snapshot"), "{:?}", l[0]);
+        let l = lines(&drawn(140, 40, &view(Stage::StopWaiting), None));
+        assert!(l[0].starts_with(" ● Stop waiting   no longer waiting for recovery"), "{:?}", l[0]);
+    }
+
+    /// The footer offers only what this build does, generated from its key table.
+    #[test]
+    fn the_footer_follows_the_stop_stage() {
+        for (stage, hint) in [(Stage::Listening, " ^L redraw   ^C stop"), (Stage::Stopping, " ^L redraw   ^C stop waiting"), (Stage::StopWaiting, " ^L redraw   ^C quit at once")] {
+            assert_eq!(lines(&drawn(110, 32, &view(stage), None))[31], hint);
+            assert_eq!(lines(&drawn(40, 8, &view(stage), None))[7], hint, "the safety view keeps the keys");
+        }
+        let l = lines(&drawn(110, 32, &view(Stage::Listening), None));
+        assert_eq!(l[30], format!(" ◆ {PROMPT}"), "the prompt offers nothing it does not do");
+    }
+
+    /// A refused stop outranks the view's notice, being about the keys just below it.
+    #[test]
+    fn a_refused_stop_outranks_the_notice() {
+        let mut v = view(Stage::Listening);
+        v.notice = Some(plain::input_gone("Receiver_UID"));
+        let l = lines(&drawn(110, 32, &v, None));
+        assert!(l[29].starts_with(" ▲ input gone  Receiver_UID"), "{:?}", l[29]);
+        let l = lines(&drawn(110, 32, &v, Some(SUSPEND)));
+        assert_eq!(l[29], format!(" {SUSPEND}"));
+    }
+
+    /// Below 60×16 only the safety view: the phase and clock, why, what size, the keys — and nothing
+    /// written outside the cells there are.
+    #[test]
+    fn the_safety_view_says_why_and_what_size() {
+        let l = lines(&drawn(40, 8, &view(Stage::Listening), None));
+        assert_eq!(l[0], " ● Listening  0:42:18");
+        assert_eq!(l[1], " Too small for the lecture view (40×8).");
+        assert_eq!(l[2], " 60×16 needed. Recording goes on.");
+        assert_eq!(l[7], " ^L redraw   ^C stop");
+        let l = lines(&drawn(59, 3, &view(Stage::Stopping), Some("Wait a moment, then Ctrl-C again to stop waiting.")));
+        assert_eq!(l, vec![" ● Stopping  0:42:18", " Too small for the lecture view (59×3).", " ^L redraw   ^C stop waiting"]);
+        let l = lines(&drawn(30, 2, &view(Stage::Listening), None));
+        assert_eq!(l, vec![" ● Listening  0:42:18", " ^L redraw   ^C stop"]);
+    }
+
+    // ---- theme --------------------------------------------------------------------------------
+
+    #[test]
+    fn the_locale_decides_the_glyphs() {
+        for (all, ctype, lang, want) in [
+            (None, None, Some("en_US.UTF-8"), true),
+            (None, None, Some("C.UTF-8"), true),
+            (None, Some("en_GB.utf8"), None, true),
+            (Some("C"), None, Some("en_US.UTF-8"), false),
+            (Some(""), None, Some("en_US.UTF-8"), true),
+            (None, Some("C"), Some("en_US.UTF-8"), false),
+            (None, None, None, false),
+            (None, None, Some("en_US.ISO8859-1"), false),
+        ] {
+            assert_eq!(utf8_locale(all, ctype, lang), want, "{all:?} {ctype:?} {lang:?}");
         }
     }
 
+    /// Teal marks the focused pane and the good-news marks; truecolour when the terminal says so,
+    /// ANSI cyan otherwise, and no colour under `NO_COLOR` — where bold still marks it.
     #[test]
-    fn the_key_hint_follows_the_stop_stage() {
-        for (stage, hint) in [(Stage::Listening, " ^C stop   ^L redraw"), (Stage::Stopping, " ^C stop waiting   ^L redraw"), (Stage::StopWaiting, " ^C quit at once   ^L redraw")] {
-            assert_eq!(lines(&drawn(110, 24, &view(stage), None))[23], hint);
+    fn teal_is_the_focus_accent() {
+        for (paint, want) in [(TRUE, Some(TEAL)), (ANSI, Some(Color::Cyan)), (OFF, None)] {
+            let b = drawn_with(140, 40, &view(Stage::Listening), None, &Theme::new(paint, true)).backend().buffer().clone();
+            let (x, y) = at(&b, 3, "Transcript");
+            assert_eq!(b[(x, y)].fg, want.unwrap_or(Color::Reset), "{paint:?}");
+            assert!(b[(x, y)].modifier.contains(Modifier::BOLD), "the focused heading is bold in every theme");
+            let (x, y) = at(&b, 3, "Notes");
+            assert_eq!((b[(x, y)].fg, b[(x, y)].modifier), (Color::Reset, Modifier::empty()), "an unfocused heading is plain ink");
+            let (x, y) = at(&b, 38, "◆");
+            assert_eq!(b[(x, y)].fg, want.unwrap_or(Color::Reset), "the prompt's mark");
         }
+    }
+
+    /// Signal red marks recording and attention: the dot while listening, gaps waiting, a failing
+    /// connection, a warning's mark. The words carry each without colour.
+    #[test]
+    fn signal_red_marks_attention_and_words_carry_it_without_colour() {
+        let mut v = view(Stage::Listening);
+        gap(&mut v, 0);
+        gap(&mut v, 8_000);
+        v.stt = Some(SttStatus::Refused("bad key".into()));
+        v.notice = Some(plain::Notice { kind: "warn", label: "snapshot failed".into(), detail: "timed out".into() });
+        for (paint, want) in [(TRUE, SIGNAL), (ANSI, Color::Red), (OFF, Color::Reset)] {
+            let b = drawn_with(140, 40, &v, None, &Theme::new(paint, true)).backend().buffer().clone();
+            for (y, text) in [(0, "●"), (1, "2 gaps"), (1, "refused: bad key"), (37, "▲")] {
+                let (x, y) = at(&b, y, text);
+                assert_eq!(b[(x, y)].fg, want, "{text} {paint:?}");
+            }
+            let l = lines(&b);
+            assert!(l[1].contains("2 gaps") && l[1].contains("refused: bad key") && l[37].contains("▲ snapshot failed"), "the words say it: {l:?}");
+        }
+        // stopping, the dot no longer claims a recording
+        let b = drawn(140, 40, &view(Stage::Stopping), None);
+        assert_eq!((b[(1, 0)].fg, b[(1, 0)].modifier), (Color::Reset, Modifier::DIM));
+        // silence and a gone input are words, in the header's health place
+        let mut quiet = view(Stage::Listening);
+        quiet.silence = true;
+        assert!(lines(&drawn(60, 16, &quiet, None))[1].contains("no signal"));
+        let mut gone = View::new(Identity { kind: SourceKind::Input, ..identity() }, Hydration::empty(), Vec::new());
+        gone.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), Local::now());
+        let l = lines(&drawn_with(60, 16, &gone, None, &Theme::new(OFF, false)).backend().buffer().clone());
+        assert!(l[1].contains("! input gone"), "{:?}", l[1]);
+    }
+
+    /// `NO_COLOR`: no cell carries a colour, and bold, dim and reverse remain.
+    #[test]
+    fn no_color_keeps_the_modifiers_and_drops_every_colour() {
+        let mut v = view(Stage::StopWaiting);
+        gap(&mut v, 0);
+        v.notice = Some(plain::Notice { kind: "notes", label: "notes".into(), detail: "412 words".into() });
+        for (w, h) in SIZES {
+            let b = drawn_with(w, h, &v, None, &Theme::new(OFF, true)).backend().buffer().clone();
+            assert!(b.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset), "{w}×{h}");
+        }
+        let b = drawn_with(140, 40, &v, None, &Theme::new(OFF, true)).backend().buffer().clone();
+        let (x, y) = at(&b, 0, "Stop waiting");
+        assert!(b[(x, y)].modifier.contains(Modifier::BOLD | Modifier::REVERSED));
+        assert!(b[(0, 2)].modifier.is_empty() && b[(1, 2)].modifier.contains(Modifier::DIM), "the rule is dim");
+    }
+
+    /// Nothing sets a background anywhere: light and dark terminals both work (plan §H).
+    #[test]
+    fn no_background_is_ever_set() {
+        let mut v = view(Stage::Listening);
+        gap(&mut v, 0);
+        for (w, h) in SIZES {
+            let b = drawn(w, h, &v, None);
+            assert!(b.content.iter().all(|c| c.bg == Color::Reset), "{w}×{h}");
+        }
+    }
+
+    /// In a tabbed column the pane shown is bold teal and the others dim; slides carry their count.
+    #[test]
+    fn the_selected_tab_stands_out() {
+        let mut v = view(Stage::Listening);
+        let b = drawn(110, 32, &v, None);
+        let (x, y) = at(&b, 3, "Transcript");
+        assert_eq!((b[(x, y)].fg, b[(x, y)].modifier), (TEAL, Modifier::BOLD));
+        let (x, y) = at(&b, 3, "Slides");
+        assert_eq!(b[(x, y)].modifier, Modifier::DIM);
+        assert!(lines(&b)[3].contains("Transcript   Slides") && !lines(&b)[3].contains("Slides 0"));
+        v.reduce(&Event::Slide { index: 18, file: "slides/slide_18_104152.png".into(), auto: true, uncertain: false, shown_at: Local::now() }, Local::now());
+        assert!(lines(&drawn(110, 32, &v, None))[3].contains("Slides 1"));
+        let l = lines(&drawn(80, 24, &view(Stage::Listening), None));
+        assert!(l[2].starts_with(" Transcript   Notes   Slides"), "narrow: every pane a tab: {:?}", l[2]);
+    }
+
+    /// ASCII chrome where the locale is not UTF-8; the lecture's own text is never transliterated.
+    #[test]
+    fn ascii_chrome_leaves_the_lecture_text_alone() {
+        let mut v = view(Stage::Listening);
+        v.notice = Some(plain::Notice { kind: "slide", label: "slide 3".into(), detail: "slide_03_100000.png, into the next snapshot".into() });
+        for (w, h) in SIZES {
+            let l = lines(drawn_with(w, h, &v, None, &Theme::new(TRUE, false)).backend().buffer());
+            let text = l.join("\n").replace("Week 03 — Optimisation", "").replace("Week 03 —", "");
+            assert!(text.is_ascii(), "{w}×{h}: {text}");
+        }
+        let l = lines(drawn_with(140, 40, &v, None, &Theme::new(TRUE, false)).backend().buffer());
+        assert!(l[0].starts_with(" * Listening   Machine Learning > Week 03 — Optimisation"), "{:?}", l[0]);
+        assert!(l[1].contains("BlackHole 2ch  #####---  transcribing"), "{:?}", l[1]);
+        assert!(l[2].trim().chars().all(|c| c == '-') && l[4].contains(" | "), "{:?} {:?}", l[2], l[4]);
+        assert!(l[37].starts_with(" [] slide 3") && l[38].starts_with(" * hints"), "{:?} {:?}", l[37], l[38]);
+        assert_eq!(lines(drawn_with(40, 8, &v, None, &Theme::new(TRUE, false)).backend().buffer())[2], " 60x16 needed. Recording goes on.");
+    }
+
+    // ---- goldens ------------------------------------------------------------------------------
+
+    /// Compares a frame's text with `crates/cli/goldens/{name}.txt` (plan §J). `LECTURELIVE_GOLDENS=update`
+    /// rewrites the file instead; the diff is then reviewed before it is committed.
+    fn golden(name: &str, terminal: &Terminal<TestBackend>) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("goldens").join(format!("{name}.txt"));
+        let got = terminal.backend().to_string();
+        if std::env::var("LECTURELIVE_GOLDENS").as_deref() == Ok("update") {
+            std::fs::write(&path, &got).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}; write it with LECTURELIVE_GOLDENS=update and review it", path.display()));
+        assert!(got == want, "{name} differs from its golden; if the change is meant, LECTURELIVE_GOLDENS=update and review the diff\n--- golden\n{want}--- drawn\n{got}");
+    }
+
+    /// Every stage at every golden size; 40×8 is the safety view. Unicode chrome, colour on (the
+    /// goldens hold text only: styles are the assertions above).
+    #[test]
+    fn goldens_for_every_stage_and_size() {
+        for (stage, name) in [(Stage::Listening, "listening"), (Stage::Stopping, "stopping"), (Stage::StopWaiting, "stop_waiting")] {
+            for (w, h) in SIZES {
+                let name = if variant(w, h) == Variant::TooSmall { format!("too_small_{name}_{w}x{h}") } else { format!("{name}_{w}x{h}") };
+                golden(&name, &drawn_with(w, h, &view(stage), None, &Theme::new(TRUE, true)));
+            }
+        }
+        golden("listening_ascii_80x24", &drawn_with(80, 24, &view(Stage::Listening), None, &Theme::new(OFF, false)));
     }
 }
