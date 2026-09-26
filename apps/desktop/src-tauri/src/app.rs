@@ -458,6 +458,38 @@ pub fn spend_summary() -> Res<spend::Summary> {
     spend_summary_at(&data_dir()?.join("spend.jsonl"), Path::new(CLI_LEDGER)).map_err(chain)
 }
 
+#[derive(Serialize)]
+pub struct CheckConfig {
+    mode: String,
+    dir: Option<String>,
+}
+
+/// A measurement or check the page runs by itself, from `LECTURELIVE_CHECK` (and `LECTURELIVE_CHECK_DIR`,
+/// the synthetic lecture folder for the live check); None in ordinary use.
+#[tauri::command]
+pub fn check_config() -> Option<CheckConfig> {
+    let mode = std::env::var("LECTURELIVE_CHECK").ok().filter(|m| !m.is_empty())?;
+    Some(CheckConfig { mode, dir: std::env::var("LECTURELIVE_CHECK_DIR").ok() })
+}
+
+/// Writes a check's report to `~/Library/Application Support/LectureLive/m4-checks/<name>.json`.
+#[tauri::command]
+pub fn check_report(name: String, json: String) -> Res<String> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!("not a report name: {name:?}"));
+    }
+    let dir = data_dir()?.join("m4-checks");
+    std::fs::create_dir_all(&dir).map_err(text)?;
+    let path = dir.join(format!("{name}.json"));
+    std::fs::write(&path, json).map_err(text)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn exit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

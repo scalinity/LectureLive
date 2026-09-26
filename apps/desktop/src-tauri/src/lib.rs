@@ -39,6 +39,9 @@ pub fn run() {
             app::save_key,
             app::import_key_from_env,
             app::spend_summary,
+            app::check_config,
+            app::check_report,
+            app::exit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

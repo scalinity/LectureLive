@@ -205,3 +205,97 @@ export function demoWithNotes(): FixtureTransport {
   }, 5000);
   return t;
 }
+
+// The gate's fixtures (spec §11): a 500-delta/s burst, and a two-hour lecture streaming live.
+
+export type Fixture = { name: string; state: SessionState; run(t: FixtureTransport, done: (notes: string) => void): void };
+
+const VOCAB = "the gradient of the loss points uphill so each step moves against it by the learning rate and momentum keeps a running average of past steps through flat stretches of the surface while noise from mini batches helps escape shallow minima near a saddle point".split(" ");
+const word = (i: number) => VOCAB[i % VOCAB.length];
+const text = (from: number, n: number) => Array.from({ length: n }, (_, i) => word(from + i)).join(" ");
+const hms = (s: number) => [Math.floor(s / 3600) % 24, Math.floor((s % 3600) / 60), s % 60].map((n) => String(n).padStart(2, "0")).join(":");
+
+/** Plays the live transcript: an open-utterance update every 500 ms, a closed segment every 5 s. */
+function speaker(t: FixtureTransport, firstId: number, startSec: number) {
+  let opens = 0;
+  let closes = 0;
+  return (elapsedMs: number) => {
+    while (opens < Math.floor(elapsedMs / 500)) {
+      opens++;
+      const n = 2 + (opens % 10) * 2;
+      t.emitTranscript({ type: "open", utterance: closes + 1, stable: text(opens, Math.max(0, n - 3)), tentative: text(opens + n, 3) });
+    }
+    while (closes < Math.floor(elapsedMs / 5000)) {
+      closes++;
+      t.emitTranscript({ type: "closed", utterance: closes, segment: { id: firstId + closes - 1, at: hms(startSec + closes * 5), text: text(closes * 7, 13), recovered: false } });
+    }
+  };
+}
+
+function running(session: string): SessionState {
+  const st = emptyState(session);
+  st.status = { ...idleStatus(), phase: "running", source: "BlackHole 2ch", level_dbfs: -24, stt: "transcribing", stt_ok: true, started_at: new Date().toISOString() };
+  return st;
+}
+
+/** 10 s of notes deltas at 500 per second (word-sized, a heading every 40), with live speech. */
+export function burstFixture(): Fixture {
+  return {
+    name: "bench-burst",
+    state: running("bench"),
+    run(t, done) {
+      const start = performance.now();
+      const speak = speaker(t, 0, 10 * 3600);
+      let sent = 0;
+      const timer = setInterval(() => {
+        const el = performance.now() - start;
+        const due = Math.min(5000, Math.floor((el / 1000) * 500));
+        for (; sent < due; sent++) {
+          const lead = sent % 40 === 0 ? `\n\n## Topic ${sent / 40 + 1}\n- ` : sent % 8 === 0 ? "\n- " : "";
+          t.emitNotes({ type: "delta", op: 1, text: `${lead}${word(sent)} ` });
+        }
+        speak(el);
+        if (sent >= 5000) {
+          clearInterval(timer);
+          t.emitNotes({ type: "committed", op: 1, revision: 1, block: "\n<!-- 10:00:10 -->\n## Burst\n- committed\n" });
+          setTimeout(() => done(`5000 deltas in ${Math.round(el)} ms; ${Math.floor(el / 500)} open updates, ${Math.floor(el / 5000)} segments`), 500);
+        }
+      }, 4);
+    },
+  };
+}
+
+/** A two-hour lecture already on screen (1,440 segments, a 6,000-word document in 60 snapshots), then
+ *  30 s live: speech, and one snapshot streamed at 60 deltas per second and committed. */
+export function twoHourFixture(): Fixture {
+  const st = running("bench");
+  st.segments = Array.from({ length: 1440 }, (_, id) => ({ id, at: hms(10 * 3600 + id * 5), text: text(id, 12 + (id % 3)), recovered: id % 97 === 0 }));
+  const chunks = Array.from({ length: 60 }, (_, i) => `\n<!-- ${hms(10 * 3600 + i * 120)} -->\n## Topic ${i + 1}\n${Array.from({ length: 5 }, (_, b) => `- ${text(i * 100 + b * 20, 20)}`).join("\n")}\n`);
+  st.document = `# Machine Learning — Week 06 — Optimisation — 2026-09-25\n${chunks.join("")}`;
+  st.revision = 60;
+  return {
+    name: "bench-twohour",
+    state: st,
+    run(t, done) {
+      t.setSeq(0);
+      const start = performance.now();
+      const speak = speaker(t, 1440, 12 * 3600);
+      let sent = 0;
+      let committed = false;
+      const timer = setInterval(() => {
+        const el = performance.now() - start;
+        speak(el);
+        const due = el < 5000 ? 0 : Math.min(900, Math.floor(((el - 5000) / 1000) * 60));
+        for (; sent < due; sent++) t.emitNotes({ type: "delta", op: 1, text: `${sent % 30 === 0 ? "\n- " : ""}${word(sent)} ` });
+        if (sent >= 900 && !committed) {
+          committed = true;
+          t.emitNotes({ type: "committed", op: 1, revision: 61, block: `\n<!-- 12:00:21 -->\n## Live snapshot\n- ${text(0, 60)}\n` });
+        }
+        if (el >= 30000) {
+          clearInterval(timer);
+          done(`1440 segments and a ${st.document.split(/\s+/).length}-word document hydrated; 30 s live: ${Math.floor(el / 500)} open updates, ${Math.floor(el / 5000)} segments, 900 deltas at 60/s, one commit`);
+        }
+      }, 4);
+    },
+  };
+}

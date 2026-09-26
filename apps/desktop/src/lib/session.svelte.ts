@@ -1,5 +1,6 @@
 // The one session store (spec §9.2): attach first, then hydrate, then apply only what is newer than
 // the state, once per animation frame. Runes only; no effects: every update comes from an event.
+import { flushSync } from "svelte";
 import { idleStatus } from "./fixture";
 import type { Transport } from "./transport";
 import type { Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg } from "./wire";
@@ -37,6 +38,8 @@ export class Session {
   /** The live preview; not reactive, since only `previewShown` is drawn. */
   preview: { op: number; text: string } | null = null;
   previewParses = 0;
+  /** Hears each frame's work in ms: applying its messages, flushing the DOM, and the panes' layout reads. */
+  onDrain: ((ms: number) => void) | null = null;
 
   private t: Transport | null = null;
   private session = "";
@@ -257,6 +260,7 @@ export class Session {
 
   /** One frame: apply what is queued, re-show the preview when due, then the panes' hooks. */
   drain(now: number) {
+    const t0 = performance.now();
     this.scheduled = false;
     const q = this.queue;
     this.queue = [];
@@ -277,7 +281,10 @@ export class Session {
         this.wake(); // the last deltas still get shown
       }
     }
+    // The DOM first, so the hooks (pin to bottom) measure what is on screen now.
+    flushSync();
     this.frameHooks.forEach((h) => h());
+    this.onDrain?.(performance.now() - t0);
   }
 
   private applyStatus(m: Envelope<StatusMsg>): boolean {

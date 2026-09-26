@@ -2,7 +2,8 @@
   // The lecture window (spec §9.1): status strip, transcript | notes | slides, command line.
   import "$lib/theme.css";
   import { isTauri } from "@tauri-apps/api/core";
-  import { demoWithNotes } from "$lib/fixture";
+  import { measure } from "$lib/bench";
+  import { burstFixture, demoWithNotes, FixtureTransport, twoHourFixture } from "$lib/fixture";
   import { session } from "$lib/session.svelte";
   import { tauriTransport, type Transport } from "$lib/transport";
   import CommandLine from "$lib/CommandLine.svelte";
@@ -12,11 +13,11 @@
   import StatusStrip from "$lib/StatusStrip.svelte";
   import Transcript from "$lib/Transcript.svelte";
 
-  /** The app talks to Tauri; the browser preview (`?fixture=demo`) plays a scripted lecture. */
-  function transport(): Transport {
-    if (isTauri()) return tauriTransport();
-    return demoWithNotes();
-  }
+  type CheckConfig = { mode: string; dir: string | null };
+
+  // The app talks to Tauri; outside it, the browser preview plays a scripted lecture.
+  const real = isTauri() ? tauriTransport() : null;
+  let current: Transport;
 
   try {
     if (localStorage.getItem("lecturelive.large") === "1") document.documentElement.classList.add("large");
@@ -26,17 +27,49 @@
 
   let keyDialog: KeyDialog;
   let spendView: SpendView;
-  const t = transport();
-  const started = session.init(t).then(async () => {
+
+  /** A check asked for by the environment (the app) or the URL (`?bench=burst`, the browser preview). */
+  async function checkConfig(): Promise<CheckConfig | null> {
+    if (real) return real.call<CheckConfig | null>("check_config");
+    const bench = new URLSearchParams(location.search).get("bench");
+    return bench ? { mode: `bench-${bench}`, dir: null } : null;
+  }
+
+  /** Frame work on a gate fixture, through the real store (spec §11); reported, then the app quits. */
+  async function bench(mode: string) {
+    const fx = mode === "bench-burst" ? burstFixture() : twoHourFixture();
+    const ft = new FixtureTransport(fx.state);
+    current = ft;
+    const t0 = performance.now();
+    await session.init(ft);
+    await new Promise((r) => requestAnimationFrame(r));
+    const m = measure(session, fx.name, performance.now() - t0);
+    fx.run(ft, async (notes) => {
+      const report = m.stop(notes);
+      console.log(JSON.stringify(report));
+      (globalThis as { __bench?: unknown }).__bench = report;
+      if (real) {
+        await real.call("check_report", { name: fx.name, json: JSON.stringify(report) });
+        await real.call("exit_app");
+      }
+    });
+  }
+
+  async function boot() {
+    const cfg = await checkConfig();
+    if (cfg?.mode.startsWith("bench-")) return bench(cfg.mode);
+    current = real ?? demoWithNotes();
+    await session.init(current);
     if (!(await session.keyStatus())?.stored) keyDialog.show();
-  });
+  }
+  const started = boot();
 </script>
 
 <div class="window">
   <StatusStrip onSpend={() => spendView.show()} onKey={() => keyDialog.show()} />
   <main class="panes">
     <Transcript />
-    <Notes toUrl={(p) => t.assetUrl(p)} />
+    <Notes toUrl={(p) => current.assetUrl(p)} />
     <aside class="slides" aria-label="Slides">
       {#if session.slides.length === 0}
         <p class="quiet">Screenshots you take during the lecture become slides.</p>
