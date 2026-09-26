@@ -10,6 +10,7 @@ mod fixture;
 mod lecture;
 mod plain;
 mod stop;
+mod tui;
 mod utility;
 
 use args::{Cli, Cmd};

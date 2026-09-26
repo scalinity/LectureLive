@@ -14,7 +14,7 @@ use lecturelive_core::audio::{input, loopback};
 use lecturelive_core::notes::chat::{self, ChatClient, ChatConfig};
 use lecturelive_core::notes::prompts;
 use lecturelive_core::session::audit;
-use lecturelive_core::session::coordinator::SessionConfig;
+use lecturelive_core::session::coordinator::{SessionConfig, StopReport};
 use lecturelive_core::session::files::{course_from_path, LectureFiles};
 use lecturelive_core::session::launch::{self, Retention};
 use lecturelive_core::session::lecture::{self, Lecture, SlideWatch};
@@ -29,6 +29,7 @@ use crate::data_dir;
 use crate::fixture;
 use crate::plain;
 use crate::stop::StopController;
+use crate::tui;
 
 const REPO_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env");
 /// The Python CLI's ledger, taken over by the app's (spec §8).
@@ -141,13 +142,14 @@ fn choose_mode(tui: bool, plain: bool, ttys: Ttys, term: Option<&str>) -> Result
 /// Names the scripted session that debug builds run in place of a recording (plan §H).
 const FIXTURE_ENV: &str = "LECTURELIVE_CLI_FIXTURE";
 
+/// A live session not yet started, for either frontend to await or spawn.
+type Engine = std::pin::Pin<Box<dyn std::future::Future<Output = Result<StopReport>> + Send>>;
+
 pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     // A build without debug assertions has no scripted session: refused before anything is read or created.
     #[cfg(not(debug_assertions))]
     anyhow::ensure!(a.command.is_some() || std::env::var_os(FIXTURE_ENV).is_none(), "{FIXTURE_ENV} is honoured only by debug builds; unset it to record a lecture.");
-    if choose_mode(a.tui, a.plain, Ttys::now(), std::env::var("TERM").ok().as_deref())? == Mode::Tui {
-        anyhow::bail!("--tui is not built yet; leave it out to follow the lecture line by line");
-    }
+    let mode = choose_mode(a.tui, a.plain, Ttys::now(), std::env::var("TERM").ok().as_deref())?;
     // Debug builds only: the scenario that stands in for the recording. It needs no key, microphone, input or
     // network, and leaves the person's ledger and route alone; the folder, `prepare` and the frontend are real.
     #[cfg(debug_assertions)]
@@ -247,6 +249,36 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     plain::print_prepared(&mut std::io::stdout().lock(), p, &ready, &files, &course, &name, &input_name);
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The session, run by the frontend: `lecture::run`, or in debug builds the scripted stand-in. Nothing runs
+    // until it is awaited or spawned.
+    let engine = |cmd_rx, ev_tx| -> Result<Engine> {
+        Ok(match fixture {
+            #[cfg(debug_assertions)]
+            Some(scenario) => {
+                let files = files.clone();
+                Box::pin(async move { fixture::run(scenario, &files, cmd_rx, ev_tx).await })
+            }
+            _ => {
+                let session = SessionConfig { dir: dir.clone(), stem: files.stem.clone(), stt: stt_link, recovery: Some(recovery()?), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
+                let watch_slides = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
+                Box::pin(lecture::run(lec, session, source_for(&uid), watch_slides, None, cmd_rx, ev_tx))
+            }
+        })
+    };
+    if mode == Mode::Tui {
+        // Debug builds only: the terminal faults the PTY tests inject, named by the scenario.
+        #[cfg(debug_assertions)]
+        match fixture {
+            Some(fixture::Scenario::InitFailRaw) => tui::terminal::inject(tui::terminal::Fault::AlternateScreen),
+            Some(fixture::Scenario::InitFail) => tui::terminal::inject(tui::terminal::Fault::Surface),
+            Some(fixture::Scenario::DrawFail) => tui::terminal::inject(tui::terminal::Fault::SecondDraw),
+            _ => {}
+        }
+        // The terminal is given back before this returns, so the summary prints on the ordinary screen.
+        let report = tui::run(engine(cmd_rx, ev_tx)?, cmd_tx, ev_rx, a.secs).await?;
+        plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);
+        return Ok(());
+    }
     plain::read_commands(cmd_tx.clone());
     let stop = Arc::new(Mutex::new(StopController::default()));
     plain::stop_on_ctrl_c(cmd_tx.clone(), p, stop.clone());
@@ -260,15 +292,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             plain::show(&mut std::io::stdout().lock(), p, &e, &mut watch);
         }
     });
-    let result = match fixture {
-        #[cfg(debug_assertions)]
-        Some(scenario) => fixture::run(scenario, &files, cmd_rx, ev_tx).await,
-        _ => {
-            let session = SessionConfig { dir: dir.clone(), stem: files.stem.clone(), stt: stt_link, recovery: Some(recovery()?), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
-            let watch_slides = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
-            lecture::run(lec, session, source_for(&uid), watch_slides, None, cmd_rx, ev_tx).await
-        }
-    };
+    let result = engine(cmd_rx, ev_tx)?.await;
     printer.await?;
     let report = result?;
     plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);
