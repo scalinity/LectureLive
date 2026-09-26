@@ -210,12 +210,35 @@ switch to the built-in mic.
 
 ### 4.2 Conversion, alignment, mixing
 
-Each source is converted to mono f32, resampled to 16 kHz with `rubato`'s asynchronous
-resampler, then framed. For one source a fixed ratio suffices. For mixed mode the two
-sources' FIFOs are aligned by timestamps and the resampling ratio of the secondary
-source is adjusted slowly to hold the FIFO level (independent clocks drift: 100 ppm
-over two hours is 0.72 s). Mixed mode stays disabled until it passes a two-hour
-alignment test. On stop, the resampler tail and the final partial frame are drained.
+Each source is converted to mono f32 and resampled to 16 kHz at its nominal rate by `rubato`'s
+FFT resampler, whose delay is trimmed, then framed. For one source that is all.
+
+Mixed mode (Zoom through the loopback, and one input) runs on the host clock, because independent
+clocks drift (100 ppm over two hours is 0.72 s), and the host clock is what capture timestamps are in
+and what outlives either device. Each source passes a drift stage, `rubato`'s asynchronous
+polynomial resampler at a ratio within 0.2% of 1, into a FIFO. The mixer takes from every FIFO
+exactly the samples the host clock says are due, 200 ms behind it.
+
+- **Joining.** A source joins with silence in front of it, so that its oldest waiting sample lands
+  where its capture time belongs: its device latency from cpal's timestamps, plus the time since its
+  last callback, plus the audio waiting in its ring. Audio too old to place is dropped before the
+  recording.
+- **Steering.** Over its first 4 s, the FIFO's smoothed level becomes its target. A
+  proportional-integral controller on the level then steers the drift stage's ratio, taking about
+  20 s to settle.
+- **Realigning.** A level more than 100 ms from its target is not drift. A source that ran dry is
+  realigned with silence in front, and a backlog delivered at once is dropped down to the target.
+  Both are gaps for that source.
+- **Gain and level.** Each source's gain is applied before the sum, and only the sum is limited. The
+  meter and the silence warning follow the loopback (§4.3).
+- **The recording** lasts while either source is there. A source that goes leaves a `device_gone`
+  gap from where its audio ends to where it joins again, written open-ended at once and closed when
+  it returns. When both have gone, the recording ends, as a single source's does.
+
+Mixed mode ships once it has passed a two-hour drift test over simulated clocks and a two-hour run
+of two real devices (M6 Findings); a build that has not passed offers no mixed choice.
+
+On stop, the resamplers' tails, the FIFOs and the final partial frame are drained.
 
 ### 4.3 Loopback device (macOS)
 
@@ -585,7 +608,7 @@ once a real capture of the watched window has succeeded.
   recordings/session_YYYYMMDD_HHMMSS.wav
   .live_notes/<stem>.v2.json          sidecar: version, lecture date, recordings + anchors, gaps,
                                       open utterances, notes {revision, len, sha256,
-                                      segment_cursor, slide_index}, slides [{index, file, shown_at}]
+                                      segment_cursor, slide_index}, slides [{index, file, shown_at, auto, uncertain}]
   .live_notes/<stem>.segments.jsonl   segment log: id, recording, samples, wall times, text, words,
                                       source (live | recovered | imported)
   .live_notes/<stem>.journal.json     pending commit, present only mid-commit
@@ -739,12 +762,12 @@ what is live. The command line is the one bold element.
 | Notes call fails, truncates or is cancelled | Document untouched; batch pending |
 | Study page part fails after its retry | No page written; notes untouched; typesetting can run again from the notes without polishing |
 | Crash mid-commit | Journal recovery on launch (§6.2) |
-| Microphone or Screen Recording denied | Affected feature disabled with fix-it button; the rest works |
+| Microphone or Screen Recording denied | Affected feature disabled, with the reason and an Open Settings fix-it. The microphone is checked before a lecture, and Start waits for it. Screen Recording is shown in the slides strip, which says to reopen the app after allowing it. The rest works |
 | BlackHole missing | Loopback disabled with install hint (`brew install blackhole-2ch`) |
 | Loopback preflight fails | Reason shown: Zoom's Speaker is not "LectureLive Loopback"; ten silent seconds during a loopback recording raise the same warning |
-| Device disappears | Mixed: surviving source continues, gap marked. Single: source stops, fallback offered |
+| Device disappears | Mixed: the surviving source continues, and a gap marks where the other was missing (§4.2). Single: the source waits for the same device and never switches by itself; the person is offered the other inputs and may record from one, as a new recording |
 | Sample-rate change | Stream rebuilt, new timing segment, gap marked |
-| Disk write error | Session stops cleanly, path surfaced |
+| Disk write error | Session stops cleanly with the path in its message; the last snapshot is still attempted; the next launch repairs the recording |
 | Spend ledger write fails | Warning in the status; the request's result is kept and recording continues |
 | App crash | Recording valid to last checkpoint and repaired at launch; system output untouched; journal recovery; unclosed utterance becomes a gap |
 | External edit of notes | Accepted as new revision |
@@ -755,7 +778,11 @@ what is live. The command line is the one bold element.
 - **Integration**: fake STT websocket replaying captured sessions with disconnects of 3, 15, 45 and 300 s; fake REST STT; fake SSE endpoint; all in `cargo test` without network.
 - **Golden**: prompts and file formats byte-compared with `live_notes.py` output on fixtures.
 - **UI**: 500-delta/s burst and a two-hour transcript fixture with p95 frame work < 16.7 ms; reload and hidden-window rehydration.
-- **Manual**: packaged app with real Zoom for every source, permission flows, routing restore after kill, a full lecture with forced restart; the study page of that lecture checked in light and dark, at phone width, and against each slide's screenshot.
+- **Manual**: packaged app with real Zoom for every source, permission flows, routing restore after kill; a full lecture with a forced restart, a receiver removal, a permission denial, a full disk and a network loss, each injected on purpose:
+  - network loss through a local forwarder (`LECTURELIVE_API_ADDR`), so that only LectureLive loses the network;
+  - a full disk on a small disk image.
+
+  The lecture is then audited with `lecturelive lecture audit` for audio missing without a gap or recorded twice. Its study page is checked in light and dark, at phone width, and against each slide's screenshot.
 
 ## 12. Milestones
 
@@ -773,10 +800,11 @@ what is live. The command line is the one bold element.
 
 Pinned in `Cargo.lock`; the versions that build together are recorded in
 `milestones.md` at M0: `tauri 2`, `tokio 1`, `tokio-tungstenite` (rustls), `reqwest`
-(stream), `serde`/`serde_json`, `cpal` (0.18 line), `rubato` (fixed-ratio resampling
-from M0; the asynchronous resampler that mixed mode needs is adopted at M6),
+(stream), `serde`/`serde_json`, `cpal` (0.18 line), `rubato` (the FFT resampler to 16 kHz;
+the asynchronous polynomial resampler as mixed mode's drift stage),
 `hound 3.5`, `xcap` (0.9 line), `image`,
-`coreaudio-sys`, `sha2`, `uuid`, `fs2` (advisory lock), `keyring`, `anyhow`/`thiserror`,
+`coreaudio-sys`, `sha2`, `uuid`, `fs2` (advisory lock), the Keychain through `security-framework` (already built
+in through `rustls-platform-verifier`), `anyhow`/`thiserror`,
 `tracing`. Frontend: `@tauri-apps/api` 2, `svelte` 5, `marked`, `dompurify 3.4.15`.
 Study page, loaded by the page rather than built: KaTeX 0.18.9 from jsDelivr with SRI
 hashes, Atkinson Hyperlegible Next and Mono from Google Fonts.
@@ -786,4 +814,4 @@ Deployment target macOS 13; toolchain pinned in `rust-toolchain.toml`.
 
 1. Loopback fallback if M0 routing fails: ScreenCaptureKit audio (`objc2-screen-capture-kit`, macOS 13+) or a Core Audio process tap (`AudioHardwareCreateProcessTap`, macOS 14.2+), which captures one app's output without a driver or output-device switching. Decide only on M0 evidence.
 2. `grok-4.7`'s context window and per-request latency at 50k–150k tokens, to set the §6.1 budget from measurement.
-3. Detector thresholds and cadence (§7.2) after calibration on real lectures.
+3. Detector thresholds and cadence (§7.2). Calibrated at M5 on the synthetic deck recorded from a window and on a recorded Zoom lecture: change 0.05, settle 0.03, animated 3 samples, expiry 10 samples, a 1 s cadence. How they hold on a live Zoom meeting window is measured from the first real lecture's recording of the detector's input.
