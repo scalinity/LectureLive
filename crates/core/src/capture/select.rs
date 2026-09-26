@@ -54,6 +54,10 @@ impl Descriptor {
 pub struct Selection {
     pub descriptor: Descriptor,
     pub region: Region,
+    /// Parts of the region that are not the slide (a speaker's camera drawn over it), as fractions of the
+    /// region: the detector never reacts to them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leave_out: Vec<Region>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,7 +128,7 @@ mod tests {
     }
 
     fn saved() -> Selection {
-        Selection { descriptor: Descriptor::of(&win(1, "us.zoom.xos", "Zoom Meeting", 1600, 900)), region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 } }
+        Selection { descriptor: Descriptor::of(&win(1, "us.zoom.xos", "Zoom Meeting", 1600, 900)), region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, leave_out: vec![] }
     }
 
     #[test]
@@ -157,7 +161,7 @@ mod tests {
     #[test]
     fn a_window_outside_a_bundle_is_named_by_its_app() {
         let dev = WindowInfo { bundle_id: None, app: "desktop".into(), ..win(5, "", "LectureLive deck", 1280, 720) };
-        let sel = Selection { descriptor: Descriptor::of(&dev), region: Region::WHOLE };
+        let sel = Selection { descriptor: Descriptor::of(&dev), region: Region::WHOLE, leave_out: vec![] };
         assert_eq!(revalidate(&sel, &[dev.clone()]), Revalidation::Match(dev));
     }
 

@@ -53,6 +53,34 @@ pub fn thumb(img: &RgbaImage, region: &Region) -> Option<GrayImage> {
     (!small.as_raw().iter().all(|&v| v < 8)).then_some(small)
 }
 
+/// Blanks the parts left out (fractions of the region, so they follow the slide when the window's layout
+/// changes) in a detector input: a speaker's camera drawn over the slide, which no rectangle can leave out
+/// (spec §7.1).
+pub fn leave_out(t: &mut GrayImage, parts: &[Region]) {
+    // One pixel wider on each side: shrinking the capture blurs a part's edge into its neighbours.
+    let span = |at: f64, size: f64, n: u32| {
+        let a = at.clamp(0.0, 1.0) * n as f64;
+        let b = (at + size).clamp(0.0, 1.0) * n as f64;
+        ((a.floor() as u32).saturating_sub(1), (b.ceil() as u32 + 1).min(n))
+    };
+    for p in parts {
+        let (x0, x1) = span(p.x, p.w, W);
+        let (y0, y1) = span(p.y, p.h, H);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                t.put_pixel(x, y, image::Luma([0]));
+            }
+        }
+    }
+}
+
+/// The detector's input with the parts left out blanked.
+pub fn thumb_for(img: &RgbaImage, region: &Region, parts: &[Region]) -> Option<GrayImage> {
+    let mut t = thumb(img, region)?;
+    leave_out(&mut t, parts);
+    Some(t)
+}
+
 /// Spec §7.2's values, calibrated on recorded Zoom frames (M5 findings).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Thresholds {
@@ -259,6 +287,37 @@ mod tests {
         d.keep(b.clone()); // a manual capture of b
         assert_eq!(d.observe(3, b.clone()), None);
         assert_eq!(d.observe(4, b), None, "b is the kept frame: not captured again");
+    }
+
+    /// Live evidence (M5, a recorded Zoom lecture): the speaker's camera is drawn over the slide, so no
+    /// rectangle leaves it out; a part left out never changes the detector's input.
+    #[test]
+    fn a_part_left_out_never_triggers_and_the_rest_still_does() {
+        let region = Region { x: 0.1, y: 0.2, w: 0.5, h: 0.5 };
+        // The camera: the region's top-right fifth, in the region's own fractions.
+        let camera = Region { x: 0.8, y: 0.0, w: 0.2, h: 0.2 };
+        let window = |cam: u8, lines: u32| {
+            let mut img = RgbaImage::from_pixel(1000, 600, image::Rgba([245, 245, 245, 255]));
+            for y in 120..180 {
+                for x in 500..600 {
+                    img.put_pixel(x, y, image::Rgba([cam, cam, cam, 255]));
+                }
+            }
+            for l in 0..lines {
+                for y in 200 + l * 40..212 + l * 40 {
+                    for x in 130..420 {
+                        img.put_pixel(x, y, image::Rgba([30, 30, 30, 255]));
+                    }
+                }
+            }
+            img
+        };
+        let seen = |img: &RgbaImage| thumb_for(img, &region, &[camera]).unwrap();
+        assert_eq!(seen(&window(40, 1)), seen(&window(200, 1)), "the camera's part is the same whatever it shows");
+        let mut d = Detector::new(Thresholds::default());
+        let frames: Vec<GrayImage> = [(40, 1), (200, 1), (200, 1), (90, 1), (90, 1), (90, 2), (90, 2)].iter().map(|&(c, l)| seen(&window(c, l))).collect();
+        let got = run(&mut d, &frames);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 6], "the first frame and the build, not the camera: {got:?}");
     }
 
     #[test]

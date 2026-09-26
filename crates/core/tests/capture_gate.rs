@@ -35,7 +35,7 @@ fn ms(n: u64) -> Duration {
 fn selection(fake: &FakeWindows, id: u32) -> Selection {
     let s = fake.0.lock().unwrap();
     let (info, _) = s.windows.iter().find(|(i, _)| i.id == id).unwrap();
-    Selection { descriptor: Descriptor::of(info), region: Region { x: 0.05, y: 0.1, w: 0.9, h: 0.85 } }
+    Selection { descriptor: Descriptor::of(info), region: Region { x: 0.05, y: 0.1, w: 0.9, h: 0.85 }, leave_out: vec![] }
 }
 
 fn start(fake: &FakeWindows, sel: Option<Selection>, dir: &Path) -> (worker::CaptureHandle, mpsc::UnboundedReceiver<CaptureEvent>) {
@@ -134,6 +134,37 @@ async fn a_replacement_whose_old_window_lingers_off_screen_still_asks() {
     let Some(CaptureState::Asking { candidates, .. }) = states.last() else { panic!("{states:?}") };
     assert_eq!(candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![77]);
     assert!(shots.is_empty(), "no silent rebinding");
+}
+
+/// Live evidence (M5, a recorded Zoom lecture): all false captures were the speaker's camera drawn over
+/// the slide. A part left out never triggers a slide, and the rest of the slide still does.
+#[tokio::test]
+async fn a_camera_left_out_takes_no_slides_and_a_build_still_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    let with_camera = |lines: u32, cam: u8| {
+        let mut img = slide(lines);
+        for y in 36..120 {
+            for x in 500..608 {
+                img.put_pixel(x, y, image::Rgba([cam, cam, cam, 255]));
+            }
+        }
+        img
+    };
+    fake.add(42, "Zoom Meeting", 1600, 900, with_camera(1, 40));
+    let mut sel = selection(&fake, 42);
+    sel.leave_out = vec![Region { x: 0.8, y: 0.0, w: 0.2, h: 0.3 }];
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (_, shots) = watch(&mut rx, 200).await;
+    assert_eq!(shots.len(), 1, "the first frame");
+    for k in 0..6u8 {
+        fake.show(42, with_camera(1, 40 + k * 30)); // the lecturer moves, and stays still a moment
+        let (_, shots) = watch(&mut rx, 60).await;
+        assert!(shots.is_empty(), "the camera is left out: {shots:?}");
+    }
+    fake.show(42, with_camera(2, 90));
+    let (_, shots) = watch(&mut rx, 300).await;
+    assert_eq!(shots, vec![(true, false)], "the build");
 }
 
 #[tokio::test]

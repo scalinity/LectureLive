@@ -14,7 +14,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
-use crate::capture::detect::{crop, thumb, Detector, Region, Thresholds};
+use crate::capture::detect::{crop, thumb_for, Detector, Region, Thresholds};
 use crate::capture::select::{revalidate, Revalidation, Selection};
 use crate::capture::window::{fit_within, is_blank, CaptureError, WindowInfo, WindowSource, MAX_PX};
 
@@ -166,9 +166,10 @@ impl Worker {
     }
 
     fn bind(&mut self, window: u32, selection: Selection) {
-        let region = self.bound.as_ref().map(|(_, s)| s.region).or(self.waiting.as_ref().map(|s| s.region));
-        if region != Some(selection.region) {
-            self.detector = Detector::new(self.cfg.thresholds); // another region: its first frame is kept
+        let seen = |s: &Selection| (s.region, s.leave_out.clone());
+        let before = self.bound.as_ref().map(|(_, s)| seen(s)).or(self.waiting.as_ref().map(seen));
+        if before != Some(seen(&selection)) {
+            self.detector = Detector::new(self.cfg.thresholds); // another region or parts left out: its first frame is kept
         }
         self.bound = Some((window, selection));
         self.waiting = None;
@@ -242,7 +243,7 @@ impl Worker {
             let (reason, candidates) = (format!("it is {} × {} now; check the region", w.width, w.height), vec![w.clone()]);
             return self.set(CaptureState::Asking { window, reason, candidates });
         }
-        let img = match self.frame(id, &sel.region) {
+        let img = match self.frame(id, &sel) {
             Ok((img, t)) => {
                 if let Some(r) = self.recorder.as_mut() {
                     r.sample(&t, &img);
@@ -261,18 +262,18 @@ impl Worker {
     }
 
     /// One capture and its detector input; a blank window or a black region is a failed capture.
-    fn frame(&mut self, id: u32, region: &Region) -> Result<(RgbaImage, GrayImage), CaptureError> {
+    fn frame(&mut self, id: u32, sel: &Selection) -> Result<(RgbaImage, GrayImage), CaptureError> {
         let img = self.source.capture(id)?;
         if is_blank(&img) {
             return Err(CaptureError::Failed("the capture was blank".into()));
         }
-        let t = thumb(&img, region).ok_or_else(|| CaptureError::Failed("the slide region was black".into()))?;
+        let t = thumb_for(&img, &sel.region, &sel.leave_out).ok_or_else(|| CaptureError::Failed("the slide region was black".into()))?;
         Ok((img, t))
     }
 
     fn capture_now(&mut self) -> Result<(), String> {
         let Some((id, sel)) = self.bound.clone() else { return Err("No window is being watched: choose one in the slides strip.".into()) };
-        let (img, t) = self.frame(id, &sel.region).map_err(|e| match e {
+        let (img, t) = self.frame(id, &sel).map_err(|e| match e {
             CaptureError::Denied => e.to_string(),
             CaptureError::Failed(m) => format!("{} could not be captured: {m}", sel.descriptor.label()),
         })?;
