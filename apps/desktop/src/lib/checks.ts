@@ -315,7 +315,7 @@ export async function zoomCheck(session: Session, t: Transport, dir: string) {
   const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
   try {
     await session.selectFolder(dir);
-    await until("Zoom's window to be chosen", () => session.capture.state === "ready", 15 * 60_000);
+    await until("Zoom's window to be chosen", () => session.capture.state === "ready", 24 * 3600_000); // the person comes when they can
     log("window chosen", true, session.capture);
     await session.start("loopback");
     log("started", session.status.phase === "running", { phase: session.status.phase, error: session.error });

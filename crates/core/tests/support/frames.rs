@@ -341,14 +341,15 @@ pub fn align(samples: &[Sample], plan: &[(State, bool)]) -> (u64, Vec<i64>) {
     (best as u64, bounds.iter().map(|b| near(b + best)).collect())
 }
 
-/// Writes `states.json`: the waiting title before Start, then the deck's states at the offset.
+/// Writes `states.json`: the waiting title before Start, then the deck's states at the offset, cut to what the
+/// recording holds (a state before its first sample or after its last is not counted).
 pub fn write_states(dir: &Path, plan: &[(State, bool)], offset: u64, end: u64) {
     let mut states = vec![State { id: "title".into(), from: 0, to: offset, kind: "slide".into() }];
     for (s, _) in plan {
-        states.push(State { id: s.id.clone(), from: s.from + offset, to: (s.to + offset).min(end.max(s.to + offset)), kind: s.kind.clone() });
-    }
-    if let Some(last) = states.last_mut() {
-        last.to = last.to.max(end);
+        let (from, to) = (s.from + offset, s.to + offset);
+        if from < end {
+            states.push(State { id: s.id.clone(), from, to: to.min(end), kind: s.kind.clone() });
+        }
     }
     std::fs::write(dir.join("states.json"), serde_json::to_vec_pretty(&States { states }).unwrap()).unwrap();
 }
