@@ -21,7 +21,9 @@ kickoff prompt carries this rule.
 | M3 | Notes/session parity | done | M2 | Migrates lecture folders to the v2 sidecar (one-way for the Python CLI) | [m3-notes-session-parity](superpowers/plans/2026-09-25-m3-notes-session-parity.md) |
 | M4 | Desktop app: transcript + notes panes | done | M3 | No | [m4-desktop-panes](superpowers/plans/2026-09-25-m4-desktop-panes.md) |
 | M5 | Slide automation | done | M4 | No | [m5-slide-automation](superpowers/plans/2026-09-25-m5-slide-automation.md) |
-| M6 | Full-lecture acceptance; mixed mode; Python retired | in progress: the two-hour lecture waits for a real class | M5 | Removes `live_notes.py` | [m6-full-lecture](superpowers/plans/2026-09-26-m6-full-lecture.md) |
+| M6 | Full-lecture acceptance; mixed mode; Python retired | implementation accepted as M7's baseline; the two-hour real lecture (gate lines 1–2) is deferred to a class | M5 | Removes `live_notes.py` | [m6-full-lecture](superpowers/plans/2026-09-26-m6-full-lecture.md) |
+| M7 | Ratatui CLI | planned | M6 (implementation baseline) | No | [m7-ratatui-cli](superpowers/plans/2026-09-26-m7-ratatui-cli.md) |
+| M8 | Automatic Zoom capture | not yet planned | M7 | No | — |
 
 The Python CLI (`live_notes.py`) stays the in-class tool until M6 passes.
 
@@ -949,3 +951,44 @@ The fifth Important finding, that `MIXED_MODE` was set before the live run ended
 *Failed lines:* none. No spec §14.1 fallback applies.
 
 *Next:* after the real lecture, a follow-up session reads its evidence (the audit's output, V01–V04 and V10–V14), ticks the gate lines that hold, and only then runs the plan's Task 17: `live_notes.py` and `pyproject.toml` are removed and the README moves to the app and the Rust CLI. Until then `live_notes.py` is the in-class tool, and it stays on `main`.
+
+*Baseline for M7* (2026-09-26): M6 implementation is accepted as the development baseline for M7. Remaining real-class verification is deferred and does not block M7 development. This is a scheduling decision, not a result: gate lines 1 and 2 stay unticked until the real lecture is run from `docs/VERIFICATION.html`, now against the newer build, and Task 17 still waits for them.
+
+## M7 — Ratatui CLI
+
+Spec: §3.1, §3.6, §9 (a new §9.5, the terminal UI, is written as built). Plan: [m7-ratatui-cli](superpowers/plans/2026-09-26-m7-ratatui-cli.md). Ratatui becomes the CLI's first-class interactive frontend for the live `lecture` command, beside the unchanged desktop app. `lecturelive-core` stays the only authority for recording, transcription, recovery, snapshots, notes, slides and durability, and M7 changes no core or desktop source (core gains tests only). The plain CLI stays for non-terminal, scripted and diagnostic use. Every task that draws a view invokes `tui-design:tui-design`, then `/frontend-design:frontend-design`, before any drawing code.
+
+Tasks (detailed in the M7 plan):
+
+0. Record the plan and the M6 ruling
+1. Characterize and split the plain CLI (behaviour-preserving, goldens first)
+2. One stop controller for both frontends
+3. Pin the frontend boundary in core (tests only)
+4. Mode selection, the debug-only fixture session, and the piped-output check
+5. Terminal lease and the minimal TUI (Ratatui 0.30.2, Crossterm 0.29 land)
+6. Session view: projection, hydration, cleaning, live header
+7. Responsive frame
+8. Transcript pane
+9. Notes pane
+10. Hint input, notes operations, cancel, help
+11. Capture on by default in the CLI (the course's saved selection)
+12. Failure UX, activity, cleaning in plain
+13. Performance and long sessions
+14. Live synthetic lecture through the TUI; spec as built
+15. Fresh final review and fixes
+16. Switch the TTY default (last behaviour change), findings, close-out
+
+**Gate** (checked in `cargo test` against fakes, in a PTY, and live on a synthetic lecture; the plan's §L has each line's evidence):
+
+- [ ] No regression of M0–M6: the core, desktop, vitest and svelte-check suites as at M6; no change to `crates/core/src` or `apps/desktop`
+- [ ] The M6 real-class procedure stays available and untouched, and M6 gate lines 1–2 stay unticked
+- [ ] Plain CLI retained: its output, grammar and exit codes unchanged except the planned stop-message fix; non-terminal output carries no terminal control sequences
+- [ ] Terminal restored on normal exit, handled error, SIGTERM, SIGHUP, the emergency stop and a panic-abort child
+- [ ] Staged stop semantics kept (a held Ctrl-C only stops); every accepted key press sends at most one command
+- [ ] An unread or slow frontend holds up neither the lecture nor core; durable state is reconciled by segment id and notes revision; latest-value telemetry may be coalesced
+- [ ] The transcript follows and scrolls; the notes preview is visibly provisional and the committed block wins; the layout works wide, at laptop width, at half screen, narrow and at the minimum
+- [ ] Capture state is truthful and never silently rebinds; warnings and recovery stay inspectable; untrusted text cannot emit terminal controls
+- [ ] The fixture session exists only in debug builds
+- [ ] One Crossterm 0.29.x and one Ratatui 0.30.2 in the CLI's graph, no other terminal backend, and every new duplicate crate classified
+- [ ] TestBackend, PTY and performance suites pass; a synthetic live lecture through the TUI audits whole
+- [ ] A fresh final review leaves no Critical or Important finding open, and the terminal-default switch is the last behaviour change
