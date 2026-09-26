@@ -1,0 +1,817 @@
+//! The session projection (M7 plan §F): the canonical files and the live events reconciled into one
+//! view of the lecture — what it is, what has been said, what the notes hold, what needs the person.
+//! The reactor alone owns it, it is never persisted, and it is reconstructible presentation state
+//! only: the segment log, the sidecar, the notes and the slides stay the lecture's record, and when
+//! provisional or live state disagrees with them, canonical wins (plan §C 1, 4, 5).
+//!
+//! Field groups (plan §F): the identity is hydrated config; the level, the silence, the input-gone
+//! mark, STT and capture state are latest-value telemetry, where a lost sample is cosmetic (§C 6);
+//! the segments, the notes and the slides reconcile by durable id; the preview is provisional; the
+//! activity ring and the notice are display-only.
+
+use std::cmp::Ordering;
+use std::collections::VecDeque;
+
+use chrono::{DateTime, Local};
+use lecturelive_core::audio::level::{dbfs, SilenceWatch};
+use lecturelive_core::capture::worker::CaptureState;
+use lecturelive_core::session::coordinator::{Notification, SttStatus};
+use lecturelive_core::session::lecture::Event;
+use lecturelive_core::session::segments::{Segment, SegmentSource};
+use lecturelive_core::session::sidecar::SlideEntry;
+use lecturelive_core::session::spend::Paint;
+
+use crate::plain::{self, Notice};
+use crate::stop::Stage;
+
+use super::hydrate::{Hydration, NotesSnapshot};
+
+/// The shared wording, unstyled: the TUI renders its own styles, so no styled string may enter the
+/// projection (plan §C 12).
+const WORDS: Paint = Paint { color: false, truecolor: false };
+
+/// What the lecture records from (plan §F): which silence to watch, and what a gone input means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    /// One input: when it goes, the person may choose another (spec §4.1).
+    Input,
+    /// Zoom through BlackHole: ten silent seconds are a warning (spec §4.3).
+    Loopback,
+    /// Zoom and an input together: the level is the loopback's, and a gone input leaves Zoom going.
+    Mixed,
+    /// The scripted session of a debug build (plan §H): no signal to watch.
+    Fixture,
+}
+
+/// What the TUI knows once the lecture is prepared (plan §F's identity fields): the lecture's and
+/// the input's names, and the files the panes will name.
+pub(crate) struct Identity {
+    pub(crate) course: String,
+    /// The lecture folder's display name.
+    pub(crate) lecture: String,
+    /// The input's display label.
+    pub(crate) input: String,
+    pub(crate) kind: SourceKind,
+    pub(crate) notes_file: String,
+    pub(crate) transcript_file: String,
+}
+
+/// One closed utterance of the transcript (plan §F): the log's id and time, the text, where it came
+/// from. The words are dropped — no view needs them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Line {
+    pub(crate) id: u64,
+    pub(crate) said_at: DateTime<Local>,
+    pub(crate) text: String,
+    pub(crate) source: SegmentSource,
+}
+
+/// The open utterance (latest-value): what is stable, and what may still change.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OpenUtterance {
+    pub(crate) stable: String,
+    pub(crate) tentative: String,
+}
+
+/// The notes as the projection holds them (plan §F): the canonical revision and the document it
+/// names, together, with the provisional preview beside them — never merged into them.
+#[derive(Debug, Default)]
+pub(crate) struct Notes {
+    pub(crate) revision: u64,
+    pub(crate) document: String,
+    /// The snapshot being written: the model's deltas in order, never dropped, cleared in the same
+    /// update that ends the work (`Committed`, `NothingNew`, `SnapshotFailed`, `Cancelled`,
+    /// `Polished`).
+    pub(crate) preview: Option<String>,
+}
+
+/// A registered slide (plan §F): what the slides pane will show.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SlideLine {
+    pub(crate) index: u32,
+    pub(crate) file: String,
+    pub(crate) shown_at: DateTime<Local>,
+    pub(crate) auto: bool,
+    pub(crate) uncertain: bool,
+}
+
+/// One activity record (plan §F): display history only, never persisted and never the record of
+/// anything. The wording is the plain CLI's own.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Activity {
+    pub(crate) at: DateTime<Local>,
+    /// The notice's mark kind, as `say` names it ("notes", "done", "slide", "page", "warn"), or
+    /// "dim" for the busy line.
+    pub(crate) kind: &'static str,
+    pub(crate) label: String,
+    pub(crate) detail: String,
+}
+
+/// The activity ring: at most [`Ring::CAPACITY`] records, the oldest falling off (plan §F).
+#[derive(Debug, Default)]
+pub(crate) struct Ring(VecDeque<Activity>);
+
+impl Ring {
+    pub(crate) const CAPACITY: usize = 500;
+
+    fn push(&mut self, a: Activity) {
+        self.0.push_back(a);
+        while self.0.len() > Self::CAPACITY {
+            self.0.pop_front();
+        }
+    }
+
+    /// The ring's readers exist for the tests and the activity overlay (Task 10): the Task-6 view
+    /// does not yet read the ring back.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> &VecDeque<Activity> {
+        &self.0
+    }
+}
+
+/// What reducing an event asked for: a re-read of the canonical files, because a discontinuity the
+/// live stream cannot fill appeared — a segment id beyond the next, a notes revision beyond the
+/// next, or a polish (plan §F's only mid-session triggers). Nothing cosmetic ever asks.
+#[derive(Debug, Default)]
+pub(crate) struct Effect {
+    pub(crate) hydrate: bool,
+}
+
+/// The session projection (plan §F). One owner: the reactor. Never shared, never locked.
+pub(crate) struct View {
+    /// The lecture's identity, cleaned as it entered (plan §C 12).
+    pub(crate) identity: Identity,
+    /// The stop stage the projection shows; the shared controller owns the truth (plan §G).
+    pub(crate) phase: Stage,
+
+    // Latest-value telemetry (plan §C 6): a missed sample is cosmetic, and none of it hydrates.
+    /// The last audio level, as it arrived (linear); the header shows its dBFS.
+    pub(crate) level: Option<f32>,
+    /// Whether the loopback has been silent for ten seconds (loopback and mixed inputs only).
+    pub(crate) silence: bool,
+    watch: Option<SilenceWatch>,
+    /// The single input that is away, while it is gone (mixed leaves it unset: Zoom goes on).
+    pub(crate) input_gone: Option<String>,
+    /// The transcription connection, as core typed it; never flattened to a string before the view.
+    pub(crate) stt: Option<SttStatus>,
+    /// The capture worker's state, as core typed it (Task 11 renders it).
+    pub(crate) capture: Option<CaptureState>,
+
+    // Canonical, reconciled state (plan §F): durable ids, canonical files.
+    /// Transcript gaps waiting for recovery.
+    pub(crate) gaps: u64,
+    /// Closed segments: contiguous log ids. [`View::pending`] holds arrivals beyond a hole until a
+    /// hydration brings what was missed.
+    pub(crate) closed: Vec<Line>,
+    pending: Vec<Line>,
+    /// The utterance being said.
+    pub(crate) open: Option<OpenUtterance>,
+    pub(crate) notes: Notes,
+    pub(crate) slides: Vec<SlideLine>,
+
+    // Sampled and display-only state.
+    /// The lecture's spend today, sampled off the reactor at most once a second (plan §B 7). The
+    /// shared ledger is the authority; no event's dollars are added to it.
+    pub(crate) spend: Option<f64>,
+    pub(crate) activity: Ring,
+    /// The notice line (plan §H): the input that is gone, while it is gone; else the latest notice.
+    pub(crate) notice: Option<Notice>,
+}
+
+impl View {
+    /// The projection as the initial hydration read it, while the folder lock was still held: the
+    /// canonical files, and the start-up records the plain report printed, seeding the activity.
+    pub(crate) fn new(identity: Identity, h: Hydration, seed: Vec<Notice>) -> View {
+        let kind = identity.kind;
+        let mut v = View {
+            identity: Identity {
+                course: plain::clean(&identity.course),
+                lecture: plain::clean(&identity.lecture),
+                input: plain::clean(&identity.input),
+                notes_file: plain::clean(&identity.notes_file),
+                transcript_file: plain::clean(&identity.transcript_file),
+                kind,
+            },
+            phase: Stage::Listening,
+            level: None,
+            silence: false,
+            watch: matches!(kind, SourceKind::Loopback | SourceKind::Mixed).then(|| SilenceWatch::new(-60.0, 10)),
+            input_gone: None,
+            stt: None,
+            capture: None,
+            gaps: h.unresolved,
+            closed: h.segments.iter().map(segment_line).collect(),
+            pending: Vec::new(),
+            open: None,
+            notes: match h.notes {
+                NotesSnapshot::At { revision, document } => Notes { revision, document, preview: None },
+                NotesSnapshot::Incoherent => Notes::default(),
+            },
+            slides: h.slides.iter().map(slide_line).collect(),
+            spend: None,
+            activity: Ring::default(),
+            notice: None,
+        };
+        let at = Local::now();
+        for n in seed {
+            v.record(n, at);
+        }
+        v
+    }
+
+    /// One live event into the projection. Pure: no I/O, no clocks but `at`. Canonical state moves
+    /// by its durable id, latest-value state is replaced, and every externally-sourced string is
+    /// cleaned as it enters (plan §C 12).
+    pub(crate) fn reduce(&mut self, e: &Event, at: DateTime<Local>) -> Effect {
+        let mut effect = Effect::default();
+        match e {
+            Event::Session(n) => self.session(n, at, &mut effect),
+            // Busy text is presentation only: shown, never parsed for what is running (plan §C 13).
+            Event::Busy(m) => self.activity.push(Activity { at, kind: "dim", label: "…".into(), detail: plain::clean(m) }),
+            // The preview accumulates in order and is never dropped; the update that ends the work clears it.
+            Event::Preview(d) => *self.notes.preview.get_or_insert_with(String::new) += &plain::clean(d),
+            Event::NothingNew | Event::SnapshotFailed(_) | Event::Cancelled(_) => self.notes.preview = None,
+            Event::Committed { block, revision, .. } => self.committed(block, *revision, &mut effect),
+            // The polished document is canonical only in the file; the event cannot rebuild it.
+            Event::Polished { .. } => {
+                self.notes.preview = None;
+                effect.hydrate = true;
+            }
+            Event::Slide { index, file, auto, uncertain, shown_at } => self.slide(*index, file, *auto, *uncertain, *shown_at),
+            Event::Capture(s) => self.capture = Some(capture_cleaned(s)),
+            _ => {}
+        }
+        // The wording both frontends share: the ring always; the notice line when no input is gone.
+        if let Some(n) = plain::notice(e, WORDS) {
+            self.record(n, at);
+        }
+        effect
+    }
+
+    /// A session notification: the recording's own events (spec §3.6).
+    fn session(&mut self, n: &Notification, at: DateTime<Local>, effect: &mut Effect) {
+        match n {
+            Notification::Segment(s) => self.segment(s, effect),
+            Notification::Level(l) => {
+                self.level = Some(*l); // latest-value: a missed sample moves nothing but the meter
+                if let Some(w) = self.watch.as_mut() {
+                    if w.observe(*l) {
+                        self.silence = true;
+                        self.record(plain::no_signal(), at);
+                    } else if dbfs(*l) >= -60.0 {
+                        self.silence = false;
+                    }
+                }
+            }
+            Notification::Gap(g) => {
+                // Only a transcript gap waits for recovery; an audio gap is explained as it is
+                // (spec §5.4), and neither kind is counted as the other.
+                if g.kind.is_transcript() && !g.resolved {
+                    self.gaps += 1;
+                }
+            }
+            Notification::DeviceGone { uid } => {
+                if self.identity.kind == SourceKind::Input {
+                    self.input_gone = Some(plain::clean(uid));
+                    // The top-priority notice holds the line until the input returns (plan §H).
+                    self.notice = Some(plain::input_gone(&plain::clean(uid)));
+                }
+            }
+            Notification::DeviceBack { .. } => {
+                // The device returned; that says nothing about the signal: only this mark clears,
+                // never the silence or the level (only a level above the threshold does).
+                if self.input_gone.is_some() {
+                    self.input_gone = None;
+                    self.notice = None;
+                }
+            }
+            Notification::Stt(s) => self.stt = Some(stt_cleaned(s)),
+            Notification::Open { stable, tentative } => {
+                self.open = Some(OpenUtterance { stable: plain::clean(stable), tentative: plain::clean(tentative) });
+            }
+            // One `Recovered` resolves the gap core says it resolved, one at a time; the transcript
+            // is never called whole on the strength of one telemetry event.
+            Notification::Recovered(_) => self.gaps = self.gaps.saturating_sub(1),
+            Notification::Recording { .. } | Notification::Failed(_) | Notification::RecoveryFailed(_) | Notification::SpendFailed(_) | Notification::SourceEnded => {}
+        }
+    }
+
+    /// A closed segment by its log id (plan §F): an id the projection already holds is ignored, the
+    /// next id appends, and anything beyond that asks for the files while the arrival waits for
+    /// them — no text is ever guessed into a hole.
+    fn segment(&mut self, s: &Segment, effect: &mut Effect) {
+        let next = self.closed.last().map_or(0, |l| l.id + 1);
+        if s.id < next {
+            return; // a duplicate or an old id: the log's id is the identity, and it is held
+        }
+        let line = segment_line(s);
+        if s.id == next {
+            self.append(line);
+        } else {
+            effect.hydrate = true; // canonical segments may have been missed
+            match self.pending.iter().position(|p| p.id >= line.id) {
+                Some(i) if self.pending[i].id == line.id => self.pending[i] = line,
+                Some(i) => self.pending.insert(i, line),
+                None => self.pending.push(line),
+            }
+        }
+    }
+
+    /// Appends a closed segment; a live one closes the open utterance it finalises — a recovered
+    /// segment is history, and never closes what is being said now (plan §F).
+    fn append(&mut self, line: Line) {
+        if line.source == SegmentSource::Live {
+            self.open = None;
+        }
+        self.closed.push(line);
+    }
+
+    /// A commit by its revision (plan §F): `held + 1` appends its block, `≤ held` changes nothing
+    /// (the document already holds it — though the work still ended), and a jump leaves the document
+    /// alone and asks for the files, because no skipped revision is invented.
+    fn committed(&mut self, block: &str, revision: u64, effect: &mut Effect) {
+        self.notes.preview = None;
+        match revision.cmp(&(self.notes.revision + 1)) {
+            Ordering::Equal => {
+                self.notes.document.push_str(&plain::clean(block));
+                self.notes.revision = revision;
+            }
+            Ordering::Less => {}
+            Ordering::Greater => effect.hydrate = true,
+        }
+    }
+
+    /// A slide registration upserts by index (plan §F): a duplicate index refreshes what is shown.
+    fn slide(&mut self, index: u32, file: &str, auto: bool, uncertain: bool, shown_at: DateTime<Local>) {
+        let line = SlideLine { index, file: plain::clean(file), shown_at, auto, uncertain };
+        match self.slides.iter_mut().find(|s| s.index == index) {
+            Some(s) => *s = line,
+            None => match self.slides.iter().position(|s| s.index > index) {
+                Some(i) => self.slides.insert(i, line),
+                None => self.slides.push(line),
+            },
+        }
+    }
+
+    /// A hydration result (plan §F): canonical state is adopted, and a result that read earlier than
+    /// what the projection already holds loses nothing. Segments beyond the log's end stay; the
+    /// notes move only to a revision at or past the one held; slides are only added, never taken
+    /// away or rolled back.
+    pub(crate) fn merge(&mut self, h: Hydration) {
+        // Segments: the log as it was read, then anything the projection holds beyond its end.
+        let mut merged: Vec<Line> = h.segments.iter().map(segment_line).collect();
+        let end = merged.last().map_or(0, |l| l.id + 1);
+        let mut held: Vec<Line> = self.closed.drain(..).chain(self.pending.drain(..)).collect();
+        held.sort_by_key(|l| l.id);
+        held.dedup_by_key(|l| l.id);
+        merged.extend(held.into_iter().filter(|l| l.id >= end));
+        self.closed = merged;
+
+        // Notes: a coherent pair at or past the held revision (an equal revision is the same
+        // document by its fingerprint). A stale pair keeps what is held; an incoherent one keeps it
+        // too — the next discontinuity re-reads, nothing retries on its own.
+        if let NotesSnapshot::At { revision, document } = h.notes {
+            if revision >= self.notes.revision {
+                self.notes.revision = revision;
+                self.notes.document = document;
+            }
+        }
+
+        // Slides: fill the indices the projection does not hold; live registrations keep their state.
+        for s in h.slides {
+            if !self.slides.iter().any(|x| x.index == s.index) {
+                let line = slide_line(&s);
+                match self.slides.iter().position(|x| x.index > line.index) {
+                    Some(i) => self.slides.insert(i, line),
+                    None => self.slides.push(line),
+                }
+            }
+        }
+    }
+
+    /// A background read that failed: the projection keeps what it holds, and the failure is said.
+    /// Nothing retries on its own; the next discontinuity reads again.
+    pub(crate) fn read_failed(&mut self, e: &anyhow::Error, at: DateTime<Local>) {
+        self.record(Notice { kind: "warn", label: "re-read".into(), detail: format!("the lecture's files could not be read again ({e:#}); what is shown still holds") }, at);
+    }
+
+    /// One notice into the ring and the notice line: the input that is gone holds the line while it
+    /// is gone (plan §H's first priority); otherwise the latest notice is the line.
+    fn record(&mut self, n: Notice, at: DateTime<Local>) {
+        let n = Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) };
+        self.activity.push(Activity { at, kind: n.kind, label: n.label.clone(), detail: n.detail.clone() });
+        if self.input_gone.is_none() {
+            self.notice = Some(n);
+        }
+    }
+}
+
+/// A log segment as the projection keeps it: cleaned, the words dropped.
+fn segment_line(s: &Segment) -> Line {
+    Line { id: s.id, said_at: s.said_at, text: plain::clean(&s.text), source: s.source }
+}
+
+/// A registered slide as the projection keeps it: cleaned.
+fn slide_line(s: &SlideEntry) -> SlideLine {
+    SlideLine { index: s.index, file: plain::clean(&s.file), shown_at: s.shown_at, auto: s.auto, uncertain: s.uncertain }
+}
+
+/// A typed connection state with its externally-sourced strings cleaned, the shape kept: later
+/// views tell a refusal from a reconnect without parsing anything.
+fn stt_cleaned(s: &SttStatus) -> SttStatus {
+    match s {
+        SttStatus::Connected => SttStatus::Connected,
+        SttStatus::Retrying { after, reason } => SttStatus::Retrying { after: *after, reason: plain::clean(reason) },
+        SttStatus::Refused(m) => SttStatus::Refused(plain::clean(m)),
+        SttStatus::ServerError(m) => SttStatus::ServerError(plain::clean(m)),
+        SttStatus::Stopped(m) => SttStatus::Stopped(plain::clean(m)),
+    }
+}
+
+/// A capture state, its window titles and reasons cleaned as they enter.
+fn capture_cleaned(s: &CaptureState) -> CaptureState {
+    match s {
+        CaptureState::Unbound => CaptureState::Unbound,
+        CaptureState::Watching { window } => CaptureState::Watching { window: plain::clean(window) },
+        CaptureState::Paused { window, reason } => CaptureState::Paused { window: plain::clean(window), reason: plain::clean(reason) },
+        CaptureState::Asking { window, reason, candidates } => CaptureState::Asking { window: plain::clean(window), reason: plain::clean(reason), candidates: candidates.clone() },
+        CaptureState::Denied => CaptureState::Denied,
+        CaptureState::Failing { window, reason } => CaptureState::Failing { window: plain::clean(window), reason: plain::clean(reason) },
+    }
+}
+
+/// What a session view is reduced from, for the tests below and the view's: one identity, over
+/// whatever canonical state the folder holds.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use lecturelive_core::session::files::LectureFiles;
+    use lecturelive_core::session::segments::{NewSegment, SegmentLog};
+    use lecturelive_core::session::sidecar::{Gap, GapKind};
+
+    use super::super::hydrate;
+
+    fn at() -> DateTime<Local> {
+        Local.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap()
+    }
+
+    fn identity(kind: SourceKind) -> Identity {
+        Identity { course: "Machine Learning".into(), lecture: "Week 03 — Optimisation".into(), input: "BlackHole 2ch".into(), kind, notes_file: "lecture_notes_20260926.md".into(), transcript_file: "lecture_transcript_20260926.txt".into() }
+    }
+
+    fn view() -> View {
+        View::new(identity(SourceKind::Loopback), Hydration::empty(), Vec::new())
+    }
+
+    fn seg(id: u64, text: &str, source: SegmentSource) -> Segment {
+        let t = at();
+        Segment { id, recording_id: Default::default(), start_sample: id * 16_000, end_sample: (id + 1) * 16_000, said_at: t, start: t, end: t, text: text.into(), words: Vec::new(), source }
+    }
+
+    fn segment(id: u64, text: &str, source: SegmentSource) -> Event {
+        Event::Session(Notification::Segment(seg(id, text, source)))
+    }
+
+    fn committed(revision: u64) -> Event {
+        Event::Committed { words: 12, slides: 1, block: format!("\n<!-- 10:00:00 -->\n## Block {revision}\n"), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision }
+    }
+
+    fn hydration(notes: NotesSnapshot) -> Hydration {
+        Hydration { segments: Vec::new(), notes, slides: Vec::new(), unresolved: 0 }
+    }
+
+    /// Plan §J: an Open utterance appears provisionally, a newer Open replaces it, and the live
+    /// segment that finalises it closes it as it lands.
+    #[test]
+    fn open_then_final_transcript() {
+        let mut v = view();
+        assert_eq!(v.open, None);
+        v.reduce(&Event::Session(Notification::Open { stable: "the learning".into(), tentative: " rate".into() }), at());
+        assert_eq!(v.open.as_ref().map(|o| (o.stable.as_str(), o.tentative.as_str())), Some(("the learning", " rate")));
+        v.reduce(&Event::Session(Notification::Open { stable: "the learning rate".into(), tentative: String::new() }), at());
+        assert_eq!(v.open.as_ref().map(|o| o.stable.as_str()), Some("the learning rate"), "an Open replaces the one before");
+        v.reduce(&segment(0, "the learning rate", SegmentSource::Live), at());
+        assert_eq!(v.open, None, "the live segment closed it");
+        assert_eq!(v.closed.iter().map(|l| (l.id, l.text.as_str())).collect::<Vec<_>>(), vec![(0, "the learning rate")]);
+    }
+
+    /// Plan §J: recovery commits history; it must not close what is being said now.
+    #[test]
+    fn recovered_segment_does_not_close_live_open() {
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Open { stable: "gradient".into(), tentative: " descent".into() }), at());
+        v.reduce(&segment(0, "recovered words", SegmentSource::Recovered), at());
+        assert!(v.open.is_some(), "a recovered segment is history");
+        assert_eq!(v.closed.len(), 1, "it is still appended");
+        v.reduce(&segment(1, "gradient descent", SegmentSource::Live), at());
+        assert!(v.open.is_none(), "only the live one closes the utterance");
+    }
+
+    /// Plan §J: an old or duplicate id is not appended; the log's id is the identity.
+    #[test]
+    fn duplicate_segment_is_not_appended() {
+        let mut v = view();
+        v.reduce(&segment(0, "one", SegmentSource::Live), at());
+        v.reduce(&segment(1, "two", SegmentSource::Live), at());
+        assert!(!v.reduce(&segment(1, "two", SegmentSource::Live), at()).hydrate);
+        assert!(!v.reduce(&segment(0, "one", SegmentSource::Live), at()).hydrate);
+        assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(v.closed.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["one", "two"], "no reordering either");
+    }
+
+    /// Plan §J: held last id N, an event at N + 2 is a hole: hydration is asked for, and nothing is
+    /// guessed into the gap.
+    #[test]
+    fn segment_hole_requests_rehydration() {
+        let mut v = view();
+        v.reduce(&segment(0, "one", SegmentSource::Live), at());
+        v.reduce(&segment(1, "two", SegmentSource::Live), at());
+        let effect = v.reduce(&segment(3, "four", SegmentSource::Live), at());
+        assert!(effect.hydrate, "id 3 while the next is 2");
+        assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), vec![0, 1], "nothing lands in the hole");
+        // and a first id that is not 0 is a hole too
+        let mut fresh = view();
+        assert!(fresh.reduce(&segment(2, "from nowhere", SegmentSource::Live), at()).hydrate);
+    }
+
+    /// Plan §J: the missed ids come from the log. A real segment log in a tempdir holds 0–9; the
+    /// events deliver 0–4 and then 7; the view ends with 0–9, once each, and goes on contiguously.
+    #[tokio::test]
+    async fn a_lost_segment_comes_back_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap());
+        std::fs::create_dir_all(files.state_dir()).unwrap();
+        let mut log = SegmentLog::open(dir.path(), &files.stem).unwrap();
+        for id in 0..=4u64 {
+            log.append(NewSegment { recording_id: Default::default(), start_sample: id * 16_000, end_sample: (id + 1) * 16_000, text: format!("line {id}"), words: Vec::new(), source: SegmentSource::Live }, at()).unwrap();
+        }
+        drop(log);
+        // the session starts over the log as it is
+        let mut v = View::new(identity(SourceKind::Loopback), hydrate::read(&files).await.unwrap(), Vec::new());
+        for id in 0..=4u64 {
+            assert!(!v.reduce(&segment(id, &format!("line {id}"), SegmentSource::Live), at()).hydrate);
+        }
+        // the log grew to 9 while the session ran; the notifications for 5 and 6 were lost, and 7's
+        // arrives now
+        let mut log = SegmentLog::open(dir.path(), &files.stem).unwrap();
+        for id in 5..=9u64 {
+            log.append(NewSegment { recording_id: Default::default(), start_sample: id * 16_000, end_sample: (id + 1) * 16_000, text: format!("line {id}"), words: Vec::new(), source: SegmentSource::Live }, at()).unwrap();
+        }
+        drop(log);
+        assert!(v.reduce(&segment(7, "line 7", SegmentSource::Live), at()).hydrate, "a hole at 5 and 6");
+        v.merge(hydrate::read(&files).await.unwrap());
+        assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), (0..=9).collect::<Vec<_>>(), "contiguous, from the log");
+        assert_eq!(v.closed.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), (0..=9).map(|id| format!("line {id}")).collect::<Vec<_>>(), "once each");
+        // the stream continues from there with no further read
+        let mut log = SegmentLog::open(dir.path(), &files.stem).unwrap();
+        log.append(NewSegment { recording_id: Default::default(), start_sample: 160_000, end_sample: 176_000, text: "line 10".into(), words: Vec::new(), source: SegmentSource::Live }, at()).unwrap();
+        drop(log);
+        assert!(!v.reduce(&segment(10, "line 10", SegmentSource::Live), at()).hydrate);
+    }
+
+    /// Plan §J: a hydration that started earlier than the live stream must not undo it — segments
+    /// the log did not yet hold, a notes revision already applied, a slide already registered.
+    #[test]
+    fn stale_hydration_never_rolls_back() {
+        let mut v = view();
+        for id in 0..=12u64 {
+            v.reduce(&segment(id, &format!("line {id}"), SegmentSource::Live), at());
+        }
+        v.reduce(&committed(1), at());
+        v.reduce(&committed(2), at());
+        v.reduce(&Event::Slide { index: 5, file: "slides/slide_05_100000.png".into(), auto: true, uncertain: false, shown_at: at() }, at());
+        let stale = Hydration {
+            segments: (0..=10).map(|id| seg(id, &format!("line {id}"), SegmentSource::Live)).collect(),
+            notes: NotesSnapshot::At { revision: 1, document: "only the first block\n".into() },
+            slides: vec![SlideEntry { index: 2, file: "slides/slide_02_100000.png".into(), shown_at: at(), auto: false, uncertain: false }],
+            unresolved: 0,
+        };
+        v.merge(stale);
+        assert_eq!(v.closed.iter().map(|l| l.id).collect::<Vec<_>>(), (0..=12).collect::<Vec<_>>(), "segments 11 and 12 survive the read that stopped at 10");
+        assert_eq!(v.notes.revision, 2, "the notes did not move back to 1");
+        assert!(v.notes.document.contains("Block 2"), "the document still holds revision 2's block");
+        assert!(v.slides.iter().any(|s| s.index == 5), "a live registration is not removed");
+        assert!(v.slides.iter().any(|s| s.index == 2), "and the read's older slide was added");
+    }
+
+    /// Plan §J: the connection's ups and downs change only its own words.
+    #[test]
+    fn reconnect_preserves_recording_state() {
+        let mut v = view();
+        v.reduce(&segment(0, "one", SegmentSource::Live), at());
+        v.reduce(&committed(1), at());
+        let before = (v.phase, v.closed.len(), v.gaps, v.notes.revision, v.slides.len(), v.spend);
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Retrying { after: std::time::Duration::from_secs(4), reason: "socket closed".into() })), at());
+        assert!(matches!(v.stt, Some(SttStatus::Retrying { .. })));
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
+        assert_eq!(v.stt, Some(SttStatus::Connected));
+        assert_eq!((v.phase, v.closed.len(), v.gaps, v.notes.revision, v.slides.len(), v.spend), before, "recording state untouched");
+    }
+
+    /// Plan §J: a refusal stays a refusal — semantically, not as a string — until a real later event
+    /// changes it.
+    #[test]
+    fn refused_stt_does_not_fake_reconnect() {
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Refused("bad key".into()))), at());
+        v.reduce(&Event::Session(Notification::Level(0.1)), at());
+        v.reduce(&Event::Session(Notification::Open { stable: "words".into(), tentative: String::new() }), at());
+        assert_eq!(v.stt, Some(SttStatus::Refused("bad key".into())), "nothing else connected it");
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
+        assert_eq!(v.stt, Some(SttStatus::Connected), "a real later event does change it");
+    }
+
+    /// Plan §J: `Level` is latest-value telemetry (plan §C 6). Widely separated samples move the
+    /// meter alone: no hydration, no canonical change.
+    #[test]
+    fn missed_level_samples_change_only_the_meter() {
+        let mut v = view();
+        v.reduce(&segment(0, "one", SegmentSource::Live), at());
+        v.reduce(&committed(1), at());
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
+        let before = (v.closed.clone(), v.gaps, v.slides.clone(), v.notes.revision, v.notes.document.clone(), v.stt.clone(), v.phase);
+        assert!(!v.reduce(&Event::Session(Notification::Level(0.5)), at()).hydrate);
+        assert!(!v.reduce(&Event::Session(Notification::Level(0.000_1)), at()).hydrate, "whatever arrived in between was missed");
+        assert_eq!(v.level, Some(0.000_1), "the meter shows the latest sample");
+        assert_eq!((v.closed.clone(), v.gaps, v.slides.clone(), v.notes.revision, v.notes.document.clone(), v.stt.clone(), v.phase), before);
+    }
+
+    /// Plan §J: held revision N, a commit at N + 2 asks for the files; the re-read's document lands.
+    #[test]
+    fn revision_jump_requests_reload() {
+        let mut v = view();
+        assert!(!v.reduce(&committed(1), at()).hydrate, "held + 1 applies with no read");
+        assert_eq!(v.notes.revision, 1);
+        assert!(v.reduce(&committed(3), at()).hydrate, "a jump over revision 2");
+        assert_eq!(v.notes.revision, 1, "the document did not move on the strength of the event");
+        v.merge(hydration(NotesSnapshot::At { revision: 3, document: "# the real notes\n".into() }));
+        assert_eq!((v.notes.revision, v.notes.document.as_str()), (3, "# the real notes\n"));
+    }
+
+    /// Plan §J: an old or duplicate commit still ends the preview — the work is over — without
+    /// duplicating notes content the document already holds.
+    #[test]
+    fn hydrated_commit_still_ends_preview() {
+        let mut v = view();
+        v.reduce(&committed(1), at());
+        v.reduce(&Event::Preview("## A".into()), at());
+        v.reduce(&Event::Preview("\n- b".into()), at());
+        assert_eq!(v.notes.preview.as_deref(), Some("## A\n- b"));
+        v.reduce(&committed(1), at()); // a duplicate delivery of revision 1
+        assert_eq!(v.notes.preview, None, "the preview ended");
+        assert_eq!(v.notes.document.matches("Block 1").count(), 1, "and nothing was appended twice");
+        v.reduce(&Event::Preview("again".into()), at());
+        v.merge(hydration(NotesSnapshot::At { revision: 1, document: v.notes.document.clone() }));
+        v.reduce(&committed(1), at()); // what a late read of revision 1 would bring
+        assert_eq!(v.notes.preview, None);
+        assert_eq!(v.notes.document.matches("Block 1").count(), 1);
+    }
+
+    /// Plan §J: a polish always re-reads the files; its event cannot rebuild the document.
+    #[test]
+    fn polished_requests_hydration_and_ends_the_preview() {
+        let mut v = view();
+        v.reduce(&Event::Preview("## A".into()), at());
+        let effect = v.reduce(&Event::Polished { backup: "l/.live_notes/backup.md".into(), usd: 0.04, revision: 4 }, at());
+        assert!(effect.hydrate);
+        assert_eq!(v.notes.preview, None);
+        assert_eq!(v.notes.revision, 0, "the revision comes only from the file");
+    }
+
+    /// Plan §J: a transcript gap raises the count, `Recovered` resolves it, saturating; an audio gap
+    /// never counts.
+    #[test]
+    fn gap_and_recovered_move_the_waiting_count() {
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Gap(audio_gap())), at());
+        assert_eq!(v.gaps, 0, "an audio gap is explained as it is");
+        v.reduce(&Event::Session(Notification::Gap(transcript_gap())), at());
+        assert_eq!(v.gaps, 1);
+        v.reduce(&Event::Session(Notification::Recovered(resolved(transcript_gap()))), at());
+        assert_eq!(v.gaps, 0);
+        v.reduce(&Event::Session(Notification::Recovered(resolved(transcript_gap()))), at());
+        assert_eq!(v.gaps, 0, "saturating: no recovery counts twice");
+    }
+
+    /// Plan §J: a single input's gone mark is held until it returns.
+    #[test]
+    fn device_gone_then_back() {
+        let mut v = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
+        assert!(!v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at()).hydrate, "a gone input never re-reads files");
+        assert_eq!(v.input_gone.as_deref(), Some("Receiver_UID"));
+        assert!(v.notice.as_ref().is_some_and(|n| n.label == "input gone"), "the top-priority notice holds the line");
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
+        assert_eq!(v.input_gone, None);
+    }
+
+    /// Plan §J: `DeviceBack` says the device returned, not that signal resumed. The loopback's
+    /// silence stays until a level at or above the threshold arrives.
+    #[test]
+    fn device_return_does_not_imply_signal() {
+        let mut v = view(); // the loopback: its level is the signal
+        let quiet = 10f32.powf(-80.0 / 20.0);
+        for _ in 0..10 {
+            v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(v.silence, "ten quiet seconds on the loopback");
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
+        assert_eq!(v.input_gone, None, "the gone mark did not survive the return");
+        assert!(v.silence, "but nothing has been heard yet");
+        assert_eq!(v.level, Some(quiet));
+        v.reduce(&Event::Session(Notification::Level(0.5)), at());
+        assert!(!v.silence, "a real level clears it");
+    }
+
+    /// Plan §F: the ring keeps the last [`Ring::CAPACITY`] records; the oldest falls off.
+    #[test]
+    fn the_activity_ring_keeps_only_the_last_500_records() {
+        let mut v = view();
+        assert!(v.activity.is_empty());
+        for k in 0..502 {
+            v.reduce(&Event::Warning(format!("number {k}")), at());
+        }
+        assert_eq!(v.activity.len(), Ring::CAPACITY);
+        assert_eq!(v.activity.records().front().unwrap().detail, "number 2", "the oldest fell off");
+        assert_eq!(v.activity.records().back().unwrap().detail, "number 501");
+    }
+
+    /// The projection's boundary cleans (plan §C 12): transcript text, open utterances, previews,
+    /// notices — no control character enters the view.
+    #[test]
+    fn untrusted_text_is_cleaned_as_it_enters() {
+        let hostile = |s: &str| s.chars().any(|c| c != '\n' && c != '\t' && c.is_control());
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Open { stable: "\x1b[31mred".into(), tentative: "\x07".into() }), at());
+        let open = v.open.clone().unwrap();
+        assert!(!hostile(&open.stable) && !hostile(&open.tentative));
+        v.reduce(&segment(0, "\x1b]0;title\x07", SegmentSource::Live), at());
+        assert!(!hostile(&v.closed[0].text));
+        v.reduce(&Event::Preview("\x1b[58;5;9mpartial".into()), at());
+        assert!(!hostile(v.notes.preview.as_deref().unwrap()));
+        v.reduce(&Event::SnapshotFailed("failed\x1b[2K".into()), at());
+        assert!(!hostile(&v.notice.as_ref().unwrap().detail));
+        v.reduce(&Event::Slide { index: 1, file: "slides/s\x1b[31m.png".into(), auto: false, uncertain: false, shown_at: at() }, at());
+        assert!(!hostile(&v.slides[0].file));
+    }
+
+    /// Busy text goes to the ring as it is, dim, and is never a notice.
+    #[test]
+    fn busy_text_is_activity_never_a_notice() {
+        let mut v = view();
+        v.reduce(&Event::Busy("snapshot, 12 words to grok-4.7".into()), at());
+        assert_eq!(v.notice, None);
+        assert_eq!(v.activity.records().iter().last().map(|a| (a.kind, a.label.as_str(), a.detail.as_str())), Some(("dim", "…", "snapshot, 12 words to grok-4.7")));
+    }
+
+    /// The seed records open the activity: what the plain report printed before the terminal was
+    /// taken (plan Task 6).
+    #[test]
+    fn the_seed_opens_the_activity() {
+        let seed = vec![plain::Notice { kind: "notes", label: "notes".into(), detail: "lecture_notes_20260926.md created".into() }];
+        let v = tested_with(identity(SourceKind::Loopback), seed);
+        assert_eq!(v.activity.len(), 1);
+        assert_eq!(v.activity.records()[0].detail, "lecture_notes_20260926.md created");
+    }
+
+    /// Slide upserts by index: a later registration of the same index refreshes what is shown.
+    #[test]
+    fn slides_upsert_by_index() {
+        let mut v = view();
+        v.reduce(&Event::Slide { index: 1, file: "slides/slide_01_100000.png".into(), auto: true, uncertain: true, shown_at: at() }, at());
+        v.reduce(&Event::Slide { index: 1, file: "slides/slide_01_100000.png".into(), auto: true, uncertain: false, shown_at: at() }, at());
+        assert_eq!(v.slides.len(), 1);
+        assert!(!v.slides[0].uncertain, "the same index refreshed, not duplicated");
+        v.reduce(&Event::Slide { index: 3, file: "slides/slide_03_100000.png".into(), auto: false, uncertain: false, shown_at: at() }, at());
+        assert_eq!(v.slides.iter().map(|s| s.index).collect::<Vec<_>>(), vec![1, 3], "in index order");
+    }
+
+    fn tested_with(identity: Identity, seed: Vec<Notice>) -> View {
+        View::new(identity, Hydration::empty(), seed)
+    }
+
+    /// A transcript gap, waiting for recovery, and an audio gap, explained as it is (spec §5.4).
+    fn transcript_gap() -> Gap {
+        Gap::new(Default::default(), 32_000, Some(48_000), GapKind::SttOffline)
+    }
+
+    fn audio_gap() -> Gap {
+        Gap::new(Default::default(), 32_000, Some(48_000), GapKind::RecorderOverflow)
+    }
+
+    fn resolved(mut g: Gap) -> Gap {
+        g.resolved = true;
+        g
+    }
+}

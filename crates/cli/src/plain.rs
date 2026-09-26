@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use lecturelive_core::audio::level::SilenceWatch;
 use lecturelive_core::audio::{input, loopback};
+use lecturelive_core::notes::page::PageOutcome;
 use lecturelive_core::session::coordinator::{Notification, SttStatus, StopReport};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::folder::How;
@@ -45,8 +46,130 @@ pub(crate) fn say(out: &mut impl Write, p: spend::Paint, kind: &str, label: &str
     writeln!(out, "{}", format!("  {} {}  {detail}", p.paint(mark, &[colour]), p.paint(label, &["bold"])).trim_end()).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
+/// An event's own wording, without any terminal styling of its own: which mark, what it is, what
+/// happened. The plain CLI prints it through `say`; the TUI shows the same words in its activity and
+/// notice line (passing a colour-off `Paint`, so nothing styled ever enters its view). Events the
+/// CLI prints as transcript or dim lines — segments, `Recording`, a first `transcribing`, `Busy`,
+/// `Preview` — carry no notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Notice {
+    /// The mark's kind, as `say` names it: "slide", "notes", "page", "done", or anything else for a
+    /// warning.
+    pub(crate) kind: &'static str,
+    pub(crate) label: String,
+    pub(crate) detail: String,
+}
+
 fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Strips what could act on a terminal from text about to be shown (M7 plan §C 12): every C0 and C1
+/// control character — ESC, so every CSI and OSC sequence's introducer, BEL, the carriage return
+/// that rewrites a line — keeping `\n` and tab, which mean something in notes and transcript text.
+/// An escape's payload without its introducer is inert text; Unicode, punctuation, useful spaces and
+/// Markdown are untouched. Display cleaning only: canonical files are never altered.
+pub(crate) fn clean(text: &str) -> String {
+    text.chars().filter(|&c| c == '\n' || c == '\t' || !c.is_control()).collect()
+}
+
+/// The input-gone notice (plan §H's notice line, top priority): the fixed sentence. The plain CLI
+/// appends its offer of the other inputs after it; the TUI shows the sentence as it is.
+pub(crate) fn input_gone(uid: &str) -> Notice {
+    Notice { kind: "warn", label: "input gone".into(), detail: format!("{uid}; waiting for it to return, and nothing switches by itself") }
+}
+
+/// The loopback silence warning (spec §4.3), as both frontends' watches say it.
+pub(crate) fn no_signal() -> Notice {
+    Notice { kind: "warn", label: "no signal".into(), detail: format!("10 s of silence on BlackHole: is Zoom's Speaker \"{}\"?", loopback::LOOPBACK_NAME) }
+}
+
+/// The committed line's detail: what was folded in and what it cost. The amount is painted dim by
+/// the plain CLI and plain for the TUI — the same words either way.
+fn committed_detail(words: usize, slides: usize, usd: f64, confirmed: bool, missing: usize, p: spend::Paint) -> String {
+    let mut detail = format!("{} and {} folded in  {}", plural(words, "word"), plural(slides, "slide"), p.paint(&spend::money(usd), &["dim"]));
+    if missing > 0 {
+        detail += &format!("  ({} not placed by the model, listed at the end)", plural(missing, "slide"));
+    }
+    if !confirmed {
+        detail += "  (transcription still catching up; the rest goes into the next snapshot)";
+    }
+    detail
+}
+
+/// The polished line's detail: where the previous version went, and what the polish cost.
+fn polished_detail(backup: &Path, usd: f64, p: spend::Paint) -> String {
+    let name = backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    format!("previous version in .live_notes/{name}  {}", p.paint(&spend::money(usd), &["dim"]))
+}
+
+/// The page line's detail: what was typeset, how long it came out, what it cost.
+fn page_detail(outcome: &PageOutcome, usd: f64, p: spend::Paint) -> String {
+    let name = outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let length = p.paint(&format!("{} words of {} allowed", outcome.words, outcome.budget), &[if outcome.words > outcome.budget as usize { "red" } else { "dim" }]);
+    let mut detail = format!("{name}  {length}  {}", p.paint(&spend::money(usd), &["dim"]));
+    if outcome.cached {
+        detail += "  (notes unchanged since they were typeset: only the design reapplied, free)";
+    }
+    if !outcome.missing.is_empty() {
+        detail += &format!("  (missing: {})", outcome.missing.join(", "));
+    }
+    detail
+}
+
+/// One notice in the CLI's line: `say`, from the shared wording.
+fn say_notice(out: &mut impl Write, p: spend::Paint, n: &Notice) {
+    say(out, p, n.kind, &n.label, &n.detail);
+}
+
+/// An event as a notice, in the plain CLI's own words (the TUI's activity and notice line show the
+/// same wording, with `p` colour-off so no styling enters the view).
+pub(crate) fn notice(e: &Event, p: spend::Paint) -> Option<Notice> {
+    let n = |kind: &'static str, label: &str, detail: String| Some(Notice { kind, label: label.into(), detail });
+    match e {
+        Event::Session(m) => match m {
+            Notification::Gap(g) => n("warn", "gap", format!("{:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id)),
+            Notification::DeviceGone { uid } => Some(input_gone(uid)),
+            Notification::DeviceBack { uid } => n("done", "input back", format!("{uid}; recording continues in a new file")),
+            Notification::Failed(m) => n("warn", "session failed", m.clone()),
+            Notification::Stt(s) => match s {
+                SttStatus::Retrying { after, reason } => n("warn", "transcription interrupted", format!("{reason}; reconnecting in {} s", after.as_secs())),
+                SttStatus::Refused(m) => n("warn", "transcription refused", format!("{}. Recording continues without it.", sentence(m))),
+                SttStatus::ServerError(m) => n("warn", "transcription server", m.clone()),
+                SttStatus::Stopped(m) => n("warn", "transcription stopped", m.clone()),
+                SttStatus::Connected => None,
+            },
+            Notification::Recovered(g) => n("done", "recovered", format!("the transcript of {:.1}–{:.1} s of recording {}", secs(g.start_sample), g.end_sample.map_or(0.0, secs), g.recording_id)),
+            Notification::RecoveryFailed(m) => n("warn", "recovery", m.clone()),
+            Notification::SpendFailed(m) => n("warn", "spend", m.clone()),
+            _ => None,
+        },
+        Event::NothingNew => n("notes", "snapshot", "nothing new since the last one".into()),
+        Event::Committed { words, slides, usd, confirmed, missing, .. } => n("notes", "notes", committed_detail(*words, *slides, *usd, *confirmed, *missing, p)),
+        Event::SnapshotFailed(m) => n("warn", "snapshot failed", m.clone()),
+        Event::Polished { backup, usd, .. } => n("done", "polished", polished_detail(backup, *usd, p)),
+        Event::PolishStopped(m) => n("warn", "polish stopped", m.clone()),
+        Event::PolishFailed(m) => n("warn", "polish failed", m.clone()),
+        Event::Cancelled(what) => n("warn", "cancelled", format!("{what}; nothing was written, everything is kept for the next snapshot")),
+        Event::Page { outcome, usd } => n("done", "page", page_detail(outcome, *usd, p)),
+        Event::PageFailed(m) => n("warn", "page failed", m.clone()),
+        Event::Slide { index, file, auto, uncertain, .. } => {
+            let how = match (auto, uncertain) {
+                (true, true) => " (auto, still changing)",
+                (true, false) => " (auto)",
+                _ => "",
+            };
+            let name = Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            n("slide", &format!("slide {index}{how}"), format!("{name}, into the next snapshot"))
+        }
+        Event::Capture(s) => {
+            let (label, detail) = s.words();
+            n("slide", &label.to_lowercase(), detail)
+        }
+        Event::CaptureMoved { note, .. } => n("slide", "found again", note.clone()),
+        Event::Warning(m) => n("warn", "warning", m.clone()),
+        Event::Busy(_) | Event::Preview(_) => None,
+    }
 }
 
 /// The fallback the CLI offers while an input is gone (spec §4.1): the other inputs, to start again with.
@@ -59,86 +182,42 @@ pub(crate) fn other_inputs(gone: &str) -> String {
 }
 
 /// Prints the lecture's events in the CLI's lines; the loopback silence warning as `record` gives it.
+/// The say-lines come from [`notice`], so the TUI's activity says the same things (M7 plan §F).
 pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
+    // The plain CLI's own lines first — the transcript, the recording path, a first `transcribing`,
+    // the busy text — and the events whose wording needs the machine (the gone input's offer).
     match e {
-        Event::Session(n) => match n {
-            Notification::Segment(s) => {
-                let tag = if s.source == SegmentSource::Recovered { p.paint("  (recovered)", &["dim"]) } else { String::new() };
-                writeln!(out, "  {}  {}{tag}", p.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), s.text).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+        Event::Session(Notification::Segment(s)) => {
+            let tag = if s.source == SegmentSource::Recovered { p.paint("  (recovered)", &["dim"]) } else { String::new() };
+            writeln!(out, "  {}  {}{tag}", p.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), s.text).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+        }
+        Event::Session(Notification::Level(l)) => {
+            if watch.as_mut().is_some_and(|w| w.observe(*l)) {
+                say_notice(out, p, &no_signal());
             }
-            Notification::Level(l) => {
-                if watch.as_mut().is_some_and(|w| w.observe(*l)) {
-                    say(out, p, "warn", "no signal", &format!("10 s of silence on BlackHole: is Zoom's Speaker \"{}\"?", loopback::LOOPBACK_NAME));
-                }
-            }
-            Notification::Recording { path } => { writeln!(out, "{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
-            Notification::Gap(g) => say(out, p, "warn", "gap", &format!("{:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id)),
-            Notification::DeviceGone { uid } => say(out, p, "warn", "input gone", &format!("{uid}; waiting for it to return, and nothing switches by itself. {}", other_inputs(uid))),
-            Notification::DeviceBack { uid } => say(out, p, "done", "input back", &format!("{uid}; recording continues in a new file")),
-            Notification::Failed(m) => say(out, p, "warn", "session failed", m),
-            Notification::Stt(s) => match s {
-                SttStatus::Connected => { writeln!(out, "{}", p.paint("  transcribing", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
-                SttStatus::Retrying { after, reason } => say(out, p, "warn", "transcription interrupted", &format!("{reason}; reconnecting in {} s", after.as_secs())),
-                SttStatus::Refused(m) => say(out, p, "warn", "transcription refused", &format!("{}. Recording continues without it.", sentence(m))),
-                SttStatus::ServerError(m) => say(out, p, "warn", "transcription server", m),
-                SttStatus::Stopped(m) => say(out, p, "warn", "transcription stopped", m),
-            },
-            Notification::Open { .. } | Notification::SourceEnded => {}
-            Notification::Recovered(g) => say(out, p, "done", "recovered", &format!("the transcript of {:.1}–{:.1} s of recording {}", secs(g.start_sample), g.end_sample.map_or(0.0, secs), g.recording_id)),
-            Notification::RecoveryFailed(m) => say(out, p, "warn", "recovery", m),
-            Notification::SpendFailed(m) => say(out, p, "warn", "spend", m),
-        },
+        }
+        Event::Session(Notification::Recording { path }) => { writeln!(out, "{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
+        // The notice is the fixed sentence; the offer of the other inputs is the plain CLI's own.
+        Event::Session(Notification::DeviceGone { uid }) => {
+            let n = input_gone(uid);
+            say(out, p, n.kind, &n.label, &format!("{}. {}", n.detail, other_inputs(uid)));
+        }
+        Event::Session(Notification::Stt(SttStatus::Connected)) => { writeln!(out, "{}", p.paint("  transcribing", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
         Event::Busy(m) => { writeln!(out, "{}", p.paint(&format!("  … {m}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
         Event::Preview(_) => {} // the committed block is printed instead, as the CLI does
-        Event::NothingNew => say(out, p, "notes", "snapshot", "nothing new since the last one"),
-        Event::Committed { words, slides, block, usd, confirmed, missing, .. } => {
+        Event::Committed { block, .. } => {
             for line in block.trim().lines().filter(|l| !l.starts_with("<!-- ")) {
                 writeln!(out, "  {} {}", p.paint("│", &["teal"]), p.paint(line, &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
             }
-            let mut detail = format!("{} and {} folded in  {}", plural(*words, "word"), plural(*slides, "slide"), p.paint(&spend::money(*usd), &["dim"]));
-            if *missing > 0 {
-                detail += &format!("  ({} not placed by the model, listed at the end)", plural(*missing, "slide"));
+            if let Some(n) = notice(e, p) {
+                say_notice(out, p, &n);
             }
-            if !confirmed {
-                detail += "  (transcription still catching up; the rest goes into the next snapshot)";
+        }
+        _ => {
+            if let Some(n) = notice(e, p) {
+                say_notice(out, p, &n);
             }
-            say(out, p, "notes", "notes", &detail);
         }
-        Event::SnapshotFailed(m) => say(out, p, "warn", "snapshot failed", m),
-        Event::Polished { backup, usd, .. } => {
-            let name = backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            say(out, p, "done", "polished", &format!("previous version in .live_notes/{name}  {}", p.paint(&spend::money(*usd), &["dim"])));
-        }
-        Event::PolishStopped(m) => say(out, p, "warn", "polish stopped", m),
-        Event::PolishFailed(m) => say(out, p, "warn", "polish failed", m),
-        Event::Cancelled(what) => say(out, p, "warn", "cancelled", &format!("{what}; nothing was written, everything is kept for the next snapshot")),
-        Event::Page { outcome, usd } => {
-            let name = outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let length = p.paint(&format!("{} words of {} allowed", outcome.words, outcome.budget), &[if outcome.words > outcome.budget as usize { "red" } else { "dim" }]);
-            let mut detail = format!("{name}  {length}  {}", p.paint(&spend::money(*usd), &["dim"]));
-            if outcome.cached {
-                detail += "  (notes unchanged since they were typeset: only the design reapplied, free)";
-            }
-            if !outcome.missing.is_empty() {
-                detail += &format!("  (missing: {})", outcome.missing.join(", "));
-            }
-            say(out, p, "done", "page", &detail);
-        }
-        Event::PageFailed(m) => say(out, p, "warn", "page failed", m),
-        Event::Slide { index, file, auto, uncertain, .. } => {
-            let how = match (auto, uncertain) {
-                (true, true) => " (auto, still changing)",
-                (true, false) => " (auto)",
-                _ => "",
-            };
-            say(out, p, "slide", &format!("slide {index}{how}"), &format!("{}, into the next snapshot", Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
-        }
-        Event::Capture(s) => {
-            let (label, detail) = s.words();
-            say(out, p, "slide", &label.to_lowercase(), &detail)
-        }
-        Event::CaptureMoved { note, .. } => say(out, p, "slide", "found again", note),
-        Event::Warning(m) => say(out, p, "warn", "warning", m),
     }
 }
 
@@ -148,43 +227,56 @@ pub(crate) fn parse_line(line: &str) -> Op {
     if text.eq_ignore_ascii_case("polish") { Op::Polish } else { Op::Snapshot(text) }
 }
 
-/// The start-up report after `prepare`: what launch did to the recordings, what the folder's
-/// initialisation found, then the lecture's header lines.
-pub(crate) fn print_prepared(out: &mut impl Write, p: spend::Paint, ready: &start::Prepared, files: &LectureFiles, course: &str, name: &str, input_name: &str) {
-    for (path, n) in &ready.launch.repaired {
-        say(out, p, "done", "repaired", &format!("{} ({:.1} s)", path.display(), secs(*n)));
+/// The start-up report's records (M7 plan Task 6): what launch did to the recordings and what the
+/// folder's initialisation found, in the order [`print_prepared`] prints them. The TUI seeds its
+/// activity with the same records, so both frontends open with the same words.
+pub(crate) fn startup_records(ready: &start::Prepared, files: &LectureFiles) -> Vec<Notice> {
+    let mut out = Vec::new();
+    let mut n = |kind: &'static str, label: &str, detail: String| out.push(Notice { kind, label: label.into(), detail });
+    for (path, lost) in &ready.launch.repaired {
+        n("done", "repaired", format!("{} ({:.1} s)", path.display(), secs(*lost)));
     }
     for path in &ready.launch.missing {
-        say(out, p, "warn", "missing", &format!("{} (marked as a gap)", path.display()));
+        n("warn", "missing", format!("{} (marked as a gap)", path.display()));
     }
     for path in &ready.launch.pruned {
-        say(out, p, "done", "deleted", &format!("{} (retention)", path.display()));
+        n("done", "deleted", format!("{} (retention)", path.display()));
     }
     let init = &ready.init;
     match init.how {
-        How::Created => say(out, p, "notes", "notes", &format!("{} created", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
-        How::Migrated => say(out, p, "notes", "migrated", "this folder's Python CLI state is now the app's (the Python CLI no longer writes here)"),
-        How::Rebuilt => say(out, p, "warn", "rebuilt", "the state was rebuilt from the notes: everything after the last <!-- --> marker is pending"),
+        How::Created => n("notes", "notes", format!("{} created", files.notes.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())),
+        How::Migrated => n("notes", "migrated", "this folder's Python CLI state is now the app's (the Python CLI no longer writes here)".into()),
+        How::Rebuilt => n("warn", "rebuilt", "the state was rebuilt from the notes: everything after the last <!-- --> marker is pending".into()),
         How::Resumed => {}
     }
     if let Some(m) = init.legacy_commit {
-        say(out, p, "warn", "recovered", m);
+        n("warn", "recovered", m.to_string());
     }
     if let Some(kept) = &init.corrupt_kept {
-        say(out, p, "warn", "rebuilt", &format!("the corrupt state is kept as {}", kept.display()));
+        n("warn", "rebuilt", format!("the corrupt state is kept as {}", kept.display()));
     }
     match init.journal {
-        Recovered::Completed => say(out, p, "done", "recovered", "the last snapshot was fully written"),
-        Recovered::Truncated => say(out, p, "warn", "recovered", "removed a half-written snapshot; its material is queued again"),
-        Recovered::NotAppended => say(out, p, "warn", "recovered", "an interrupted snapshot never reached the notes; its material is queued again"),
+        Recovered::Completed => n("done", "recovered", "the last snapshot was fully written".into()),
+        Recovered::Truncated => n("warn", "recovered", "removed a half-written snapshot; its material is queued again".into()),
+        Recovered::NotAppended => n("warn", "recovered", "an interrupted snapshot never reached the notes; its material is queued again".into()),
         Recovered::Nothing => {}
     }
     if init.external_edit {
-        say(out, p, "notes", "notes", "edited outside the app since the last session; kept as they are");
+        n("notes", "notes", "edited outside the app since the last session; kept as they are".into());
     }
     for (stem, r) in &ready.other_days {
-        say(out, p, "done", "recovered", &format!("{stem}'s transcript gaps{}", if r.unresolved > 0 { format!(", {} still waiting", r.unresolved) } else { String::new() }));
+        n("done", "recovered", format!("{stem}'s transcript gaps{}", if r.unresolved > 0 { format!(", {} still waiting", r.unresolved) } else { String::new() }));
     }
+    out
+}
+
+/// The start-up report after `prepare`: what launch did to the recordings, what the folder's
+/// initialisation found, then the lecture's header lines.
+pub(crate) fn print_prepared(out: &mut impl Write, p: spend::Paint, ready: &start::Prepared, files: &LectureFiles, course: &str, name: &str, input_name: &str) {
+    for n in startup_records(ready, files) {
+        say_notice(out, p, &n);
+    }
+    let init = &ready.init;
 
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     writeln!(out, "  {}  {}  {name}", p.paint(course, &["bold"]), p.paint("›", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
@@ -649,5 +741,70 @@ mod goldens {
         let mut fed = StopController::default();
         fed.advance(Origin::SourceEnded, std::time::Instant::now());
         assert_eq!(ctrl_c(&mut fed), (STOP_WAITING.into(), 2, Step::Advance { stage: Stage::StopWaiting, stops_to_send: 2 }));
+    }
+
+    /// M7 plan §C 12 and §J: nothing shown can act on a terminal. The introducers go (ESC and every
+    /// C0/C1 control), so each sequence's payload is left as the inert text it then is.
+    #[test]
+    fn display_text_cannot_emit_terminal_controls() {
+        let hostile = [
+            "\x1b[31mred\x1b[0m",            // a CSI colour
+            "\x1b[2J\x1b[H",                 // clear screen, cursor home
+            "\x1b]0;popup title\x07",        // an OSC title
+            "\x1b]52;c,QmFzZTY0\x07",        // an OSC clipboard write
+            "\x1b]8;;http://x.example\x1b\\click\x1b]8;;\x1b\\", // a hyperlink
+            "fine\x07audio",                 // BEL
+            "was written\rwas rewritten",    // a carriage return that rewrites the line
+            "a\x00b\x1fc\x7fd",              // other C0 controls and DEL
+            "line\u{9b}31mfeed\u{85}next",       // C1 CSI and NEL as single characters
+        ];
+        for text in hostile {
+            let safe = clean(text);
+            assert!(!safe.contains('\x1b') && !safe.contains('\r') && !safe.contains('\x07'), "{text:?} left controls: {safe:?}");
+            assert!(safe.chars().all(|c| c == '\n' || c == '\t' || !c.is_control()), "{text:?} left a control: {safe:?}");
+            assert!(!safe.is_empty(), "{text:?} still has its human text: {safe:?}");
+        }
+        assert_eq!(clean("\x1b[31m"), "[31m", "the payload without its introducer is inert text");
+        assert_eq!(clean("\x1b]0;title\x07"), "]0;title");
+        // what people and models actually write survives, Markdown and all
+        assert_eq!(clean("Voilà — naïve… 🎓 ελληνικά"), "Voilà — naïve… 🎓 ελληνικά");
+        assert_eq!(clean("## Heading\n\n- bullet **bold** `code`\n![Slide 3](slides/slide_3.png)\n"), "## Heading\n\n- bullet **bold** `code`\n![Slide 3](slides/slide_3.png)\n");
+        assert_eq!(clean("col1\tcol2\n"), "col1\tcol2\n");
+    }
+
+    /// The shared wording, unstyled: what the TUI's activity and notice line hold, and what `show`
+    /// then paints (already pinned byte for byte by the goldens above).
+    #[test]
+    fn notice_carries_the_plain_words_without_styling() {
+        let off = spend::Paint { color: false, truecolor: false };
+        let on = spend::Paint { color: true, truecolor: true };
+        let e = Event::Committed { words: 486, slides: 2, block: "<!-- 10:42:03 -->\n## Sampling".into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision: 3 };
+        let n = notice(&e, off).unwrap();
+        assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("notes", "notes", "486 words and 2 slides folded in  $0.02"));
+        assert!(!n.detail.contains('\x1b'), "the TUI's wording carries no styling");
+        assert_eq!(notice(&e, on).unwrap().detail, "486 words and 2 slides folded in  \x1b[2m$0.02\x1b[0m", "the plain CLI's own paint is unchanged");
+        assert_eq!(notice(&Event::Session(Notification::Open { stable: "a".into(), tentative: "b".into() }), off), None);
+        assert_eq!(notice(&Event::Busy("snapshot, 12 words".into()), off), None, "busy text is shown verbatim, never a notice");
+        assert_eq!(notice(&Event::Session(Notification::Stt(SttStatus::Connected)), off), None);
+        let gone = notice(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }), off).unwrap();
+        assert_eq!((gone.kind, gone.label.as_str()), ("warn", "input gone"));
+        assert_eq!(gone.detail, "Gone-UID; waiting for it to return, and nothing switches by itself", "the offer is the plain CLI's own addition");
+    }
+
+    /// The start-up records are what `print_prepared` prints — the pinned goldens cover the printing —
+    /// so the TUI's seed says what the plain report said.
+    #[test]
+    fn startup_records_are_the_printed_lines() {
+        let mut ready = prepared(InitReport { how: How::Rebuilt, journal: Recovered::Truncated, ..Default::default() });
+        ready.launch.repaired = vec![(PathBuf::from("/tmp/lec/recordings/session_1.wav"), 19200)];
+        let records = startup_records(&ready, &files());
+        assert_eq!(
+            records.iter().map(|n| (n.kind, n.label.as_str(), n.detail.as_str())).collect::<Vec<_>>(),
+            vec![
+                ("done", "repaired", "/tmp/lec/recordings/session_1.wav (1.2 s)"),
+                ("warn", "rebuilt", "the state was rebuilt from the notes: everything after the last <!-- --> marker is pending"),
+                ("warn", "recovered", "removed a half-written snapshot; its material is queued again"),
+            ]
+        );
     }
 }

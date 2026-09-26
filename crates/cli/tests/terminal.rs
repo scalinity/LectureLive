@@ -180,8 +180,9 @@ fn a_held_ctrl_c_only_stops() {
         std::thread::sleep(Duration::from_millis(30)); // a key repeat's pace
     }
     let stopping = l.pty.wait_for("Stopping", listening, SOON);
-    // The repeats were read and refused, with the reason on screen.
-    l.pty.wait_for("moment,", stopping, SOON);
+    // The repeats were read and refused, with the reason on screen (Task 6's notice line shares the
+    // row with the start-up records, so the wait is on a run that is written whole).
+    l.pty.wait_for("Ctrl-C again to stop waiting", stopping, SOON);
     // Past the dwell since the first byte: had a repeat counted, stage 2 would be showing by now.
     std::thread::sleep(STOP_DWELL);
     assert!(find(l.out(), b"Stop waiting", listening).is_none(), "a held key escalated:\n{}", visible(l.out()));
@@ -244,6 +245,26 @@ fn resizing_redraws_and_the_lecture_goes_on() {
     let status = l.pty.wait(SOON);
     assert_eq!(code(status, &l), Some(0));
     let after = l.restored(at);
+    l.at("saved", after);
+}
+
+/// Task 6 (plan §J's "a fixture PTY run shows STT words and the gap count updating"): the session
+/// view is live — the connection's words, a gap and its recovery reaching the notice line, the spend
+/// sample — while events keep draining and the background reads and samples change no terminal
+/// behaviour: the lifecycle ends exactly as Task 5's.
+#[test]
+fn the_session_view_shows_the_scripted_lecture_live() {
+    let mut l = tui("quiet", &["--secs", "8"], 110, 30);
+    let listening = l.listening();
+    let stt = l.pty.wait_for("transcribing", listening, SOON);
+    // An empty day's ledger renders as $-0.00, as the plain end summary's own golden pins it.
+    let spend = l.pty.wait_for("$-0.00 today", stt, SOON);
+    let gap = l.pty.wait_for("gap", spend, SOON); // t ≈ 2 s: a transcript gap opens, then recovery resolves it
+    let recovered = l.pty.wait_for("recovered", gap, SOON);
+    l.pty.wait_for("reconnect", recovered, SOON); // t ≈ 4 s: the connection dips and comes back
+    let status = l.pty.wait(SOON);
+    assert_eq!(code(status, &l), Some(0));
+    let after = l.restored(listening);
     l.at("saved", after);
 }
 

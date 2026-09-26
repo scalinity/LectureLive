@@ -30,6 +30,7 @@ use crate::fixture;
 use crate::plain;
 use crate::stop::StopController;
 use crate::tui;
+use crate::tui::state::{Identity, SourceKind};
 
 const REPO_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env");
 /// The Python CLI's ledger, taken over by the app's (spec §8).
@@ -274,8 +275,33 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             Some(fixture::Scenario::DrawFail) => tui::terminal::inject(tui::terminal::Fault::SecondDraw),
             _ => {}
         }
+        // What the session view opens with (plan Task 6): the lecture's names, the input it records
+        // from, and the start-up records the plain report printed.
+        let kind = if fixture.is_some() {
+            SourceKind::Fixture
+        } else if uid.starts_with("mixed:") {
+            SourceKind::Mixed
+        } else if uid == loopback::BLACKHOLE_UID {
+            SourceKind::Loopback
+        } else {
+            SourceKind::Input
+        };
+        let file_name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let session = tui::Session {
+            identity: Identity {
+                course: course.clone(),
+                lecture: name.clone(),
+                input: input_name.clone(),
+                kind,
+                notes_file: file_name(&files.notes),
+                transcript_file: file_name(&files.transcript),
+            },
+            files: files.clone(),
+            spend: spend.clone(),
+            seed: plain::startup_records(&ready, &files),
+        };
         // The terminal is given back before this returns, so the summary prints on the ordinary screen.
-        let report = tui::run(engine(cmd_rx, ev_tx)?, cmd_tx, ev_rx, a.secs).await?;
+        let report = tui::run(session, engine(cmd_rx, ev_tx)?, cmd_tx, ev_rx, a.secs).await?;
         plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);
         return Ok(());
     }
