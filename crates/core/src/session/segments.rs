@@ -61,6 +61,9 @@ pub fn transcript_line(s: &Segment) -> String {
 pub struct SegmentLog {
     log: File,
     transcript: File,
+    /// Named in a failed write's message (spec §10: a disk write error surfaces the path).
+    log_path: PathBuf,
+    transcript_path: PathBuf,
     /// Recording and interval of every logged segment, in log order.
     intervals: Vec<(Uuid, u64, u64)>,
 }
@@ -85,7 +88,7 @@ impl SegmentLog {
             repair_transcript(tpath, last)?;
         }
         let transcript = OpenOptions::new().create(true).append(true).open(tpath).with_context(|| format!("open {}", tpath.display()))?;
-        Ok(Self { log, transcript, intervals: segments.iter().map(|s| (s.recording_id, s.start_sample, s.end_sample)).collect() })
+        Ok(Self { log, transcript, log_path: path, transcript_path: tpath.to_path_buf(), intervals: segments.iter().map(|s| (s.recording_id, s.start_sample, s.end_sample)).collect() })
     }
 
     pub fn len(&self) -> u64 {
@@ -113,10 +116,9 @@ impl SegmentLog {
         };
         let mut line = serde_json::to_vec(&seg)?;
         line.push(b'\n');
-        self.log.write_all(&line)?;
-        self.log.sync_data()?;
-        self.transcript.write_all(transcript_line(&seg).as_bytes())?;
-        self.transcript.sync_data()?;
+        let (log, transcript) = (&self.log_path, &self.transcript_path);
+        self.log.write_all(&line).and_then(|_| self.log.sync_data()).with_context(|| format!("write {}", log.display()))?;
+        self.transcript.write_all(transcript_line(&seg).as_bytes()).and_then(|_| self.transcript.sync_data()).with_context(|| format!("write {}", transcript.display()))?;
         self.intervals.push((seg.recording_id, seg.start_sample, seg.end_sample));
         Ok(seg)
     }
@@ -166,10 +168,11 @@ pub fn session_marker(transcript: &Path, at: DateTime<Local>) -> Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(transcript).with_context(|| format!("open {}", transcript.display()))?;
     // A line a crash cut short is ended first, so the session line stands on its own.
     if std::fs::read(transcript).is_ok_and(|b| b.last().is_some_and(|&c| c != b'\n')) {
-        f.write_all(b"\n")?;
+        f.write_all(b"\n").with_context(|| format!("write {}", transcript.display()))?;
     }
-    f.write_all(format!("--- {} {} ---\n", if resumed { "resumed" } else { "started" }, at.format("%H:%M:%S")).as_bytes())?;
-    f.sync_data()?;
+    f.write_all(format!("--- {} {} ---\n", if resumed { "resumed" } else { "started" }, at.format("%H:%M:%S")).as_bytes())
+        .and_then(|_| f.sync_data())
+        .with_context(|| format!("write {}", transcript.display()))?;
     Ok(())
 }
 
@@ -322,6 +325,22 @@ mod tests {
         std::fs::write(&t, "--- started 10:00:00 ---\n--- resu").unwrap();
         session_marker(&t, anchor() + chrono::Duration::minutes(3)).unwrap();
         assert_eq!(std::fs::read_to_string(&t).unwrap(), "--- started 10:00:00 ---\n--- resu\n--- resumed 10:03:00 ---\n");
+    }
+
+    /// Final review, I2 (Review Focus 4's other half): a segment-log or transcript write that fails, as a full disk
+    /// refuses, names its file.
+    #[test]
+    fn a_write_that_fails_names_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tpath) = (segments_path(dir.path(), STEM), transcript_path(dir.path(), STEM));
+        let mut log = SegmentLog::open(dir.path(), STEM).unwrap();
+        log.log = std::fs::File::open(&path).unwrap(); // read-only: every write fails
+        let err = format!("{:#}", log.append(seg(Uuid::new_v4(), 0, 16_000, "one", vec![], SegmentSource::Live), anchor()).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        let mut log = SegmentLog::open(dir.path(), STEM).unwrap();
+        log.transcript = std::fs::File::open(&tpath).unwrap();
+        let err = format!("{:#}", log.append(seg(Uuid::new_v4(), 0, 16_000, "two", vec![], SegmentSource::Live), anchor()).unwrap_err());
+        assert!(err.contains(&tpath.display().to_string()), "{err}");
     }
 
     #[test]
