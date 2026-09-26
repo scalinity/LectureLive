@@ -164,6 +164,10 @@ fn repair_transcript(path: &Path, last: &Segment) -> Result<()> {
 pub fn session_marker(transcript: &Path, at: DateTime<Local>) -> Result<()> {
     let resumed = std::fs::metadata(transcript).is_ok_and(|m| m.len() > 0);
     let mut f = OpenOptions::new().create(true).append(true).open(transcript).with_context(|| format!("open {}", transcript.display()))?;
+    // A line a crash cut short is ended first, so the session line stands on its own.
+    if std::fs::read(transcript).is_ok_and(|b| b.last().is_some_and(|&c| c != b'\n')) {
+        f.write_all(b"\n")?;
+    }
     f.write_all(format!("--- {} {} ---\n", if resumed { "resumed" } else { "started" }, at.format("%H:%M:%S")).as_bytes())?;
     f.sync_data()?;
     Ok(())
@@ -308,6 +312,16 @@ mod tests {
         session_marker(&t, anchor() + chrono::Duration::minutes(5)).unwrap();
         SegmentLog::open(dir.path(), STEM).unwrap();
         assert_eq!(std::fs::read_to_string(&t).unwrap(), "[10:00:00] one\n[10:00:01] two\n--- resumed 10:05:00 ---\n", "a marker after the last line hides nothing");
+    }
+
+    /// M3 minor: a session line never glues onto a line a crash cut short.
+    #[test]
+    fn a_session_marker_after_a_torn_line_starts_a_line_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("t.txt");
+        std::fs::write(&t, "--- started 10:00:00 ---\n--- resu").unwrap();
+        session_marker(&t, anchor() + chrono::Duration::minutes(3)).unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "--- started 10:00:00 ---\n--- resu\n--- resumed 10:03:00 ---\n");
     }
 
     #[test]

@@ -340,3 +340,53 @@ async fn a_cancelled_snapshot_writes_nothing_drops_the_queue_and_its_material_go
     assert!(cancelled.iter().all(|l| user_text(&bodies[1]).contains(l.as_str())), "the cancelled material went again");
     assert!(spend::read(&ledger).unwrap().iter().filter(|e| e.what == "notes").count() <= bodies.len() - 1, "a cancelled stream records nothing");
 }
+
+/// Speech, then a failure the session cannot go on from (a full disk, say).
+struct SpeechThenFailure {
+    frames: u64,
+    fake: Arc<fake_stt::State>,
+}
+
+impl lecturelive_core::audio::source::Source for SpeechThenFailure {
+    fn run(self: Box<Self>, out: mpsc::Sender<lecturelive_core::audio::source::SourceEvent>, _stop: Arc<std::sync::atomic::AtomicBool>) {
+        use lecturelive_core::audio::source::SourceEvent;
+        let id = uuid::Uuid::new_v4();
+        out.blocking_send(SourceEvent::Begin { recording_id: id, anchor: support::sources::anchor(), source_uid: "Test_UID".into(), input_rate: 16_000, channels: 1 }).unwrap();
+        for k in 0..self.frames {
+            let f = lecturelive_core::audio::frame::Frame { recording_id: id, sample_offset: k * 1600, valid_samples: 1600, pcm16: support::speech::frame_pcm(k) };
+            out.blocking_send(SourceEvent::Frame(f)).unwrap();
+            self.fake.feed.store((k + 1) * 1600, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(ms(2));
+        }
+        out.blocking_send(SourceEvent::Failed("No space left on device".into())).unwrap();
+    }
+}
+
+/// §10 "Disk write error: session stops cleanly" (M3 minor; Review Focus 4): a session that fails still takes its
+/// last snapshot, then reports the failure.
+#[tokio::test]
+async fn a_failed_session_still_takes_its_last_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let sse = fake_sse::start(respond).await;
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
+    let (_cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let source = SpeechThenFailure { frames: 150, fake: stt.state.clone() };
+    let result = tokio::time::timeout(Duration::from_secs(30), lecture::run(lec, session, Box::new(source), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx)).await.expect("the lecture ends");
+    assert!(format!("{:#}", result.unwrap_err()).contains("No space left on device"));
+    let mut committed = false;
+    while let Ok(e) = ev.try_recv() {
+        committed |= matches!(e, Event::Committed { .. });
+    }
+    assert!(committed, "the last snapshot committed what was logged");
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    let logged = segments::read(&f.segments()).unwrap().len() as u64;
+    assert!(logged > 0);
+    assert_eq!(sc.notes.segment_cursor, logged);
+}

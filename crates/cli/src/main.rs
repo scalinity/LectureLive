@@ -472,6 +472,14 @@ fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, Stri
         .with_context(|| format!("No audio input matches {want:?}. Inputs now: {}.", inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
+/// The lecture folder as an absolute path, `.` components dropped, without touching the filesystem: the course is
+/// read from the folder's real names (so `--dir .` works), and a folder is still created only once the input is known.
+fn lecture_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let d = dir.map_or_else(|| cwd.clone(), |d| cwd.join(d));
+    Ok(d.components().filter(|c| !matches!(c, std::path::Component::CurDir)).collect())
+}
+
 /// The fallback the CLI offers while an input is gone (spec §4.1): the other inputs, to start again with.
 fn other_inputs(gone: &str) -> String {
     let others: Vec<String> = input::list_inputs().unwrap_or_default().into_iter().filter(|i| i.uid != gone).map(|i| format!("{} ({})", i.name, i.uid)).collect();
@@ -591,10 +599,7 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         print!("{}", spend::render(&spend::read(&app_ledger)?, columns, p, &app_ledger));
         return Ok(());
     }
-    let dir = match a.dir {
-        Some(d) => d,
-        None => std::env::current_dir()?,
-    };
+    let dir = lecture_dir(a.dir)?;
     let key = env_value("GROK_API_KEY").context("GROK_API_KEY is not set (the environment, a .env here or above, or the repository's .env)")?;
     let course = a.course.or_else(|| course_from_path(&dir)).or_else(|| env_value("LECTURE_COURSE")).unwrap_or_else(|| "Lecture".into());
     let recording = a.command.is_none();
@@ -754,4 +759,23 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     println!("{}", p.paint(&format!("    {} spent on this lecture today; `lecture spend` has the rest", spend::money(spend.lecture_total())), &["dim"]));
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M3 minor: the course comes from the folder's absolute path, so `--dir .` names the course above Weeks/.
+    #[test]
+    fn a_relative_folder_is_made_absolute_before_the_course_is_read() {
+        let root = std::env::temp_dir().join(format!("lecturelive-cli-{}", std::process::id()));
+        let week = root.join("Machine Learning/Weeks/Week 01");
+        std::fs::create_dir_all(&week).unwrap();
+        let here = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&week).unwrap();
+        let dir = lecture_dir(Some(PathBuf::from(".")));
+        std::env::set_current_dir(here).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(course_from_path(&dir.unwrap()).as_deref(), Some("Machine Learning"));
+    }
 }

@@ -148,3 +148,19 @@ async fn an_error_key_that_is_null_is_not_an_error() {
     let (out, _, _) = once(move || Reply::Stream(vec![body.clone()])).await;
     assert_eq!(out.unwrap().text, "fine");
 }
+
+/// §10 "Spend ledger write fails": the answer is kept, with a warning.
+#[tokio::test]
+async fn a_ledger_that_cannot_be_written_is_a_warning_and_the_answer_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("spend.jsonl");
+    let fake = fake_sse::start(|_| fake_sse::answer("kept", 1_000)).await;
+    let c = client(&fake.url, &ledger);
+    std::fs::write(&ledger, "").unwrap();
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let (out, _) = ask(&c, &request()).await;
+    let a = out.unwrap();
+    assert_eq!(a.text, "kept");
+    assert!(a.warning.as_deref().is_some_and(|w| w.contains("spend ledger")), "{:?}", a.warning);
+}

@@ -674,7 +674,8 @@ async fn run(cfg: SessionConfig, source: Box<dyn Source>, mut cmd_rx: mpsc::Rece
             },
         }
     }
-    c.notify(Notification::SourceEnded);
+    // The lecture's cue to take nothing new: waited for (a full channel must not drop it), though never for long.
+    let _ = c.notify.send_timeout(Notification::SourceEnded, Duration::from_secs(1)).await;
     // The source has ended: close the recorder and STT queues and drain every worker. Recovery's
     // queue closes once STT can raise no more gaps, and recovery finishes what it holds. Stores are
     // served until the last one is dropped.
@@ -1241,6 +1242,85 @@ mod tests {
             vec![Gap::new(a, 0, Some(32_000), GapKind::SttInterrupted), Gap::new(b, 0, Some(len_b), GapKind::SttInterrupted)],
             "both recordings' audio waits for recovery"
         );
+    }
+
+    /// §10 "Spend ledger write fails": a warning; recording and transcription go on.
+    #[tokio::test]
+    async fn a_ledger_that_cannot_be_written_is_a_warning_and_the_session_goes_on() {
+        use crate::session::spend::Spend;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("spend.jsonl");
+        let spend = Spend::open(&ledger, "Machine Learning", "Week 01", chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap()).unwrap();
+        std::fs::write(&ledger, "").unwrap();
+        std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let a = Uuid::new_v4();
+        let stt = scripted_stt(move |i| match i {
+            SttInput::End { samples, .. } => vec![
+                SttEvent::Streamed { recording_id: a, samples: 16_000 },
+                SttEvent::Ended { recording_id: a, gap: Some(Gap::new(a, 8_000, Some(samples), GapKind::SttOffline)) },
+            ],
+            _ => vec![],
+        });
+        let recovery = scripted_recovery(|j| {
+            vec![
+                RecoverEvent::Piece { recording_id: j.recording_id, gap_start: j.gap_start, start_sample: j.from, end_sample: j.end, text: "recovered".into(), words: vec![] },
+                RecoverEvent::Done { recording_id: j.recording_id, gap_start: j.gap_start },
+            ]
+        });
+        let cfg = SessionConfig { stt: Some(stt), recovery: Some(recovery), spend: Some(spend), ..cfg(dir.path()) };
+        let (report, notes) = run_with(cfg, Script(recording(a, 10))).await;
+        let report = report.unwrap();
+        assert_eq!((report.segments, report.recordings[0].1), (1, 16_000), "transcription and recording went on");
+        assert!(notes.iter().any(|n| matches!(n, Notification::SpendFailed(_))));
+    }
+
+    /// Review Focus 4: a sidecar that cannot be written (as a full disk refuses) stops the session with its path.
+    #[tokio::test]
+    async fn a_sidecar_that_cannot_be_saved_stops_the_session_with_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join(".live_notes");
+        std::fs::create_dir_all(&state).unwrap();
+        let a = Uuid::new_v4();
+        let go = Arc::new(AtomicBool::new(false));
+        let source = Gated { before: vec![begin(a, 0), frame(a, 0)], go: go.clone(), after: vec![SourceEvent::Gap(Gap::new(a, 1600, Some(3200), GapKind::CaptureOverflow)), SourceEvent::End { recording_id: a, samples: 3200, stream_errors: 0 }] };
+        let (handle, mut notes) = spawn(cfg(dir.path()), Box::new(source));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        go.store(true, Ordering::Relaxed);
+        let result = handle.finish().await;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains(".live_notes"), "the path is surfaced: {msg}");
+        let mut seen = Vec::new();
+        while let Ok(n) = notes.try_recv() {
+            seen.push(n);
+        }
+        assert!(seen.iter().any(|n| matches!(n, Notification::Failed(m) if m.contains(".live_notes"))));
+    }
+
+    /// M4 open thread: SourceEnded is the lecture's cue to take nothing new, so a full notification channel
+    /// must not drop it.
+    #[tokio::test]
+    async fn source_ended_is_delivered_even_when_notifications_back_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4();
+        let mut events = vec![begin(a, 0)];
+        events.extend((0..400).map(|k| SourceEvent::Level(k as f32 / 400.0))); // more than the channel holds
+        events.push(frame(a, 0));
+        events.push(SourceEvent::End { recording_id: a, samples: 1600, stream_errors: 0 });
+        let (handle, mut notes) = spawn(cfg(dir.path()), Box::new(Script(events)));
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await; // the lecture is busy, then reads
+            let mut got = false;
+            while let Some(n) = notes.recv().await {
+                got |= matches!(n, Notification::SourceEnded);
+            }
+            got
+        });
+        handle.finish().await.unwrap();
+        assert!(reader.await.unwrap());
     }
 
     #[tokio::test]
