@@ -200,7 +200,7 @@ footer p{max-width:var(--measure);margin:.3rem 0}
   <p class="mark"><b>LectureLive</b>checks for you</p>
   <h1>What LectureLive still needs from you</h1>
   <p class="lede">Everything the automated runs could not do: a real Zoom lecture, a pointer on the window, a prompt only macOS shows you, and two choices that are yours to make. Each item names the line of <code>docs/milestones.md</code> it comes from. Statuses and notes save in this browser; Export keeps a copy.</p>
-  <p class="updated">Last updated 26 September 2026, after M5 (<code>main</code> at 394bd13).</p>
+  <p class="updated">Last updated 26 September 2026, during M6 (the two-hour lecture and the desk checks V15 and V16 added).</p>
   <div class="tally">
     <div class="squares" id="squares" aria-label="Every item, in page order"></div>
     <p class="count" id="count"></p>
@@ -218,71 +218,158 @@ footer p{max-width:var(--measure);margin:.3rem 0}
 <section class="occasion lecture" id="lecture" aria-labelledby="lecture-h">
   <div class="occ-head">
     <p class="count" data-count-for="lecture"></p>
-    <h2 id="lecture-h">At your next Zoom lecture</h2>
-    <p class="why">Four checks, done in the order of a class. They close the three gate lines left open since M0 and M1, and answer the one question M5 could not: whether Zoom keeps drawing while it is full screen and you work elsewhere. Nothing here is transcribed or sent, so it costs nothing, and you keep taking notes the way you do now.</p>
+    <h2 id="lecture-h">Your two-hour lecture with LectureLive</h2>
+    <p class="why">One real Zoom lecture closes M6's gate. LectureLive runs beside your usual notes for two hours while five failures are caused on purpose, one at a time. Afterwards, one command checks that no audio went missing and none was recorded twice. The Python tool keeps taking your notes of record in its own folder, and nothing below touches it: it records BlackHole, its network is the real one, and its folder is not on the test disk. The same class closes the three lines left open since M0 and M1, and answers M5's full-screen question.</p>
   </div>
 
   <div class="row step">
-    <div class="gut"><span class="when">Before class</span>about 5 minutes</div>
+    <div class="gut"><span class="when">Before class</span>about 10 minutes</div>
     <div class="body">
-      <div class="head"><h3>Set up three Terminal windows and Zoom's speaker</h3></div>
-      <p>In Zoom, open Settings, Audio, and set <b>Speaker</b> to “LectureLive Loopback”. Keep the Mac's own output on your speakers or headphones. If the tool you take notes with stops hearing Zoom after this, set Zoom's speaker back and leave V01 for another lecture.</p>
+      <div class="head"><h3>Plug in the receiver, open four Terminal windows, start LectureLive on a test disk</h3></div>
+      <p>Zoom's <b>Speaker</b> stays on “LectureLive Loopback” (or wherever your notes already hear it), and the Mac's output on your headphones. Start the Python tool the way you always do, in its own folder. Then run the four windows below. In the app, choose the lecture folder on the test disk, choose <b>Zoom and Wireless Mic Rx together</b> (or <b>Zoom through LectureLive Loopback</b> if that choice is missing), and press Start. Answer <b>Always Allow</b> if the Keychain asks.</p>
       <details class="how"><summary>Commands</summary>
         <h4>Terminal 1: the app's page server (leave it running)</h4>
         <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive/apps/desktop" &amp;&amp; npm run dev</code></pre></div>
-        <h4>Terminal 2: the app in record-only mode (it waits until you choose a window)</h4>
+        <h4>Terminal 2: the forwarder that V10 stops (note the pid it prints)</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; cargo run -q -p lecturelive-core --example netcut -- 127.0.0.1:8443 api.x.ai:443</code></pre></div>
+        <h4>Terminal 3: the test disk V13 fills, and the lecture folder on it</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>hdiutil create -size 2g -fs HFS+ -volname LLLecture "$HOME/Library/Application Support/LectureLive/m6-lecture.dmg"
+hdiutil attach "$HOME/Library/Application Support/LectureLive/m6-lecture.dmg"
+mkdir -p "/Volumes/LLLecture/&lt;Course&gt;/Weeks/&lt;Week NN — Title&gt;"</code></pre></div>
+        <h4>Terminal 4: the app, through the forwarder, recording what the slide detector sees</h4>
         <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive"
-D="$HOME/Library/Application Support/LectureLive/m5-recording/Weeks/Week 01 — Recording"
-mkdir -p "$D"
-LECTURELIVE_CHECK=record LECTURELIVE_CHECK_DIR="$D" \
-  LECTURELIVE_RECORD="$HOME/Library/Application Support/LectureLive/m5-fixtures/zoom-live-$(date +%Y%m%d)" \
+LECTURELIVE_API_ADDR=127.0.0.1:8443 \
+  LECTURELIVE_RECORD="$HOME/Library/Application Support/LectureLive/m6-fixtures/zoom-live-$(date +%Y%m%d)" \
   ./target/debug/desktop</code></pre></div>
-        <h4>Terminal 3: kept free for V01 and V03</h4>
-        <p>Record-only mode starts no lecture: it records what the slide detector sees from the window you choose, for 40 minutes, then closes the app. The frames stay on this Mac in <code>m5-fixtures/</code>.</p>
+        <p>Keep one more Terminal free for the commands in V03, V10, V13 and V14.</p>
       </details>
     </div>
   </div>
 
-  <article class="row item" id="V01" data-kind="check" data-from="M1" data-rev="r1">
-    <div class="gut"><span class="when">As it starts</span><span class="id">V01</span><span class="from">M1 gate</span></div>
-    <div class="body">
-      <div class="head"><h3>Record 30 minutes of the lecture's sound with no unexplained gaps</h3><div class="status"></div></div>
-      <p class="closes">Closes M1's gate line <b>“A 30-minute Zoom recording with no unexplained captured-audio gaps”</b>.</p>
-      <p class="what">Proves the loopback path carries a real Zoom lecture for half an hour without losing any of it. Every automated run used synthetic sound.</p>
-      <details class="how"><summary>Commands and what to expect</summary>
-        <h4>In Terminal 3, once the lecturer is speaking</h4>
-        <div class="cmdwrap"><pre class="cmd"><code>L=$HOME/Documents/Tools/LectureLive/target/debug/lecturelive
-$L loopback check --secs 15          # while Zoom plays; pass above −60 dBFS
-$L record --loopback --secs 1800 --dir "$HOME/Library/Application Support/LectureLive/m1-zoom"</code></pre></div>
-        <h4>After class</h4>
-        <div class="cmdwrap"><pre class="cmd"><code>cat "$HOME/Library/Application Support/LectureLive/m1-zoom/.live_notes/lecture_notes_$(date +%Y%m%d).v2.json"   # "gaps": []</code></pre></div>
-        <h4>Expected</h4>
-        <ul>
-          <li>The level check passes above −60 dBFS.</li>
-          <li>The recording stops by itself after 1,800 seconds.</li>
-          <li>The file shows <code>"gaps": []</code>, or only gaps with a stated cause (the receiver unplugged, for instance).</li>
-        </ul>
-        <h4>If it fails</h4>
-        <p>A gap with no stated cause: mark Failed, keep the <code>m1-zoom</code> folder and note the time. M6's gate is zero unexplained missing audio, so it starts there.</p>
-      </details>
-    </div>
-  </article>
-
-  <article class="row item" id="V02" data-kind="check" data-from="M5" data-rev="r1">
+  <article class="row item" id="V02" data-kind="check" data-from="M5" data-rev="r2">
     <div class="gut"><span class="when">As it starts</span><span class="id">V02</span><span class="from">M5</span></div>
     <div class="body">
       <div class="head"><h3>Watch Zoom's window in the app, with the speaker's camera left out</h3><div class="status"></div></div>
       <p class="closes">From M5's list <b>“Needing the person”</b>. The Zoom gate held only with the camera left out, and this is its first use on a live meeting.</p>
-      <p class="what">In the app from Terminal 2, click <b>Choose window</b>, pick Zoom's meeting window, and drag over the shared slide without Zoom's controls. Then click <b>Leave out a part</b> and drag over the speaker's camera wherever Zoom draws it on the slide. Finish with <b>Watch this region</b>. Recording starts at once and runs for 40 minutes.</p>
-      <details class="how"><summary>What to expect, and after class</summary>
+      <p class="what">In the slides strip, click <b>Choose…</b>, pick Zoom's meeting window, and drag over the shared slide without Zoom's controls. Click <b>Leave out a part</b> and drag over the speaker's camera wherever Zoom draws it. Finish with <b>Watch this region</b>. The strip reads “Watching”, and what the detector sees is recorded for M6 to measure.</p>
+      <details class="how"><summary>What to expect, and what to keep</summary>
+        <ul>
+          <li>The camera shows dimmed, like everything outside the region.</li>
+          <li>Slides appear in the strip as they change, and none when only the camera moves.</li>
+        </ul>
+        <p>Keep <code>m6-fixtures/zoom-live-&lt;date&gt;</code>. It never leaves this Mac and is deleted once measured.</p>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V01" data-kind="check" data-from="M1" data-rev="r2">
+    <div class="gut"><span class="when">0:00 to 0:30</span><span class="id">V01</span><span class="from">M1 gate</span></div>
+    <div class="body">
+      <div class="head"><h3>Thirty minutes of the lecture's sound with no unexplained gaps</h3><div class="status"></div></div>
+      <p class="closes">Closes M1's gate line <b>“A 30-minute Zoom recording with no unexplained captured-audio gaps”</b>.</p>
+      <p class="what">Do nothing for the first 30 minutes. Nothing is caused before 0:35, so these minutes are the clean recording M1 asked for; the audit after class reads them.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul><li>After class, the audit lists the first recording with no gap in its first 30 minutes, or only gaps with a stated cause.</li></ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V10" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="when">0:35 in</span><span class="id">V10</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>LectureLive loses the network, twice</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“Network down / websocket error”</b>: reconnects, the gap is recorded, recovered once online, and recording continues.</p>
+      <p class="what">First the link drops with nothing passing, as Wi-Fi does; ten minutes later the connection is refused. Only LectureLive goes through the forwarder, so Zoom and your notes keep the network.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <h4>At 0:35: the link drops for a minute (the pid Terminal 2 printed)</h4>
+        <div class="cmdwrap"><pre class="cmd"><code>kill -STOP &lt;pid&gt;; sleep 60; kill -CONT &lt;pid&gt;</code></pre></div>
+        <h4>At 0:45: connections are refused for 30 seconds</h4>
+        <p>Press Ctrl-C in Terminal 2, wait 30 seconds, then run its command again.</p>
         <h4>Expected</h4>
         <ul>
-          <li>The camera shows dimmed, like everything outside the region. The strip reads “Watching”.</li>
-          <li>After class the report lists a decision near each slide change, and none when only the camera moved.</li>
+          <li>The strip says “reconnecting”, then “transcribing” again.</li>
+          <li>The gap count rises, then falls to 0 as the gaps are recovered.</li>
+          <li>Zoom and the Python tool carry on as if nothing happened.</li>
         </ul>
-        <div class="cmdwrap"><pre class="cmd"><code>cat "$HOME/Library/Application Support/LectureLive/m5-checks/record.json"</code></pre></div>
-        <h4>Keep</h4>
-        <p>The folder <code>m5-fixtures/zoom-live-&lt;date&gt;</code>. M6 measures the detector on it, a live meeting rather than a recording's playback. It never leaves this Mac and is deleted once measured.</p>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V11" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="when">0:55 in</span><span class="id">V11</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>The receiver is unplugged for 30 seconds</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“Device disappears. Mixed: surviving source continues, gap marked”</b>.</p>
+      <p class="what">Unplug the Wireless Mic Rx, wait 30 seconds, and plug it back in. The Python tool records BlackHole, so it does not notice. If LectureLive runs on Zoom alone, skip this and do V15 at the desk instead.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>A notice: “Wireless Mic Rx; Zoom goes on, and the gap is marked”. The transcript keeps coming from Zoom.</li>
+          <li>When it is back: “Input back”, and its sound is in the transcript again.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V12" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="when">1:05 in</span><span class="id">V12</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>Screen Recording is turned off for a minute</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“Microphone or Screen Recording denied”</b>: the affected feature stops with a fix-it, and the rest works.</p>
+      <p class="what">In System Settings, Privacy &amp; Security, Screen &amp; System Audio Recording, turn <b>Terminal</b> off. After a minute, turn it on again. If macOS offers “Quit &amp; Reopen”, choose <b>Later</b>: quitting Terminal would stop the Python tool. The Python tool does not record the screen, so it carries on.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>The slides strip says Screen Recording is off, with <b>Open Settings</b>. The transcript and notes carry on.</li>
+          <li>Afterwards, note whether capture came back by itself or waits for the app to be reopened. Either is a result; it is what M6 records.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V04" data-kind="check" data-from="M5" data-rev="r2">
+    <div class="gut"><span class="when">1:10 in</span><span class="id">V04</span><span class="from">M5 open thread</span></div>
+    <div class="body">
+      <div class="head"><h3>Zoom full screen, with another app in front for five minutes</h3><div class="status"></div></div>
+      <p class="closes">Answers M5's open thread: <b>whether Zoom keeps drawing while it is full screen on another desktop</b>.</p>
+      <p class="what">Put Zoom's meeting window in full screen. Then switch to another app or desktop and stay there five minutes or more while the slides change. Come back, and note roughly when you left and when you returned.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>“Found again” in the notices around the switch, and no question in the strip.</li>
+          <li>Slides in the strip with times inside the minutes Zoom was out of sight. If none arrived, Zoom stops drawing when hidden: mark Needs follow-up.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V13" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="when">1:20 in</span><span class="id">V13</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>The test disk fills up</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“Disk write error”</b>: the session stops cleanly, naming the path.</p>
+      <p class="what">Fill the test disk. LectureLive stops its lecture; your notes are on another disk and carry on. Then free the space and start LectureLive's lecture again in the same folder.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <div class="cmdwrap"><pre class="cmd"><code>dd if=/dev/zero of=/Volumes/LLLecture/filler bs=1m
+# after LectureLive has stopped:
+rm /Volumes/LLLecture/filler</code></pre></div>
+        <ul>
+          <li>“Session failed” with a path on <code>/Volumes/LLLecture</code>, and a last snapshot attempted.</li>
+          <li>Start again (same folder, same source): “Repaired” in the notices, and the lecture goes on.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V14" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="when">1:35 in</span><span class="id">V14</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>LectureLive is killed and started again</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“App crash”</b>: the recording is valid to its last checkpoint and repaired, the system output is untouched, and the unclosed utterance becomes a gap.</p>
+      <p class="what">Kill the app outright, start it again with Terminal 4's command, choose the same folder and source, and press Start.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <div class="cmdwrap"><pre class="cmd"><code>pkill -9 -f target/debug/desktop</code></pre></div>
+        <ul>
+          <li>“Repaired” and “Recovered” in the notices, and the gap count shows the crash's gaps, then falls to 0.</li>
+          <li>The Mac's sound output is what it was.</li>
+        </ul>
       </details>
     </div>
   </article>
@@ -308,38 +395,28 @@ open -W -n "$APP" --args --check capture &lt;ID of the zoom.us meeting window&gt
     </div>
   </article>
 
-  <article class="row item" id="V04" data-kind="check" data-from="M5" data-rev="r1">
-    <div class="gut"><span class="when">About 10 minutes in</span><span class="id">V04</span><span class="from">M5 open thread</span></div>
-    <div class="body">
-      <div class="head"><h3>Zoom full screen, with another app in front for five minutes</h3><div class="status"></div></div>
-      <p class="closes">Answers M5's open thread: <b>whether Zoom keeps drawing while it is full screen on another desktop</b>. Capture itself was shown working there, on a window the app owns.</p>
-      <p class="what">While V02 records, put Zoom's meeting window in full screen. Then switch to another app or desktop and stay there five minutes or more while the slides change. Come back, and note roughly when you left and when you returned.</p>
-      <details class="how"><summary>What to expect</summary>
-        <ul>
-          <li>In <code>record.json</code>, “Found again” around the switch, and no “Asking”.</li>
-          <li>Decisions with times inside the minutes Zoom was out of sight.</li>
-        </ul>
-        <h4>If no decision arrived while Zoom was out of sight</h4>
-        <p>Zoom stops drawing when hidden. Capture only reads what an app has drawn, and a web page behaved the same way at M5. Mark Needs follow-up: M6 then decides whether Zoom must stay visible, and the app says so.</p>
-      </details>
-    </div>
-  </article>
-
   <div class="row step">
-    <div class="gut"><span class="when">After class</span></div>
+    <div class="gut"><span class="when">After class</span>about 10 minutes, then typesetting</div>
     <div class="body">
-      <div class="head"><h3>Read the two files, set the statuses above</h3></div>
-      <p>V01's <code>cat</code> and V02's <code>record.json</code> answer V01, V02 and V04. Nothing needs stopping: the recording and the app both end by themselves.</p>
+      <div class="head"><h3>Stop, check the audio, make the study page</h3></div>
+      <p>Press Stop and wait for “Stopped”. Run the audit below; it should end with <code>0 unexplained, 0 waiting</code>. Then click <b>Study page</b> and note roughly how long it takes to typeset. Afterwards, stop the forwarder and the page server, copy the lecture folder somewhere else if you want LectureLive's notes, and detach the test disk. Leave <code>m6-fixtures/zoom-live-&lt;date&gt;</code> where it is.</p>
+      <details class="how"><summary>Commands</summary>
+        <div class="cmdwrap"><pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive"
+./target/debug/lecturelive lecture audit --dir "/Volumes/LLLecture/&lt;Course&gt;/Weeks/&lt;Week NN — Title&gt;"
+hdiutil detach /Volumes/LLLecture</code></pre></div>
+        <p>Then tell the next M6 session the lecture happened: it reads these files, measures the recording, and finishes M6.</p>
+      </details>
     </div>
   </div>
 </section>
+
 
 <!-- ======================================================================================= -->
 <section class="occasion" id="desk" aria-labelledby="desk-h">
   <div class="occ-head">
     <p class="count" data-count-for="desk"></p>
     <h2 id="desk-h">A few minutes at the Mac, no lecture needed</h2>
-    <p class="why">From the M4 and M5 lists “Needing the person”. No gate line depends on them, but they are the only checks of the app as you see and touch it.</p>
+    <p class="why">From the M4, M5 and M6 lists “Needing the person”. V15 and V16 are part of M6's gate (spec §10, a device that goes and a permission denied); the rest are the only checks of the app as you see and touch it.</p>
   </div>
 
   <div class="row step">
@@ -370,20 +447,22 @@ cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/desktop</code><
     </div>
   </article>
 
-  <article class="row item" id="V06" data-kind="check" data-from="M4" data-rev="r1">
-    <div class="gut"><span class="id">V06</span><span class="from">M4, M5</span></div>
+  <article class="row item" id="V06" data-kind="check" data-from="M4" data-rev="r2">
+    <div class="gut"><span class="id">V06</span><span class="from">M4, M5, M6</span></div>
     <div class="body">
       <div class="head"><h3>Look at the app in light and dark, and with large type</h3><div class="status"></div></div>
-      <p class="what">Every view was checked in a browser engine and in screenshots. This is you reading it at arm's length. Switch macOS between Light and Dark, and press <b>Aa</b> in the strip for large type.</p>
+      <p class="what">Every view was checked in a browser engine and in screenshots at 1168 px. This is you reading it at arm's length. Switch macOS between Light and Dark, and press <b>Aa</b> in the strip for large type.</p>
       <details class="how"><summary>What to expect</summary>
         <ul>
-          <li>Everything is readable, and nothing overlaps the traffic lights.</li>
+          <li>Everything is readable, and nothing overlaps the traffic lights. In large type all three columns stay on screen.</li>
           <li>The window and region picker (Choose…) shows parts left out as dimmed boxes with a × each.</li>
-          <li>Known and deferred to M6: at the narrowest window (960 px) with large type, the strip's clock is cut off, and the traffic lights sit a little high.</li>
+          <li>Before a lecture, “Listen to” offers “Zoom and &lt;input&gt; together”, with a line about headphones when you choose it.</li>
+          <li>Known and left: in large type the strip shortens the course name, and the traffic lights sit a little high.</li>
         </ul>
       </details>
     </div>
   </article>
+
 
   <article class="row item" id="V07" data-kind="check" data-from="M4" data-rev="r1">
     <div class="gut"><span class="id">V07</span><span class="from">M4</span></div>
@@ -406,6 +485,38 @@ cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/desktop</code><
       </details>
     </div>
   </article>
+
+  <article class="row item" id="V15" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="id">V15</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>Unplug the receiver while it is the only input, and record from another</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“Device disappears. Single: source stops, fallback offered”</b>. Nothing ever switches by itself.</p>
+      <p class="what">With a synthetic or scratch folder, choose <b>Wireless Mic Rx</b> under “Listen to” and press Start. Unplug the receiver. When the offer appears above the prompt, choose <b>MacBook Pro Microphone</b> and click <b>Record from it</b>. Then stop.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>“Wireless Mic Rx is unplugged. LectureLive waits for it and records nothing meanwhile.”, with the other inputs to choose from.</li>
+          <li>After the click: “Recording from BuiltInMicrophoneDevice, in a new file”, and the level meter moves again.</li>
+          <li>Had you plugged the receiver back in instead, recording would have continued from it.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V16" data-kind="check" data-from="M6" data-rev="r1">
+    <div class="gut"><span class="id">V16</span><span class="from">M6 gate, §10</span></div>
+    <div class="body">
+      <div class="head"><h3>Turn the microphone off for Terminal, see the fix-it, turn it back on</h3><div class="status"></div></div>
+      <p class="closes">Spec §10, <b>“Microphone or Screen Recording denied”</b>, the microphone half. Never during a lecture: the Python tool records through Terminal too.</p>
+      <p class="what">In System Settings, Privacy &amp; Security, Microphone, turn <b>Terminal</b> off; if macOS offers “Quit &amp; Reopen”, choose <b>Later</b>. Open the app (Commands above) and choose a folder. Then turn Terminal back on, and press Refresh in the app.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>Above the bar: “Microphone access is off, so nothing can be recorded. Turn it on in System Settings, then press Refresh.” with <b>Open Settings</b>, and Start greyed out. Choosing folders and the study page still work.</li>
+          <li><b>Open Settings</b> opens the Microphone pane.</li>
+          <li>After turning it on and pressing Refresh, the line is gone and Start works.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
 </section>
 
 <!-- ======================================================================================= -->
@@ -416,14 +527,24 @@ cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/desktop</code><
     <p class="why">Optional, with a deadline. M6's last task deletes <code>live_notes.py</code>. After that, this comparison can never be made.</p>
   </div>
 
-  <article class="row item" id="V09" data-kind="check" data-from="M3" data-rev="r1">
+  <article class="row item" id="V09" data-kind="check" data-from="M3" data-rev="r2">
     <div class="gut"><span class="id">V09</span><span class="from">M3, optional</span></div>
     <div class="body">
-      <div class="head"><h3>The Python tool and the Rust CLI write the same files</h3><div class="status"></div></div>
+      <div class="head"><h3>The Python tool and the Rust CLI write the same study page</h3><div class="status"></div></div>
       <p class="closes">From M3's list <b>“Optional, needing the person”</b>: a Python CLI run on a synthetic folder, byte-compared with the Rust CLI's output.</p>
-      <p class="what">Nothing depends on it. The Rust side was built to match the Python tool's formats, and golden tests hold them. It is the one direct side-by-side, and it has to happen before the Python tool is gone.</p>
-      <details class="how"><summary>How</summary>
-        <p>Ask the M6 session to prepare a synthetic folder and the two commands before it removes the Python tool. It sets them up in one sitting with M6's other steps. Mark Blocked if you decide to skip it.</p>
+      <p class="what">A synthetic lecture's notes were typeset once by the Rust CLI. The Python tool re-renders the same cache in a copy of the folder, for free, and the two pages are compared byte for byte. M6 ran it once and they were identical. This repeats it with your own eyes, before the Python tool is gone.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <div class="cmdwrap"><pre class="cmd"><code>A="$HOME/Library/Application Support/LectureLive"
+F="$A/m6-v09/Weeks/Week 01 — Compare"
+P="$A/m6-v09-python/m6-v09/Weeks/Week 01 — Compare"
+rm -f "$P/Compare.html"
+cd "$P" &amp;&amp; "$HOME/Documents/Tools/LectureLive/.venv/bin/python" "$HOME/Documents/Tools/LectureLive/live_notes.py" page --notes lecture_notes_20260926.md
+cmp "$F/Compare.html" "$P/Compare.html" &amp;&amp; echo identical</code></pre></div>
+        <ul>
+          <li>The Python tool says the notes are unchanged, so only the page design is reapplied (free).</li>
+          <li><code>cmp</code> prints nothing, then “identical”.</li>
+        </ul>
+        <p>Mark Blocked if you decide to skip it.</p>
       </details>
     </div>
   </article>
@@ -454,17 +575,6 @@ cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/desktop</code><
   </article>
 </section>
 
-<!-- ======================================================================================= -->
-<section class="occasion" id="m6" aria-labelledby="m6-h">
-  <div class="occ-head">
-    <p class="count"></p>
-    <h2 id="m6-h">Coming with M6</h2>
-  </div>
-  <div class="row">
-    <div class="gut"></div>
-    <div class="body"><p class="later">M6's two-hour real lecture, with a forced restart, the receiver removed, a permission denied, a full disk and the network lost (M6, task 3), is added here as its own occasion when M6's plan is written.</p></div>
-  </div>
-</section>
 
 <footer>
   <p>Statuses and notes are saved in this browser under <code>lecturelive.verification/state@1</code>, and nowhere else. Export a copy before clearing the browser's data, and Import it to merge: the newer record wins and both histories are kept.</p>
