@@ -12,6 +12,25 @@ const config = {
     adapter: adapter({
       fallback: "index.html",
     }),
+    // Spec §9.3: nothing the page renders can load from the network. The dev server sends this as a
+    // header with a nonce on SvelteKit's own script; a built page carries it as a meta tag, and
+    // tauri.conf.json gives the custom protocol the same directives. Styles stay inline-capable
+    // because Svelte and Vite inject them; scripts never are.
+    csp: {
+      mode: "auto",
+      directives: {
+        "default-src": ["self"],
+        "script-src": ["self"],
+        "style-src": ["self", "unsafe-inline"],
+        "img-src": ["self", "asset:", "http://asset.localhost"],
+        "connect-src": ["self", "ipc:", "http://ipc.localhost", "ws://localhost:1420", "ws://127.0.0.1:1420"],
+        "font-src": ["self"],
+        "object-src": ["none"],
+        "frame-src": ["none"],
+        "base-uri": ["none"],
+        "form-action": ["none"],
+      },
+    },
   },
 };
 

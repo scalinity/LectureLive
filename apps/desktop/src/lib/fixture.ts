@@ -155,3 +155,49 @@ export function demoTransport(): FixtureTransport {
   setTimeout(speak, 800);
   return t;
 }
+
+const DEMO_DIR = "/Lectures/Machine Learning/Weeks/Week 06 — Optimisation";
+const DEMO_NOTES = `# Machine Learning — Week 06 — Optimisation — 2026-09-25
+
+<!-- 10:04:12 -->
+## Gradient descent
+- The loss is a function of the weights; training moves downhill on it.
+- Each step goes against the gradient, scaled by the **learning rate** η.
+  - Too small: slow progress. Too large: overshoots and oscillates.
+
+![Slide 1](slides/slide_01_100251.png)
+
+| Variant | Gradient from | Cost per step |
+|---|---|---|
+| Batch | whole data set | high |
+| Stochastic | one mini-batch | low |
+`;
+
+const DEMO_SNAPSHOT = `## Momentum
+- Keeps a running average of past gradients: \`v ← βv + ∇L\`, then \`w ← w − ηv\`.
+- The ball keeps rolling through flat stretches and damps zig-zags across narrow valleys.
+
+**Exam:** be able to write the momentum update and say what β does.
+`;
+
+/** The browser preview with notes: a committed document, a slide, then a streamed snapshot. */
+export function demoWithNotes(): FixtureTransport {
+  const t = demoTransport();
+  t.state_.status.folder = { dir: DEMO_DIR, course: "Machine Learning", name: "Week 06 — Optimisation", notes_dir: DEMO_DIR, page: null };
+  t.state_.document = DEMO_NOTES;
+  t.state_.revision = 2;
+  t.state_.slides = [{ index: 1, file: "slides/slide_01_100251.png", path: `${DEMO_DIR}/slides/slide_01_100251.png` }];
+  t.assetUrl = () => "/demo-slide.svg";
+  const words = DEMO_SNAPSHOT.match(/\S+\s*/g) ?? [];
+  setTimeout(() => {
+    let i = 0;
+    const tick = () => {
+      t.emitNotes({ type: "delta", op: 1, text: words.slice(i, i + 2).join("") });
+      i += 2;
+      if (i < words.length) return setTimeout(tick, 60);
+      setTimeout(() => t.emitNotes({ type: "committed", op: 1, revision: 3, block: `\n<!-- 10:07:40 -->\n${DEMO_SNAPSHOT}\n` }), 3000);
+    };
+    tick();
+  }, 5000);
+  return t;
+}

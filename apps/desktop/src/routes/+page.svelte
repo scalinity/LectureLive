@@ -2,15 +2,16 @@
   // The lecture window (spec §9.1): status strip, transcript | notes | slides, command line.
   import "$lib/theme.css";
   import { isTauri } from "@tauri-apps/api/core";
-  import { demoTransport } from "$lib/fixture";
+  import { demoWithNotes } from "$lib/fixture";
   import { session } from "$lib/session.svelte";
   import { tauriTransport, type Transport } from "$lib/transport";
+  import Notes from "$lib/Notes.svelte";
   import Transcript from "$lib/Transcript.svelte";
 
   /** The app talks to Tauri; the browser preview (`?fixture=demo`) plays a scripted lecture. */
   function transport(): Transport {
     if (isTauri()) return tauriTransport();
-    return demoTransport();
+    return demoWithNotes();
   }
 
   const t = transport();
@@ -21,7 +22,7 @@
   <header class="strip"></header>
   <main class="panes">
     <Transcript />
-    <section class="notes" aria-label="Notes"></section>
+    <Notes toUrl={(p) => t.assetUrl(p)} />
     <aside class="slides" aria-label="Slides">
       {#if session.slides.length === 0}
         <p class="quiet">Screenshots you take during the lecture become slides.</p>
