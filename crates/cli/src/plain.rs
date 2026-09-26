@@ -39,7 +39,7 @@ pub(crate) fn say(out: &mut impl Write, p: spend::Paint, kind: &str, label: &str
         "done" => ("✓", "teal"),
         _ => ("▲", "red"),
     };
-    let _ = writeln!(out, "{}", format!("  {} {}  {detail}", p.paint(mark, &[colour]), p.paint(label, &["bold"])).trim_end());
+    writeln!(out, "{}", format!("  {} {}  {detail}", p.paint(mark, &[colour]), p.paint(label, &["bold"])).trim_end()).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -61,20 +61,20 @@ pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut
         Event::Session(n) => match n {
             Notification::Segment(s) => {
                 let tag = if s.source == SegmentSource::Recovered { p.paint("  (recovered)", &["dim"]) } else { String::new() };
-                let _ = writeln!(out, "  {}  {}{tag}", p.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), s.text);
+                writeln!(out, "  {}  {}{tag}", p.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), s.text).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
             }
             Notification::Level(l) => {
                 if watch.as_mut().is_some_and(|w| w.observe(*l)) {
                     say(out, p, "warn", "no signal", &format!("10 s of silence on BlackHole: is Zoom's Speaker \"{}\"?", loopback::LOOPBACK_NAME));
                 }
             }
-            Notification::Recording { path } => { let _ = writeln!(out, "{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])); }
+            Notification::Recording { path } => { writeln!(out, "{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
             Notification::Gap(g) => say(out, p, "warn", "gap", &format!("{:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id)),
             Notification::DeviceGone { uid } => say(out, p, "warn", "input gone", &format!("{uid}; waiting for it to return, and nothing switches by itself. {}", other_inputs(uid))),
             Notification::DeviceBack { uid } => say(out, p, "done", "input back", &format!("{uid}; recording continues in a new file")),
             Notification::Failed(m) => say(out, p, "warn", "session failed", m),
             Notification::Stt(s) => match s {
-                SttStatus::Connected => { let _ = writeln!(out, "{}", p.paint("  transcribing", &["dim"])); }
+                SttStatus::Connected => { writeln!(out, "{}", p.paint("  transcribing", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
                 SttStatus::Retrying { after, reason } => say(out, p, "warn", "transcription interrupted", &format!("{reason}; reconnecting in {} s", after.as_secs())),
                 SttStatus::Refused(m) => say(out, p, "warn", "transcription refused", &format!("{}. Recording continues without it.", sentence(m))),
                 SttStatus::ServerError(m) => say(out, p, "warn", "transcription server", m),
@@ -85,12 +85,12 @@ pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut
             Notification::RecoveryFailed(m) => say(out, p, "warn", "recovery", m),
             Notification::SpendFailed(m) => say(out, p, "warn", "spend", m),
         },
-        Event::Busy(m) => { let _ = writeln!(out, "{}", p.paint(&format!("  … {m}"), &["dim"])); }
+        Event::Busy(m) => { writeln!(out, "{}", p.paint(&format!("  … {m}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
         Event::Preview(_) => {} // the committed block is printed instead, as the CLI does
         Event::NothingNew => say(out, p, "notes", "snapshot", "nothing new since the last one"),
         Event::Committed { words, slides, block, usd, confirmed, missing, .. } => {
             for line in block.trim().lines().filter(|l| !l.starts_with("<!-- ")) {
-                let _ = writeln!(out, "  {} {}", p.paint("│", &["teal"]), p.paint(line, &["dim"]));
+                writeln!(out, "  {} {}", p.paint("│", &["teal"]), p.paint(line, &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
             }
             let mut detail = format!("{} and {} folded in  {}", plural(*words, "word"), plural(*slides, "slide"), p.paint(&spend::money(*usd), &["dim"]));
             if *missing > 0 {
@@ -183,31 +183,31 @@ pub(crate) fn print_prepared(out: &mut impl Write, p: spend::Paint, ready: &star
         say(out, p, "done", "recovered", &format!("{stem}'s transcript gaps{}", if r.unresolved > 0 { format!(", {} still waiting", r.unresolved) } else { String::new() }));
     }
 
-    let _ = writeln!(out);
-    let _ = writeln!(out, "  {}  {}  {name}", p.paint(course, &["bold"]), p.paint("›", &["dim"]));
+    writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "  {}  {}  {name}", p.paint(course, &["bold"]), p.paint("›", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     let waiting = if init.pending_segments > 0 || init.pending_slides > 0 {
         format!(", resumed with {} and {} for the next snapshot", plural(init.pending_segments as usize, "line"), plural(init.pending_slides, "slide"))
     } else {
         String::new()
     };
-    let _ = writeln!(out, "{}", p.paint(&format!("  listening on {input_name}{waiting}"), &["dim"]));
-    let _ = writeln!(out, "{}", p.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop", &["dim"]));
-    let _ = writeln!(out);
+    writeln!(out, "{}", p.paint(&format!("  listening on {input_name}{waiting}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "{}", p.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
 /// The end summary: what was saved, what still waits for the next session, and what the lecture cost today.
 pub(crate) fn print_end(out: &mut impl Write, p: spend::Paint, files: &LectureFiles, report: &StopReport, spend: &Spend) {
     let file_name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let _ = writeln!(out);
-    let _ = writeln!(out, "  {} {}  {}  {}", p.paint("✓", &["teal"]), p.paint("saved", &["bold"]), file_name(&files.notes), file_name(&files.transcript));
+    writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "  {} {}  {}  {}", p.paint("✓", &["teal"]), p.paint("saved", &["bold"]), file_name(&files.notes), file_name(&files.transcript)).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     if let Some(e) = &report.last_snapshot {
         say(out, p, "warn", "notes", &format!("the last snapshot failed ({e}); the next session in this folder adds what it missed"));
     }
     if report.unresolved > 0 {
-        let _ = writeln!(out, "{}", p.paint(&format!("    {} still to recover; the next session in this folder does it", plural(report.unresolved, "transcript gap")), &["dim"]));
+        writeln!(out, "{}", p.paint(&format!("    {} still to recover; the next session in this folder does it", plural(report.unresolved, "transcript gap")), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     }
-    let _ = writeln!(out, "{}", p.paint(&format!("    {} spent on this lecture today; `lecture spend` has the rest", spend::money(spend.lecture_total())), &["dim"]));
-    let _ = writeln!(out);
+    writeln!(out, "{}", p.paint(&format!("    {} spent on this lecture today; `lecture spend` has the rest", spend::money(spend.lecture_total())), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
 /// The stdin worker: every line of stdin becomes the grammar's command, until stdin ends or the channel closes.
@@ -549,5 +549,41 @@ mod goldens {
         let mut out = Vec::new();
         print_end(&mut out, TRUE, &files(), &StopReport::default(), &ledger());
         assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[38;2;93;184;192m✓\u{1b}[0m \u{1b}[1msaved\u{1b}[0m  lecture_notes_20260926.md  lecture_transcript_20260926.txt\n\u{1b}[2m    $-0.00 spent on this lecture today; `lecture spend` has the rest\u{1b}[0m\n\n");
+    }
+
+    /// A writer whose writes fail (a broken pipe): the seam panics as `println!` did, never swallowing a line.
+    struct Broken;
+
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stdout")]
+    fn a_failed_say_line_panics_as_println_did() {
+        say(&mut Broken, OFF, "notes", "notes", "nothing new");
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stdout")]
+    fn a_failed_show_line_panics_as_println_did() {
+        show(&mut Broken, OFF, &Event::Busy("polishing 40 words".into()), &mut None);
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stdout")]
+    fn a_failed_prepared_line_panics_as_println_did() {
+        print_prepared(&mut Broken, OFF, &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stdout")]
+    fn a_failed_end_line_panics_as_println_did() {
+        print_end(&mut Broken, OFF, &files(), &StopReport::default(), &ledger());
     }
 }
