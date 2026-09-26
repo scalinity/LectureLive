@@ -107,3 +107,51 @@ export class FixtureTransport implements Transport {
     send();
   }
 }
+
+const LECTURE = [
+  "Last week we set up the loss as a function of the weights, so today the question is how to move downhill.",
+  "Gradient descent takes a step against the gradient, scaled by the learning rate.",
+  "If the learning rate is too small you crawl, and if it is too large you overshoot the minimum and bounce around.",
+  "Here is the update rule on the slide: w becomes w minus eta times the gradient of L.",
+  "Notice that eta is the only thing we choose; the gradient comes from the data.",
+  "A useful picture is a ball rolling in a bowl, where the bowl is the loss surface.",
+  "Stochastic gradient descent uses one mini-batch at a time instead of the whole data set.",
+  "That makes each step noisy but much cheaper, and the noise can even help escape shallow minima.",
+  "Momentum keeps a running average of past gradients so the ball keeps rolling through flat stretches.",
+  "This will be on the exam: be able to write the momentum update and say what beta does.",
+];
+
+const clock = (base: number, i: number) => {
+  const s = base + i * 17;
+  return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60].map((n) => String(n).padStart(2, "0")).join(":");
+};
+
+/** The browser preview: a lecture in progress, then new speech every few seconds. */
+export function demoTransport(): FixtureTransport {
+  const st = emptyState("demo");
+  st.status = { ...idleStatus(), phase: "running", source: "BlackHole 2ch", level_dbfs: -24, stt: "transcribing", stt_ok: true, started_at: new Date(Date.now() - 42 * 60_000).toISOString(), spend_usd: 0.14, folder: { dir: "/Lectures/Machine Learning/Weeks/Week 06 — Optimisation", course: "Machine Learning", name: "Week 06 — Optimisation", notes_dir: "/Lectures/Machine Learning/Weeks/Week 06 — Optimisation", page: null } };
+  st.segments = LECTURE.slice(0, 6).map((text, id) => ({ id, at: clock(10 * 3600 + 2 * 60, id), text, recovered: id === 3 }));
+  const t = new FixtureTransport(st);
+  let id = 6;
+  let utterance = 1;
+  const speak = () => {
+    const words = LECTURE[id % LECTURE.length].split(" ");
+    let n = 0;
+    const tick = () => {
+      n = Math.min(words.length, n + 2);
+      const stable = words.slice(0, Math.max(0, n - 3)).join(" ");
+      const tentative = words.slice(Math.max(0, n - 3), n).join(" ");
+      t.emitTranscript({ type: "open", utterance, stable, tentative });
+      if (n < words.length) return setTimeout(tick, 450);
+      setTimeout(() => {
+        t.emitTranscript({ type: "closed", utterance, segment: { id, at: clock(10 * 3600 + 2 * 60, id), text: words.join(" "), recovered: false } });
+        id++;
+        utterance++;
+        setTimeout(speak, 900);
+      }, 500);
+    };
+    tick();
+  };
+  setTimeout(speak, 800);
+  return t;
+}

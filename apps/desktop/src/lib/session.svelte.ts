@@ -119,6 +119,7 @@ export class Session {
     this.preview = st.preview ? { ...st.preview } : null;
     this.previewShown = this.preview ? wholeWords(this.preview.text) : "";
     this.previewDirty = false;
+    this.wake(); // the panes' frame hooks run on the new state too
   }
 
   /** While hidden nothing is applied; on return the store rehydrates (spec §9.2). */
