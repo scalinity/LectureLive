@@ -415,7 +415,10 @@ pub async fn open_page(app: State<'_, App>) -> Res<String> {
     drop(tx);
     let _ = forward.await;
     let outcome = outcome?;
-    std::process::Command::new("open").arg(&outcome.path).status().map_err(text)?;
+    // A check typesets without opening the default browser: the page itself loads math and fonts from the web.
+    if std::env::var_os("LECTURELIVE_CHECK").is_none() {
+        std::process::Command::new("open").arg(&outcome.path).status().map_err(text)?;
+    }
     Ok(outcome.path.to_string_lossy().into_owned())
 }
 
@@ -483,6 +486,16 @@ pub fn check_report(name: String, json: String) -> Res<String> {
     let path = dir.join(format!("{name}.json"));
     std::fs::write(&path, json).map_err(text)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Hides the window for `ms`, then shows it again: the hidden-window rehydration check (spec §9.2).
+#[tauri::command]
+pub async fn hide_window_for(ms: u64, handle: AppHandle) -> Res<()> {
+    let w = handle.get_webview_window("main").ok_or("no main window")?;
+    w.hide().map_err(text)?;
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    w.show().map_err(text)?;
+    w.set_focus().map_err(text)
 }
 
 #[tauri::command]
