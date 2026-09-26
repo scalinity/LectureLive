@@ -5,6 +5,7 @@ pub mod frame;
 pub mod input;
 pub mod level;
 pub mod loopback;
+pub mod mix;
 pub mod permission;
 pub mod pipeline;
 pub mod recorder;

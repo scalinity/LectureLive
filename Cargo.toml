@@ -26,3 +26,18 @@ opt-level = 3
 
 [profile.dev.package.xcap]
 opt-level = 3
+
+# Mixed mode resamples two sources and steers a drift stage per source (spec §4.2). rubato's resamplers are
+# generic, so they compile inside lecturelive-core at its opt-level: unoptimised, the two-hour drift test over
+# simulated clocks took 330 s, at opt-level 1 60 s, at opt-level 3 11 s (M6 ledger).
+[profile.dev.package.lecturelive-core]
+opt-level = 3
+
+[profile.dev.package.rubato]
+opt-level = 3
+
+[profile.dev.package.realfft]
+opt-level = 3
+
+[profile.dev.package.rustfft]
+opt-level = 3
