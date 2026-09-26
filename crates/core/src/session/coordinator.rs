@@ -750,6 +750,18 @@ mod tests {
         }
     }
 
+    /// A script sent at a device's pace (a millisecond per event), so a loaded machine's recorder keeps up as it
+    /// does with a real device.
+    struct Paced(Vec<SourceEvent>);
+    impl Source for Paced {
+        fn run(self: Box<Self>, out: mpsc::Sender<SourceEvent>, _stop: Arc<AtomicBool>) {
+            for e in self.0 {
+                out.blocking_send(e).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
     /// Sends frames until stopped, like a live device.
     struct Endless;
     impl Source for Endless {
@@ -1033,7 +1045,7 @@ mod tests {
             drop(tx);
         });
         let a = Uuid::new_v4();
-        let (report, _) = run_with(SessionConfig { stt: Some(SttLink { input, events }), ..cfg(dir.path()) }, Script(recording(a, 200))).await;
+        let (report, _) = run_with(SessionConfig { stt: Some(SttLink { input, events }), ..cfg(dir.path()) }, Paced(recording(a, 200))).await;
         assert_eq!(report.unwrap().recordings[0].1, 200 * 1600, "the recorder is unaffected");
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.first().map(String::as_str), Some("begin"));
