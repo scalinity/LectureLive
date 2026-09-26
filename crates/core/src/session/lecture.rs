@@ -98,6 +98,9 @@ pub enum Event {
     Slide { index: u32, file: String, auto: bool, uncertain: bool, shown_at: DateTime<Local> },
     /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
     Capture(CaptureState),
+    /// The watched window changed size and its slide is watched through the region for that size: saved by
+    /// the adapter for the course, and said.
+    CaptureMoved { selection: Selection, note: String },
     Warning(String),
 }
 
@@ -513,6 +516,9 @@ fn slide_event(s: &SlideEntry) -> Event {
 async fn capture_task(lec: Arc<Lecture>, store: Store, mut rx: UnboundedReceiver<CaptureEvent>, events: UnboundedSender<Event>) {
     while let Some(e) = rx.recv().await {
         match e {
+            CaptureEvent::Relocated { selection, note } => {
+                let _ = events.send(Event::CaptureMoved { selection, note });
+            }
             CaptureEvent::State(s) => {
                 let _ = events.send(Event::Capture(s));
             }

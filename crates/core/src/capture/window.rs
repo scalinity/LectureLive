@@ -1,5 +1,6 @@
-//! Windows to capture (spec §7.1): enumeration through CoreGraphics, which also finds a window that is
-//! off screen, and capture through `xcap`. A missing permission is an error of its own, never "no windows".
+//! Windows to capture (spec §7.1): enumeration and capture through CoreGraphics, by window id, so a window
+//! that is covered or on another desktop is still found and asked for. A missing permission is an error of
+//! its own, never "no windows".
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +30,51 @@ extern "C" {
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
     fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect) -> bool;
+    fn CGWindowListCreateImage(bounds: CGRect, option: u32, window: u32, image_option: u32) -> *const std::ffi::c_void;
+    fn CGImageGetWidth(image: *const std::ffi::c_void) -> usize;
+    fn CGImageGetHeight(image: *const std::ffi::c_void) -> usize;
+    fn CGImageGetBytesPerRow(image: *const std::ffi::c_void) -> usize;
+    fn CGImageGetBitsPerPixel(image: *const std::ffi::c_void) -> usize;
+    fn CGImageGetDataProvider(image: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    fn CGDataProviderCopyData(provider: *const std::ffi::c_void) -> core_foundation::data::CFDataRef;
+    fn CGImageRelease(image: *const std::ffi::c_void);
+}
+
+/// `kCGWindowListOptionIncludingWindow`: the window alone, whatever covers it.
+const ONE_WINDOW: u32 = 8;
+/// `kCGWindowImageBoundsIgnoreFraming`: no shadow around it.
+const NO_FRAMING: u32 = 1;
+
+/// One window by id, straight from the window server: no lookup in the on-screen list, so a window that is
+/// covered, or on another desktop (a full-screen Zoom while the person works elsewhere), is still asked for.
+fn capture_by_id(id: u32) -> Result<RgbaImage, CaptureError> {
+    // CGRectNull: the window's own bounds.
+    let null = CGRect { x: f64::INFINITY, y: f64::INFINITY, w: 0.0, h: 0.0 };
+    let image = unsafe { CGWindowListCreateImage(null, ONE_WINDOW, id, NO_FRAMING) };
+    if image.is_null() {
+        return Err(CaptureError::Failed("the window server returned no image".into()));
+    }
+    let result = (|| {
+        let (w, h, row, bits) = unsafe { (CGImageGetWidth(image), CGImageGetHeight(image), CGImageGetBytesPerRow(image), CGImageGetBitsPerPixel(image)) };
+        if w == 0 || h == 0 || bits != 32 {
+            return Err(CaptureError::Failed(format!("an empty or unexpected image ({w}×{h}, {bits} bits)")));
+        }
+        let data = unsafe { CGDataProviderCopyData(CGImageGetDataProvider(image)) };
+        if data.is_null() {
+            return Err(CaptureError::Failed("the image had no pixels".into()));
+        }
+        let data = unsafe { core_foundation::data::CFData::wrap_under_create_rule(data) };
+        let bytes = data.bytes();
+        // BGRA, premultiplied, rows padded to `row` bytes: copy the rows, then swap blue and red.
+        let mut px = Vec::with_capacity(w * h * 4);
+        for line in bytes.chunks(row).take(h) {
+            px.extend_from_slice(&line[..w * 4]);
+        }
+        px.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+        RgbaImage::from_raw(w as u32, h as u32, px).ok_or_else(|| CaptureError::Failed("the image was cut short".into()))
+    })();
+    unsafe { CGImageRelease(image) };
+    result
 }
 
 /// `kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements`: on screen or not.
@@ -120,8 +166,7 @@ impl WindowSource for SystemWindows {
 
     fn capture(&mut self, id: u32) -> Result<RgbaImage, CaptureError> {
         ensure_screen_access().map_err(|_| CaptureError::Denied)?;
-        let window = xcap::Window::all().map_err(|e| CaptureError::Failed(format!("list windows: {e}")))?.into_iter().find(|w| w.id().is_ok_and(|i| i == id)).ok_or_else(|| CaptureError::Failed("the window is not on screen".into()))?;
-        window.capture_image().map_err(|e| CaptureError::Failed(format!("capture: {e}")))
+        capture_by_id(id)
     }
 }
 
@@ -203,6 +248,19 @@ mod tests {
     #[ignore]
     fn lists_at_least_one_window() {
         assert!(!list_windows().unwrap().is_empty());
+    }
+
+    /// Needs Screen Recording (inherited from Terminal.app when run from its shell):
+    /// cargo test -p lecturelive-core system_windows -- --ignored
+    #[test]
+    #[ignore]
+    fn system_windows_captures_the_terminal_by_id_at_its_size() {
+        let mut s = SystemWindows;
+        let term = s.windows().unwrap().into_iter().find(|w| w.bundle_id.as_deref() == Some("com.apple.Terminal") && w.on_screen).expect("a Terminal window");
+        let img = s.capture(term.id).unwrap();
+        assert!(!is_blank(&img));
+        // Pixels, not points: a Retina capture is twice the window's size.
+        assert!(img.width() >= term.width && img.height() >= term.height, "{}×{} for a {}×{} window", img.width(), img.height(), term.width, term.height);
     }
 
     /// Needs Screen Recording (inherited from Terminal.app when run from its shell):

@@ -58,6 +58,43 @@ pub struct Selection {
     /// region: the detector never reacts to them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leave_out: Vec<Region>,
+    /// The region at the window's other sizes (full screen and back), found again or chosen there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sizes: Vec<SizedRegion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SizedRegion {
+    pub width: u32,
+    pub height: u32,
+    pub region: Region,
+}
+
+impl Selection {
+    /// The same window: its app and title, at its size or at a size seen before.
+    pub fn matches(&self, w: &WindowInfo) -> bool {
+        let d = &self.descriptor;
+        d.same_app(w) && d.title == w.title && self.at_size(w.width, w.height).is_some()
+    }
+
+    /// This selection with the window at `width`×`height`: its region for that size, if the size was seen.
+    pub fn at_size(&self, width: u32, height: u32) -> Option<Selection> {
+        let probe = WindowInfo { id: 0, app: String::new(), bundle_id: None, title: String::new(), width, height, on_screen: true };
+        if self.descriptor.same_size(&probe) {
+            return Some(self.clone());
+        }
+        let s = self.sizes.iter().find(|s| Descriptor { width: s.width, height: s.height, ..self.descriptor.clone() }.same_size(&probe))?;
+        Some(self.with_size(s.width, s.height, s.region))
+    }
+
+    /// This selection at a new size with its region there; the size it was at is remembered.
+    pub fn with_size(&self, width: u32, height: u32, region: Region) -> Selection {
+        let mut sizes: Vec<SizedRegion> = self.sizes.iter().filter(|s| (s.width, s.height) != (width, height)).copied().collect();
+        if (self.descriptor.width, self.descriptor.height) != (width, height) {
+            sizes.push(SizedRegion { width: self.descriptor.width, height: self.descriptor.height, region: self.region });
+        }
+        Selection { descriptor: Descriptor { width, height, ..self.descriptor.clone() }, region, leave_out: self.leave_out.clone(), sizes }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,10 +104,10 @@ pub enum Revalidation {
     Ask { reason: String, candidates: Vec<WindowInfo> },
 }
 
-/// Spec §7.1: exactly one window matching bundle id, title and size binds; anything else asks.
+/// Spec §7.1: exactly one window matching bundle id, title and a size it had binds; anything else asks.
 pub fn revalidate(sel: &Selection, windows: &[WindowInfo]) -> Revalidation {
     let d = &sel.descriptor;
-    let exact: Vec<WindowInfo> = windows.iter().filter(|w| d.matches(w)).cloned().collect();
+    let exact: Vec<WindowInfo> = windows.iter().filter(|w| sel.matches(w)).cloned().collect();
     match exact.len() {
         1 => return Revalidation::Match(exact[0].clone()),
         n if n > 1 => return Revalidation::Ask { reason: format!("{n} windows match {}; choose one", d.label()), candidates: exact },
@@ -128,7 +165,7 @@ mod tests {
     }
 
     fn saved() -> Selection {
-        Selection { descriptor: Descriptor::of(&win(1, "us.zoom.xos", "Zoom Meeting", 1600, 900)), region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, leave_out: vec![] }
+        Selection { descriptor: Descriptor::of(&win(1, "us.zoom.xos", "Zoom Meeting", 1600, 900)), region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, leave_out: vec![], sizes: vec![] }
     }
 
     #[test]
@@ -161,8 +198,26 @@ mod tests {
     #[test]
     fn a_window_outside_a_bundle_is_named_by_its_app() {
         let dev = WindowInfo { bundle_id: None, app: "desktop".into(), ..win(5, "", "LectureLive deck", 1280, 720) };
-        let sel = Selection { descriptor: Descriptor::of(&dev), region: Region::WHOLE, leave_out: vec![] };
+        let sel = Selection { descriptor: Descriptor::of(&dev), region: Region::WHOLE, leave_out: vec![], sizes: vec![] };
         assert_eq!(revalidate(&sel, &[dev.clone()]), Revalidation::Match(dev));
+    }
+
+    /// Full screen and back: one window, two sizes, the slide in a different place in each.
+    #[test]
+    fn a_selection_remembers_a_region_per_window_size_and_matches_either() {
+        let sel = saved(); // 1600 × 900, region (0.1, 0.1, 0.8, 0.8)
+        let full = Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 };
+        let both = sel.with_size(1920, 1200, full);
+        let at_full = both.at_size(1920, 1200).unwrap();
+        assert_eq!((at_full.descriptor.width, at_full.descriptor.height, at_full.region), (1920, 1200, full));
+        let back = at_full.at_size(1600, 900).unwrap();
+        assert_eq!((back.descriptor.width, back.region), (1600, sel.region));
+        assert_eq!(both.at_size(1280, 800), None);
+        let fullscreen = win(42, "us.zoom.xos", "Zoom Meeting", 1920, 1200);
+        assert_eq!(revalidate(&both, &[fullscreen.clone()]), Revalidation::Match(fullscreen), "a size seen before is the same window");
+        let old = r#"{"descriptor":{"bundle_id":"us.zoom.xos","app":"zoom.us","title":"Zoom Meeting","width":1600,"height":900},"region":{"x":0.1,"y":0.1,"w":0.8,"h":0.8}}"#;
+        let loaded: Selection = serde_json::from_str(old).unwrap();
+        assert!(loaded.sizes.is_empty() && loaded.leave_out.is_empty(), "an earlier capture.json still loads");
     }
 
     #[test]

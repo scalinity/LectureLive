@@ -200,6 +200,7 @@ impl Pump {
                 self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}{how}, into the next snapshot"));
             }
             Event::Capture(s) => self.capture_state(s),
+            Event::CaptureMoved { note, .. } => self.notice(NoticeKind::Slide, "Found again", &note),
             Event::Warning(m) => self.notice(NoticeKind::Warn, "Warning", &m),
         }
         self.flush_status();
@@ -506,5 +507,18 @@ mod tests {
         assert_eq!((slide["auto"].as_bool(), slide["uncertain"].as_bool(), slide["at"].as_str()), (Some(true), Some(true), Some("10:02:51")));
         let status = msgs.iter().rev().find(|m| m["type"] == "status").unwrap();
         assert_eq!((status["capture"]["state"].as_str(), status["capture"]["captured"].as_bool()), (Some("asking"), Some(true)));
+    }
+
+    #[test]
+    fn a_slide_found_again_after_a_resize_is_said() {
+        use lecturelive_core::capture::detect::Region;
+        use lecturelive_core::capture::select::{Descriptor, Selection};
+        let (mut p, sink) = pump();
+        let d = Descriptor { bundle_id: None, app: "zoom.us".into(), title: "Zoom Meeting".into(), width: 1920, height: 1200 };
+        let selection = Selection { descriptor: d, region: Region::WHOLE, leave_out: vec![], sizes: vec![] };
+        p.apply(Event::CaptureMoved { selection, note: "Zoom Meeting is 1920 × 1200 now; the slide was found again there".into() });
+        let n: Vec<Value> = sink.on(Stream::Status).into_iter().filter(|m| m["type"] == "notice").collect();
+        assert_eq!((n[0]["label"].as_str(), n[0]["kind"].as_str()), (Some("Found again"), Some("slide")));
+        assert!(n[0]["detail"].as_str().unwrap().contains("1920 × 1200"));
     }
 }

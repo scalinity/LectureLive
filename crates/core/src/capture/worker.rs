@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::capture::detect::{crop, thumb_for, Detector, Region, Thresholds};
+use crate::capture::locate::locate;
 use crate::capture::select::{revalidate, Revalidation, Selection};
 use crate::capture::window::{fit_within, is_blank, CaptureError, WindowInfo, WindowSource, MAX_PX};
 
@@ -71,6 +72,8 @@ pub struct Captured {
 #[derive(Debug)]
 pub enum CaptureEvent {
     State(CaptureState),
+    /// The same window's slide is watched through another region (its size changed): to save, and to say.
+    Relocated { selection: Selection, note: String },
     Captured(Captured),
 }
 
@@ -99,7 +102,7 @@ pub fn spawn(source: Box<dyn WindowSource>, selection: Option<Selection>, cfg: W
         .name("capture".into())
         .spawn(move || {
             let recorder = cfg.record.as_ref().and_then(|d| Recorder::new(d.clone()).ok());
-            let mut w = Worker { detector: Detector::new(cfg.thresholds), source, cfg, events, bound: None, waiting: None, sent: None, failures: 0, recorder };
+            let mut w = Worker { detector: Detector::new(cfg.thresholds), source, cfg, events, bound: None, waiting: None, sent: None, failures: 0, tried: None, new_size: None, settling: 0, recorder };
             w.start(selection);
             w.run(rx);
         })
@@ -118,6 +121,12 @@ struct Worker {
     detector: Detector<DateTime<Local>>,
     sent: Option<CaptureState>,
     failures: u32,
+    /// The last window size a search for the slide was made at.
+    tried: Option<(u32, u32)>,
+    /// A size the window reported that differs from the region's, and for how many samples in a row.
+    new_size: Option<((u32, u32), u32)>,
+    /// Samples after a new region that only settle the kept frame.
+    settling: u32,
     recorder: Option<Recorder>,
 }
 
@@ -150,7 +159,7 @@ impl Worker {
         let Some(sel) = selection else { return self.set(CaptureState::Unbound) };
         match self.source.windows() {
             Ok(ws) => match revalidate(&sel, &ws) {
-                Revalidation::Match(w) => self.bound = Some((w.id, sel)),
+                Revalidation::Match(w) => self.bound = Some((w.id, sel.at_size(w.width, w.height).unwrap_or(sel))),
                 Revalidation::Ask { reason, candidates } => {
                     let window = sel.descriptor.label();
                     self.waiting = Some(sel);
@@ -173,6 +182,7 @@ impl Worker {
         }
         self.bound = Some((window, selection));
         self.waiting = None;
+        self.tried = None;
         self.failures = 0;
     }
 
@@ -221,28 +231,35 @@ impl Worker {
             Ok(ws) => ws,
             Err(e) => return self.failed(&window, e),
         };
-        let Some(w) = windows.iter().find(|w| w.id == id) else {
-            let others: Vec<WindowInfo> = windows.into_iter().filter(|w| sel.descriptor.matches(w)).collect();
+        let Some(w) = windows.iter().find(|w| w.id == id).cloned() else {
+            let others: Vec<WindowInfo> = windows.into_iter().filter(|w| sel.matches(w)).collect();
             return self.set(if others.is_empty() {
                 CaptureState::Paused { window, reason: "the window closed; a new one is offered here when it opens".into() }
             } else {
                 CaptureState::Asking { reason: format!("a new “{window}” window opened"), window, candidates: others }
             });
         };
-        if !w.on_screen {
-            // A closed window's id can stay listed off screen while its app runs, so another window matching
-            // the descriptor on screen is a replacement to ask about, not a reason to wait.
-            let others: Vec<WindowInfo> = windows.iter().filter(|o| o.id != id && o.on_screen && sel.descriptor.matches(o)).cloned().collect();
-            return self.set(if others.is_empty() {
-                CaptureState::Paused { window, reason: "not on screen (minimised or on another desktop); capture resumes when it is back".into() }
-            } else {
-                CaptureState::Asking { reason: format!("a new “{window}” window opened"), window, candidates: others }
-            });
-        }
-        if !sel.descriptor.same_size(w) {
-            let (reason, candidates) = (format!("it is {} × {} now; check the region", w.width, w.height), vec![w.clone()]);
-            return self.set(CaptureState::Asking { window, reason, candidates });
-        }
+        let sel = if sel.descriptor.same_size(&w) {
+            self.new_size = None;
+            sel
+        } else {
+            // Full screen animates, and a size can be reported before the content is laid out for it: act
+            // once the new size has held for a sample.
+            let seen = match self.new_size {
+                Some((size, n)) if size == (w.width, w.height) => n + 1,
+                _ => 1,
+            };
+            self.new_size = Some(((w.width, w.height), seen));
+            if seen < 2 {
+                return;
+            }
+            match self.resized(id, &sel, &w) {
+                Some(s) => s,
+                None => return,
+            }
+        };
+        // Captured by its id whether on screen or not: covered, or full screen on another desktop while the
+        // person works elsewhere. Only a window that cannot be captured waits.
         let img = match self.frame(id, &sel) {
             Ok((img, t)) => {
                 if let Some(r) = self.recorder.as_mut() {
@@ -250,7 +267,27 @@ impl Worker {
                 }
                 self.failures = 0;
                 self.set(CaptureState::Watching { window: window.clone() });
-                self.detector.observe(Local::now(), t).map(|d| (img, d))
+                if self.settling > 0 {
+                    // Just after a new region: the frames settle into the kept frame, never a slide of their own.
+                    self.settling -= 1;
+                    self.detector.keep(t);
+                    None
+                } else {
+                    self.detector.observe(Local::now(), t).map(|d| (img, d))
+                }
+            }
+            Err(e) if !w.on_screen => {
+                // A closed window's id can stay listed off screen while its app runs, so another window
+                // matching on screen is a replacement to ask about, not a reason to wait.
+                let others: Vec<WindowInfo> = windows.iter().filter(|o| o.id != id && o.on_screen && sel.matches(o)).cloned().collect();
+                if let Some(r) = self.recorder.as_mut() {
+                    r.error(&e.to_string());
+                }
+                return self.set(if others.is_empty() {
+                    CaptureState::Paused { window, reason: "not on screen and cannot be captured (minimised?); capture resumes when it is back".into() }
+                } else {
+                    CaptureState::Asking { reason: format!("a new “{window}” window opened"), window, candidates: others }
+                });
             }
             Err(e) => return self.failed(&window, e),
         };
@@ -259,6 +296,42 @@ impl Worker {
                 self.set(CaptureState::Failing { window, reason: e });
             }
         }
+    }
+
+    /// The window changed size (full screen on or off): its region at that size, remembered or found again
+    /// by looking for the last kept slide; None while the person is asked.
+    fn resized(&mut self, id: u32, sel: &Selection, w: &WindowInfo) -> Option<Selection> {
+        let window = sel.descriptor.label();
+        if let Some(known) = sel.at_size(w.width, w.height) {
+            return Some(self.rebind(id, known, format!("{window} is {} × {} again; watching its slide there", w.width, w.height)));
+        }
+        if self.tried != Some((w.width, w.height)) {
+            self.tried = Some((w.width, w.height)); // one search per new size, not one per second
+            let kept = self.detector.kept().cloned();
+            if let (Ok(img), Some(kept)) = (self.source.capture(id), kept) {
+                let aspect = (sel.region.w * sel.descriptor.width as f64) / (sel.region.h * sel.descriptor.height as f64);
+                if let Some(region) = locate(&img, &kept, aspect, &sel.leave_out) {
+                    let found = sel.with_size(w.width, w.height, region);
+                    return Some(self.rebind(id, found, format!("{window} is {} × {} now; the slide was found again there", w.width, w.height)));
+                }
+            }
+        }
+        let reason = format!("it is {} × {} now and the slide was not found in it; check the region", w.width, w.height);
+        self.set(CaptureState::Asking { window, reason, candidates: vec![w.clone()] });
+        None
+    }
+
+    /// The same window through another region: the slide on screen becomes the kept frame rather than a new
+    /// slide, and the app is told (it saves the region and says so).
+    fn rebind(&mut self, id: u32, sel: Selection, note: String) -> Selection {
+        if let Ok((_, t)) = self.frame(id, &sel) {
+            self.detector.keep(t);
+        }
+        self.bound = Some((id, sel.clone()));
+        self.tried = None;
+        self.settling = 2;
+        let _ = self.events.send(CaptureEvent::Relocated { selection: sel.clone(), note });
+        sel
     }
 
     /// One capture and its detector input; a blank window or a black region is a failed capture.

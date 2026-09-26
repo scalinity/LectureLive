@@ -541,6 +541,7 @@ fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
             let (label, detail) = s.words();
             say(p, "slide", &label.to_lowercase(), &detail)
         }
+        Event::CaptureMoved { note, .. } => say(p, "slide", "found again", note),
         Event::Warning(m) => say(p, "warn", "warning", m),
     }
 }

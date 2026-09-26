@@ -143,6 +143,11 @@ impl<T: Clone> Detector<T> {
         Self { t, reference: None, prev: None, candidate: None, moving: [0; TILES], masked: [false; TILES] }
     }
 
+    /// The last kept frame: what the slide on screen should look like.
+    pub fn kept(&self) -> Option<&GrayImage> {
+        self.reference.as_ref()
+    }
+
     /// Tiles masked as animated.
     pub fn masked(&self) -> usize {
         self.masked.iter().filter(|&&m| m).count()
