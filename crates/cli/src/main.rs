@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lecturelive_core::audio::level::{self, SilenceWatch};
 use lecturelive_core::audio::permission::{self, MicPermission};
-use lecturelive_core::audio::source::DeviceSource;
+use lecturelive_core::audio::mixed::{MixedSource, MIXED_MODE};
+use lecturelive_core::audio::source::{DeviceSource, Source};
 use lecturelive_core::audio::{input, loopback, recorder, routing};
 use lecturelive_core::capture::window;
 use lecturelive_core::session::coordinator::{self, Notification, SessionConfig, SttStatus};
@@ -42,6 +43,9 @@ enum Cmd {
     Record {
         #[arg(long, conflicts_with = "device")]
         loopback: bool,
+        /// Record Zoom (through LectureLive Loopback) and this input together: its UID or part of its name
+        #[arg(long, conflicts_with_all = ["loopback", "device"])]
+        mixed: Option<String>,
         /// Input device UID (see `inputs`)
         #[arg(long)]
         device: Option<String>,
@@ -82,6 +86,9 @@ struct LectureArgs {
     /// Record BlackHole: Zoom through "LectureLive Loopback"
     #[arg(long, conflicts_with = "device")]
     loopback: bool,
+    /// Record Zoom (through LectureLive Loopback) and this input together: its UID or part of its name
+    #[arg(long, conflicts_with_all = ["loopback", "device"])]
+    mixed: Option<String>,
     /// Audio input: its UID or part of its name (default: LECTURE_DEVICE)
     #[arg(long)]
     device: Option<String>,
@@ -195,7 +202,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Loopback(l) => loopback_cmd(l)?,
-        Cmd::Record { loopback, device, dir, secs, keep_days, stt, keyterms } => record(loopback, device, dir, secs, keep_days, stt, keyterms).await?,
+        Cmd::Record { loopback, mixed, device, dir, secs, keep_days, stt, keyterms } => record(loopback, mixed, device, dir, secs, keep_days, stt, keyterms).await?,
         Cmd::Lecture(args) => lecture_cmd(args).await?,
         Cmd::Canary(c) => canary(c).await?,
     }
@@ -230,7 +237,7 @@ fn secs(samples: u64) -> f64 {
     samples as f64 / 16_000.0
 }
 
-async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>, secs_limit: Option<u64>, keep_days: Option<u32>, stt: bool, keyterms: Vec<String>) -> Result<()> {
+async fn record(use_loopback: bool, mixed: Option<String>, device: Option<String>, dir: Option<PathBuf>, secs_limit: Option<u64>, keep_days: Option<u32>, stt: bool, keyterms: Vec<String>) -> Result<()> {
     match permission::microphone() {
         MicPermission::Denied | MicPermission::Restricted => {
             anyhow::bail!("microphone access is denied for this terminal: System Settings → Privacy & Security → Microphone")
@@ -276,7 +283,9 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
             g.recording_id
         );
     }
-    let uid = if use_loopback {
+    let uid = if let Some(m) = &mixed {
+        resolve_mixed(m)?.0
+    } else if use_loopback {
         let s = loopback::status()?;
         anyhow::ensure!(s.blackhole_present, "BlackHole 2ch is not installed (brew install blackhole-2ch)");
         if !s.present {
@@ -287,8 +296,8 @@ async fn record(use_loopback: bool, device: Option<String>, dir: Option<PathBuf>
         device.context("give --loopback or --device <UID> (`lecturelive inputs` lists them)")?
     };
 
-    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, stt: stt_link, recovery, ..Default::default() }, Box::new(DeviceSource { uid }));
-    let mut watch = use_loopback.then(|| SilenceWatch::new(-60.0, 10));
+    let (handle, mut notes) = coordinator::spawn(SessionConfig { dir, stem, stt: stt_link, recovery, ..Default::default() }, source_for(&uid));
+    let mut watch = (use_loopback || mixed.is_some()).then(|| SilenceWatch::new(-60.0, 10));
     let timer = async {
         match secs_limit {
             Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
@@ -462,6 +471,23 @@ fn resolve_input(loopback: bool, device: Option<String>) -> Result<(String, Stri
         .with_context(|| format!("No audio input matches {want:?}. Inputs now: {}.", inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
+/// `--mixed <input>`: Zoom through BlackHole and that input together, once mixed mode has passed its drift test.
+/// Returns the source as `mixed:<input UID>` and its name.
+fn resolve_mixed(want: &str) -> Result<(String, String)> {
+    anyhow::ensure!(MIXED_MODE, "mixed mode is disabled: it did not pass its drift test (docs/milestones.md, M6)");
+    anyhow::ensure!(loopback::status()?.blackhole_present, "BlackHole 2ch is not installed (brew install blackhole-2ch)");
+    let (uid, name) = resolve_input(false, Some(want.to_string()))?;
+    Ok((format!("mixed:{uid}"), format!("Zoom and {name}")))
+}
+
+/// The source a UID names: `mixed:<input>` is Zoom through BlackHole with that input (spec §4.2).
+fn source_for(uid: &str) -> Box<dyn Source> {
+    match uid.strip_prefix("mixed:") {
+        Some(input) => Box::new(MixedSource::new(loopback::BLACKHOLE_UID, input)),
+        None => Box::new(DeviceSource { uid: uid.to_string() }),
+    }
+}
+
 /// Prints the lecture's events in the CLI's lines; the loopback silence warning as `record` gives it.
 fn show(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
     match e {
@@ -563,7 +589,14 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let course = a.course.or_else(|| course_from_path(&dir)).or_else(|| env_value("LECTURE_COURSE")).unwrap_or_else(|| "Lecture".into());
     let recording = a.command.is_none();
     // Checked before any file is created, so a missing device leaves the folder untouched.
-    let input = if recording { Some(resolve_input(a.loopback, a.device.or_else(|| env_value("LECTURE_DEVICE")))?) } else { None };
+    let input = if recording {
+        Some(match &a.mixed {
+            Some(m) => resolve_mixed(m)?,
+            None => resolve_input(a.loopback, a.device.or_else(|| env_value("LECTURE_DEVICE")))?,
+        })
+    } else {
+        None
+    };
     std::fs::create_dir_all(&dir)?;
     let dir = dir.canonicalize()?;
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -692,14 +725,14 @@ async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         });
     }
     drop(cmd_tx);
-    let mut watch = (uid == loopback::BLACKHOLE_UID).then(|| SilenceWatch::new(-60.0, 10));
+    let mut watch = (uid == loopback::BLACKHOLE_UID || uid.starts_with("mixed:")).then(|| SilenceWatch::new(-60.0, 10));
     let printer = tokio::spawn(async move {
         while let Some(e) = ev_rx.recv().await {
             show(p, &e, &mut watch);
         }
     });
     let watch_slides = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
-    let result = lecture::run(lec, session, Box::new(DeviceSource { uid }), watch_slides, None, cmd_rx, ev_tx).await;
+    let result = lecture::run(lec, session, source_for(&uid), watch_slides, None, cmd_rx, ev_tx).await;
     printer.await?;
     let report = result?;
     let file_name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

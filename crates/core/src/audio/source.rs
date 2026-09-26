@@ -24,6 +24,8 @@ pub enum SourceEvent {
     Begin { recording_id: Uuid, anchor: DateTime<Local>, source_uid: String, input_rate: u32, channels: u16 },
     Frame(Frame),
     Gap(Gap),
+    /// The end of a gap sent open-ended (a mixed source back in the mix).
+    GapEnd { recording_id: Uuid, start_sample: u64, end_sample: u64 },
     End { recording_id: Uuid, samples: u64, stream_errors: u64 },
     Level(f32),
     DeviceGone { uid: String },
@@ -145,22 +147,29 @@ impl Segment<'_> {
 }
 
 /// Opens and starts the device's input stream at its own configuration.
-fn open_stream(device: &cpal::Device) -> Result<(cpal::Stream, CaptureConsumer, Arc<StreamFlags>, u32, u16)> {
+pub(crate) fn open_stream(device: &cpal::Device) -> Result<(cpal::Stream, CaptureConsumer, Arc<StreamFlags>, u32, u16)> {
     let config = device.default_input_config()?;
     let rate = config.sample_rate();
     let channels = config.channels();
     let (mut producer, consumer, flags) = ring(channels, rate, RING_SECONDS);
     let err_flags = flags.clone();
+    let cb_flags = flags.clone();
+    // Each callback notes when it came and how long after capture: what a mixed source is aligned by (spec §4.2).
+    let latency = |info: &cpal::InputCallbackInfo| Some(info.timestamp().callback.duration_since(info.timestamp().capture));
     let on_error = move |e: cpal::Error| err_flags.on_error(e.kind());
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
-            device.build_input_stream(config.config(), move |d: &[f32], _: &cpal::InputCallbackInfo| producer.push(d), on_error, None)?
+            device.build_input_stream(config.config(), move |d: &[f32], info: &cpal::InputCallbackInfo| {
+                cb_flags.note_callback(latency(info));
+                producer.push(d)
+            }, on_error, None)?
         }
         cpal::SampleFormat::I16 => {
             let mut scratch: Vec<f32> = Vec::with_capacity(16_384 * channels as usize);
             device.build_input_stream(
                 config.config(),
-                move |d: &[i16], _: &cpal::InputCallbackInfo| {
+                move |d: &[i16], info: &cpal::InputCallbackInfo| {
+                    cb_flags.note_callback(latency(info));
                     scratch.clear(); // within capacity: no allocation in the callback
                     scratch.extend(d.iter().map(|&s| s as f32 / i16::MAX as f32));
                     producer.push(&scratch);

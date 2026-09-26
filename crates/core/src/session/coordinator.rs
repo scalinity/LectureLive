@@ -347,6 +347,14 @@ impl Coordinator {
                 self.save().await?;
                 self.notify(Notification::Gap(g));
             }
+            SourceEvent::GapEnd { recording_id, start_sample, end_sample } => {
+                // An open gap is durable as soon as it starts, so a crash while a mixed source is away still explains it.
+                let open = self.sidecar.gaps.iter_mut().find(|g| g.recording_id == recording_id && g.start_sample == start_sample && g.end_sample.is_none());
+                if let Some(g) = open {
+                    g.end_sample = Some(end_sample);
+                    self.save().await?;
+                }
+            }
             SourceEvent::End { recording_id, samples, stream_errors } => {
                 self.report.stream_errors += stream_errors;
                 self.overflow = None;
@@ -849,6 +857,24 @@ mod tests {
         assert_eq!(sc.gaps, vec![overflow, gone]);
         assert!(notes.iter().any(|n| matches!(n, Notification::DeviceGone { .. })));
         assert!(notes.iter().any(|n| matches!(n, Notification::DeviceBack { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_gap_left_open_is_closed_by_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4();
+        let script = Script(vec![
+            begin(a, 0),
+            frame(a, 0),
+            SourceEvent::Gap(Gap::new(a, 1600, None, GapKind::DeviceGone)),
+            frame(a, 1600),
+            SourceEvent::GapEnd { recording_id: a, start_sample: 1600, end_sample: 4800 },
+            frame(a, 3200),
+            SourceEvent::End { recording_id: a, samples: 4800, stream_errors: 0 },
+        ]);
+        run(dir.path(), script).await.0.unwrap();
+        let sc = Sidecar::load(&sidecar_path(dir.path(), STEM)).unwrap().unwrap();
+        assert_eq!(sc.gaps, vec![Gap::new(a, 1600, Some(4800), GapKind::DeviceGone)]);
     }
 
     #[tokio::test]

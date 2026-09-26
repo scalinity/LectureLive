@@ -25,9 +25,32 @@ pub struct StreamFlags {
     first_ms: AtomicU64,
     ended: AtomicBool,
     end_frame: AtomicU64,
+    latency_us: AtomicU64,
+    last_callback_ns: AtomicU64,
+}
+
+/// Nanoseconds on the host's monotonic clock since this process first asked: what callback times are compared in.
+pub fn mono_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
 
 impl StreamFlags {
+    /// Called from each audio callback: when it came, and (once) how long after capture.
+    pub fn note_callback(&self, latency: Option<std::time::Duration>) {
+        self.last_callback_ns.store(mono_ns(), Ordering::Relaxed);
+        if let Some(l) = latency {
+            let _ = self.latency_us.compare_exchange(0, (l.as_micros() as u64).max(1), Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
+
+    /// Seconds since the oldest of `waiting` frames at `rate` was captured: the time since the last callback,
+    /// the device's latency, and the audio waiting.
+    pub fn age_of_oldest(&self, waiting: u64, rate: u32) -> f64 {
+        let since = mono_ns().saturating_sub(self.last_callback_ns.load(Ordering::Relaxed)) as f64 / 1e9;
+        since + self.latency_us.load(Ordering::Relaxed) as f64 / 1e6 + waiting as f64 / rate as f64
+    }
+
     /// Wall-clock milliseconds of the first captured sample, once audio has arrived.
     pub fn anchor_ms(&self) -> Option<u64> {
         match self.first_ms.load(Ordering::Acquire) {
