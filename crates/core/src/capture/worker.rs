@@ -336,12 +336,15 @@ impl Worker {
     /// The same window through another region: the slide on screen becomes the kept frame rather than a new
     /// slide, and the app is told (it saves the region and says so).
     fn rebind(&mut self, id: u32, sel: Selection, note: String) -> Selection {
-        if let Ok((_, t)) = self.frame(id, &sel) {
-            self.detector.keep(t);
+        // Before the first slide there is nothing to settle into: the next good frame is the first slide.
+        if self.detector.kept().is_some() {
+            if let Ok((_, t)) = self.frame(id, &sel) {
+                self.detector.keep(t);
+            }
+            self.settling = 2;
         }
         self.bound = Some((id, sel.clone()));
         self.tried = None;
-        self.settling = 2;
         let _ = self.events.send(CaptureEvent::Relocated { selection: sel.clone(), note });
         sel
     }

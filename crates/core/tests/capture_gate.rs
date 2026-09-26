@@ -235,6 +235,26 @@ async fn a_resize_within_the_same_size_that_moves_the_slide_takes_it_once() {
     assert_eq!(shots, vec![(true, false)], "a build at the new size");
 }
 
+/// Live evidence (M5 full-screen check, second run): a new window was still settling its size (1166 × 718, then
+/// 1168 × 720) as watching began; the re-layout came before the first slide, which is still taken, once.
+#[tokio::test]
+async fn a_size_change_before_the_first_slide_still_takes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    let (before, after) = (zoom_window(1166, 718, (60, 40, 1040, 585), 1), zoom_window(1168, 720, (61, 41, 1040, 585), 1));
+    fake.add(42, "Zoom Meeting", 1166, 718, before);
+    let mut sel = selection(&fake, 42);
+    sel.region = Region { x: 60.0 / 1166.0, y: 40.0 / 718.0, w: 1040.0 / 1166.0, h: 585.0 / 718.0 };
+    fake.0.lock().unwrap().fail_next = 10; // nothing to capture yet, so no first slide before the size settles
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let (_, early) = watch(&mut rx, 60).await; // bound, with nothing captured yet
+    fake.resize(42, 1168, 720);
+    fake.show(42, after);
+    let (_, mut shots) = watch(&mut rx, 800).await;
+    shots.splice(0..0, early);
+    assert_eq!(shots, vec![(true, false)], "the first slide, once");
+}
+
 /// A window a few pixels off its saved size is the same window at start: its first slide is taken, with no
 /// relocation, since only a change of size while watching moves the slide.
 #[tokio::test]
