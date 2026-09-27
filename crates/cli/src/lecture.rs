@@ -353,8 +353,10 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             capture: capture.clone(),
         };
         // The terminal is given back before this returns, so the summary prints on the ordinary screen.
+        // A fatal error's words are cleaned only as they leave for stderr — after the restoration
+        // inside `tui::run`, so the engine → restore → `Error` order stands (Task 12's remediation).
         let (engine, events) = engine(cmd_rx, ev_tx)?;
-        let report = tui::run(session, engine, cmd_tx, events, a.secs).await?;
+        let report = tui::run(session, engine, cmd_tx, events, a.secs).await.map_err(plain::fatal)?;
         plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
         return Ok(());
     }
@@ -384,7 +386,9 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     });
     let result = engine.await;
     printer.await?;
-    let report = result?;
+    // The same final boundary as the TUI's: a fatal error's words are cleaned only as they leave
+    // for a terminal stderr, after the events are drained and printed.
+    let report = result.map_err(plain::fatal)?;
     plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
     Ok(())
 }

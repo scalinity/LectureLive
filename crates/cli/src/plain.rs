@@ -262,6 +262,33 @@ fn say_notice(out: &mut impl Write, d: Display, n: &Notice) {
     say(out, d, n.kind, &n.label, &n.detail);
 }
 
+/// A fatal lecture error on its way out of the process (Task 12's audit remediation): the engine's
+/// own failure text can carry a source's, device's or file's hostile bytes, and the runtime's
+/// final `Error: …` is printed to stderr outside both adapters' cleaning. When stderr is a
+/// terminal — asked here, of stderr itself, independently of stdout and of colour, for `NO_COLOR`
+/// says nothing about safety — the error's displayed words are cleaned; otherwise the error is
+/// returned exactly as it was. A control-free error is returned as itself either way, so ordinary
+/// errors keep their exact bytes, chain and all. The TUI has already restored the terminal by the
+/// time its error reaches this (the error travels after `leave`), so the engine → restore →
+/// `Error` order is unchanged.
+pub(crate) fn fatal(e: anyhow::Error) -> anyhow::Error {
+    use std::io::IsTerminal;
+    fatal_on(e, std::io::stderr().is_terminal())
+}
+
+/// [`fatal`] with the terminal-ness supplied, for the tests: the decision belongs to the display,
+/// never to the colour.
+pub(crate) fn fatal_on(e: anyhow::Error, stderr_is_a_terminal: bool) -> anyhow::Error {
+    if !stderr_is_a_terminal {
+        return e;
+    }
+    let words = format!("{e:?}");
+    if !words.chars().any(|c| c != '\n' && c != '\t' && c.is_control()) {
+        return e; // nothing to clean: the error keeps its exact words and its chain
+    }
+    anyhow::anyhow!(clean(&words))
+}
+
 /// One notice whose detail already embeds the CLI's own painting (the committed, polished and page
 /// results): its untrusted fragments were cleaned as it was built, so only the label is cleaned
 /// again here.
@@ -1114,6 +1141,37 @@ mod goldens {
             show(&mut b, term(OFF), &e, &mut None, &words(), false);
             assert_eq!(a, b, "control-free text is the same on a TTY and a pipe");
         }
+    }
+
+    /// Task 12's audit remediation: the one string both adapters' cleaning never saw — the fatal
+    /// lecture error the runtime finally prints as `Error: …` on stderr. The decision belongs to
+    /// stderr's own terminal-ness, never stdout's and never colour's (the function takes no
+    /// `Paint`, so `NO_COLOR` cannot turn safety off); a control-free error is returned as itself,
+    /// so ordinary errors keep their exact bytes on a terminal and a pipe alike.
+    #[test]
+    fn a_fatal_session_failure_is_cleaned_before_a_terminal_sees_it() {
+        // every hostile class, with the failure's recognizable words retained
+        let hostile = "disk full in the scripted session \x1b[31mcsi\x1b[0m \x1b[2J \x1b[H \x1b]0;owned title\x07 \x1b]52;c;cGF5bWU=\x07 \x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\ bel\x07 cr\rrewritten del\x7f end";
+        // a terminal stderr: the words stay, every sequence goes, and CR cannot rewrite
+        let text = format!("{:?}", fatal_on(anyhow::anyhow!(hostile), true));
+        assert!(text.starts_with("disk full in the scripted session"), "{text:?}");
+        for kept in ["csi", "link", "bel", "cr\nrewritten", "del", "end"] {
+            assert!(text.contains(kept), "{kept:?} not in {text:?}");
+        }
+        for gone in ["\x1b", "\x07", "\r", "\x7f"] {
+            assert!(!text.contains(gone), "{gone:?} survived: {text:?}");
+        }
+        // an ordinary error on a terminal stderr: byte-identical, chain and all
+        let ordinary = "recording to /tmp/lec/recordings/session_1.wav failed: no space left on device";
+        assert_eq!(format!("{:?}", fatal_on(anyhow::anyhow!(ordinary), true)), ordinary);
+        // a hostile chain, cleaned whole with its shape kept
+        let chained = anyhow::anyhow!(hostile).context("the recording failed");
+        let text = format!("{:?}", fatal_on(chained, true));
+        assert!(text.contains("the recording failed") && text.contains("Caused by:") && text.contains("disk full in the scripted session"), "{text:?}");
+        assert!(!text.contains('\x1b') && !text.contains('\x07') && !text.contains('\x7f'), "{text:?}");
+        // a pipe: the hostile bytes pass through exactly as they were, and so does an ordinary error
+        assert_eq!(format!("{:?}", fatal_on(anyhow::anyhow!(hostile), false)), hostile);
+        assert_eq!(format!("{:?}", fatal_on(anyhow::anyhow!("disk full"), false)), "disk full");
     }
 
     /// The shared wording, unstyled: what the TUI's activity and notice line hold, and what `show`

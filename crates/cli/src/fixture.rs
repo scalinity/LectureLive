@@ -61,7 +61,9 @@ pub(crate) enum Scenario {
     Failures,
     /// A session that dies of its own disk (plan Task 12): the lecture starts normally, says
     /// `Failed` — the notice the frontends word as "session failed" — and the engine then returns
-    /// `Err`, so the terminal is restored before the ordinary `Error: …` and exit 1.
+    /// `Err` whose message carries a hostile terminal-control payload after the recognizable
+    /// words, so the terminal is restored before the ordinary `Error: …` (cleaned only when
+    /// stderr is a terminal) and exit 1.
     SessionFail,
 }
 
@@ -261,7 +263,10 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
             _ = &mut disk_at, if failing_session => {
                 let _ = events.send(Event::Session(Notification::Failed("disk full in the scripted session".into())));
                 tokio::time::sleep(Duration::from_millis(500)).await; // a moment for the notice to show
-                anyhow::bail!("disk full in the scripted session");
+                // The engine's own error carries a hostile payload after the recognizable words —
+                // Task 12's audit case: the notice is cleaned by the projection, and this string
+                // only by the final stderr boundary when stderr is a terminal.
+                anyhow::bail!("disk full in the scripted session \x1b[31mcsi\x1b[0m \x1b[2J \x1b[H \x1b]0;owned title\x07 \x1b]52;c;cGF5bWU=\x07 \x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\ bel\x07 cr\rrewritten del\x7f end");
             }
             _ = work.tick(), if job.is_some() => {
                 let Job { op, step } = job.as_mut().expect("a job");

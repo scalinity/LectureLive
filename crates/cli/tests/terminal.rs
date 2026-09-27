@@ -346,18 +346,27 @@ fn a_failed_draw_gives_the_terminal_back_before_the_error() {
     l.at("Error: the terminal stopped accepting output: a failure injected by the debug fixture; the next session in this folder picks up what was left", after);
 }
 
-/// Plan Task 12's session-failure row: the engine itself fails — a `Failed` notice first, then
-/// its own `Err`. The terminal is given back before the ordinary error path reports it, the
-/// process exits 1, and the `Error: …` line lands on the ordinary screen after the restoration.
+/// Plan Task 12's session-failure row, with the audit's hostile payload in the engine's own
+/// error: the in-TUI `session failed` notice is rendered by the (cleaning) projection; the
+/// terminal is restored; only then does the ordinary `Error: …` appear — carrying the failure's
+/// visible words and none of the payload's sequences (the restoration's own escapes are
+/// legitimate, so the assertions look only at the post-restoration error region) — and the
+/// process exits 1 with the person's data untouched.
 #[test]
-fn a_failed_session_restores_the_terminal_then_errors() {
+fn a_session_failure_restores_then_errors_cleanly() {
     let mut l = tui("session-fail", &[], 100, 30);
     let listening = l.listening();
     l.pty.wait_for("session failed", listening, SOON);
     let status = l.pty.wait(SOON);
     assert_eq!(code(status, &l), Some(1));
     let after = l.restored(listening);
-    l.at("Error: disk full in the scripted session", after);
+    let error = l.at("Error: disk full in the scripted session", after);
+    for gone in ["\x1b[31m", "\x1b[2J", "\x1b]0;", "\x1b]52;", "\x1b]8;", "\x07", "\x7f"] {
+        assert!(find(l.out(), gone.as_bytes(), error).is_none(), "the payload's {gone:?} survived into the final error:\n{}", visible(l.out()));
+    }
+    for kept in ["csi", "link", "bel", "rewritten", "del"] {
+        assert!(find(l.out(), kept.as_bytes(), error).is_some(), "{kept:?} left the final error:\n{}", visible(l.out()));
+    }
     assert!(untouched(&l.home), "the person's data folder was never touched");
 }
 
