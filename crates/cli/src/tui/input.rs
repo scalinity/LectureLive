@@ -46,6 +46,8 @@ pub(crate) enum Key {
     Activity,
     /// Ctrl-T: the reading pane fills the body.
     Zoom,
+    /// Ctrl-S (Task 11): capture now, or watch the one window offered.
+    Capture,
     /// Esc with an overlay open.
     Close,
     /// A reading move: the overlay's, else the focused pane's.
@@ -58,7 +60,7 @@ pub(crate) enum Key {
 }
 
 /// A key's meaning (plan §H), in priority order: a release is nothing; the app's Ctrl chords are
-/// taken before the editor can see them (Ctrl-S is Task 11's and does nothing yet); F1 is help; Esc
+/// taken before the editor can see them (Ctrl-S is Task 11's capture action); F1 is help; Esc
 /// closes an overlay before it means "back to live"; then the reading keys, Tab, Enter, and the
 /// editor's keys last. A key with Ctrl and Alt together is text (AltGr), not a chord.
 pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
@@ -75,7 +77,7 @@ pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
                 'h' => Key::Help,
                 'o' => Key::Activity,
                 't' => Key::Zoom,
-                's' => Key::Nothing,
+                's' => Key::Capture,
                 _ => Key::Edit,
             };
         }
@@ -196,11 +198,11 @@ mod tests {
         h
     }
 
-    /// The app's chords come first: tui-input never sees Ctrl-X, -G, -O, -T, -C, -Z or -L; its own
-    /// Ctrl-A/E/W/U/K still edit; Ctrl-S does nothing yet.
+    /// The app's chords come first: tui-input never sees Ctrl-X, -H, -O, -T, -C, -Z, -L or -S; its
+    /// own Ctrl-A/E/W/U/K still edit; Ctrl-S is the capture action (Task 11).
     #[test]
     fn app_chords_are_taken_before_the_editor() {
-        for (c, want) in [('c', Key::Stop), ('z', Key::Suspend), ('l', Key::Clear), ('x', Key::Cancel), ('h', Key::Help), ('o', Key::Activity), ('t', Key::Zoom), ('s', Key::Nothing)] {
+        for (c, want) in [('c', Key::Stop), ('z', Key::Suspend), ('l', Key::Clear), ('x', Key::Cancel), ('h', Key::Help), ('o', Key::Activity), ('t', Key::Zoom), ('s', Key::Capture)] {
             assert_eq!(classify(&ctrl(c), Overlay::None), want, "^{c}");
             assert_eq!(classify(&ctrl(c), Overlay::Help), want, "^{c} with help open");
         }

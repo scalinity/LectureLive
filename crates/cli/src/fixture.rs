@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Local;
+use lecturelive_core::capture::detect::Region;
+use lecturelive_core::capture::select::{Descriptor, Selection, SizedRegion};
+use lecturelive_core::capture::window::WindowInfo;
+use lecturelive_core::capture::worker::CaptureState;
 use lecturelive_core::session::coordinator::{Notification, StopReport, SttStatus};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::lecture::{Command, Event, Op};
@@ -42,6 +46,13 @@ pub(crate) enum Scenario {
     /// command received is logged, one line each, to `fixture-commands.log` in the lecture folder.
     /// The first stop drains for up to 8 s (a second stop ends it), long enough to try Enter while stopping, then a last snapshot runs.
     Ops,
+    /// The slides pane's and Ctrl-S's check (plan Task 11): capture walks its states — unbound,
+    /// watching, asking (one window offered, at a size the saved selection remembers), paused,
+    /// denied, failing, asking unsafely (a size with no region), found again — while slides are
+    /// registered auto, unsettled and manual. `capture-now` and `bind` are logged like `ops`
+    /// logs its commands; the selections it would save go to `.live_notes/fixture-capture.json`,
+    /// never the person's data folder, and no window server is reached.
+    Capture,
 }
 
 impl Scenario {
@@ -56,7 +67,8 @@ impl Scenario {
             "init-fail" => Ok(Scenario::InitFail),
             "draw-fail" => Ok(Scenario::DrawFail),
             "ops" => Ok(Scenario::Ops),
-            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\" and \"ops\""),
+            "capture" => Ok(Scenario::Capture),
+            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\", \"ops\" and \"capture\""),
         }
     }
 }
@@ -79,7 +91,13 @@ const SENTENCES: [&str; 8] = [
 /// The `ops` scenario's command log, in the lecture folder the test made: one line per command.
 pub(crate) const COMMAND_LOG: &str = "fixture-commands.log";
 
-/// A command received, as the `ops` log records it: `snapshot<TAB>hint`, `polish`, `cancel`, `stop`.
+/// Where the `capture` scenario's selections are kept (plan Task 11): in the lecture folder the
+/// test made, never the person's data folder.
+pub(crate) const CAPTURE_JSON: &str = "fixture-capture.json";
+
+/// A command received, as the `ops` and `capture` logs record it: `snapshot<TAB>hint`, `polish`,
+/// `cancel`, `stop`, `capture-now`, or a `bind` with the window and enough of the selection to
+/// tell which candidate and region were sent.
 fn log_command(files: &LectureFiles, c: &Command) {
     use std::io::Write;
     let line = match c {
@@ -87,11 +105,65 @@ fn log_command(files: &LectureFiles, c: &Command) {
         Command::Op(Op::Polish) => "polish".into(),
         Command::Cancel => "cancel".into(),
         Command::Stop => "stop".into(),
+        Command::CaptureNow(_) => "capture-now".into(),
+        Command::Bind { window, selection } => format!("bind\t{window}\t{}", selection_id(selection)),
         other => format!("{other:?}"),
     };
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(files.dir.join(COMMAND_LOG)) {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// A bound selection's log identity: the saved window's app, title and size, and its region.
+fn selection_id(s: &Selection) -> String {
+    let d = &s.descriptor;
+    let r = &s.region;
+    format!("{}|{}|{}|{}×{}|({},{},{},{})", d.bundle_id.as_deref().unwrap_or("-"), d.app, d.title, d.width, d.height, r.x, r.y, r.w, r.h)
+}
+
+/// The `capture` scenario's saved window: Zoom's meeting window at 1600 × 900 with its smaller
+/// size remembered, as the app would have it after a first lecture. The asking state offers this
+/// same window at 1280 × 720, so Ctrl-S's watch-it has a region to reuse.
+pub(crate) fn saved_selection() -> Selection {
+    Selection {
+        descriptor: Descriptor { bundle_id: Some("us.zoom.xos".into()), app: "zoom.us".into(), title: "Zoom Meeting".into(), width: 1600, height: 900 },
+        region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+        leave_out: vec![],
+        sizes: vec![SizedRegion { width: 1280, height: 720, region: Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 } }],
+    }
+}
+
+/// One scripted happening of the `capture` scenario's timeline.
+enum Cap {
+    State(CaptureState),
+    Moved { selection: Selection, note: String },
+    Slide { auto: bool, uncertain: bool },
+}
+
+fn window(id: u32, title: &str, w: u32, h: u32) -> WindowInfo {
+    WindowInfo { id, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: title.into(), width: w, height: h, on_screen: true }
+}
+
+/// The `capture` scenario's timeline, one step every 1.5 s: each capture state far enough from the
+/// last to try Ctrl-S in it, slides registered between, ending healthy after a relocation.
+fn capture_step(step: u32) -> Option<Cap> {
+    Some(match step {
+        1 => Cap::State(CaptureState::Unbound),
+        2 => Cap::State(CaptureState::Watching { window: "Zoom Meeting".into() }),
+        3 => Cap::Slide { auto: true, uncertain: false },
+        4 => Cap::Slide { auto: true, uncertain: true },
+        5 => Cap::Slide { auto: false, uncertain: false },
+        6 => Cap::State(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "Zoom Meeting is 1280 × 720 now; it was 1600 × 900".into(), candidates: vec![window(42, "Zoom Meeting", 1280, 720)] }),
+        7 | 8 => return None, // the asking stays: a moment to press ^S in
+        9 => Cap::State(CaptureState::Paused { window: "Zoom Meeting".into(), reason: "not on screen and cannot be captured (minimised?); capture resumes when it is back".into() }),
+        10 => Cap::State(CaptureState::Denied),
+        11 => Cap::State(CaptureState::Failing { window: "Zoom Meeting".into(), reason: "3 failed captures in a row".into() }),
+        12 => Cap::State(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is 999 × 600 now and the slide was not found in it; check the region".into(), candidates: vec![window(43, "Zoom Meeting", 999, 600)] }),
+        13 => Cap::Moved { selection: saved_selection().with_size(1280, 720, Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 }), note: "Zoom Meeting is 1280 × 720 again; watching its slide there".into() },
+        14 => Cap::State(CaptureState::Watching { window: "Zoom Meeting".into() }),
+        15 => Cap::Slide { auto: true, uncertain: false },
+        _ => return None,
+    })
 }
 
 /// The notes a scripted snapshot writes: the shapes the notes pane draws — headings, emphasis, TeX,
@@ -149,6 +221,10 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     tokio::pin!(panic_at);
     // The `ops` scenario: notes already committed, a slide they embed, and requests run in turn.
     let ops = scenario == Scenario::Ops;
+    // The `capture` scenario (plan Task 11): the timeline above, and its own commands.
+    let cap = scenario == Scenario::Capture;
+    let (mut cap_step, mut watching, mut next_slide): (u32, bool, u32) = (0, false, 0);
+    let mut cap_clock = interval_at(Instant::now() + Duration::from_millis(1500), Duration::from_millis(1500));
     let (mut job, mut queued, mut snapshots): (Option<Job>, std::collections::VecDeque<Op>, u32) = (None, Default::default(), 0);
     let mut work = interval(Duration::from_millis(120));
     let mut page_at: Option<Instant> = None;
@@ -272,8 +348,26 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                 let _ = events.send(Event::Session(Notification::Segment(s)));
                 next += 1;
             }
+            _ = cap_clock.tick(), if cap => {
+                cap_step += 1;
+                match capture_step(cap_step) {
+                    Some(Cap::State(s)) => {
+                        watching = matches!(s, CaptureState::Watching { .. });
+                        let _ = events.send(Event::Capture(s));
+                    }
+                    Some(Cap::Moved { selection, note }) => {
+                        watching = true; // core rebinds as it relocates
+                        let _ = events.send(Event::CaptureMoved { selection, note });
+                    }
+                    Some(Cap::Slide { auto, uncertain }) => {
+                        next_slide += 1;
+                        let _ = events.send(Event::Slide { index: next_slide, file: format!("slides/slide_{next_slide:02}_{}.png", Local::now().format("%H%M%S")), auto, uncertain, shown_at: Local::now() });
+                    }
+                    None => {}
+                }
+            }
             c = commands.recv(), if open => match c {
-                Some(c) if ops && !matches!(c, Command::Stop) => {
+                Some(c) if (ops || cap) && !matches!(c, Command::Stop) => {
                     log_command(files, &c);
                     match c {
                         Command::Op(op) if job.is_none() => job = Some(Job { op, step: 0 }),
@@ -285,6 +379,23 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                                 let _ = events.send(Event::Cancelled(what.into()));
                             }
                             queued.clear();
+                        }
+                        // A manual capture, as core's worker answers it: the reply says whether the
+                        // frame was taken, and the slide itself arrives as its own canonical event —
+                        // never fabricated from the reply. Its file name says how it was taken.
+                        Command::CaptureNow(reply) => {
+                            if watching {
+                                let _ = reply.send(Ok(()));
+                                next_slide += 1;
+                                let _ = events.send(Event::Slide { index: next_slide, file: format!("slides/captured-{next_slide}_{}.png", Local::now().format("%H%M%S")), auto: false, uncertain: false, shown_at: Local::now() });
+                            } else {
+                                let _ = reply.send(Err("no window is being watched: choose it once in the LectureLive app".into()));
+                            }
+                        }
+                        // The person's Ctrl-S on a safe offering: watched from this moment.
+                        Command::Bind { selection, .. } => {
+                            watching = true;
+                            let _ = events.send(Event::Capture(CaptureState::Watching { window: selection.descriptor.label() }));
                         }
                         _ => {}
                     }
@@ -304,7 +415,7 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                     words = 0;
                 }
                 Some(Command::Stop) => {
-                    if ops {
+                    if ops || cap {
                         log_command(files, &Command::Stop);
                     }
                     break;

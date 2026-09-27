@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 mod args;
+mod capture;
 // The scripted session for pipe and terminal tests: absent from any build without debug assertions (plan §C 15).
 #[cfg(debug_assertions)]
 mod fixture;

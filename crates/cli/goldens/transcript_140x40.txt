@@ -2,7 +2,7 @@
 " BlackHole 2ch  ■■■■■□□□  transcribing  0 gaps                                                                                  $0.18 today "
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " Transcript                                │ Notes                                                           │ Slides                       "
-"           we can reason about.            │ Nothing written yet.                                            │ Slides show here.            "
+"           we can reason about.            │ Nothing written yet.                                            │ No slides yet.               "
 " 10:39:58  That shift in view, from one    │                                                                 │                              "
 "           number to a distribution of     │                                                                 │                              "
 "           numbers, is the whole of today. │                                                                 │                              "

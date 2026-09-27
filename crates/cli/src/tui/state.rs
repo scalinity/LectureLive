@@ -22,6 +22,7 @@ use lecturelive_core::session::segments::{Segment, SegmentSource};
 use lecturelive_core::session::sidecar::{Gap, SlideEntry};
 use lecturelive_core::session::spend::Paint;
 
+use crate::capture;
 use crate::plain::{self, Notice};
 use crate::stop::Stage;
 
@@ -373,6 +374,12 @@ pub(crate) struct View {
     /// refused): a real `Connected` makes it untrue, so that one clears the line — and only then.
     /// Set from the event's type as the notice is recorded, never read back from its words.
     stt_notice: bool,
+    /// The notice line holds a capture notice that says capture needs the person (asking, or
+    /// Screen Recording denied): ordinary notices must not displace it (plan §H's second
+    /// priority), and healthy watching clears it. Typed here, never read back from the words.
+    capture_notice: bool,
+    /// Whose Screen Recording permission a denial names, read once as the session starts.
+    host: &'static str,
 }
 
 impl View {
@@ -408,12 +415,14 @@ impl View {
             activity: Ring::default(),
             notice: None,
             stt_notice: false,
+            capture_notice: false,
+            host: capture::host(),
         };
         // An empty projection merging its first read: one reconciliation rule for every hydration.
         v.merge(h);
         let at = Local::now();
         for n in seed {
-            v.record(n, at);
+            v.record(n, at, false);
         }
         v
     }
@@ -441,9 +450,41 @@ impl View {
             _ => {}
         }
         // The wording both frontends share: the ring always; the notice line when no input is gone.
-        if let Some(n) = plain::notice(e, WORDS) {
-            self.record(n, at);
-            self.stt_notice = self.input_gone.is_none() && matches!(e, Event::Session(Notification::Stt(_)));
+        // Capture is the exception plan §H makes: healthy watching is telemetry the ring keeps
+        // while the line stops claiming attention, and asking or denied holds the line against
+        // ordinary notices, because capture needs the person until core says otherwise.
+        let words = self.capture_words();
+        match e {
+            Event::Capture(CaptureState::Watching { .. }) => {
+                if let Some(n) = plain::notice(e, WORDS, &words) {
+                    self.to_ring(n, at);
+                }
+                if self.capture_notice {
+                    self.notice = None;
+                    self.capture_notice = false;
+                }
+            }
+            Event::Capture(CaptureState::Asking { .. } | CaptureState::Denied) => {
+                if let Some(n) = plain::notice(e, WORDS, &words) {
+                    self.record(n, at, true);
+                }
+            }
+            Event::CaptureMoved { .. } => {
+                // The worker re-found the window through its new region: whatever the hold was
+                // asking for is resolved, and the relocation's own good news takes the line.
+                self.capture_notice = false;
+                if let Some(n) = plain::notice(e, WORDS, &words) {
+                    self.record(n, at, false);
+                }
+            }
+            _ => {
+                if let Some(n) = plain::notice(e, WORDS, &words) {
+                    self.record(n, at, false);
+                    // the flag tracks the line itself: never set while an input is gone or capture
+                    // holds it, so only a real Connected clears what the connection raised
+                    self.stt_notice = self.input_gone.is_none() && !self.capture_notice && matches!(e, Event::Session(Notification::Stt(_)));
+                }
+            }
         }
         effect
     }
@@ -457,7 +498,7 @@ impl View {
                 if let Some(w) = self.watch.as_mut() {
                     if w.observe(*l) {
                         self.silence = true;
-                        self.record(plain::no_signal(), at);
+                        self.record(plain::no_signal(), at, false);
                     } else if dbfs(*l) >= -60.0 {
                         self.silence = false;
                     }
@@ -473,6 +514,7 @@ impl View {
                     // The top-priority notice holds the line until the input returns (plan §H).
                     self.notice = Some(plain::input_gone(&plain::clean(uid)));
                     self.stt_notice = false;
+                    self.capture_notice = false;
                 }
             }
             Notification::DeviceBack { .. } => {
@@ -481,6 +523,7 @@ impl View {
                 if self.input_gone.is_some() {
                     self.input_gone = None;
                     self.notice = None;
+                    self.capture_notice = false;
                 }
             }
             Notification::Stt(s) => {
@@ -540,6 +583,18 @@ impl View {
         self.waiting.len()
     }
 
+    /// The words the shared capture wording says capture states in (plan Task 11): this course,
+    /// and the host whose Screen Recording permission a denial names.
+    pub(crate) fn capture_words(&self) -> capture::Words {
+        capture::Words { course: self.identity.course.clone(), host: self.host }
+    }
+
+    /// Tests fix the host, so a denial's wording is the same on every machine that runs them.
+    #[cfg(test)]
+    pub(crate) fn set_capture_host(&mut self, host: &'static str) {
+        self.host = host;
+    }
+
     /// A transcript gap seen, live or in a read: it waits unless it is resolved, and once resolved —
     /// here or earlier — it never waits again, because core never reopens a gap. Seeing it twice
     /// changes nothing.
@@ -588,7 +643,7 @@ impl View {
         text.push_str(&plain::clean(delta));
         if text.len() > PREVIEW_CAP && !n.capped {
             n.capped = true;
-            self.record(Notice { kind: "warn", label: "preview".into(), detail: "the snapshot being written is longer than 1 MiB; only its first 1 MiB is shown until it is committed".into() }, at);
+            self.record(Notice { kind: "warn", label: "preview".into(), detail: "the snapshot being written is longer than 1 MiB; only its first 1 MiB is shown until it is committed".into() }, at, false);
         }
     }
 
@@ -655,18 +710,30 @@ impl View {
     /// A background read that failed: the projection keeps what it holds, and the failure is said.
     /// Nothing retries on its own; the next discontinuity reads again.
     pub(crate) fn read_failed(&mut self, e: &anyhow::Error, at: DateTime<Local>) {
-        self.record(Notice { kind: "warn", label: "re-read".into(), detail: format!("the lecture's files could not be read again ({e:#}); what is shown still holds") }, at);
+        self.record(Notice { kind: "warn", label: "re-read".into(), detail: format!("the lecture's files could not be read again ({e:#}); what is shown still holds") }, at, false);
     }
 
     /// One notice into the ring and the notice line: the input that is gone holds the line while it
-    /// is gone (plan §H's first priority); otherwise the latest notice is the line.
-    fn record(&mut self, n: Notice, at: DateTime<Local>) {
+    /// is gone (plan §H's first priority); a notice saying capture needs the person holds it
+    /// against ordinary ones (the second); otherwise the latest notice is the line.
+    fn record(&mut self, n: Notice, at: DateTime<Local>, hold: bool) {
         let n = Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) };
         self.activity.push(Activity { at, kind: n.kind, label: n.label.clone(), detail: n.detail.clone() });
-        if self.input_gone.is_none() {
-            self.notice = Some(n);
-            self.stt_notice = false;
+        if self.input_gone.is_some() {
+            return;
         }
+        if self.capture_notice && !hold {
+            return; // capture still needs the person: an ordinary notice waits in the ring
+        }
+        self.notice = Some(n);
+        self.capture_notice = hold;
+        self.stt_notice = false;
+    }
+
+    /// One notice into the ring alone: the line is not touched.
+    fn to_ring(&mut self, n: Notice, at: DateTime<Local>) {
+        let n = Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) };
+        self.activity.push(Activity { at, kind: n.kind, label: n.label, detail: n.detail });
     }
 }
 
@@ -1124,6 +1191,81 @@ mod tests {
         assert_eq!((c.app.as_str(), c.title.as_str()), ("zoom.us", "Zoom Meeting"));
         assert_eq!((c.id, c.bundle_id.as_deref(), c.width, c.height, c.on_screen), (4242, Some("us.zoom.xos"), 1280, 800, true), "identity untouched");
         assert_eq!(hostile.title, "\x1b[2JZoom Meeting\x1b]52;c;cGF5\x07", "the event's own data is not mutated");
+    }
+
+    /// Plan §J `capture_lost_then_found`: watching → asking → watching replaces the typed state,
+    /// attention turns on and off with it, no stale asking warning survives healthy watching, and
+    /// the ring keeps the transitions. Nothing is decided by reading the words back.
+    #[test]
+    fn capture_lost_then_found() {
+        let watching = || Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() });
+        let asking = || Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] });
+        let mut v = view();
+        v.reduce(&watching(), at());
+        assert_eq!(v.capture, Some(CaptureState::Watching { window: "Zoom Meeting".into() }), "the typed state replaces the one before");
+        assert!(!capture::attention(v.capture.as_ref().unwrap()), "healthy: no attention");
+        assert_eq!(v.notice, None, "healthy telemetry is not the line");
+        v.reduce(&asking(), at());
+        assert!(capture::attention(v.capture.as_ref().unwrap()));
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("asking"), "asking holds the line (plan §H's second priority)");
+        assert!(v.capture_notice);
+        // an ordinary notice does not displace it
+        v.reduce(&Event::NothingNew, at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("asking"));
+        // a relocation is ordinary good news, but the state is still asking until core says
+        v.reduce(&Event::CaptureMoved { selection: selection(), note: "the slide was found again there".into() }, at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("found again"), "the hold gave way to the relocation's own notice");
+        v.reduce(&asking(), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("asking"));
+        // found again: healthy watching clears the stale warning
+        v.reduce(&watching(), at());
+        assert!(!capture::attention(v.capture.as_ref().unwrap()));
+        assert_eq!(v.notice, None, "no stale asking warning after healthy watching");
+        assert!(!v.capture_notice);
+        // the ring keeps the whole history
+        let labels: Vec<&str> = v.activity.records().iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, vec!["watching", "asking", "snapshot", "found again", "asking", "watching"]);
+    }
+
+    /// Plan §H's notice priorities, typed: a gone input outranks capture asking, capture asking
+    /// outranks the latest ordinary notice, and healthy capture telemetry never erases one.
+    #[test]
+    fn capture_notice_priority() {
+        // a gone input holds the line through an asking
+        let mut v = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "gone".into(), candidates: vec![] }), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input gone"), "the first priority keeps the line");
+        assert!(v.activity.records().iter().any(|a| a.label == "asking"), "the ring still keeps the transition");
+        // the input back: its own good news takes the line (the capture hold went with the input)
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input back"));
+        // denied holds the line; paused, failing and unbound are ordinary notices
+        v.reduce(&Event::Capture(CaptureState::Denied), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("screen recording"));
+        assert!(v.capture_notice);
+        v.reduce(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), at());
+        v.reduce(&Event::Capture(CaptureState::Paused { window: "Zoom Meeting".into(), reason: "minimised".into() }), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("paused"), "an ordinary capture notice is the latest notice");
+        assert!(!v.capture_notice);
+        // and an ordinary notice can displace it again
+        v.reduce(&Event::NothingNew, at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot"));
+        // healthy telemetry repeated (a state re-said after a transition) erases nothing
+        v.reduce(&Event::Slide { index: 1, file: "slides/s.png".into(), auto: true, uncertain: false, shown_at: at() }, at());
+        v.reduce(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("slide 1 (auto)"), "routine watching does not erase a meaningful notice");
+    }
+
+    /// A saved selection as the app keeps it, for the relocation notices above.
+    fn selection() -> lecturelive_core::capture::select::Selection {
+        use lecturelive_core::capture::detect::Region;
+        lecturelive_core::capture::select::Selection {
+            descriptor: lecturelive_core::capture::select::Descriptor { bundle_id: Some("us.zoom.xos".into()), app: "zoom.us".into(), title: "Zoom Meeting".into(), width: 1600, height: 900 },
+            region: Region::WHOLE,
+            leave_out: vec![],
+            sizes: vec![],
+        }
     }
 
     /// Plan §J: a single input's gone mark is held until it returns.

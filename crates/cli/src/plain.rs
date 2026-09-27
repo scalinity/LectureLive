@@ -18,6 +18,7 @@ use lecturelive_core::session::segments::SegmentSource;
 use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::session::start;
 
+use crate::capture;
 use crate::stop::{Origin, Stage, Step, StopController};
 
 pub(crate) fn secs(samples: u64) -> f64 {
@@ -187,8 +188,9 @@ fn say_notice(out: &mut impl Write, p: spend::Paint, n: &Notice) {
 }
 
 /// An event as a notice, in the plain CLI's own words (the TUI's activity and notice line show the
-/// same wording, with `p` colour-off so no styling enters the view).
-pub(crate) fn notice(e: &Event, p: spend::Paint) -> Option<Notice> {
+/// same wording, with `p` colour-off so no styling enters the view). Capture states and
+/// relocations use the terminal's own words ([`capture::state_words`]), not the desktop's.
+pub(crate) fn notice(e: &Event, p: spend::Paint, words: &capture::Words) -> Option<Notice> {
     let n = |kind: &'static str, label: &str, detail: String| Some(Notice { kind, label: label.into(), detail });
     match e {
         Event::Session(m) => match m {
@@ -227,10 +229,13 @@ pub(crate) fn notice(e: &Event, p: spend::Paint) -> Option<Notice> {
             n("slide", &format!("slide {index}{how}"), format!("{name}, into the next snapshot"))
         }
         Event::Capture(s) => {
-            let (label, detail) = s.words();
-            n("slide", &label.to_lowercase(), detail)
+            let (kind, label, detail) = capture::state_words(s, words);
+            n(kind, label, detail)
         }
-        Event::CaptureMoved { note, .. } => n("slide", "found again", note.clone()),
+        Event::CaptureMoved { note, .. } => {
+            let (kind, label, detail) = capture::moved_words(note);
+            n(kind, label, detail)
+        }
         Event::Warning(m) => n("warn", "warning", m.clone()),
         Event::Busy(_) | Event::Preview(_) => None,
     }
@@ -246,8 +251,9 @@ pub(crate) fn other_inputs(gone: &str) -> String {
 }
 
 /// Prints the lecture's events in the CLI's lines; the loopback silence warning as `record` gives it.
-/// The say-lines come from [`notice`], so the TUI's activity says the same things (M7 plan §F).
-pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) {
+/// The say-lines come from [`notice`], so the TUI's activity says the same things (M7 plan §F);
+/// capture states arrive in the terminal's own `words`.
+pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>, words: &capture::Words) {
     // The plain CLI's own lines first — the transcript, the recording path, a first `transcribing`,
     // the busy text — and the events whose wording needs the machine (the gone input's offer).
     match e {
@@ -273,12 +279,12 @@ pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut
             for line in block.trim().lines().filter(|l| !l.starts_with("<!-- ")) {
                 writeln!(out, "  {} {}", p.paint("│", &["teal"]), p.paint(line, &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
             }
-            if let Some(n) = notice(e, p) {
+            if let Some(n) = notice(e, p, words) {
                 say_notice(out, p, &n);
             }
         }
         _ => {
-            if let Some(n) = notice(e, p) {
+            if let Some(n) = notice(e, p, words) {
                 say_notice(out, p, &n);
             }
         }
@@ -446,12 +452,18 @@ mod goldens {
 
     fn shown(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) -> String {
         let mut out = Vec::new();
-        show(&mut out, p, e, watch);
+        show(&mut out, p, e, watch, &words());
         String::from_utf8(out).unwrap()
     }
 
     fn plain(e: &Event) -> String {
         shown(OFF, e, &mut None)
+    }
+
+    /// The words the tests print capture states in: a fixed course and host, so no test depends on
+    /// the machine running it.
+    fn words() -> capture::Words {
+        capture::Words { course: "Machine Learning".into(), host: "Terminal" }
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -573,15 +585,27 @@ mod goldens {
         assert_eq!(plain(&Event::Slide { index: 17, file: "slides/slide_17_103941.png".into(), auto: true, uncertain: false, shown_at: now }), "  ▣ slide 17 (auto)  slide_17_103941.png, into the next snapshot\n");
         assert_eq!(plain(&Event::Slide { index: 18, file: "slides/slide_18_104152.png".into(), auto: true, uncertain: true, shown_at: now }), "  ▣ slide 18 (auto, still changing)  slide_18_104152.png, into the next snapshot\n");
         assert_eq!(plain(&Event::Slide { index: 19, file: "slides/slide_19_104201.png".into(), auto: false, uncertain: false, shown_at: now }), "  ▣ slide 19  slide_19_104201.png, into the next snapshot\n");
-        assert_eq!(plain(&Event::Capture(CaptureState::Unbound)), "  ▣ no window  choose the window with the slides in the slides strip\n");
+        // Task 11: the terminal's own capture words, never the desktop's "slides strip" (plan §H).
+        assert_eq!(plain(&Event::Capture(CaptureState::Unbound)), "  ▣ no window  No Zoom window chosen for Machine Learning yet: choose it once in the LectureLive app. Screenshots (⌘⇧4) still become slides.\n");
         assert_eq!(plain(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() })), "  ▣ watching  Zoom Meeting\n");
-        assert_eq!(plain(&Event::Capture(CaptureState::Paused { window: "Zoom Meeting".into(), reason: "the window is minimised".into() })), "  ▣ paused  Zoom Meeting: the window is minimised\n");
-        assert_eq!(plain(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] })), "  ▣ asking  it is not where it was; choose in the slides strip which window to watch for Zoom Meeting\n");
-        assert_eq!(plain(&Event::Capture(CaptureState::Denied)), "  ▣ screen recording  Screen Recording is off for LectureLive: System Settings → Privacy & Security → Screen & System Audio Recording\n");
-        assert_eq!(plain(&Event::Capture(CaptureState::Failing { window: "Zoom Meeting".into(), reason: "3 failed captures in a row".into() })), "  ▣ capture failing  Zoom Meeting: 3 failed captures in a row\n");
+        assert_eq!(plain(&Event::Capture(CaptureState::Paused { window: "Zoom Meeting".into(), reason: "the window is minimised".into() })), "  ▲ paused  Zoom Meeting: the window is minimised\n");
+        assert_eq!(plain(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] })), "  ▲ asking  it is not where it was; choose or update “Zoom Meeting” in the LectureLive app\n");
+        assert_eq!(plain(&Event::Capture(CaptureState::Denied)), "  ▲ screen recording  Screen Recording is off for Terminal: System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen Terminal.\n");
+        assert_eq!(plain(&Event::Capture(CaptureState::Failing { window: "Zoom Meeting".into(), reason: "3 failed captures in a row".into() })), "  ▲ capture failing  Zoom Meeting: 3 failed captures in a row\n");
         let selection = Selection { descriptor: Descriptor { bundle_id: Some("us.zoom.xos".into()), app: "Zoom".into(), title: "Zoom Meeting".into(), width: 1600, height: 900 }, region: Region::WHOLE, leave_out: vec![], sizes: vec![] };
         assert_eq!(plain(&Event::CaptureMoved { selection, note: "the slide moved with the window; watching it at the new size".into() }), "  ▣ found again  the slide moved with the window; watching it at the new size\n");
         assert_eq!(plain(&Event::Warning("slide 5 (slides/slide_5.png) is no longer on disk; left out of the notes".into())), "  ▲ warning  slide 5 (slides/slide_5.png) is no longer on disk; left out of the notes\n");
+    }
+
+    /// The host is part of the wording: a session in iTerm says iTerm, not the test's Terminal.
+    #[test]
+    fn capture_denied_names_the_host() {
+        let mut out = Vec::new();
+        show(&mut out, OFF, &Event::Capture(CaptureState::Denied), &mut None, &capture::Words { course: "Machine Learning".into(), host: "iTerm" });
+        assert_eq!(String::from_utf8(out).unwrap(), "  ▲ screen recording  Screen Recording is off for iTerm: System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen iTerm.\n");
+        let mut out = Vec::new();
+        show(&mut out, OFF, &Event::Capture(CaptureState::Unbound), &mut None, &capture::Words { course: "Statistics".into(), host: "this terminal app" });
+        assert_eq!(String::from_utf8(out).unwrap(), "  ▣ no window  No Zoom window chosen for Statistics yet: choose it once in the LectureLive app. Screenshots (⌘⇧4) still become slides.\n");
     }
 
     #[test]
@@ -742,7 +766,7 @@ mod goldens {
     #[test]
     #[should_panic(expected = "failed printing to stdout")]
     fn a_failed_show_line_panics_as_println_did() {
-        show(&mut Broken, OFF, &Event::Busy("polishing 40 words".into()), &mut None);
+        show(&mut Broken, OFF, &Event::Busy("polishing 40 words".into()), &mut None, &words());
     }
 
     #[test]
@@ -853,17 +877,23 @@ mod goldens {
     fn notice_carries_the_plain_words_without_styling() {
         let off = spend::Paint { color: false, truecolor: false };
         let on = spend::Paint { color: true, truecolor: true };
+        let w = &words();
         let e = Event::Committed { words: 486, slides: 2, block: "<!-- 10:42:03 -->\n## Sampling".into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision: 3 };
-        let n = notice(&e, off).unwrap();
+        let n = notice(&e, off, w).unwrap();
         assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("notes", "notes", "486 words and 2 slides folded in  $0.02"));
         assert!(!n.detail.contains('\x1b'), "the TUI's wording carries no styling");
-        assert_eq!(notice(&e, on).unwrap().detail, "486 words and 2 slides folded in  \x1b[2m$0.02\x1b[0m", "the plain CLI's own paint is unchanged");
-        assert_eq!(notice(&Event::Session(Notification::Open { stable: "a".into(), tentative: "b".into() }), off), None);
-        assert_eq!(notice(&Event::Busy("snapshot, 12 words".into()), off), None, "busy text is shown verbatim, never a notice");
-        assert_eq!(notice(&Event::Session(Notification::Stt(SttStatus::Connected)), off), None);
-        let gone = notice(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }), off).unwrap();
+        assert_eq!(notice(&e, on, w).unwrap().detail, "486 words and 2 slides folded in  \x1b[2m$0.02\x1b[0m", "the plain CLI's own paint is unchanged");
+        assert_eq!(notice(&Event::Session(Notification::Open { stable: "a".into(), tentative: "b".into() }), off, w), None);
+        assert_eq!(notice(&Event::Busy("snapshot, 12 words".into()), off, w), None, "busy text is shown verbatim, never a notice");
+        assert_eq!(notice(&Event::Session(Notification::Stt(SttStatus::Connected)), off, w), None);
+        let gone = notice(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }), off, w).unwrap();
         assert_eq!((gone.kind, gone.label.as_str()), ("warn", "input gone"));
         assert_eq!(gone.detail, "Gone-UID; waiting for it to return, and nothing switches by itself", "the offer is the plain CLI's own addition");
+        // capture states use the terminal's wording, unstyled
+        let n = notice(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), on, w).unwrap();
+        assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("slide", "watching", "Zoom Meeting"));
+        let n = notice(&Event::Capture(CaptureState::Denied), on, w).unwrap();
+        assert_eq!(n.detail, "Screen Recording is off for Terminal: System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen Terminal.", "no styling and no host guessing");
     }
 
     /// The start-up records are what `print_prepared` prints — the pinned goldens cover the printing —

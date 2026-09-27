@@ -17,13 +17,14 @@ use lecturelive_core::session::audit;
 use lecturelive_core::session::coordinator::{SessionConfig, StopReport};
 use lecturelive_core::session::files::{course_from_path, LectureFiles};
 use lecturelive_core::session::launch::{self, Retention};
-use lecturelive_core::session::lecture::{self, Lecture, SlideWatch};
+use lecturelive_core::session::lecture::{self, Event, Lecture, SlideWatch};
 use lecturelive_core::session::lock::FolderLock;
 use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::session::start;
 use lecturelive_core::stt::{rest, stream};
 
 use crate::args::LectureArgs;
+use crate::capture;
 use crate::data_dir;
 #[cfg(debug_assertions)]
 use crate::fixture;
@@ -212,10 +213,13 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         anyhow::ensure!(files.notes.exists(), "No notes to typeset: {} is not in this folder.", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         let _lock = FolderLock::acquire(&dir)?;
         plain::say(&mut std::io::stdout().lock(), p, "page", "page", &format!("distilling {} with {}, a few minutes", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), chat::MODEL));
-        let printer = tokio::spawn(async move {
-            let mut none = None;
-            while let Some(e) = ev_rx.recv().await {
-                plain::show(&mut std::io::stdout().lock(), p, &e, &mut none);
+        let printer = tokio::spawn({
+            let words = capture::Words::new(&course);
+            async move {
+                let mut none = None;
+                while let Some(e) = ev_rx.recv().await {
+                    plain::show(&mut std::io::stdout().lock(), p, &e, &mut none, &words);
+                }
             }
         });
         let _ = lec.page(&ev_tx).await;
@@ -250,19 +254,60 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     plain::print_prepared(&mut std::io::stdout().lock(), p, &ready, &files, &course, &name, &input_name);
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    // The session, run by the frontend: `lecture::run`, or in debug builds the scripted stand-in. Nothing runs
-    // until it is awaited or spawned.
-    let engine = |cmd_rx, ev_tx| -> Result<Engine> {
+    // Capture on by default (plan Task 11): the course's saved window is loaded before the engine
+    // starts, off the reactor, and the same saved state seeds the worker and the TUI's Ctrl-S. A
+    // scripted session never reaches the window server or the person's data folder: its selections
+    // live in the lecture folder, and only the `capture` scenario has any.
+    let capture = if fixture.is_some() {
+        #[cfg(debug_assertions)]
+        {
+            (fixture == Some(fixture::Scenario::Capture)).then(|| capture::Context {
+                path: files.state_dir().join(fixture::CAPTURE_JSON),
+                course: course.clone(),
+                saved: Some(fixture::saved_selection()),
+            })
+        }
+        #[cfg(not(debug_assertions))]
+        { None }
+    } else {
+        let path = data_dir()?.join(capture::FILE);
+        Some(capture::Context { path: path.clone(), course: course.clone(), saved: capture::load(&path, &course).await? })
+    };
+    // The session, run by the frontend: `lecture::run`, or in debug builds the scripted stand-in.
+    // Nothing runs until it is awaited or spawned. Both run behind the capture adapter, so Plain
+    // and the TUI see the same already-adapted events, and the engine's future resolves only after
+    // every final event has been handed on.
+    let engine_uid = uid.clone();
+    let engine = |cmd_rx, ev_tx| -> Result<(Engine, tokio::sync::mpsc::UnboundedReceiver<Event>)> {
+        let (fe_tx, fe_rx) = tokio::sync::mpsc::unbounded_channel();
+        let forward = tokio::spawn(capture::forward(capture.clone(), ev_rx, fe_tx));
         Ok(match fixture {
             #[cfg(debug_assertions)]
             Some(scenario) => {
                 let files = files.clone();
-                Box::pin(async move { fixture::run(scenario, &files, cmd_rx, ev_tx).await })
+                (
+                    Box::pin(async move {
+                        let r = fixture::run(scenario, &files, cmd_rx, ev_tx).await;
+                        let _ = forward.await;
+                        r
+                    }),
+                    fe_rx,
+                )
             }
             _ => {
                 let session = SessionConfig { dir: dir.clone(), stem: files.stem.clone(), stt: stt_link, recovery: Some(recovery()?), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
                 let watch_slides = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
-                Box::pin(lecture::run(lec, session, source_for(&uid), watch_slides, None, cmd_rx, ev_tx))
+                // Spec §7, as the desktop builds it: the course's saved selection, revalidated by
+                // the worker as the lecture starts; LECTURELIVE_RECORD verbatim when it is set.
+                let setup = capture.as_ref().map(|c| capture::setup(c.saved.clone(), capture::record_path(std::env::var_os("LECTURELIVE_RECORD"))));
+                (
+                    Box::pin(async move {
+                        let r = lecture::run(lec, session, source_for(&engine_uid), watch_slides, setup, cmd_rx, ev_tx).await;
+                        let _ = forward.await;
+                        r
+                    }),
+                    fe_rx,
+                )
             }
         })
     };
@@ -300,9 +345,11 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             files: files.clone(),
             spend: spend.clone(),
             seed: plain::startup_records(&ready, &files),
+            capture: capture.clone(),
         };
         // The terminal is given back before this returns, so the summary prints on the ordinary screen.
-        let report = tui::run(session, engine(cmd_rx, ev_tx)?, cmd_tx, ev_rx, a.secs).await?;
+        let (engine, events) = engine(cmd_rx, ev_tx)?;
+        let report = tui::run(session, engine, cmd_tx, events, a.secs).await?;
         plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);
         return Ok(());
     }
@@ -314,12 +361,14 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     }
     drop(cmd_tx);
     let mut watch = (uid == loopback::BLACKHOLE_UID || uid.starts_with("mixed:")).then(|| SilenceWatch::new(-60.0, 10));
+    let (engine, mut events) = engine(cmd_rx, ev_tx)?;
+    let words = capture::Words::new(&course);
     let printer = tokio::spawn(async move {
-        while let Some(e) = ev_rx.recv().await {
-            plain::show(&mut std::io::stdout().lock(), p, &e, &mut watch);
+        while let Some(e) = events.recv().await {
+            plain::show(&mut std::io::stdout().lock(), p, &e, &mut watch, &words);
         }
     });
-    let result = engine(cmd_rx, ev_tx)?.await;
+    let result = engine.await;
     printer.await?;
     let report = result?;
     plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);

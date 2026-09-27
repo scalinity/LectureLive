@@ -20,10 +20,11 @@ use lecturelive_core::audio::level::dbfs;
 use lecturelive_core::session::coordinator::SttStatus;
 use lecturelive_core::session::spend::{self, Paint};
 
+use crate::capture;
 use crate::stop::Stage;
 
 use super::input::{Hint, Overlay};
-use super::panes::{self, ActivityScroll, NoteScroll, Preview, Scroll};
+use super::panes::{self, ActivityScroll, NoteScroll, Preview, Scroll, SlidesScroll};
 use super::state::{Lane, View};
 
 pub(crate) const SUSPEND: &str = "Suspending would stop the recording. Stop the lecture first (Ctrl-C).";
@@ -365,6 +366,13 @@ fn footer(v: &View, c: &Chrome, room: usize) -> Vec<Span<'static>> {
             if listening {
                 parts.push((2, chord(g.enter, "snapshot", DIM)));
                 parts.push((4, chord(g.polish, "", DIM)));
+                // Ctrl-S only where it does something: capture now while a window is watched,
+                // watch the one offered window when its region is saved (plan §H).
+                match c.capture {
+                    capture::Action::Now => parts.push((2, chord("^S", "capture", DIM))),
+                    capture::Action::Watch { .. } => parts.push((2, chord("^S", "watch", DIM))),
+                    capture::Action::Refused(_) => {}
+                }
             }
             if v.work.mine() {
                 parts.push((2, chord("^X", "cancel", DIM)));
@@ -450,6 +458,8 @@ pub(crate) struct Chrome<'a> {
     pub(crate) zoom: bool,
     pub(crate) transcript: &'a Scroll,
     pub(crate) notes: &'a NoteScroll,
+    /// The reader's place in the slides.
+    pub(crate) slides: &'a SlidesScroll,
     /// The preview as last parsed, at most ten times a second.
     pub(crate) preview: &'a Preview,
     pub(crate) hint: &'a Hint,
@@ -457,6 +467,8 @@ pub(crate) struct Chrome<'a> {
     pub(crate) activity: &'a ActivityScroll,
     /// The help overlay's first row shown.
     pub(crate) help: usize,
+    /// What Ctrl-S does in the capture state as this frame is drawn (nothing while stopping).
+    pub(crate) capture: capture::Action,
     pub(crate) theme: &'a Theme,
 }
 
@@ -467,6 +479,8 @@ pub(crate) struct Drawn {
     pub(crate) small: bool,
     pub(crate) transcript: Option<Rect>,
     pub(crate) notes: Option<Rect>,
+    /// The slides list (below the capture block), where the slides' reading keys move.
+    pub(crate) slides: Option<Rect>,
     /// The activity overlay's body.
     pub(crate) activity: Option<Rect>,
     /// The furthest the help overlay can scroll at this size.
@@ -537,12 +551,16 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Drawn {
                     }
                     frame.render_widget(Line::from(lane).right_aligned(), col.heading);
                 }
-                let ink = panes::Ink { edge: g.edge, bullet: g.bullet, quote: g.bar, slide: g.slide, rule: g.rule, teal: c.theme.teal() };
+                let ink = panes::Ink { edge: g.edge, bullet: g.bullet, quote: g.bar, slide: g.slide, rule: g.rule, warn: g.warn, teal: c.theme.teal() };
                 panes::notes(frame.buffer_mut(), col.body, v, c.preview, c.notes, &ink);
                 drawn.notes = Some(col.body);
             }
             Pane::Slides if col.body.height > 0 => {
-                frame.render_widget(Span::styled(fit("Slides show here.", col.body.width as usize, g.ellipsis), DIM), Rect { height: 1, ..col.body });
+                if let Some(lane) = c.slides.unseen(v).and_then(|n| reading_lane(n, room, c.theme)) {
+                    frame.render_widget(Line::from(lane).right_aligned(), col.heading);
+                }
+                let ink = panes::Ink { edge: g.edge, bullet: g.bullet, quote: g.bar, slide: g.slide, rule: g.rule, warn: g.warn, teal: c.theme.teal() };
+                drawn.slides = panes::slides(frame.buffer_mut(), col.body, v, c.slides, &c.capture, &v.capture_words(), &ink, c.theme.signal());
             }
             Pane::Slides => {}
         }
@@ -656,7 +674,7 @@ fn help_lines(g: &Glyphs, inner: usize) -> Vec<Line<'static>> {
     let groups: [(&str, Vec<(&str, &str)>); 5] = [
         ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests, running and queued")]),
         ("Reading", vec![(g.updown, "a row in the focused pane"), ("PgUp PgDn", "a page"), (tabs.as_str(), "the next or previous pane"), ("Esc", "back to live"), ("^T", "the focused pane fills the body; again to go back")]),
-        ("Slides", vec![("Tab", "reaches the Slides pane")]),
+        ("Slides", vec![("^S", "capture the watched window's slide now"), ("^S", "watch the window offered, if its region is saved")]),
         ("App", vec![("^O", "activity: this session's notices"), ("^H F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
         (
             "Stopping",
@@ -835,15 +853,18 @@ fn second_row(v: &View, t: &Theme, max: usize) -> (Vec<Span<'static>>, Option<Ve
 }
 
 /// A column's heading: the pane's name, or its tabs with the one shown bold in teal and the others
-/// dim. Slides carry their count once there is one. Stacked's notes heading is a rule with its name in it.
-/// Returns the spans and the cells the names take, before any rule after them.
+/// dim. Slides carry their count once there is one, and the attention mark while capture needs the
+/// person (plan §H) — a mark that reads without colour. Stacked's notes heading is a rule with its
+/// name in it. Returns the spans and the cells the names take, before any rule after them.
 fn heading(col: &Column, v: &View, c: &Chrome) -> (Vec<Span<'static>>, usize) {
     let t = c.theme;
+    let attention = v.capture.as_ref().is_some_and(capture::attention).then(|| format!(" {}", t.glyphs.warn)).unwrap_or_default();
     let name = |p: Pane| match p {
         Pane::Transcript => "Transcript".to_string(),
         Pane::Notes => "Notes".to_string(),
-        Pane::Slides if v.slides.is_empty() => "Slides".to_string(),
-        Pane::Slides => format!("Slides {}", v.slides.len()),
+        Pane::Slides if v.slides.is_empty() && attention.is_empty() => "Slides".to_string(),
+        Pane::Slides if v.slides.is_empty() => format!("Slides{attention}"),
+        Pane::Slides => format!("Slides {}{attention}", v.slides.len()),
     };
     let shown = col.shown(c.focus);
     let style = |p: Pane| match (p == shown, p == c.focus, col.tabs.len() > 1) {
@@ -966,7 +987,7 @@ mod tests {
     /// The frame's chrome as a test draws it: the hint empty, no overlay, the notes and activity
     /// following, at 0:42:18.
     fn chrome<'a>(theme: &'a Theme, transcript: &'a Scroll, preview: &'a Preview, focus: Pane, refused: Option<&'a str>) -> Chrome<'a> {
-        Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus, zoom: false, transcript, notes: Box::leak(Box::default()), preview, hint: Box::leak(Box::default()), overlay: Overlay::None, activity: Box::leak(Box::default()), help: 0, theme }
+        Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus, zoom: false, transcript, notes: Box::leak(Box::default()), slides: Box::leak(Box::default()), preview, hint: Box::leak(Box::default()), overlay: Overlay::None, activity: Box::leak(Box::default()), help: 0, capture: capture::Action::Refused(capture::Refusal::None), theme }
     }
 
     fn drawn_with(width: u16, height: u16, v: &View, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
@@ -1811,14 +1832,19 @@ mod tests {
         help: usize,
         activity: ActivityScroll,
         notes: NoteScroll,
+        slides: SlidesScroll,
         refused: Option<&'static str>,
+        /// The saved selection, when a test wants Ctrl-S's watch-it offered.
+        saved: Option<lecturelive_core::capture::select::Selection>,
+        /// The capture action, when a test wants it forced rather than derived.
+        capture: Option<capture::Action>,
     }
 
     fn looked(w: u16, h: u16, v: &View, look: &Look, theme: &Theme) -> (Terminal<TestBackend>, Drawn) {
         let mut preview = Preview::default();
         preview.refresh(&v.notes, std::time::Instant::now());
         let scroll = Scroll::default();
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: look.refused, focus: look.focus.unwrap_or(Pane::Transcript), zoom: look.zoom, transcript: &scroll, notes: &look.notes, preview: &preview, hint: &look.hint, overlay: look.overlay, activity: &look.activity, help: look.help, theme };
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: look.refused, focus: look.focus.unwrap_or(Pane::Transcript), zoom: look.zoom, transcript: &scroll, notes: &look.notes, slides: &look.slides, preview: &preview, hint: &look.hint, overlay: look.overlay, activity: &look.activity, help: look.help, capture: look.capture.clone().unwrap_or_else(|| capture::action(v.capture.as_ref(), look.saved.as_ref())), theme };
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut drawn = Drawn::default();
         terminal.draw(|f| drawn = render(f, v, &chrome)).unwrap();
@@ -1946,7 +1972,8 @@ mod tests {
         let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(prose.contains("stop waiting: recovery and queued requests wait for the next session; what runs now and the last snapshot still finish"), "stage 2 never claims to abort what runs: {prose}");
         assert!(prose.contains("Spend is this lecture's cost today; speech-to-text is added when a recording closes."), "{prose}");
-        assert!(!text.contains("^S"));
+        assert!(text.contains("^S"), "Task 11's capture key is documented");
+        assert!(prose.contains("capture the watched window's slide now") && prose.contains("watch the window offered, if its region is saved"), "{prose}");
         assert_eq!(drawn.help_max, 0, "it all fits at 140×40");
         assert!(l[bottom].contains("Esc closes"));
         // small: it scrolls, and the border says there is more
@@ -2031,15 +2058,21 @@ mod tests {
         assert_eq!(layout(Rect::new(0, 0, 110, 32)).variant, Variant::Normal, "the ladder is unchanged");
     }
 
-    /// Narrow shows only the focused pane; Slides is a placeholder until Task 11.
+    /// Narrow shows only the focused pane; the Slides pane is Task 11's real one.
     #[test]
     fn narrow_shows_the_focused_pane() {
         let theme = Theme::new(TRUE, true);
-        let (t, d) = looked(80, 25, &noted(Work::Writing), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme);
-        let l = lines(t.backend().buffer());
-        assert!(l[3].contains("Slides show here.") && d.transcript.is_none() && d.notes.is_none());
-        let (x, y) = at(t.backend().buffer(), 2, "Slides 1");
-        assert_eq!(t.backend().buffer()[(x, y)].fg, TEAL);
+        let (t, d) = looked(80, 25, &noted(Work::Committed), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme);
+        let b = t.backend().buffer().clone();
+        let l = lines(&b);
+        assert!(l.iter().any(|r| r.contains("▣ Slide 17")) && l.iter().any(|r| r.trim() == "auto"), "the registered slide, with its provenance: {l:?}");
+        assert!(d.transcript.is_none() && d.notes.is_none(), "one pane only");
+        assert!(d.slides.is_some(), "the reading keys have their list");
+        let (x, y) = at(&b, 2, "Slides 1");
+        assert_eq!(b[(x, y)].fg, TEAL, "the focused tab keeps its accent");
+        // empty, the pane says so
+        let (t, d) = looked(80, 25, &view(Stage::Listening), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme);
+        assert!(lines(t.backend().buffer())[3].contains("No slides yet.") && d.slides.is_none());
     }
 
     /// A scrolled notes pane says the way back in its heading.
@@ -2054,6 +2087,180 @@ mod tests {
         assert!(notes.apply(panes::Move::Up(3), &v, &preview, drawn.notes.unwrap()));
         let (t, _) = looked(80, 25, &v, &Look { focus: Some(Pane::Notes), notes, ..Look::default() }, &theme);
         assert!(lines(t.backend().buffer())[2].ends_with("snapshot: writing   Esc live"), "{:?}", lines(t.backend().buffer())[2]);
+    }
+
+    // ---- the slides pane and Ctrl-S in the frame (Task 11) -------------------------------------
+
+    use lecturelive_core::capture::detect::Region;
+    use lecturelive_core::capture::select::{Descriptor, Selection, SizedRegion};
+    use lecturelive_core::capture::window::WindowInfo;
+    use lecturelive_core::capture::worker::CaptureState;
+
+    /// The course's saved window, as in capture.rs's tests: Zoom's meeting window, two sizes.
+    fn saved_selection() -> Selection {
+        Selection {
+            descriptor: Descriptor { bundle_id: Some("us.zoom.xos".into()), app: "zoom.us".into(), title: "Zoom Meeting".into(), width: 1600, height: 900 },
+            region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+            leave_out: vec![],
+            sizes: vec![SizedRegion { width: 1280, height: 720, region: Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 } }],
+        }
+    }
+
+    /// A lecture whose capture is in `state`, with three slides of every provenance and the
+    /// transcript live.
+    fn capturing(state: CaptureState) -> View {
+        let mut v = live();
+        v.notice = None;
+        v.set_capture_host("Terminal");
+        v.reduce(&Event::Capture(state), fixed());
+        let at = |h, m, s| chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, h, m, s).unwrap();
+        for (index, shown_at, auto, uncertain) in [(16u32, at(10, 37, 9), true, false), (17, at(10, 39, 41), true, true), (18, at(10, 41, 52), false, false)] {
+            v.reduce(&Event::Slide { index, file: format!("slides/slide_{index:02}_104152.png"), auto, uncertain, shown_at }, fixed());
+        }
+        v
+    }
+
+    /// The one window an asking state can offer safely, at the size the selection remembers.
+    fn safe_candidate() -> WindowInfo {
+        WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1280, height: 720, on_screen: true }
+    }
+
+    fn asking(reason: &str, candidates: Vec<WindowInfo>) -> CaptureState {
+        CaptureState::Asking { window: "Zoom Meeting".into(), reason: reason.into(), candidates }
+    }
+
+    /// Plan Task 11's goldens: the capture states in the wide slides column, the narrow pane, and
+    /// the slides scrolled with arrivals below.
+    #[test]
+    fn goldens_for_capture_and_the_slides() {
+        let theme = Theme::new(TRUE, true);
+        let watching = capturing(CaptureState::Watching { window: "Zoom Meeting".into() });
+        let states: [(CaptureState, &str); 6] = [
+            (CaptureState::Watching { window: "Zoom Meeting".into() }, "capture_watching"),
+            (asking("Zoom Meeting is 1280 × 720 now; it was 1600 × 900", vec![safe_candidate()]), "capture_asking"),
+            (CaptureState::Denied, "capture_denied"),
+            (CaptureState::Paused { window: "Zoom Meeting".into(), reason: "the window is minimised".into() }, "capture_paused"),
+            (CaptureState::Failing { window: "Zoom Meeting".into(), reason: "3 failed captures in a row".into() }, "capture_failing"),
+            (CaptureState::Unbound, "capture_unbound"),
+        ];
+        for (state, name) in &states {
+            let v = capturing(state.clone());
+            let look = Look { saved: Some(saved_selection()), ..Look::default() };
+            golden(&format!("{name}_140x40"), &looked(140, 40, &v, &look, &theme).0);
+        }
+        // the narrow pane, Slides focused: watching (with the footer's ^S), asking safe, denied
+        for (state, name) in [(states[0].0.clone(), "capture_watching"), (states[1].0.clone(), "capture_asking"), (states[2].0.clone(), "capture_denied")] {
+            let v = capturing(state);
+            let look = Look { focus: Some(Pane::Slides), saved: Some(saved_selection()), ..Look::default() };
+            golden(&format!("{name}_narrow_80x25"), &looked(80, 25, &v, &look, &theme).0);
+        }
+        golden("capture_denied_narrow_60x16", &looked(60, 16, &capturing(CaptureState::Denied), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme).0);
+        golden("capture_watching_ascii_80x25", &looked(80, 25, &watching, &Look { focus: Some(Pane::Slides), ..Look::default() }, &Theme::new(OFF, false)).0);
+        // the slides scrolled, with a slide arrived below: more slides than the pane holds
+        let mut scrolled_look = Look { focus: Some(Pane::Slides), ..Look::default() };
+        let mut many = capturing(CaptureState::Watching { window: "Zoom Meeting".into() });
+        for index in 19..=30 {
+            let shown_at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 10, 43, index).unwrap();
+            many.reduce(&Event::Slide { index, file: format!("slides/slide_{index:02}_104300.png"), auto: index % 2 == 0, uncertain: false, shown_at }, fixed());
+        }
+        let (_, drawn) = looked(80, 25, &many, &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme);
+        assert!(scrolled_look.slides.apply(panes::Move::Up(6), &many, drawn.slides.unwrap()));
+        many.reduce(&Event::Slide { index: 31, file: "slides/slide_31_104400.png".into(), auto: true, uncertain: false, shown_at: fixed() }, fixed());
+        golden("slides_scrolled_80x25", &looked(80, 25, &many, &scrolled_look, &theme).0);
+    }
+
+    /// The slides tab carries the attention mark while capture needs the person, in words that
+    /// read without colour, and the focused tab keeps its accent.
+    #[test]
+    fn the_slides_tab_marks_attention_in_words() {
+        let theme = Theme::new(TRUE, true);
+        for (state, want) in [
+            (CaptureState::Watching { window: "Zoom Meeting".into() }, " Transcript   Slides 3"),
+            (asking("gone", vec![]), " Transcript   Slides 3 ▲"),
+            (CaptureState::Denied, " Transcript   Slides 3 ▲"),
+            (CaptureState::Unbound, " Transcript   Slides 3 ▲"),
+        ] {
+            let (t, _) = looked(110, 32, &capturing(state.clone()), &Look::default(), &theme);
+            let l = lines(t.backend().buffer());
+            assert!(l[3].starts_with(want), "{state:?}: {}", l[3]);
+        }
+        // without colour the mark is still there, and the focused tab keeps its bold
+        let (t, _) = looked(80, 25, &capturing(CaptureState::Denied), &Look { focus: Some(Pane::Slides), ..Look::default() }, &Theme::new(OFF, true));
+        let b = t.backend().buffer();
+        assert!(lines(&b)[2].starts_with(" Transcript   Notes   Slides 3 ▲"), "{:?}", lines(&b)[2]);
+        assert!(b.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        let (x, y) = at(&b, 2, "Slides 3");
+        assert!(b[(x, y)].modifier.contains(Modifier::BOLD), "the focused tab is bold without colour");
+        // ASCII: the mark falls back to the warning glyph
+        let (t, _) = looked(80, 25, &capturing(CaptureState::Denied), &Look { focus: Some(Pane::Slides), ..Look::default() }, &Theme::new(OFF, false));
+        assert!(lines(t.backend().buffer())[2].starts_with(" Transcript   Notes   Slides 3 !"));
+    }
+
+    /// The footer advertises Ctrl-S exactly when it acts (plan §H): capture while a window is
+    /// watched, watch on a safe offering, nothing otherwise or while stopping.
+    #[test]
+    fn the_footer_advertises_ctrl_s_only_when_it_acts() {
+        let theme = Theme::new(TRUE, true);
+        let keys = |v: &View, look: &Look| lines(&looked(110, 32, v, look, &theme).0.backend().buffer())[31].clone();
+        let watch = Look::default();
+        assert!(keys(&capturing(CaptureState::Watching { window: "Zoom Meeting".into() }), &watch).contains("^S capture"), "{}", keys(&capturing(CaptureState::Watching { window: "Zoom Meeting".into() }), &watch));
+        let safe = Look { saved: Some(saved_selection()), ..Look::default() };
+        let asking_keys = keys(&capturing(asking("1280 × 720 now", vec![safe_candidate()])), &safe);
+        assert!(asking_keys.contains("^S watch"), "{asking_keys}");
+        for state in [CaptureState::Unbound, CaptureState::Denied, CaptureState::Paused { window: "Zoom Meeting".into(), reason: "gone".into() }, CaptureState::Failing { window: "Zoom Meeting".into(), reason: "blank".into() }] {
+            let k = keys(&capturing(state.clone()), &safe);
+            assert!(!k.contains("^S"), "{state:?}: {k}");
+        }
+        // an unsafe asking (no saved region for the size) and no capture at all
+        let unsafe_asking = capturing(asking("999 × 600 now", vec![WindowInfo { id: 43, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 999, height: 600, on_screen: true }]));
+        assert!(!keys(&unsafe_asking, &safe).contains("^S"));
+        assert!(!keys(&view(Stage::Listening), &watch).contains("^S"));
+        // stopping: no ^S even while watching
+        let mut stopping = capturing(CaptureState::Watching { window: "Zoom Meeting".into() });
+        stopping.phase = Stage::Stopping;
+        assert!(!keys(&stopping, &watch).contains("^S"));
+    }
+
+    /// The wide slides column's styles: the teal live edge on the watched window, the attention
+    /// word in signal red, the gutter and provenance dim, the slide glyph teal, no background.
+    #[test]
+    fn the_slides_column_styles() {
+        let theme = Theme::new(TRUE, true);
+        let (t, _) = looked(140, 40, &capturing(CaptureState::Watching { window: "Zoom Meeting".into() }), &Look::default(), &theme);
+        let b = t.backend().buffer().clone();
+        let l = lines(&b);
+        let edge_row = l.iter().position(|r| r.contains("▎ Watching Zoom Meeting")).unwrap_or_else(|| panic!("{l:?}")) as u16;
+        let (x, y) = at(&b, edge_row, "▎");
+        assert_eq!(b[(x, y)].fg, TEAL, "the watched window's live edge");
+        let slide_row = l.iter().position(|r| r.contains("▣ Slide 16")).unwrap() as u16;
+        let (gx, gy) = at(&b, slide_row, "▣");
+        assert_eq!(b[(gx, gy)].fg, TEAL, "the slide glyph");
+        assert_eq!(b[(gx - 10, gy)].modifier, Modifier::DIM, "the time gutter");
+        let provenance = l.iter().position(|r| r.contains("auto / unsettled")).unwrap() as u16;
+        assert!(b[(gx - 10, provenance)].modifier.contains(Modifier::DIM), "the provenance dim");
+        for (state, word) in [(asking("gone", vec![]), "Asking"), (CaptureState::Denied, "Screen Recording"), (CaptureState::Failing { window: "Zoom Meeting".into(), reason: "blank".into() }, "Capture failing")] {
+            let (t, _) = looked(140, 40, &capturing(state.clone()), &Look::default(), &theme);
+            let b = t.backend().buffer().clone();
+            let (x, y) = at(&b, lines(&b).iter().position(|r| r.contains(word)).unwrap_or_else(|| panic!("{word}")) as u16, word);
+            assert_eq!(b[(x, y)].fg, SIGNAL, "{state:?}: {word}");
+        }
+        for (w, h) in [(140, 40), (80, 25), (60, 16)] {
+            let (t, _) = looked(w, h, &capturing(CaptureState::Watching { window: "Zoom Meeting".into() }), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme);
+            assert!(t.backend().buffer().content.iter().all(|c| c.bg == Color::Reset), "{w}×{h}: no background");
+        }
+    }
+
+    /// A zoomed Slides pane fills the body, under the same heading the other panes zoom under.
+    #[test]
+    fn the_slides_pane_zooms() {
+        let theme = Theme::new(TRUE, true);
+        let v = capturing(CaptureState::Watching { window: "Zoom Meeting".into() });
+        let (t, drawn) = looked(110, 32, &v, &Look { zoom: true, focus: Some(Pane::Slides), ..Look::default() }, &theme);
+        let l = lines(t.backend().buffer());
+        assert!(l[3].starts_with(" Transcript   Notes   Slides 3"), "{}", l[3]);
+        assert!(drawn.slides.is_some_and(|b| b.width == 108) && drawn.transcript.is_none() && drawn.notes.is_none(), "{:?}", drawn.slides);
+        assert!(l.iter().any(|r| r.contains("▎ Watching Zoom Meeting")));
+        assert!(l.iter().any(|r| r.contains("▣ Slide 18")));
     }
 
     /// Both bullet glyphs are one cell: the notes walker counts them as one.

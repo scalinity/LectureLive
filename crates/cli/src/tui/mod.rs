@@ -25,11 +25,13 @@ use lecturelive_core::session::lecture::{Command, Event, Op};
 use lecturelive_core::session::spend::Spend;
 use ratatui::crossterm::event::{Event as TermEvent, EventStream, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use lecturelive_core::capture::select::Selection;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinError;
 use tokio::time::{interval_at, sleep_until, Instant, MissedTickBehavior};
 
+use crate::capture;
 use crate::plain;
 use crate::stop::{Origin, Stage, Step, StopController};
 use state::{Identity, OwnOp, View};
@@ -48,6 +50,10 @@ pub(crate) struct Session {
     pub(crate) files: LectureFiles,
     pub(crate) spend: Spend,
     pub(crate) seed: Vec<plain::Notice>,
+    /// The capture context (plan Task 11): where the course's selection is saved and the
+    /// selection as it was loaded before the lecture started. None in a scripted session without
+    /// capture. The reactor alone holds it; nothing rereads the file while the lecture runs.
+    pub(crate) capture: Option<capture::Context>,
 }
 
 /// The view's state and the stop controller: the reactor's decisions, without its I/O. Everything
@@ -57,9 +63,9 @@ pub(crate) struct Session {
 struct Ui {
     stop: StopController,
     events: u64,
-    /// The reactor's own notice — a refused stop, a refused command, a refused paste: UI-local,
-    /// shown above the view's own notices.
-    notice: Option<&'static str>,
+    /// The reactor's own notice — a refused stop, a refused command, a refused paste, a capture
+    /// reply: UI-local, shown above the view's own notices.
+    notice: Option<String>,
     /// The reading pane the keys read and a tabbed column shows.
     focus: view::Pane,
     zoom: bool,
@@ -69,8 +75,12 @@ struct Ui {
     /// layout, so a pane that is hidden and shown again is where it was left.
     transcript: panes::Scroll,
     notes: panes::NoteScroll,
+    /// The reader's place in the slides: following the newest, or held at a slide (Task 11).
+    slides: panes::SlidesScroll,
     activity: panes::ActivityScroll,
     help: usize,
+    /// The capture context: the course's selections file and the selection as loaded, for Ctrl-S.
+    capture: Option<capture::Context>,
     /// Where the last frame put things: reading moves count rows as the person sees them.
     drawn: view::Drawn,
     /// The preview as last parsed for drawing: at most every [`panes::PREVIEW_EVERY`], never per delta.
@@ -91,6 +101,23 @@ enum Act {
     Op(Op),
     /// Ctrl-X: cancel this TUI's notes requests.
     Cancel,
+    /// Ctrl-S while a window is watched: one manual capture. The reply comes back through
+    /// [`CaptureReply`]; the slide itself only ever arrives as core's own `Event::Slide`.
+    CaptureNow,
+    /// Ctrl-S on the one window offered whose region is saved: kept for the course first, then
+    /// exactly one `Bind` (plan Task 11) — none if the save fails.
+    CaptureWatch { window: u32, selection: Selection },
+}
+
+/// What a Ctrl-S comes back as, off the reactor: the oneshot's answer to a capture-now, or the
+/// watch-it save's outcome. Nothing here is a slide; slides are core's own events.
+#[derive(Debug)]
+enum CaptureReply {
+    Now(Result<(), String>),
+    /// The watch-it save failed: no `Bind` was sent.
+    WatchFailed(anyhow::Error),
+    /// The watch-it save succeeded and the `Bind` went out; watching arrives as its own event.
+    Watched,
 }
 
 /// Enter while stopping: nothing is sent, and what was typed stays (plan §H).
@@ -105,7 +132,7 @@ const ENDED: &str = "The lecture has ended; nothing was sent.";
 const PANES: [view::Pane; 3] = [view::Pane::Transcript, view::Pane::Notes, view::Pane::Slides];
 
 impl Ui {
-    fn new(view: View, theme: view::Theme) -> Ui {
+    fn new(view: View, theme: view::Theme, capture: Option<capture::Context>) -> Ui {
         Ui {
             stop: StopController::default(),
             events: 0,
@@ -116,8 +143,10 @@ impl Ui {
             hint: input::Hint::default(),
             transcript: panes::Scroll::default(),
             notes: panes::NoteScroll::default(),
+            slides: panes::SlidesScroll::default(),
             activity: panes::ActivityScroll::default(),
             help: 0,
+            capture,
             drawn: view::Drawn::default(),
             preview: panes::Preview::default(),
             theme,
@@ -138,16 +167,23 @@ impl Ui {
                     self.view.work.hurry();
                 }
             }
-            Step::Ignored(_) if origin == Origin::Key => self.notice = Some(view::not_yet(self.view.phase)),
+            Step::Ignored(_) if origin == Origin::Key => self.notice = Some(view::not_yet(self.view.phase).to_string()),
             Step::Ignored(_) | Step::Quit => {}
         }
         step
     }
 
     /// Every event is drained and reduced into the view; the audio's own end is a stop the controller
-    /// must know of. Returns the stop step, if any, and whether a re-read of the files was asked for.
+    /// must know of. A relocation the adapter has already saved also becomes this TUI's saved
+    /// selection, without rereading the file. Returns the stop step, if any, and whether a re-read
+    /// of the files was asked for.
     fn event(&mut self, e: &Event, now: std::time::Instant) -> (Option<Step>, bool) {
         self.events += 1;
+        if let Event::CaptureMoved { selection, .. } = e {
+            if let Some(ctx) = &mut self.capture {
+                ctx.saved = Some(selection.clone());
+            }
+        }
         let effect = self.view.reduce(e, Local::now());
         let step = matches!(e, Event::Session(Notification::SourceEnded)).then(|| self.stop(Origin::SourceEnded, now));
         (step, effect.hydrate)
@@ -198,7 +234,12 @@ impl Ui {
                     None if m == panes::Move::Live => self.notes.apply(m, &self.view, &self.preview, Rect::default()),
                     None => false,
                 },
-                view::Pane::Slides => false, // Task 11's pane
+                // the slides list, below the capture block, where the last frame put it
+                view::Pane::Slides => match self.drawn.slides {
+                    Some(body) => self.slides.apply(m, &self.view, body),
+                    None if m == panes::Move::Live => self.slides.apply(m, &self.view, Rect::default()),
+                    None => false,
+                },
             },
         };
         if moved {
@@ -228,7 +269,7 @@ impl Ui {
                 Act::Redraw
             }
             // behind an overlay, nothing that cannot be seen changes
-            Key::Zoom | Key::Focus(_) if self.overlay != input::Overlay::None => Act::Nothing,
+            Key::Zoom | Key::Focus(_) | Key::Capture if self.overlay != input::Overlay::None => Act::Nothing,
             Key::Zoom => {
                 self.zoom = !self.zoom;
                 Act::Redraw
@@ -238,6 +279,7 @@ impl Ui {
                 self.focus = PANES[if forward { (at + 1) % 3 } else { (at + 2) % 3 }];
                 Act::Redraw
             }
+            Key::Capture => self.capture_key(),
             Key::Read(m) => self.read(m),
             Key::Enter => self.enter(now),
             Key::Edit => match self.hint.edit(key) {
@@ -250,12 +292,58 @@ impl Ui {
 
     /// What the frame needs besides the session view, from the reactor's own state.
     fn chrome(&self, elapsed: Duration) -> view::Chrome<'_> {
-        view::Chrome { elapsed, refused: self.notice, focus: self.focus, zoom: self.zoom, transcript: &self.transcript, notes: &self.notes, preview: &self.preview, hint: &self.hint, overlay: self.overlay, activity: &self.activity, help: self.help, theme: &self.theme }
+        view::Chrome { elapsed, refused: self.notice.as_deref(), focus: self.focus, zoom: self.zoom, transcript: &self.transcript, notes: &self.notes, slides: &self.slides, preview: &self.preview, hint: &self.hint, overlay: self.overlay, activity: &self.activity, help: self.help, capture: self.capture_action(), theme: &self.theme }
     }
 
-    fn say(&mut self, notice: &'static str) -> Act {
-        self.notice = Some(notice);
+    fn say(&mut self, notice: impl Into<String>) -> Act {
+        self.notice = Some(notice.into());
         Act::Redraw
+    }
+
+    /// What Ctrl-S does now (plan Task 11): nothing once the lecture is stopping — core drops
+    /// capture at the first stop, so no manual capture can happen then either.
+    fn capture_action(&self) -> capture::Action {
+        if self.view.phase != Stage::Listening {
+            return capture::Action::Refused(capture::Refusal::None);
+        }
+        capture::action(self.view.capture.as_ref(), self.capture.as_ref().and_then(|c| c.saved.as_ref()))
+    }
+
+    /// Ctrl-S, by what capture is doing (plan §H): a watched window captures now; the one window
+    /// offered through its saved region is watched — saved first, by the send, then bound. Every
+    /// other state says why it refuses, and sends nothing.
+    fn capture_key(&mut self) -> Act {
+        match self.capture_action() {
+            capture::Action::Now => Act::CaptureNow,
+            capture::Action::Watch { window, selection } => Act::CaptureWatch { window, selection },
+            capture::Action::Refused(why) => self.say(self.capture_refusal(why)),
+        }
+    }
+
+    /// Why Ctrl-S did nothing, in the state's own terms; the Slides pane holds the fuller story.
+    fn capture_refusal(&self, why: capture::Refusal) -> String {
+        match why {
+            capture::Refusal::None => "Nothing is being watched yet.".into(),
+            capture::Refusal::Unbound => "No window is chosen for this course yet: choose it once in the LectureLive app. Screenshots (⌘⇧4) still become slides.".into(),
+            capture::Refusal::Paused => "Capture is paused; it comes back by itself when the window is back.".into(),
+            capture::Refusal::Denied => "Screen Recording is off for this terminal; the Slides pane has the steps to turn it on.".into(),
+            capture::Refusal::Failing => "Capture is failing; the Slides pane says why.".into(),
+            capture::Refusal::AskingNone => "No window to watch is being offered; the Slides pane says what capture is waiting for.".into(),
+            capture::Refusal::AskingMany => "More than one window is offered; choose between them in the LectureLive app.".into(),
+            capture::Refusal::AskingSize => "That window size has no saved region; choose where its slide is in the LectureLive app.".into(),
+            capture::Refusal::AskingOther => "The window offered is not the one saved; choose in the LectureLive app.".into(),
+        }
+    }
+
+    /// A Ctrl-S reply landing back on the reactor: a capture-now that failed says why; one that
+    /// succeeded says nothing, because the slide itself arrives only as core's own `Event::Slide`.
+    fn capture_reply(&mut self, reply: CaptureReply) -> Act {
+        match reply {
+            CaptureReply::Now(Ok(())) => Act::Nothing,
+            CaptureReply::Now(Err(m)) => self.say(format!("The capture did not happen: {}", plain::sentence(&plain::clean(&m)))),
+            CaptureReply::Watched => Act::Nothing,
+            CaptureReply::WatchFailed(e) => self.say(format!("The window was not watched: saving its region failed ({}).", plain::sentence(&format!("{e:#}")))),
+        }
     }
 
     fn toggle(&mut self, overlay: input::Overlay) -> Act {
@@ -290,8 +378,10 @@ impl Ui {
 
     /// Sends the one command a key asked for. Only a command the lecture took joins this TUI's
     /// queue (an op) or empties it (a cancel); then the hint empties. One the lecture could not
-    /// take changes nothing and says so.
-    fn send(&mut self, act: Act, commands: &UnboundedSender<Command>) {
+    /// take changes nothing and says so. A Ctrl-S goes further off the reactor than a send: the
+    /// capture-now oneshot is answered later on a task of its own, and a watch-it is saved for the
+    /// course — on a blocking thread — before its single `Bind` goes out, or not at all.
+    fn send(&mut self, act: Act, commands: &UnboundedSender<Command>, replies: &tokio::sync::mpsc::Sender<CaptureReply>) {
         match act {
             Act::Op(op) => {
                 let own = match op {
@@ -303,7 +393,7 @@ impl Ui {
                     self.hint.clear();
                     self.notice = None;
                 } else {
-                    self.notice = Some(ENDED);
+                    self.notice = Some(ENDED.into());
                 }
             }
             Act::Cancel => {
@@ -311,8 +401,48 @@ impl Ui {
                     self.view.work.cancel();
                     self.notice = None;
                 } else {
-                    self.notice = Some(ENDED);
+                    self.notice = Some(ENDED.into());
                 }
+            }
+            Act::CaptureNow => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if commands.send(Command::CaptureNow(tx)).is_ok() {
+                    self.notice = None;
+                    let replies = replies.clone();
+                    tokio::spawn(async move {
+                        // core replies on its own time; the reactor stays the one place notices land
+                        let answer = match rx.await {
+                            Ok(r) => r,
+                            Err(_) => Err("the capture worker stopped without answering".into()),
+                        };
+                        let _ = replies.send(CaptureReply::Now(answer)).await;
+                    });
+                } else {
+                    self.notice = Some(ENDED.into());
+                }
+            }
+            Act::CaptureWatch { window, selection } => {
+                let (commands, replies, ctx) = (commands.clone(), replies.clone(), self.capture.clone());
+                tokio::spawn(async move {
+                    // kept for the course first, off the reactor: no Bind goes out until the
+                    // selection is on disk (plan Task 11)
+                    let saved = match ctx {
+                        Some(ctx) => {
+                            let sel = selection.clone();
+                            tokio::task::spawn_blocking(move || capture::keep_selection(&ctx.path, &ctx.course, &sel)).await
+                        }
+                        None => Ok(Ok(())),
+                    };
+                    match saved.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                        Ok(()) => {
+                            let _ = commands.send(Command::Bind { window, selection });
+                            let _ = replies.send(CaptureReply::Watched).await;
+                        }
+                        Err(e) => {
+                            let _ = replies.send(CaptureReply::WatchFailed(e)).await;
+                        }
+                    }
+                });
             }
             _ => {}
         }
@@ -359,11 +489,13 @@ pub(crate) async fn run(session: Session, engine: impl Future<Output = Result<St
     let lecture = tokio::spawn(engine);
     let keys = EventStream::new();
     // The spend sample (plan §B 7) and the hydration results (plan §F) both arrive from background
-    // work; the reactor alone applies them.
+    // work; the reactor alone applies them. So do Ctrl-S's answers (plan Task 11): the oneshot's
+    // reply and the watch-it save's outcome, from tasks of their own.
     let (spend_tx, spend_rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(sample_spend(session.spend.clone(), spend_tx));
     let (hydrate_tx, hydrate_rx) = tokio::sync::mpsc::channel::<anyhow::Result<hydrate::Hydration>>(1);
-    let exit = react(Io { screen, keys, lecture, events, commands, interrupt, terminate, hangup, files: session.files, hydrate_tx, hydrate_rx, spend_rx }, view, started, secs).await;
+    let (capture_tx, capture_rx) = tokio::sync::mpsc::channel::<CaptureReply>(4);
+    let exit = react(Io { screen, keys, lecture, events, commands, interrupt, terminate, hangup, files: session.files, hydrate_tx, hydrate_rx, spend_rx, capture_tx, capture_rx }, view, session.capture, started, secs).await;
     leave(exit)
 }
 
@@ -401,6 +533,9 @@ struct Io {
     hydrate_tx: tokio::sync::mpsc::Sender<anyhow::Result<hydrate::Hydration>>,
     hydrate_rx: tokio::sync::mpsc::Receiver<anyhow::Result<hydrate::Hydration>>,
     spend_rx: tokio::sync::mpsc::Receiver<f64>,
+    /// Ctrl-S's answers, from the tasks that awaited them.
+    capture_tx: tokio::sync::mpsc::Sender<CaptureReply>,
+    capture_rx: tokio::sync::mpsc::Receiver<CaptureReply>,
 }
 
 /// One hydration at a time (plan §F): a trigger while one runs sets `again`, and the next read
@@ -421,9 +556,9 @@ fn want_hydration(io: &Io, hydrating: &mut bool, again: &mut bool) {
 
 /// The loop. It draws only here, and only when something changed, at most every [`FRAME`]; returning
 /// is the fence after which it never draws again.
-async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> Exit {
+async fn react(mut io: Io, view: View, capture: Option<capture::Context>, started: Instant, secs: Option<u64>) -> Exit {
     // Colour and glyphs are the terminal's for the whole session: read once, as the plain CLI reads them.
-    let mut ui = Ui::new(view, view::Theme::detect());
+    let mut ui = Ui::new(view, view::Theme::detect(), capture);
     let mut timer = secs.map(|s| started + Duration::from_secs(s));
     let mut clock = interval_at(started + Duration::from_secs(1), Duration::from_secs(1));
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -453,7 +588,10 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
                     }
                     Act::Redraw => dirty = true,
                     Act::Nothing => {}
-                    act @ (Act::Op(_) | Act::Cancel) => { ui.send(act, &io.commands); dirty = true; }
+                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. }) => {
+                        ui.send(act, &io.commands, &io.capture_tx);
+                        dirty = true;
+                    }
                 },
                 // The next draw lays out `frame.area()` at the new size; nothing else keeps one.
                 Some(Ok(TermEvent::Resize(..))) => dirty = true,
@@ -508,6 +646,11 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
             Some(usd) = io.spend_rx.recv() => {
                 ui.view.spend = Some(usd);
                 dirty = true;
+            }
+            Some(reply) = io.capture_rx.recv() => {
+                if ui.capture_reply(reply) == Act::Redraw {
+                    dirty = true;
+                }
             }
             _ = sleep_until(timer.unwrap_or(started)), if timer.is_some() => {
                 timer = None;
@@ -579,7 +722,7 @@ mod tests {
     }
 
     fn ui() -> Ui {
-        Ui::new(state::View::new(identity(), Hydration::empty(), Vec::new()), view::Theme::new(lecturelive_core::session::spend::Paint { color: true, truecolor: true }, true))
+        Ui::new(state::View::new(identity(), Hydration::empty(), Vec::new()), view::Theme::new(lecturelive_core::session::spend::Paint { color: true, truecolor: true }, true), None)
     }
 
     fn ctrl(c: char) -> KeyEvent {
@@ -597,9 +740,9 @@ mod tests {
         assert_eq!(ui.view.phase, Stage::Stopping);
         // The Key origin's quiet and dwell hold: a repeat 30 ms later is not taken, and says why.
         assert!(matches!(ui.key(ctrl('c'), t0 + ms(30)), Act::Stop(Step::Ignored(_))));
-        assert_eq!(ui.notice, Some(view::not_yet(Stage::Stopping)));
+        assert_eq!(ui.notice.as_deref(), Some(view::not_yet(Stage::Stopping)));
         assert_eq!(ui.key(ctrl('c'), t0 + ms(2500)), Act::Stop(Step::Advance { stage: Stage::StopWaiting, stops_to_send: 1 }));
-        assert_eq!((ui.view.phase, ui.notice), (Stage::StopWaiting, None));
+        assert_eq!((ui.view.phase, ui.notice.as_deref()), (Stage::StopWaiting, None));
         assert_eq!(ui.key(ctrl('c'), t0 + ms(5000)), Act::Stop(Step::Quit));
     }
 
@@ -650,7 +793,7 @@ mod tests {
     fn ctrl_z_only_says_why_it_does_nothing_and_ctrl_l_clears() {
         let (mut ui, t0) = (ui(), Instant::now());
         assert_eq!(ui.key(ctrl('z'), t0), Act::Redraw);
-        assert_eq!((ui.view.phase, ui.notice), (Stage::Listening, Some(view::SUSPEND)));
+        assert_eq!((ui.view.phase, ui.notice.as_deref()), (Stage::Listening, Some(view::SUSPEND)));
         assert_eq!(ui.key(ctrl('l'), t0), Act::Clear);
         assert_eq!(ui.view.phase, Stage::Listening);
     }
@@ -812,7 +955,8 @@ mod tests {
     fn press(ui: &mut Ui, k: KeyEvent, now: Instant, tx: &UnboundedSender<Command>) -> Act {
         let act = ui.key(k, now);
         if matches!(act, Act::Op(_) | Act::Cancel) {
-            ui.send(act, tx);
+            let (replies, _) = tokio::sync::mpsc::channel(1);
+            ui.send(act, tx, &replies);
             return Act::Redraw;
         }
         act
@@ -832,6 +976,8 @@ mod tests {
                 Command::Op(Op::Polish) => "polish".into(),
                 Command::Cancel => "cancel".into(),
                 Command::Stop => "stop".into(),
+                Command::CaptureNow(_) => "capture-now".into(),
+                Command::Bind { window, .. } => format!("bind {window}"),
                 other => format!("{other:?}"),
             });
         }
@@ -895,7 +1041,7 @@ mod tests {
         assert_eq!(press(&mut ui, key(KeyCode::Enter), t0 + ms(500), &tx), Act::Redraw);
         assert!(sent(&mut rx).is_empty());
         assert_eq!(ui.hint.value(), "keep this hint", "the text stays");
-        assert_eq!(ui.notice, Some(STOPPING));
+        assert_eq!(ui.notice.as_deref(), Some(STOPPING));
         assert!(!ui.view.work.mine(), "nothing joined the queue");
         // the audio ending by itself is stopping too
         let mut ui = drawn_ui();
@@ -913,7 +1059,7 @@ mod tests {
         let (mut ui, t0) = (drawn_ui(), Instant::now());
         press(&mut ui, ctrl('x'), t0, &tx);
         assert!(sent(&mut rx).is_empty());
-        assert_eq!(ui.notice, Some(NOTHING_TO_CANCEL));
+        assert_eq!(ui.notice.as_deref(), Some(NOTHING_TO_CANCEL));
         press(&mut ui, key(KeyCode::Enter), t0, &tx);
         type_in(&mut ui, "polish", t0, &tx);
         press(&mut ui, key(KeyCode::Enter), t0 + ms(400), &tx);
@@ -990,8 +1136,21 @@ mod tests {
         let notes = ui.notes.anchor().unwrap();
         ui.key(tab, Instant::now());
         assert_eq!(ui.focus, view::Pane::Slides);
-        assert!(frame(&mut ui, 80, 25)[3].contains("Slides show here."));
-        assert_eq!(ui.key(key(KeyCode::Up), Instant::now()), Act::Nothing, "slides do not scroll yet");
+        let rows = frame(&mut ui, 80, 25);
+        assert!(rows[3].contains("No slides yet."), "the real slides pane: {rows:?}");
+        // the slides read too: enough arrive to overflow the pane, up leaves the newest, Esc back
+        for index in 1..=30u32 {
+            ui.event(&Event::Slide { index, file: format!("slides/slide_{index}.png"), auto: index % 3 != 0, uncertain: index % 3 == 2, shown_at: Local::now() }, Instant::now());
+        }
+        let slides = frame(&mut ui, 80, 25);
+        assert!(slides.iter().any(|r| r.contains("Slide 30")), "{slides:?}");
+        assert_eq!(ui.key(key(KeyCode::Up), Instant::now()), Act::Redraw, "the slides scroll now (Task 11)");
+        assert!(!ui.slides.following());
+        assert_eq!(ui.key(key(KeyCode::Down), Instant::now()), Act::Redraw);
+        assert!(ui.slides.following(), "down to the end follows again");
+        ui.key(key(KeyCode::PageUp), Instant::now());
+        assert_eq!(ui.key(key(KeyCode::Esc), Instant::now()), Act::Redraw);
+        assert!(ui.slides.following(), "Esc returns the slides to live");
         ui.key(tab, Instant::now());
         assert_eq!(ui.focus, view::Pane::Transcript);
         ui.key(back, Instant::now());
@@ -1017,6 +1176,18 @@ mod tests {
         assert!(ui.notes.scrolled() && ui.transcript.following(), "the notes moved, the transcript did not");
         assert_eq!(ui.mouse(wheel(MouseEventKind::ScrollDown)), Act::Redraw);
         assert!(!ui.notes.scrolled());
+        // the slides read the wheel too, through their own list (Task 11)
+        ui.key(key(KeyCode::Tab), Instant::now());
+        assert_eq!(ui.focus, view::Pane::Slides);
+        for index in 1..=40u32 {
+            ui.event(&Event::Slide { index, file: format!("slides/slide_{index}.png"), auto: true, uncertain: false, shown_at: Local::now() }, Instant::now());
+        }
+        frame(&mut ui, 110, 32);
+        assert!(ui.drawn.slides.is_some(), "the slides list is on screen");
+        assert_eq!(ui.mouse(wheel(MouseEventKind::ScrollUp)), Act::Redraw);
+        assert!(!ui.slides.following(), "the wheel left the newest slide");
+        assert_eq!(ui.mouse(wheel(MouseEventKind::ScrollDown)), Act::Redraw);
+        assert!(ui.slides.following(), "down to the end follows again");
     }
 
     /// Esc closes an overlay first; only then does it take a scrolled pane back to live. Behind
@@ -1094,8 +1265,8 @@ mod tests {
         assert!(!ui.zoom && ui.drawn.transcript.is_some() && ui.drawn.notes.is_some());
     }
 
-    /// Below the minimum size typing is ignored — no invisible hint piles up — while Ctrl-C and
-    /// Ctrl-L still work.
+    /// Below the minimum size typing is ignored — no invisible hint piles up — while Ctrl-C,
+    /// Ctrl-L and the capture key still classify and none of them sends anything.
     #[test]
     fn too_small_ignores_typing() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1104,7 +1275,7 @@ mod tests {
         assert!(ui.drawn.small);
         type_in(&mut ui, "invisible", Instant::now(), &tx);
         assert_eq!(ui.paste("pasted"), Act::Nothing);
-        for k in [key(KeyCode::Enter), key(KeyCode::Tab), ctrl('x'), ctrl('t'), ctrl('h')] {
+        for k in [key(KeyCode::Enter), key(KeyCode::Tab), ctrl('x'), ctrl('t'), ctrl('h'), ctrl('s')] {
             assert_eq!(press(&mut ui, k, Instant::now(), &tx), Act::Nothing, "{k:?}");
         }
         assert_eq!(ui.hint.value(), "");
@@ -1113,15 +1284,195 @@ mod tests {
         assert!(matches!(ui.key(ctrl('c'), Instant::now()), Act::Stop(Step::Advance { .. })));
     }
 
-    /// Ctrl-S is Task 11's: it does nothing yet, and is neither text nor a command.
+    /// Ctrl-S is Task 11's: with nothing watched it says why and sends nothing.
     #[test]
     fn no_ctrl_s_action_yet() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ui = drawn_ui();
         type_in(&mut ui, "abc", Instant::now(), &tx);
-        assert_eq!(press(&mut ui, ctrl('s'), Instant::now(), &tx), Act::Nothing);
-        assert_eq!(ui.hint.value(), "abc");
-        assert!(sent(&mut rx).is_empty() && ui.notice.is_none());
+        assert_eq!(press(&mut ui, ctrl('s'), Instant::now(), &tx), Act::Redraw);
+        assert_eq!(ui.hint.value(), "abc", "Ctrl-S never edits");
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(ui.notice.as_deref(), Some("Nothing is being watched yet."));
+    }
+
+    // ---- Ctrl-S and capture (Task 11) ---------------------------------------------------------
+
+    use lecturelive_core::capture::detect::Region;
+    use lecturelive_core::capture::select::{Descriptor, Selection, Selections, SizedRegion};
+    use lecturelive_core::capture::window::WindowInfo;
+    use lecturelive_core::capture::worker::CaptureState;
+
+    /// The course's saved window, as the app leaves it: Zoom's meeting window at 1600 × 900, its
+    /// smaller size remembered, a camera patch left out.
+    fn saved_selection() -> Selection {
+        Selection {
+            descriptor: Descriptor { bundle_id: Some("us.zoom.xos".into()), app: "zoom.us".into(), title: "Zoom Meeting".into(), width: 1600, height: 900 },
+            region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+            leave_out: vec![Region { x: 0.75, y: 0.0, w: 0.25, h: 0.3 }],
+            sizes: vec![SizedRegion { width: 1280, height: 720, region: Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 } }],
+        }
+    }
+
+    fn candidate(id: u32, w: u32, h: u32) -> WindowInfo {
+        WindowInfo { id, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: w, height: h, on_screen: true }
+    }
+
+    fn asking(candidates: Vec<WindowInfo>) -> Event {
+        Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "Zoom Meeting is 1280 × 720 now; it was 1600 × 900".into(), candidates })
+    }
+
+    /// A Ui with a capture context: the course's selections in a temp file, the saved selection
+    /// as it was loaded before the lecture started.
+    fn capture_ui(dir: &tempfile::TempDir) -> Ui {
+        let mut ui = ui();
+        ui.capture = Some(crate::capture::Context { path: dir.path().join("capture.json"), course: identity().course, saved: Some(saved_selection()) });
+        ui
+    }
+
+    /// Ctrl-S while watching: exactly one `CaptureNow`; a successful reply alone fabricates no
+    /// slide (core's own `Event::Slide` is the truth), a failed one says why.
+    #[tokio::test]
+    async fn ctrl_s_watching_sends_exactly_one_capture_now() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), Instant::now());
+        assert_eq!(ui.key(ctrl('s'), Instant::now()), Act::CaptureNow);
+        ui.send(Act::CaptureNow, &tx, &replies);
+        // core answers the oneshot on its own time; the reactor applies what comes back
+        let Command::CaptureNow(answer) = rx.recv().await.unwrap() else { panic!("the one command: {:?}", sent(&mut rx)) };
+        assert!(rx.try_recv().is_err(), "one key, one command");
+        answer.send(Ok(())).unwrap();
+        let replied = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(ui.capture_reply(replied), Act::Nothing, "a successful capture-now says nothing");
+        assert!(ui.view.slides.is_empty(), "no slide is fabricated from the reply");
+        assert_eq!(ui.notice, None);
+        // the slide itself arrives as core's own event, and lands
+        ui.event(&Event::Slide { index: 4, file: "slides/slide_04.png".into(), auto: false, uncertain: false, shown_at: Local::now() }, Instant::now());
+        assert_eq!(ui.view.slides.len(), 1);
+        assert_eq!(ui.view.slides[0].index, 4, "the canonical slide, not a fabricated one");
+        // a failed capture-now is a notice; a second press is a second command, never a retry
+        assert_eq!(ui.key(ctrl('s'), Instant::now()), Act::CaptureNow);
+        ui.send(Act::CaptureNow, &tx, &replies);
+        let Command::CaptureNow(answer) = rx.recv().await.unwrap() else { panic!() };
+        assert!(rx.try_recv().is_err(), "one more key, one more command");
+        answer.send(Err("Zoom Meeting could not be captured: the capture was blank".into())).unwrap();
+        let replied = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(ui.capture_reply(replied), Act::Redraw);
+        assert_eq!(ui.notice.as_deref(), Some("The capture did not happen: Zoom Meeting could not be captured: the capture was blank"));
+    }
+
+    /// Ctrl-S on the one safe offering: the saved-size selection is prepared, kept for the course
+    /// (another course untouched), and exactly one `Bind` follows — with the saved region, parts
+    /// left out and remembered sizes intact.
+    #[tokio::test]
+    async fn ctrl_s_watch_it_saves_then_binds_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        // another course's selection, which the save must leave exactly as it is
+        let other = Selection { descriptor: Descriptor { bundle_id: None, app: "TextEdit".into(), title: "Deck".into(), width: 1000, height: 700 }, region: Region::WHOLE, leave_out: vec![], sizes: vec![] };
+        let mut all = Selections::default();
+        all.set("Statistics", other.clone());
+        all.save(&dir.path().join("capture.json")).unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&asking(vec![candidate(42, 1280, 720)]), Instant::now());
+        let Act::CaptureWatch { window, selection } = ui.key(ctrl('s'), Instant::now()) else { panic!("{:?}", ui.notice) };
+        assert_eq!(window, 42);
+        assert_eq!(selection.region, Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 }, "the saved region at the offered size");
+        assert_eq!(selection.leave_out, saved_selection().leave_out, "the parts left out are kept");
+        assert_eq!(selection.sizes, vec![SizedRegion { width: 1600, height: 900, region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 } }], "the size it was at is remembered; the offered one is now live");
+        ui.send(Act::CaptureWatch { window, selection }, &tx, &replies);
+        // the save runs off the reactor; the Bind follows it
+        let bound = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(c) = rx.try_recv() {
+                    return c;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let bound = bound.expect("the Bind went out");
+        assert!(matches!(bound, Command::Bind { window: 42, .. }), "{bound:?}");
+        assert!(rx.try_recv().is_err(), "one key, one Bind");
+        let answer = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(ui.capture_reply(answer), Act::Nothing);
+        // the course's selection is on disk, the other course untouched
+        let after = Selections::load(&dir.path().join("capture.json")).unwrap();
+        let kept = after.get("Machine Learning").unwrap();
+        assert_eq!((kept.descriptor.width, kept.descriptor.height, kept.region), (1280, 720, Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 }));
+        assert_eq!(after.get("Statistics"), Some(&other));
+        // a relocation updates the TUI's own saved selection, without rereading the file
+        let moved = saved_selection().with_size(1920, 1200, Region { x: 0.02, y: 0.02, w: 0.96, h: 0.96 });
+        ui.event(&Event::CaptureMoved { selection: moved.clone(), note: "found again".into() }, Instant::now());
+        assert_eq!(ui.capture.as_ref().unwrap().saved, Some(moved));
+    }
+
+    /// Every state that cannot act says why and sends nothing: unbound, paused, denied, failing,
+    /// asking with none, two or an unknown size offered, a window that is not the saved one,
+    /// nothing watched at all — and stopping, where core has already dropped capture.
+    #[test]
+    fn unsafe_ctrl_s_sends_nothing_and_says_why() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        let notice = |ui: &mut Ui, e: &Event| {
+            ui.event(e, Instant::now());
+            let act = ui.key(ctrl('s'), Instant::now());
+            assert_eq!(act, Act::Redraw, "{e:?}");
+            ui.notice.clone()
+        };
+        assert_eq!(notice(&mut ui, &Event::Capture(CaptureState::Unbound)).as_deref(), Some("No window is chosen for this course yet: choose it once in the LectureLive app. Screenshots (⌘⇧4) still become slides."));
+        assert_eq!(notice(&mut ui, &Event::Capture(CaptureState::Paused { window: "Zoom Meeting".into(), reason: "minimised".into() })).as_deref(), Some("Capture is paused; it comes back by itself when the window is back."));
+        assert_eq!(notice(&mut ui, &Event::Capture(CaptureState::Denied)).as_deref(), Some("Screen Recording is off for this terminal; the Slides pane has the steps to turn it on."));
+        assert_eq!(notice(&mut ui, &Event::Capture(CaptureState::Failing { window: "Zoom Meeting".into(), reason: "blank".into() })).as_deref(), Some("Capture is failing; the Slides pane says why."));
+        assert_eq!(notice(&mut ui, &asking(vec![])).as_deref(), Some("No window to watch is being offered; the Slides pane says what capture is waiting for."));
+        assert_eq!(notice(&mut ui, &asking(vec![candidate(42, 1280, 720), candidate(43, 1280, 720)])).as_deref(), Some("More than one window is offered; choose between them in the LectureLive app."));
+        assert_eq!(notice(&mut ui, &asking(vec![candidate(42, 999, 600)])).as_deref(), Some("That window size has no saved region; choose where its slide is in the LectureLive app."));
+        let chrome = WindowInfo { id: 7, app: "Google Chrome".into(), bundle_id: Some("com.google.Chrome".into()), title: "Zoom Meeting".into(), width: 1280, height: 720, on_screen: true };
+        assert_eq!(notice(&mut ui, &asking(vec![chrome])).as_deref(), Some("The window offered is not the one saved; choose in the LectureLive app."));
+        // behind an overlay, Ctrl-S changes nothing
+        ui.key(ctrl('h'), Instant::now());
+        assert_eq!(ui.key(ctrl('s'), Instant::now()), Act::Nothing);
+        ui.key(key(KeyCode::Esc), Instant::now());
+        // stopping: core has dropped capture; no command, and the notice says so
+        ui.event(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), Instant::now());
+        ui.key(ctrl('c'), Instant::now());
+        assert_ne!(ui.view.phase, crate::stop::Stage::Listening);
+        assert_eq!(ui.key(ctrl('s'), Instant::now()), Act::Redraw);
+        assert_eq!(ui.notice.as_deref(), Some("Nothing is being watched yet."), "stopping refuses like an unwatched capture");
+        assert!(sent(&mut rx).is_empty(), "not one capture command in any of these states");
+    }
+
+    /// A watch-it whose save fails sends no `Bind` and surfaces the failure.
+    #[tokio::test]
+    async fn a_failed_watch_save_binds_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("capture.json"), "{ not json").unwrap(); // unreadable: the save fails
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&asking(vec![candidate(42, 1280, 720)]), Instant::now());
+        let act = ui.key(ctrl('s'), Instant::now());
+        assert!(matches!(act, Act::CaptureWatch { .. }));
+        ui.send(act, &tx, &replies);
+        let answer = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv()).await.unwrap().unwrap();
+        match answer {
+            CaptureReply::WatchFailed(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(sent(&mut rx).is_empty(), "no Bind without a save");
+        assert_eq!(ui.capture_reply(CaptureReply::WatchFailed(anyhow::anyhow!("read capture.json: not json"))), Act::Redraw);
+        assert!(ui.notice.as_deref().unwrap().contains("The window was not watched: saving its region failed"), "{:?}", ui.notice);
+        // the session's own asking state is untouched: the worker is still offering the window
+        assert!(matches!(ui.view.capture, Some(CaptureState::Asking { .. })));
     }
 
     /// A paste past the limit inserts nothing and says so; typing at the limit says so too.
@@ -1131,10 +1482,10 @@ mod tests {
         let mut ui = drawn_ui();
         type_in(&mut ui, "kept", Instant::now(), &tx);
         assert_eq!(ui.paste(&"x".repeat(input::HINT_CAP)), Act::Redraw);
-        assert_eq!((ui.hint.value(), ui.notice), ("kept", Some(PASTE_TOO_LONG)));
+        assert_eq!((ui.hint.value(), ui.notice.as_deref()), ("kept", Some(PASTE_TOO_LONG)));
         ui.paste(&"y".repeat(input::HINT_CAP - 4));
         press(&mut ui, key(KeyCode::Char('z')), Instant::now(), &tx);
-        assert_eq!(ui.notice, Some(HINT_FULL));
+        assert_eq!(ui.notice.as_deref(), Some(HINT_FULL));
     }
 
     /// A command the lecture can no longer take changes nothing: no queue entry, the hint kept.
@@ -1145,7 +1496,7 @@ mod tests {
         let mut ui = drawn_ui();
         type_in(&mut ui, "late", Instant::now(), &tx);
         press(&mut ui, key(KeyCode::Enter), Instant::now(), &tx);
-        assert_eq!((ui.hint.value(), ui.view.work.mine(), ui.notice), ("late", false, Some(ENDED)));
+        assert_eq!((ui.hint.value(), ui.view.work.mine(), ui.notice.as_deref()), ("late", false, Some(ENDED)));
     }
 
     /// Plan Task 10: the lanes follow what the TUI actually submits, and typed events alone.

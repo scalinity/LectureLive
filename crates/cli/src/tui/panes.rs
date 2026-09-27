@@ -12,11 +12,14 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use lecturelive_core::capture::worker::CaptureState;
 use lecturelive_core::session::segments::SegmentSource;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::capture;
 
 use super::markdown::{self, Block, Chunk, Kind, Lead};
 use super::state::{Line, Notes, View, PREVIEW_CAP};
@@ -453,6 +456,8 @@ pub(crate) struct Ink<'a> {
     pub(crate) quote: &'a str,
     pub(crate) slide: &'a str,
     pub(crate) rule: &'a str,
+    /// The attention mark (denied capture in the slides pane).
+    pub(crate) warn: &'a str,
     pub(crate) teal: Style,
 }
 
@@ -893,6 +898,231 @@ pub(crate) fn activity(buf: &mut Buffer, body: Rect, ring: &super::state::Ring, 
         let (after, _) = buf.set_stringn(at, y, drawn(&text[b..rest]), room, Style::new().add_modifier(Modifier::BOLD));
         buf.set_stringn(after, y, drawn(&text[rest..r.text.end]), room.saturating_sub((after - at) as usize), body_style);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The slides pane (Task 11): the capture state, then the registered slides, newest last. Textual
+// only — no thumbnails (plan §M) — each slide its two rows: the time it was shown and `Slide N`,
+// then how it came to be (auto, auto while it still changes, or the person's own). The reader's
+// place is a slide's canonical index, never a row number, so a resize (a slide's rows never
+// rewrap) keeps it exactly, and a slide refreshed in place moves nothing.
+
+/// A slide's rows in the pane: its label, then how it came to be.
+const SLIDE_ROWS: usize = 2;
+
+/// One drawn row of the capture block: its parts, already clipped by the draw.
+type BlockRow = Vec<(String, Style)>;
+
+/// The reader's place in the slides (plan §F per-pane scroll, UI-local): following the newest,
+/// or held at a slide's canonical index and the row within it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SlidesScroll {
+    held: Option<SlidesHeld>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SlidesHeld {
+    /// The slide's registration index: durable, unlike a row number.
+    index: u32,
+    /// 0: the label row; 1: the provenance row.
+    row: usize,
+    /// Slides the view held when the reader left the newest: every one after is new below.
+    seen: usize,
+}
+
+impl SlidesScroll {
+    /// Whether the reader has left the newest slide.
+    #[cfg(test)]
+    pub(crate) fn following(&self) -> bool {
+        self.held.is_none()
+    }
+
+    /// The anchor, while scrolled.
+    #[cfg(test)]
+    pub(crate) fn anchor(&self) -> Option<(u32, usize)> {
+        self.held.map(|h| (h.index, h.row))
+    }
+
+    /// Slides registered below since the reader left the newest; none while following.
+    pub(crate) fn unseen(&self, v: &View) -> Option<usize> {
+        self.held.map(|h| v.slides.len().saturating_sub(h.seen))
+    }
+
+    /// Where a slide's index is in the view's ordered list, as its first flat row.
+    fn at(v: &View, index: u32) -> Option<usize> {
+        v.slides.iter().position(|s| s.index == index).map(|p| p * SLIDE_ROWS)
+    }
+
+    /// One reading move through the slides in `list`, as it was last drawn: as the panes' (up
+    /// leaves the newest, down to it follows again, Esc goes back). Returns whether anything moved.
+    pub(crate) fn apply(&mut self, m: Move, v: &View, list: Rect) -> bool {
+        if m == Move::Live {
+            return self.held.take().is_some();
+        }
+        let (height, total) = (list.height as usize, v.slides.len() * SLIDE_ROWS);
+        if height == 0 || total == 0 {
+            return false;
+        }
+        let live_top = total.saturating_sub(height);
+        let k = match m {
+            Move::PageUp | Move::PageDown => height.saturating_sub(2).max(1),
+            _ => m.rows(),
+        };
+        let held = match m {
+            Move::Up(_) | Move::PageUp => {
+                let here = match self.held {
+                    Some(h) => Self::at(v, h.index).map(|r| r + h.row).unwrap_or(live_top),
+                    None if live_top == 0 => return false, // it all fits: nothing above
+                    None => live_top,
+                };
+                let to = here.saturating_sub(k);
+                let held = Some(SlidesHeld { index: v.slides[to / SLIDE_ROWS].index, row: to % SLIDE_ROWS, seen: self.held.map_or(v.slides.len(), |h| h.seen) });
+                if self.held == held {
+                    return false;
+                }
+                held
+            }
+            Move::Down(_) | Move::PageDown => {
+                let Some(h) = self.held else { return false };
+                let Some(here) = Self::at(v, h.index).map(|r| r + h.row) else { return self.held.take().is_some() };
+                let to = (here + k).min(total - 1);
+                if to >= live_top {
+                    self.held = None;
+                    return true;
+                }
+                let held = Some(SlidesHeld { index: v.slides[to / SLIDE_ROWS].index, row: to % SLIDE_ROWS, seen: h.seen });
+                if self.held == held {
+                    return false;
+                }
+                held
+            }
+            Move::Live => unreachable!("taken above"),
+        };
+        self.held = held;
+        true
+    }
+}
+
+/// The capture state as the pane heads with it (plan §H): the teal live edge while a window is
+/// watched, the attention word in signal red while capture needs the person, the Ctrl-S row the
+/// state allows — wrapped to the pane's width, never boxed.
+fn capture_block(state: &CaptureState, words: &capture::Words, action: &capture::Action, width: usize, ink: &Ink, signal: Style) -> Vec<BlockRow> {
+    let mut rows: Vec<BlockRow> = Vec::new();
+    let plain = Style::new();
+    // One logical line: a lead (a glyph or an attention word) then its text, wrapped beside it on
+    // the first row and two cells in below — a small block that keeps the pane's narrow width. A
+    // glyph lead takes one space, as the transcript's live edge does; a word takes two.
+    let line = |rows: &mut Vec<BlockRow>, lead: Vec<(&str, Style)>, text: String, style: Style| {
+        let lead_w: usize = lead.iter().map(|(s, _)| s.width()).sum();
+        let gap = if lead_w <= 2 { 1 } else { 2 };
+        let beside = lead_w + gap;
+        if lead_w > 0 && beside > width / 2 {
+            // a lead that would leave no room beside it (the narrow pane): its own row, then the
+            // text at the pane's full width
+            rows.push(lead.iter().map(|(s, st)| (s.to_string(), *st)).collect());
+            for r in wrap(&text, width.max(1)) {
+                rows.push(vec![(text[r].to_string(), style)]);
+            }
+            return;
+        }
+        for (i, r) in wrap(&text, width.saturating_sub(beside.max(2)).max(1)).into_iter().enumerate() {
+            let mut row: BlockRow = Vec::new();
+            if i == 0 && lead_w > 0 {
+                row.extend(lead.iter().map(|(s, st)| (s.to_string(), *st)));
+                row.push((" ".repeat(gap), plain));
+            } else if lead_w > 0 {
+                row.push(("  ".to_string(), plain));
+            }
+            row.push((text[r].to_string(), style));
+            rows.push(row);
+        }
+    };
+    match state {
+        CaptureState::Watching { window } => {
+            line(&mut rows, vec![(ink.edge, ink.teal)], format!("Watching {window}"), plain);
+            if matches!(action, capture::Action::Now) {
+                rows.push(ctrl_s("capture now"));
+            }
+        }
+        CaptureState::Unbound => {
+            line(&mut rows, vec![], format!("No Zoom window chosen for {} yet: choose it once in the LectureLive app.", words.course), plain);
+            line(&mut rows, vec![], "Screenshots (⌘⇧4) still become slides.".into(), DIM);
+        }
+        CaptureState::Paused { window, reason } => line(&mut rows, vec![("Paused", signal)], format!("{window}: {reason}"), plain),
+        CaptureState::Asking { reason, .. } => {
+            line(&mut rows, vec![("Asking", signal)], reason.clone(), plain);
+            if matches!(action, capture::Action::Watch { .. }) {
+                rows.push(ctrl_s("watch it"));
+            }
+        }
+        CaptureState::Denied => {
+            line(&mut rows, vec![(ink.warn, signal)], format!("Screen Recording is off for {}", words.host), signal);
+            line(&mut rows, vec![], "System Settings → Privacy & Security → Screen & System Audio Recording,".into(), DIM);
+            line(&mut rows, vec![], format!("then quit and reopen {}.", words.host), DIM);
+        }
+        CaptureState::Failing { window, reason } => line(&mut rows, vec![("Capture failing", signal)], format!("{window}: {reason}"), plain),
+    }
+    rows
+}
+
+/// The Ctrl-S row, in the footer's chord vocabulary: the chord bold, what it does dim.
+fn ctrl_s(what: &str) -> BlockRow {
+    vec![("  ".into(), Style::new()), ("^S".into(), Style::new().add_modifier(Modifier::BOLD)), (" ".into(), Style::new()), (what.into(), DIM)]
+}
+
+/// Draws the slides pane into `body` — the capture state, a breath, then the registered slides,
+/// following the newest or scrolled from the anchor — and says where the list went, for the
+/// reading keys: none when the capture block left no room.
+pub(crate) fn slides(buf: &mut Buffer, body: Rect, v: &View, scroll: &SlidesScroll, action: &capture::Action, words: &capture::Words, ink: &Ink, signal: Style) -> Option<Rect> {
+    if body.height == 0 {
+        return None;
+    }
+    let mut y = body.y;
+    let block = v.capture.as_ref().map(|s| capture_block(s, words, action, body.width as usize, ink, signal)).unwrap_or_default();
+    for row in &block {
+        if y >= body.bottom() {
+            return None;
+        }
+        let mut x = body.x;
+        for (text, style) in row {
+            let (after, _) = buf.set_stringn(x, y, text, (body.right().saturating_sub(x)) as usize, *style);
+            x = after;
+        }
+        y += 1;
+    }
+    if !block.is_empty() && y < body.bottom() {
+        y += 1; // a breath between the state and the slides
+    }
+    let list = Rect::new(body.x, y, body.width, body.bottom().saturating_sub(y));
+    let total = v.slides.len() * SLIDE_ROWS;
+    if total == 0 {
+        if block.is_empty() {
+            buf.set_stringn(body.x, body.y, "No slides yet.", body.width as usize, DIM);
+        }
+        return None;
+    }
+    let live_top = total.saturating_sub(list.height as usize);
+    let start = match scroll.held {
+        Some(h) => SlidesScroll::at(v, h.index).map(|r| r + h.row).unwrap_or(live_top),
+        None => live_top,
+    };
+    for (row, y) in (start..total).zip(list.y..list.bottom()) {
+        let s = &v.slides[row / SLIDE_ROWS];
+        if row % SLIDE_ROWS == 0 {
+            buf.set_stringn(list.x, y, s.shown_at.format("%H:%M:%S").to_string(), TIME, DIM);
+            let (after, _) = buf.set_stringn(list.x + LANE as u16, y, ink.slide, 2, ink.teal);
+            buf.set_stringn(after + 1, y, format!("Slide {}", s.index), (list.right().saturating_sub(after + 1)) as usize, Style::new());
+        } else {
+            // the provenance under the label row, as the transcript's `recovered` sits under its time
+            let how = match (s.auto, s.uncertain) {
+                (true, false) => "auto",
+                (true, true) => "auto / unsettled",
+                _ => "manual",
+            };
+            buf.set_stringn(list.x, y, how, list.width as usize, DIM);
+        }
+    }
+    Some(list)
 }
 
 /// The time a slide embed was shown: the registered slide whose file it names (by its path, or its
@@ -1377,7 +1607,7 @@ mod tests {
 ![Slide 17](slides/slide_17_103941.png)\n\n> the lecturer's aside\n\n```\nse = sd / sqrt(n)\n    indented\n```\n\n\
 | n | se |\n|---|---|\n| 25 | 2.0 |\n\n<!-- 10:41:52 -->\n## Sample size\n- 標本サイズ 🎓\n";
 
-    const NOTE_INK: Ink<'static> = Ink { edge: "▎", bullet: "•", quote: "│", slide: "▣", rule: "─", teal: TEAL };
+    const NOTE_INK: Ink<'static> = Ink { edge: "▎", bullet: "•", quote: "│", slide: "▣", rule: "─", warn: "▲", teal: TEAL };
 
     fn notes_view(doc: &str) -> View {
         use crate::tui::hydrate::NotesSnapshot;
@@ -1669,5 +1899,203 @@ mod tests {
         let a = s.anchor().unwrap();
         assert!(a.chunk < v.notes.chunks.len(), "{a:?}");
         assert!(s.apply(Move::Down(1), &v, &p, Rect::new(0, 0, 60, 6)) && !s.scrolled());
+    }
+
+    // ---- the slides pane (Task 11) -------------------------------------------------------------
+
+    use lecturelive_core::capture::detect::Region;
+    use lecturelive_core::capture::select::{Descriptor, Selection, SizedRegion};
+    use lecturelive_core::capture::window::WindowInfo;
+    use lecturelive_core::capture::worker::CaptureState;
+
+    /// Zoom's meeting window, saved with a region at each of its two sizes (as in capture.rs).
+    fn saved_selection() -> Selection {
+        Selection {
+            descriptor: Descriptor { bundle_id: Some("us.zoom.xos".into()), app: "zoom.us".into(), title: "Zoom Meeting".into(), width: 1600, height: 900 },
+            region: Region { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+            leave_out: vec![],
+            sizes: vec![SizedRegion { width: 1280, height: 720, region: Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 } }],
+        }
+    }
+
+    fn words() -> crate::capture::Words {
+        crate::capture::Words { course: identity().course, host: "Terminal" }
+    }
+
+    const SIGNAL: Style = Style::new().fg(ratatui::style::Color::Red);
+
+    fn draw_slides(v: &View, s: &SlidesScroll, action: &crate::capture::Action, width: u16, height: u16) -> (Buffer, Vec<String>) {
+        let mut b = Buffer::empty(Rect::new(0, 0, width, height));
+        let area = b.area;
+        slides(&mut b, area, v, s, action, &words(), &NOTE_INK, SIGNAL);
+        (b.clone(), (0..height).map(|y| row_text(&b, y)).collect())
+    }
+
+    /// A lecture with `n` slides of mixed provenance, watching a window.
+    fn slides_view(n: u32, state: CaptureState) -> View {
+        let mut v = view(0);
+        v.reduce(&Event::Capture(state), at(0));
+        for index in 1..=n {
+            let (auto, uncertain) = match index % 3 {
+                0 => (true, true),
+                1 => (false, false),
+                _ => (true, false),
+            };
+            v.reduce(&Event::Slide { index, file: format!("slides/slide_{index:02}_100000.png"), auto, uncertain, shown_at: at(u64::from(index) * 60) }, at(0));
+        }
+        v
+    }
+
+    /// The pane heads with the capture state and lists the slides newest last, each with its
+    /// time, its number and how it came to be; empty, it says so.
+    #[test]
+    fn the_slides_pane_shows_state_then_provenance() {
+        let watch = crate::capture::Action::Now;
+        let v = slides_view(3, CaptureState::Watching { window: "Zoom Meeting".into() });
+        let (b, l) = draw_slides(&v, &SlidesScroll::default(), &watch, 28, 12);
+        assert_eq!(
+            l[..8],
+            [
+                "▎ Watching Zoom Meeting",
+                "  ^S capture now",
+                "",
+                "10:01:00  ▣ Slide 1",
+                "manual",
+                "10:02:00  ▣ Slide 2",
+                "auto",
+                "10:03:00  ▣ Slide 3",
+            ]
+        );
+        assert_eq!(b[(0, 0)].fg, ratatui::style::Color::Cyan, "the live edge");
+        assert!(b[(2, 1)].modifier.contains(Modifier::BOLD), "^S bold");
+        assert!(b[(5, 1)].modifier.contains(Modifier::DIM), "capture now dim");
+        assert_eq!(b[(0, 3)].modifier, Modifier::DIM, "the time gutter");
+        assert_eq!(b[(10, 3)].fg, ratatui::style::Color::Cyan, "the slide glyph teal");
+        assert_eq!(b[(10, 3)].modifier, Modifier::empty());
+        assert_eq!(b[(0, 4)].modifier, Modifier::DIM, "the provenance dim, under the label row");
+        // an unsettled auto says so
+        let (_, l) = draw_slides(&slides_view(3, CaptureState::Watching { window: "Zoom Meeting".into() }), &SlidesScroll::default(), &watch, 28, 12);
+        assert_eq!(l[8], "auto / unsettled");
+        // empty: the placeholder is gone, the state still heads the pane
+        let empty = slides_view(0, CaptureState::Watching { window: "Zoom Meeting".into() });
+        let (_, l) = draw_slides(&empty, &SlidesScroll::default(), &watch, 28, 4);
+        assert_eq!(l[..2], ["▎ Watching Zoom Meeting", "  ^S capture now"]);
+        // no state and no slides: the pane says so (the fixture-less goldens)
+        let mut none = view(0);
+        none.capture = None;
+        let (_, l) = draw_slides(&none, &SlidesScroll::default(), &crate::capture::Action::Refused(crate::capture::Refusal::None), 28, 3);
+        assert_eq!(l[0], "No slides yet.");
+    }
+
+    /// Each attention state heads the pane with its own attention word, and only a safe asking
+    /// offers `^S watch it`; denied wraps its instructions inside the pane.
+    #[test]
+    fn attention_states_head_the_pane_and_only_a_safe_asking_offers_watch() {
+        let none = crate::capture::Action::Refused(crate::capture::Refusal::None);
+        let asking = |candidates: Vec<WindowInfo>| CaptureState::Asking { window: "Zoom Meeting".into(), reason: "Zoom Meeting is 1280 × 720 now; it was 1600 × 900".into(), candidates };
+        let candidate = WindowInfo { id: 42, app: "zoom.us".into(), bundle_id: Some("us.zoom.xos".into()), title: "Zoom Meeting".into(), width: 1280, height: 720, on_screen: true };
+        let v = slides_view(1, asking(vec![candidate]));
+        let watch = crate::capture::action(v.capture.as_ref(), Some(&saved_selection()));
+        let (b, l) = draw_slides(&v, &SlidesScroll::default(), &watch, 28, 10);
+        assert!(l[0].starts_with("Asking  Zoom Meeting is"), "{l:?}");
+        assert_eq!(l[3], "  ^S watch it");
+        assert_eq!(b[(0, 0)].fg, ratatui::style::Color::Red, "the attention word");
+        // the same state without a saved region: no Ctrl-S row
+        let refused = crate::capture::action(v.capture.as_ref(), None);
+        let (_, l) = draw_slides(&v, &SlidesScroll::default(), &refused, 28, 10);
+        assert!(!l.iter().any(|r| r.contains("^S")), "{l:?}");
+        // paused, failing, unbound
+        for (state, first) in [
+            (CaptureState::Paused { window: "Zoom Meeting".into(), reason: "the window is minimised".into() }, "Paused  Zoom Meeting: the"),
+            (CaptureState::Failing { window: "Zoom Meeting".into(), reason: "3 failed captures in a row".into() }, "Capture failing"),
+            (CaptureState::Unbound, "No Zoom window chosen for"),
+        ] {
+            let v = slides_view(1, state);
+            let (_, l) = draw_slides(&v, &SlidesScroll::default(), &none, 28, 10);
+            assert!(l[0].starts_with(first), "{:?}: {:?}", v.capture, l);
+        }
+        // denied: the warning, then the steps, wrapped inside 28 columns
+        let v = slides_view(1, CaptureState::Denied);
+        let (b, l) = draw_slides(&v, &SlidesScroll::default(), &none, 28, 10);
+        assert!(l[0].starts_with("▲ Screen Recording is off"), "{l:?}");
+        assert!(l.iter().take(4).any(|r| r.contains("System Settings → Privacy")), "{l:?}");
+        assert!(l.iter().take(7).any(|r| r.contains("then quit and reopen")), "{l:?}");
+        assert!(l.iter().take(7).any(|r| r.contains("Terminal.")), "{l:?}");
+        assert_eq!(b[(0, 0)].fg, ratatui::style::Color::Red);
+        assert!(l.iter().all(|r| r.chars().count() <= 28), "nothing runs past the pane: {l:?}");
+    }
+
+    /// The slides follow their newest; up leaves the newest and counts what arrives below, Esc
+    /// goes back, and the anchor is a slide's index, so a resize keeps the reader's place.
+    #[test]
+    fn the_slides_follow_scroll_and_keep_their_anchor() {
+        let watch = crate::capture::Action::Now;
+        let v = slides_view(9, CaptureState::Watching { window: "Zoom Meeting".into() });
+        let mut s = SlidesScroll::default();
+        let list = Rect::new(0, 3, 28, 8); // below the two-row state and its breath
+        let (_, live) = draw_slides(&v, &s, &watch, 28, 11);
+        assert!(live[9].contains("Slide 9") && live[9].starts_with("10:09:00"), "the newest at the bottom: {live:?}");
+        assert_eq!(live[10].trim(), "auto / unsettled");
+        assert!(s.apply(Move::Up(2), &v, list));
+        assert!(!s.following());
+        assert_eq!(s.anchor().unwrap(), (5, 0), "a slide's index, not a row number");
+        let (_, up) = draw_slides(&v, &s, &watch, 28, 11);
+        assert!(up[3].contains("Slide 5"), "{up:?}");
+        // a new slide below moves nothing and is counted
+        let more = slides_view(10, CaptureState::Watching { window: "Zoom Meeting".into() });
+        assert_eq!(s.unseen(&more), Some(1));
+        let (_, still) = draw_slides(&more, &s, &watch, 28, 11);
+        assert_eq!(still[3], up[3], "the reader's place held");
+        // a resize: the list is taller, the same slide stays on top
+        let (_, at40) = draw_slides(&more, &s, &watch, 40, 18);
+        assert!(at40[3].contains("Slide 5"), "the anchor's slide on top at another width: {at40:?}");
+        // down to the end follows again; Esc from mid-way goes back
+        assert!(s.apply(Move::Down(100), &v, list));
+        assert!(s.following());
+        s.apply(Move::PageUp, &v, list);
+        assert!(!s.following());
+        assert_eq!(s.unseen(&v), Some(0));
+        assert!(s.apply(Move::Live, &v, list));
+        assert!(s.following());
+        // a slide refreshed in place (the same index) moves nothing
+        let mut refreshed = slides_view(10, CaptureState::Watching { window: "Zoom Meeting".into() });
+        s.apply(Move::Up(1), &v, list);
+        let held = s.anchor();
+        refreshed.reduce(&Event::Slide { index: 7, file: "slides/slide_07_100000.png".into(), auto: false, uncertain: false, shown_at: at(421) }, at(0));
+        assert_eq!(s.anchor(), held, "a refresh is not a move");
+    }
+
+    /// Tiny bodies draw nothing past their edge and never panic, with or without a state.
+    #[test]
+    fn slides_in_tiny_bodies_never_panic() {
+        for v in [slides_view(3, CaptureState::Watching { window: "Zoom Meeting".into() }), slides_view(3, CaptureState::Denied), slides_view(0, CaptureState::Unbound)] {
+            for (w, h) in [(0, 0), (1, 1), (5, 2), (10, 3), (11, 3), (28, 1), (28, 2), (0, 5), (40, 0)] {
+                let mut b = Buffer::empty(Rect::new(0, 0, w.max(1), h.max(1)));
+                let mut s = SlidesScroll::default();
+                slides(&mut b, Rect::new(0, 0, w, h), &v, &s, &crate::capture::Action::Now, &words(), &NOTE_INK, SIGNAL);
+                for m in [Move::Up(1), Move::PageUp, Move::Down(1), Move::PageDown, Move::Live] {
+                    s.apply(m, &v, Rect::new(0, 0, w, h));
+                }
+            }
+        }
+    }
+
+    /// ASCII chrome: the live edge, the warning mark and the slide glyph fall back; the wording
+    /// keeps its Unicode (⌘⇧4, →) as the lecture's own words do.
+    #[test]
+    fn ascii_slides_chrome_falls_back() {
+        let ink = Ink { edge: "|", bullet: "-", quote: "|", slide: "[]", rule: "-", warn: "!", teal: TEAL };
+        let mut b = Buffer::empty(Rect::new(0, 0, 28, 10));
+        let area = b.area;
+        let v = slides_view(2, CaptureState::Watching { window: "Zoom Meeting".into() });
+        slides(&mut b, area, &v, &SlidesScroll::default(), &crate::capture::Action::Now, &words(), &ink, SIGNAL);
+        let l: Vec<String> = (0..10).map(|y| row_text(&b, y)).collect();
+        assert!(l[0].starts_with("| Watching Zoom Meeting"), "{l:?}");
+        assert!(l[3].contains("[] Slide 1"), "{l:?}");
+        let mut b = Buffer::empty(Rect::new(0, 0, 28, 6));
+        let area = b.area;
+        let v = slides_view(0, CaptureState::Denied);
+        slides(&mut b, area, &v, &SlidesScroll::default(), &crate::capture::Action::Refused(crate::capture::Refusal::None), &words(), &ink, SIGNAL);
+        assert!(row_text(&b, 0).starts_with("! Screen Recording is off"), "{:?}", row_text(&b, 0));
     }
 }

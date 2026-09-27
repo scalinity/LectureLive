@@ -411,3 +411,51 @@ fn the_hint_line_sends_exactly_what_was_asked() {
     let after = l.restored(listening);
     l.at("saved", after);
 }
+
+/// Plan Task 11: the `capture` fixture, whose command log is the count. Ctrl-S while watching
+/// sends exactly one `capture-now` and the slide itself arrives as its own event; the safe
+/// asking (the one window offered, at a size the saved selection remembers) sends exactly one
+/// `bind` for that window and region; the unsafe asking (a size with no region) sends nothing;
+/// Ctrl-S once stopping sends nothing. The scripted relocation is kept in the lecture folder's
+/// own selections file, never the person's data folder (HOME stays empty). The waits are on
+/// whole written words: the frame is a diff, so a phrase split across changed cells never
+/// appears contiguously in the byte stream.
+#[test]
+fn the_capture_scenario_ctrl_s_sends_exactly_one_command_each() {
+    // wide, so the slides column — and every capture state in it — is on screen throughout
+    let mut l = tui("capture", &[], 140, 40);
+    let listening = l.listening();
+    // unbound first, then watching
+    l.pty.wait_for("Screenshots", listening, SOON);
+    let watching = l.pty.wait_for("capture now", listening, SOON);
+    l.pty.write(b"\x13"); // Ctrl-S
+    assert_eq!(wait_commands(&l, 1), ["capture-now"]);
+    // the slide itself arrives as its own canonical event — never fabricated from the reply
+    let captured = l.pty.wait_for("captured-", watching, SOON);
+    // the safe asking: one offered window at 1280 × 720, a size the saved selection remembers —
+    // its Ctrl-S row is on screen exactly while the offering is safe
+    let watch_it = l.pty.wait_for("watch it", captured, Duration::from_secs(20));
+    l.pty.write(b"\x13"); // Ctrl-S: watch it
+    assert_eq!(wait_commands(&l, 2)[1], "bind\t42\tus.zoom.xos|zoom.us|Zoom Meeting|1280×720|(0.05,0.12,0.9,0.7)");
+    let watching_again = l.pty.wait_for("capture now", watch_it, SOON);
+    // the unsafe asking: a size with no saved region — no bind, a notice instead
+    let unsafe_asking = l.pty.wait_for("999", watching_again, Duration::from_secs(20));
+    l.pty.write(b"\x13");
+    l.pty.wait_for("saved", unsafe_asking, SOON);
+    assert_eq!(commands(&l).len(), 2);
+    // the relocation (and the watching after it) recovers the pane; its save — the adapter's,
+    // before any notice — is in the lecture folder's own file, never the person's data folder
+    let found = l.pty.wait_for("Watching", unsafe_asking, Duration::from_secs(20));
+    let kept = std::fs::read_to_string(l.dir.join(".live_notes/fixture-capture.json")).unwrap_or_default();
+    assert!(kept.contains("\"Fixture Course\"") && kept.contains("\"width\": 1280"), "{kept}");
+    // one Ctrl-C stops; Ctrl-S while stopping sends no capture command
+    l.pty.write(CTRL_C);
+    let stopped = l.pty.wait_for("Stopping", found, SOON);
+    l.pty.write(b"\x13");
+    let status = l.pty.wait(Duration::from_secs(20));
+    assert_eq!(code(status, &l), Some(0));
+    assert_eq!(commands(&l), ["capture-now", "bind\t42\tus.zoom.xos|zoom.us|Zoom Meeting|1280×720|(0.05,0.12,0.9,0.7)", "stop"], "no capture command from an unsafe asking or a stopping lecture");
+    let after = l.restored(stopped);
+    l.at("saved", after);
+    assert!(untouched(&l.home), "the person's data folder was never reached");
+}
