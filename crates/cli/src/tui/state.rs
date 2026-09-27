@@ -368,16 +368,18 @@ pub(crate) struct View {
     /// shared ledger is the authority; no event's dollars are added to it.
     pub(crate) spend: Option<f64>,
     pub(crate) activity: Ring,
-    /// The notice line (plan §H): the input that is gone, while it is gone; else the latest notice.
+    /// The latest ordinary notice (plan §H's fourth priority): the last thing that happened,
+    /// whatever higher-priority condition may be holding the line above it.
     pub(crate) notice: Option<Notice>,
     /// The notice line holds a transcription-connection notice (interrupted, server, stopped,
     /// refused): a real `Connected` makes it untrue, so that one clears the line — and only then.
     /// Set from the event's type as the notice is recorded, never read back from its words.
     stt_notice: bool,
-    /// The notice line holds a capture notice that says capture needs the person (asking, or
-    /// Screen Recording denied): ordinary notices must not displace it (plan §H's second
-    /// priority), and healthy watching clears it. Typed here, never read back from the words.
-    capture_notice: bool,
+    /// Capture's persistent ask for the person (plan §H's second priority): the notice an Asking
+    /// or Denied state raised, held until healthy watching or a relocation resolves it — never
+    /// dropped by an input going or coming back, which only outranks it while it lasts. Typed
+    /// here as a condition, never read back from the words.
+    capture_hold: Option<Notice>,
     /// Whose Screen Recording permission a denial names, read once as the session starts.
     host: &'static str,
 }
@@ -415,14 +417,14 @@ impl View {
             activity: Ring::default(),
             notice: None,
             stt_notice: false,
-            capture_notice: false,
+            capture_hold: None,
             host: capture::host(),
         };
         // An empty projection merging its first read: one reconciliation rule for every hydration.
         v.merge(h);
         let at = Local::now();
         for n in seed {
-            v.record(n, at, false);
+            v.record(n, at);
         }
         v
     }
@@ -449,40 +451,43 @@ impl View {
             Event::Capture(s) => self.capture = Some(capture_cleaned(s)),
             _ => {}
         }
-        // The wording both frontends share: the ring always; the notice line when no input is gone.
-        // Capture is the exception plan §H makes: healthy watching is telemetry the ring keeps
-        // while the line stops claiming attention, and asking or denied holds the line against
-        // ordinary notices, because capture needs the person until core says otherwise.
+        // The wording both frontends share goes to the ring; the line is layered, not
+        // overwritten (plan §H): a gone input and capture's ask for the person are persistent
+        // conditions drawn above the latest ordinary notice, and neither erases the other — the
+        // frame picks between the typed conditions (View::input_gone_notice,
+        // View::capture_attention, View::notice).
         let words = self.capture_words();
+        let mixed = self.identity.kind == SourceKind::Mixed;
         match e {
-            Event::Capture(CaptureState::Watching { .. }) => {
-                if let Some(n) = plain::notice(e, WORDS, &words) {
+            // capture needs the person: the ask holds until core resolves it
+            Event::Capture(CaptureState::Asking { .. } | CaptureState::Denied) => {
+                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                    self.capture_hold = Some(n.clone());
                     self.to_ring(n, at);
                 }
-                if self.capture_notice {
-                    self.notice = None;
-                    self.capture_notice = false;
-                }
             }
-            Event::Capture(CaptureState::Asking { .. } | CaptureState::Denied) => {
-                if let Some(n) = plain::notice(e, WORDS, &words) {
-                    self.record(n, at, true);
+            // healthy watching is telemetry: the ring keeps it, the hold it ended is gone
+            Event::Capture(CaptureState::Watching { .. }) => {
+                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                    self.to_ring(n, at);
                 }
+                self.capture_hold = None;
             }
             Event::CaptureMoved { .. } => {
-                // The worker re-found the window through its new region: whatever the hold was
-                // asking for is resolved, and the relocation's own good news takes the line.
-                self.capture_notice = false;
-                if let Some(n) = plain::notice(e, WORDS, &words) {
-                    self.record(n, at, false);
+                // The worker re-found the window through its new region (Task 11): whatever the
+                // hold was asking for is resolved even before the next Watching telemetry, and
+                // the relocation's own good news takes the ordinary slot.
+                self.capture_hold = None;
+                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                    self.record(n, at);
                 }
             }
             _ => {
-                if let Some(n) = plain::notice(e, WORDS, &words) {
-                    self.record(n, at, false);
-                    // the flag tracks the line itself: never set while an input is gone or capture
-                    // holds it, so only a real Connected clears what the connection raised
-                    self.stt_notice = self.input_gone.is_none() && !self.capture_notice && matches!(e, Event::Session(Notification::Stt(_)));
+                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                    self.record(n, at);
+                    // the flag tracks the line itself: only a real Connected clears what the
+                    // connection raised, and only when this notice is what holds it
+                    self.stt_notice = matches!(e, Event::Session(Notification::Stt(_)));
                 }
             }
         }
@@ -498,7 +503,7 @@ impl View {
                 if let Some(w) = self.watch.as_mut() {
                     if w.observe(*l) {
                         self.silence = true;
-                        self.record(plain::no_signal(), at, false);
+                        self.record(plain::no_signal(), at);
                     } else if dbfs(*l) >= -60.0 {
                         self.silence = false;
                     }
@@ -509,22 +514,19 @@ impl View {
             Notification::Gap(g) if g.kind.is_transcript() => self.gap(g),
             Notification::Gap(_) => {}
             Notification::DeviceGone { uid } => {
+                // A single input's absence is the top-priority condition, held until the input
+                // returns; a mixed source keeps recording its loopback, so only the mark distinguishes
+                // the single case. Neither erases the capture hold or the ordinary notice: the frame
+                // picks the layer (plan §H).
                 if self.identity.kind == SourceKind::Input {
                     self.input_gone = Some(plain::clean(uid));
-                    // The top-priority notice holds the line until the input returns (plan §H).
-                    self.notice = Some(plain::input_gone(&plain::clean(uid)));
-                    self.stt_notice = false;
-                    self.capture_notice = false;
                 }
             }
-            Notification::DeviceBack { .. } => {
+            Notification::DeviceBack { uid: _ } => {
                 // The device returned; that says nothing about the signal: only this mark clears,
-                // never the silence or the level (only a level above the threshold does).
-                if self.input_gone.is_some() {
-                    self.input_gone = None;
-                    self.notice = None;
-                    self.capture_notice = false;
-                }
+                // never the silence or the level (only a level above the threshold does). The
+                // lower layers the gone input covered become visible again as they are.
+                self.input_gone = None;
             }
             Notification::Stt(s) => {
                 // The connection is back: a notice saying it is not no longer holds. The activity
@@ -595,6 +597,21 @@ impl View {
         self.host = host;
     }
 
+    /// The notice line's first priority (plan §H), from the typed condition alone: the single
+    /// input that is gone, while it is gone. A mixed source never holds the line for a missing
+    /// mic — its wording says the loopback keeps recording and it rides as an ordinary notice.
+    pub(crate) fn input_gone_notice(&self) -> Option<Notice> {
+        let uid = self.input_gone.as_ref()?;
+        Some(plain::input_gone(uid, self.identity.kind != SourceKind::Input))
+    }
+
+    /// The notice line's second priority: capture's ask for the person — asking, or Screen
+    /// Recording denied — while core has not resolved it. Watching and a relocation end it;
+    /// nothing else does.
+    pub(crate) fn capture_attention(&self) -> Option<&Notice> {
+        self.capture_hold.as_ref()
+    }
+
     /// A transcript gap seen, live or in a read: it waits unless it is resolved, and once resolved —
     /// here or earlier — it never waits again, because core never reopens a gap. Seeing it twice
     /// changes nothing.
@@ -643,7 +660,7 @@ impl View {
         text.push_str(&plain::clean(delta));
         if text.len() > PREVIEW_CAP && !n.capped {
             n.capped = true;
-            self.record(Notice { kind: "warn", label: "preview".into(), detail: "the snapshot being written is longer than 1 MiB; only its first 1 MiB is shown until it is committed".into() }, at, false);
+            self.record(Notice { kind: "warn", label: "preview".into(), detail: "the snapshot being written is longer than 1 MiB; only its first 1 MiB is shown until it is committed".into() }, at);
         }
     }
 
@@ -710,7 +727,7 @@ impl View {
     /// A background read that failed: the projection keeps what it holds, and the failure is said.
     /// Nothing retries on its own; the next discontinuity reads again.
     pub(crate) fn read_failed(&mut self, e: &anyhow::Error, at: DateTime<Local>) {
-        self.record(Notice { kind: "warn", label: "re-read".into(), detail: format!("the lecture's files could not be read again ({e:#}); what is shown still holds") }, at, false);
+        self.record(Notice { kind: "warn", label: "re-read".into(), detail: format!("the lecture's files could not be read again ({e:#}); what is shown still holds") }, at);
     }
 
     /// A relocation whose preference could not be kept (plan Task 11): the activity keeps the
@@ -719,23 +736,17 @@ impl View {
     /// §H's first priority); the ring keeps both truths either way.
     pub(crate) fn relocation_unsaved(&mut self, error: &str, at: DateTime<Local>) {
         let (kind, label, detail) = crate::capture::unsaved_words(error);
-        self.record(Notice { kind, label: label.into(), detail }, at, false);
+        self.record(Notice { kind, label: label.into(), detail }, at);
     }
 
-    /// One notice into the ring and the notice line: the input that is gone holds the line while it
-    /// is gone (plan §H's first priority); a notice saying capture needs the person holds it
-    /// against ordinary ones (the second); otherwise the latest notice is the line.
-    fn record(&mut self, n: Notice, at: DateTime<Local>, hold: bool) {
+    /// One notice into the ring and the ordinary slot: the line is drawn from the layers above
+    /// ([`Self::input_gone_notice`], [`Self::capture_attention`]) when they hold, so an ordinary
+    /// notice waits underneath them and shows as soon as they clear — never lost, never displacing
+    /// a condition that still stands.
+    fn record(&mut self, n: Notice, at: DateTime<Local>) {
         let n = Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) };
         self.activity.push(Activity { at, kind: n.kind, label: n.label.clone(), detail: n.detail.clone() });
-        if self.input_gone.is_some() {
-            return;
-        }
-        if self.capture_notice && !hold {
-            return; // capture still needs the person: an ordinary notice waits in the ring
-        }
         self.notice = Some(n);
-        self.capture_notice = hold;
         self.stt_notice = false;
     }
 
@@ -990,12 +1001,13 @@ mod tests {
         // and a Connected with no connection notice showing changes nothing
         v.reduce(&connected, at());
         assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot failed"));
-        // a gone input holds the line through a reconnect
+        // a gone input holds the line through a reconnect: the layers coexist, typed
         let mut w = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
         w.reduce(&retrying(), at());
         w.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
         w.reduce(&connected, at());
-        assert_eq!(w.notice.as_ref().map(|n| n.label.as_str()), Some("input gone"));
+        assert!(w.input_gone_notice().is_some(), "the input is still gone: the top layer holds");
+        assert_ne!(w.notice.as_ref().map(|n| n.label.as_str()), Some("transcription interrupted"), "the connection's notice is not what shows once it reconnected");
     }
 
     /// Plan §J: a refusal stays a refusal — semantically, not as a string — until a real later event
@@ -1213,50 +1225,59 @@ mod tests {
         v.reduce(&watching(), at());
         assert_eq!(v.capture, Some(CaptureState::Watching { window: "Zoom Meeting".into() }), "the typed state replaces the one before");
         assert!(!capture::attention(v.capture.as_ref().unwrap()), "healthy: no attention");
-        assert_eq!(v.notice, None, "healthy telemetry is not the line");
+        assert_eq!(v.capture_attention(), None, "healthy telemetry is not the line");
         v.reduce(&asking(), at());
         assert!(capture::attention(v.capture.as_ref().unwrap()));
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("asking"), "asking holds the line (plan §H's second priority)");
-        assert!(v.capture_notice);
-        // an ordinary notice does not displace it
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"), "asking holds the line (plan §H's second priority)");
+        // an ordinary notice does not displace it: the hold is drawn above the ordinary slot
         v.reduce(&Event::NothingNew, at());
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("asking"));
-        // a relocation is ordinary good news, but the state is still asking until core says
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot"));
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"), "the ask still stands above it");
+        // a relocation is ordinary good news, and it ends the hold before watching says so (Task 11)
         v.reduce(&Event::CaptureMoved { selection: selection(), note: "the slide was found again there".into() }, at());
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("found again"), "the hold gave way to the relocation's own notice");
+        assert_eq!(v.capture_attention(), None, "the relocation resolved the ask");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("found again"), "its own good news takes the ordinary slot");
         v.reduce(&asking(), at());
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("asking"));
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"));
         // found again: healthy watching clears the stale warning
         v.reduce(&watching(), at());
         assert!(!capture::attention(v.capture.as_ref().unwrap()));
-        assert_eq!(v.notice, None, "no stale asking warning after healthy watching");
-        assert!(!v.capture_notice);
+        assert_eq!(v.capture_attention(), None, "no stale asking warning after healthy watching");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("found again"), "the ordinary notice the hold covered shows again");
         // the ring keeps the whole history
         let labels: Vec<&str> = v.activity.records().iter().map(|a| a.label.as_str()).collect();
         assert_eq!(labels, vec!["watching", "asking", "snapshot", "found again", "asking", "watching"]);
     }
 
-    /// Plan §H's notice priorities, typed: a gone input outranks capture asking, capture asking
-    /// outranks the latest ordinary notice, and healthy capture telemetry never erases one.
+    /// Plan §H's notice priorities, typed: a gone input outranks capture's ask, and neither
+    /// erases the other — the ask is a persistent condition that outlives the input's absence,
+    /// so it is what shows the moment the input returns. Paused, failing and unbound are ordinary
+    /// notices, not holds; healthy watching repeated erases nothing.
     #[test]
     fn capture_notice_priority() {
-        // a gone input holds the line through an asking
+        // a gone input holds the line through an asking; both conditions exist, typed
         let mut v = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
         v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
         v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "gone".into(), candidates: vec![] }), at());
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input gone"), "the first priority keeps the line");
+        assert!(v.input_gone_notice().is_some(), "the first priority keeps the line");
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"), "the second priority still exists beneath it");
         assert!(v.activity.records().iter().any(|a| a.label == "asking"), "the ring still keeps the transition");
-        // the input back: its own good news takes the line (the capture hold went with the input)
+        // the input back: the capture ask did not go with it — capture still needs the person
         v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input back"));
-        // denied holds the line; paused, failing and unbound are ordinary notices
+        assert_eq!(v.input_gone_notice(), None);
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"), "the ask survived the input's round trip");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input back"), "the return is the ordinary notice underneath");
+        assert!(v.activity.records().iter().any(|a| a.label == "input back"));
+        // denied holds the line the same way; watching ends it
         v.reduce(&Event::Capture(CaptureState::Denied), at());
-        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("screen recording"));
-        assert!(v.capture_notice);
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("screen recording"));
         v.reduce(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), at());
+        assert_eq!(v.capture_attention(), None, "healthy: nobody is asked for");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input back"), "the ordinary notice the hold covered shows again");
+        // paused, failing and unbound are ordinary notices, not holds
         v.reduce(&Event::Capture(CaptureState::Paused { window: "Zoom Meeting".into(), reason: "minimised".into() }), at());
         assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("paused"), "an ordinary capture notice is the latest notice");
-        assert!(!v.capture_notice);
+        assert_eq!(v.capture_attention(), None);
         // and an ordinary notice can displace it again
         v.reduce(&Event::NothingNew, at());
         assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot"));
@@ -1283,9 +1304,19 @@ mod tests {
         let mut v = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
         assert!(!v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at()).hydrate, "a gone input never re-reads files");
         assert_eq!(v.input_gone.as_deref(), Some("Receiver_UID"));
-        assert!(v.notice.as_ref().is_some_and(|n| n.label == "input gone"), "the top-priority notice holds the line");
+        let n = v.input_gone_notice().expect("the top-priority notice holds the line");
+        assert_eq!((n.kind, n.label.as_str()), ("warn", "Receiver_UID"), "the uid is the line's bold label");
+        assert_eq!(n.detail, "is unplugged. LectureLive waits for it and records nothing meanwhile.");
         v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
         assert_eq!(v.input_gone, None);
+        assert_eq!(v.input_gone_notice(), None, "the condition cleared with it");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("input back"), "the return is the ordinary notice");
+        // a mixed source never holds the line for a missing mic: the wording says Zoom still records
+        let mut m = View::new(identity(SourceKind::Mixed), Hydration::empty(), Vec::new());
+        m.reduce(&Event::Session(Notification::DeviceGone { uid: "Mic-UID".into() }), at());
+        assert_eq!(m.input_gone, None, "no top-priority condition");
+        let n = m.notice.as_ref().expect("the ordinary notice says it");
+        assert_eq!((n.label.as_str(), n.detail.as_str()), ("Mic-UID", "is unplugged. LectureLive waits for it; Zoom's audio still records meanwhile."));
     }
 
     /// Plan §J: `DeviceBack` says the device returned, not that signal resumed. The loopback's
@@ -1305,6 +1336,163 @@ mod tests {
         assert_eq!(v.level, Some(quiet));
         v.reduce(&Event::Session(Notification::Level(0.5)), at());
         assert!(!v.silence, "a real level clears it");
+    }
+
+    /// The loopback silence warning clears only on a level at or above −60 dBFS (plan §H): a
+    /// device returning, a transcription reconnecting, a snapshot succeeding and time passing
+    /// (more quiet samples) each leave it standing.
+    #[test]
+    fn loopback_silence_clears_only_on_real_signal() {
+        let mut v = view();
+        let quiet = 10f32.powf(-70.0 / 20.0); // −70 dBFS: silent, but not the very bottom
+        for _ in 0..10 {
+            v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(v.silence);
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
+        assert!(v.silence, "a device returning is not signal");
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
+        assert!(v.silence, "a transcription reconnecting is not signal");
+        v.reduce(&Event::NothingNew, at());
+        v.reduce(&Event::Committed { words: 1, slides: 0, block: "<!-- 10:00:00 -->\n- x\n".into(), usd: 0.0, confirmed: true, removed: 0, missing: 0, revision: 1 }, at());
+        assert!(v.silence, "a snapshot succeeding is not signal");
+        for _ in 0..60 {
+            v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(v.silence, "elapsed quiet time is not signal either");
+        assert_eq!(v.activity.records().iter().filter(|a| a.label == "no signal").count(), 1, "one warning per silent stretch");
+        let heard = 10f32.powf(-55.0 / 20.0); // −55 dBFS: at or above the threshold
+        v.reduce(&Event::Session(Notification::Level(heard)), at());
+        assert!(!v.silence, "a real level clears it");
+    }
+
+    /// Plan §J `audio_loss_is_not_labelled_recovered` (Task 12's missing test): an audio gap has
+    /// no durable audio for its interval, so it never counts as a transcript gap waiting for
+    /// recovery, its wording says the loss truthfully, and a defensively synthetic `Recovered`
+    /// for one is never dressed as a recovered transcript.
+    #[test]
+    fn audio_loss_is_not_labelled_recovered() {
+        let mut v = view();
+        let before = v.gaps();
+        v.reduce(&Event::Session(Notification::Gap(audio_gap())), at());
+        assert_eq!(v.gaps(), before, "an audio gap never opens a transcript count");
+        let n = v.notice.as_ref().expect("the loss is said");
+        assert_eq!((n.kind, n.label.as_str()), ("warn", "gap"));
+        assert_eq!(n.detail, "the recording's audio was lost for 2.0–3.0 s of recording 00000000-0000-0000-0000-000000000000; it cannot be recovered from the recording");
+        assert!(!n.detail.contains("recovery fills it in") && !n.detail.contains("waiting"), "never a recovery promised");
+        assert!(v.activity.records().iter().any(|a| a.label == "gap" && a.detail.contains("cannot be recovered")), "the ring keeps the loss");
+        // the defensive half: a synthetic Recovered for an audio gap — core never sends one — is
+        // not dressed as a recovered transcript, and cannot decrement a count that never opened
+        let mut resolved_audio = audio_gap();
+        resolved_audio.resolved = true;
+        v.reduce(&Event::Session(Notification::Recovered(resolved_audio)), at());
+        assert_eq!(v.gaps(), before, "nothing was recovered out of a count that never was");
+        let n = v.notice.as_ref().expect("the truth is said");
+        assert_eq!(n.label, "gap", "not a recovery");
+        assert!(!n.detail.contains("the transcript of"), "no transcript is claimed");
+        assert!(n.detail.contains("there is no transcript to recover"));
+        // and a real transcript gap still words the other truth: recovery pending
+        v.reduce(&Event::Session(Notification::Gap(transcript_gap())), at());
+        let n = v.notice.as_ref().unwrap();
+        assert!(n.detail.contains("recovery fills it in when it can"), "{}", n.detail);
+    }
+
+    /// `RecoveryFailed` (plan §H): a warning notice and activity, the gap stays open, and nothing
+    /// claims it was recovered.
+    #[test]
+    fn recovery_failure_keeps_gap_open() {
+        let mut v = view();
+        v.reduce(&Event::Session(Notification::Gap(gap_at(1, 0))), at());
+        assert_eq!(v.gaps(), 1);
+        v.reduce(&Event::Session(Notification::RecoveryFailed("the recovery server was busy".into())), at());
+        assert_eq!(v.gaps(), 1, "the gap is still waiting");
+        let n = v.notice.as_ref().expect("the failure is said");
+        assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("warn", "recovery", "the recovery server was busy"));
+        assert!(!n.label.contains("recovered") && !n.detail.contains("recovered"), "no recovery is claimed");
+        assert!(v.activity.records().iter().any(|a| a.label == "recovery" && a.detail.contains("busy")), "inspectable in the ring");
+        // a later real recovery still closes it, by identity
+        v.reduce(&Event::Session(Notification::Recovered(resolved(gap_at(1, 0)))), at());
+        assert_eq!(v.gaps(), 0);
+    }
+
+    /// Snapshot, polish and page failures (plan §H): the canonical notes stay whatever they were,
+    /// each work lane ends, the page never begins from a failed polish, and every failure enters
+    /// the activity ring where later notices cannot dislodge it.
+    #[test]
+    fn operation_failures_leave_canonical_notes_unchanged() {
+        let mut v = view();
+        v.reduce(&committed(1), at());
+        let (doc, chunks, revision) = (v.notes.document.clone(), v.notes.chunks.clone(), v.notes.revision);
+        // a failed snapshot: the preview ends, the notes hold, the material stays for the next one
+        v.work.submit(OwnOp::Snapshot);
+        v.reduce(&Event::Preview("## Provisional ".into()), at());
+        v.reduce(&Event::SnapshotFailed("the model refused; everything is kept for the next one".into()), at());
+        assert_eq!(v.notes.preview, None);
+        assert_eq!((v.notes.document.as_str(), &v.notes.chunks, v.notes.revision), (doc.as_str(), &chunks, revision));
+        assert_eq!(v.work.lane(), Lane::Idle);
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot failed"));
+        // a failed polish: canonical notes unchanged, the lane ends, and no page lane begins
+        v.work.submit(OwnOp::Polish);
+        v.reduce(&Event::PolishFailed("read notes: denied; the notes are unchanged".into()), at());
+        assert_eq!((v.notes.document.as_str(), &v.notes.chunks, v.notes.revision), (doc.as_str(), &chunks, revision), "the polish touched nothing");
+        assert_eq!(v.work.lane(), Lane::Idle);
+        assert!(!v.work.page(), "a failed polish typesets no page");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("polish failed"));
+        // a failed page: the notes untouched again, the page lane it ended was already over
+        v.reduce(&Event::PageFailed("the model refused. The notes are unchanged; `lecture page` tries again.".into()), at());
+        assert_eq!((v.notes.document.as_str(), &v.notes.chunks, v.notes.revision), (doc.as_str(), &chunks, revision));
+        assert!(!v.work.page());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("page failed"));
+        // all three remain inspectable after the line has moved on
+        v.reduce(&Event::NothingNew, at());
+        let labels: Vec<&str> = v.activity.records().iter().map(|a| a.label.as_str()).collect();
+        for said in ["snapshot failed", "polish failed", "page failed"] {
+            assert!(labels.contains(&said), "{said:?} in {labels:?}");
+        }
+    }
+
+    /// The typed warnings that change nothing else (plan §H): a spend-ledger failure and a session
+    /// failure are notices and activity — recording, transcript and notes all go on.
+    #[test]
+    fn spend_and_session_failures_are_inspectable_and_stop_nothing() {
+        let mut v = view();
+        v.reduce(&segment(0, "one", SegmentSource::Live), at());
+        let held = (v.closed.clone(), v.notes.revision, v.phase, v.level);
+        v.reduce(&Event::Session(Notification::SpendFailed("the ledger could not be written".into())), at());
+        assert_eq!(v.notice.as_ref().map(|n| (n.kind, n.label.as_str(), n.detail.as_str())), Some(("warn", "spend", "the ledger could not be written")));
+        v.reduce(&Event::Session(Notification::Failed("disk full in the recording folder".into())), at());
+        assert_eq!(v.notice.as_ref().map(|n| (n.kind, n.label.as_str(), n.detail.as_str())), Some(("warn", "session failed", "disk full in the recording folder")));
+        assert_eq!((v.closed.clone(), v.notes.revision, v.phase, v.level), held, "nothing else moved");
+        let labels: Vec<&str> = v.activity.records().iter().map(|a| a.label.as_str()).collect();
+        assert!(labels.contains(&"spend") && labels.contains(&"session failed"), "{labels:?}");
+    }
+
+    /// Activity is the inspectable history (plan §H): a representative failure sequence, with the
+    /// one-line notice replaced several times along the way, leaves every failure in the ring —
+    /// bounded by its capacity, in memory only.
+    #[test]
+    fn failures_remain_inspectable_in_the_activity_ring() {
+        let mut v = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
+        v.set_capture_host("Terminal");
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Retrying { after: std::time::Duration::from_secs(5), reason: "socket closed".into() })), at());
+        v.reduce(&Event::Session(Notification::Gap(gap_at(1, 0))), at());
+        v.reduce(&Event::Session(Notification::RecoveryFailed("the recovery server was busy".into())), at());
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
+        v.reduce(&Event::Busy("snapshot, 12 words to the model".into()), at());
+        v.reduce(&Event::SnapshotFailed("the model refused".into()), at());
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] }), at());
+        v.reduce(&Event::Session(Notification::SpendFailed("the ledger could not be written".into())), at());
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), at());
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), at());
+        v.reduce(&Event::NothingNew, at());
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot"), "the line has moved on many times");
+        let details = || v.activity.records().iter().map(|a| (a.label.as_str(), a.kind)).collect::<Vec<_>>();
+        let all = details();
+        for (label, kind) in [("transcription interrupted", "warn"), ("gap", "warn"), ("recovery", "warn"), ("…", "dim"), ("snapshot failed", "warn"), ("asking", "warn"), ("spend", "warn"), ("Receiver_UID", "warn"), ("input back", "done"), ("snapshot", "notes")] {
+            assert!(all.contains(&(label, kind)), "{label:?} ({kind}) missing from {all:?}");
+        }
+        assert!(v.activity.len() <= Ring::CAPACITY && !v.activity.wrapped(), "an ordinary session never wraps");
     }
 
     /// Plan §F: the ring keeps the last [`Ring::CAPACITY`] records; the oldest falls off.

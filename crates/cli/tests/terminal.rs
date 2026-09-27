@@ -346,6 +346,21 @@ fn a_failed_draw_gives_the_terminal_back_before_the_error() {
     l.at("Error: the terminal stopped accepting output: a failure injected by the debug fixture; the next session in this folder picks up what was left", after);
 }
 
+/// Plan Task 12's session-failure row: the engine itself fails — a `Failed` notice first, then
+/// its own `Err`. The terminal is given back before the ordinary error path reports it, the
+/// process exits 1, and the `Error: …` line lands on the ordinary screen after the restoration.
+#[test]
+fn a_failed_session_restores_the_terminal_then_errors() {
+    let mut l = tui("session-fail", &[], 100, 30);
+    let listening = l.listening();
+    l.pty.wait_for("session failed", listening, SOON);
+    let status = l.pty.wait(SOON);
+    assert_eq!(code(status, &l), Some(1));
+    let after = l.restored(listening);
+    l.at("Error: disk full in the scripted session", after);
+    assert!(untouched(&l.home), "the person's data folder was never touched");
+}
+
 /// The `ops` fixture's command log: every command the TUI sent, one line each, in order.
 fn commands(l: &Lecture) -> Vec<String> {
     std::fs::read_to_string(l.dir.join("fixture-commands.log")).unwrap_or_default().lines().map(str::to_string).collect()

@@ -53,6 +53,16 @@ pub(crate) enum Scenario {
     /// logs its commands; the selections it would save go to `.live_notes/fixture-capture.json`,
     /// never the person's data folder, and no window server is reached.
     Capture,
+    /// The failure table's check (plan Task 12): a non-fatal walk through what can go wrong — a
+    /// transcript gap that recovery then fails to fill, a spend-ledger failure, a transcription
+    /// reconnect that comes back, a failed snapshot, a failed page — while the lecture stays
+    /// alive, so the header, the notice line and the activity overlay can all be inspected. No
+    /// API, no audio; stop with Ctrl-C.
+    Failures,
+    /// A session that dies of its own disk (plan Task 12): the lecture starts normally, says
+    /// `Failed` — the notice the frontends word as "session failed" — and the engine then returns
+    /// `Err`, so the terminal is restored before the ordinary `Error: …` and exit 1.
+    SessionFail,
 }
 
 impl Scenario {
@@ -68,7 +78,9 @@ impl Scenario {
             "draw-fail" => Ok(Scenario::DrawFail),
             "ops" => Ok(Scenario::Ops),
             "capture" => Ok(Scenario::Capture),
-            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\", \"ops\" and \"capture\""),
+            "failures" => Ok(Scenario::Failures),
+            "session-fail" => Ok(Scenario::SessionFail),
+            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\", \"ops\", \"capture\", \"failures\" and \"session-fail\""),
         }
     }
 }
@@ -196,8 +208,11 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     let (mut next, mut words, mut open) = (first, 0, true);
     // Scripted ups and downs for the session view (plan Task 6): a transcript gap that recovery
     // resolves, and a transcription reconnect. Only dim presentation comes of these; nothing here
-    // writes a file.
-    let mut happen = interval_at(Instant::now() + Duration::from_secs(2), Duration::from_secs(1));
+    // writes a file. The `failures` scenario walks its own, longer list (plan Task 12); a session
+    // that dies of its disk fails on its own clock below.
+    let failing_session = scenario == Scenario::SessionFail;
+    let failures = scenario == Scenario::Failures;
+    let mut happen = interval_at(Instant::now() + Duration::from_secs(2), Duration::from_secs(if failures { 2 } else { 1 }));
     let mut step = 0u32;
     let mut gapped: Option<Gap> = None;
     let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected)));
@@ -219,6 +234,10 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     let mut segment = interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     let panic_at = tokio::time::sleep(Duration::from_secs(1));
     tokio::pin!(panic_at);
+    // The `session-fail` scenario (plan Task 12): the session dies of its own disk — a notice
+    // first, a moment for the frontends to show it, then the engine's own `Err`.
+    let disk_at = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(disk_at);
     // The `ops` scenario: notes already committed, a slide they embed, and requests run in turn.
     let ops = scenario == Scenario::Ops;
     // The `capture` scenario (plan Task 11): the timeline above, and its own commands.
@@ -239,6 +258,11 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     loop {
         tokio::select! {
             _ = &mut panic_at, if scenario == Scenario::Panic => panic_without_unwinding(),
+            _ = &mut disk_at, if failing_session => {
+                let _ = events.send(Event::Session(Notification::Failed("disk full in the scripted session".into())));
+                tokio::time::sleep(Duration::from_millis(500)).await; // a moment for the notice to show
+                anyhow::bail!("disk full in the scripted session");
+            }
             _ = work.tick(), if job.is_some() => {
                 let Job { op, step } = job.as_mut().expect("a job");
                 *step += 1;
@@ -302,21 +326,36 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
             _ = level.tick() => { let _ = events.send(Event::Session(Notification::Level(0.05))); }
             _ = happen.tick() => {
                 step += 1;
-                match step {
-                    1 => {
-                        let g = Gap::new(Default::default(), 32_000, Some(48_000), GapKind::SttOffline);
-                        let _ = events.send(Event::Session(Notification::Gap(g.clone())));
-                        gapped = Some(g);
+                if failures {
+                    // The failure table's non-fatal walk (plan Task 12): each kind once, in an
+                    // order that keeps the notice line moving while the lecture stays alive.
+                    match step {
+                        1 => { let _ = events.send(Event::Session(Notification::Gap(Gap::new(Default::default(), 32_000, Some(48_000), GapKind::SttOffline)))); }
+                        2 => { let _ = events.send(Event::Session(Notification::RecoveryFailed("the recovery server was busy with a backlog; the gap waits for the next session".into()))); }
+                        3 => { let _ = events.send(Event::Session(Notification::SpendFailed("the spend ledger could not be written; today's total may be incomplete".into()))); }
+                        4 => { let _ = events.send(Event::Session(Notification::Stt(SttStatus::Retrying { after: Duration::from_secs(5), reason: "socket closed by the server".into() }))); }
+                        5 => { let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected))); }
+                        6 => { let _ = events.send(Event::SnapshotFailed("the model refused; everything is kept for the next one".into())); }
+                        7 => { let _ = events.send(Event::PageFailed("the model refused. The notes are unchanged; `lecture page` tries again.".into())); }
+                        _ => {}
                     }
-                    2 => {
-                        if let Some(mut g) = gapped.take() {
-                            g.resolved = true;
-                            let _ = events.send(Event::Session(Notification::Recovered(g)));
+                } else {
+                    match step {
+                        1 => {
+                            let g = Gap::new(Default::default(), 32_000, Some(48_000), GapKind::SttOffline);
+                            let _ = events.send(Event::Session(Notification::Gap(g.clone())));
+                            gapped = Some(g);
                         }
+                        2 => {
+                            if let Some(mut g) = gapped.take() {
+                                g.resolved = true;
+                                let _ = events.send(Event::Session(Notification::Recovered(g)));
+                            }
+                        }
+                        3 => { let _ = events.send(Event::Session(Notification::Stt(SttStatus::Retrying { after: Duration::from_secs(1), reason: "socket closed".into() }))); }
+                        4 => { let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected))); }
+                        _ => {}
                     }
-                    3 => { let _ = events.send(Event::Session(Notification::Stt(SttStatus::Retrying { after: Duration::from_secs(1), reason: "socket closed".into() }))); }
-                    4 => { let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected))); }
-                    _ => {}
                 }
             }
             _ = speech.tick(), if lecture => {

@@ -891,20 +891,27 @@ fn heading(col: &Column, v: &View, c: &Chrome) -> (Vec<Span<'static>>, usize) {
     (spans, named)
 }
 
-/// The notice line: a refused stop first — it is about the keys just below — else the view's
-/// current notice, its mark red for a warning and teal otherwise, its label bold. One line, cut to
-/// fit; it never moves anything else.
+/// The notice line, plan §H's priority drawn from the typed conditions and nothing else: the
+/// single input that is gone while it is gone, then capture's ask for the person while it holds,
+/// then the reactor's own command error — it is about the keys just below — then the latest
+/// ordinary notice. No layer erases another; each is chosen as this frame is drawn. The notice's
+/// mark is red for a warning and teal otherwise, its label bold, and the line is cut to fit — it
+/// never moves anything else.
 fn notice(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
     let (t, g) = (c.theme, c.theme.glyphs);
-    let spans = if let Some(r) = c.refused {
-        vec![Span::raw(r.to_string())]
-    } else if let Some(n) = &v.notice {
-        let (mark, style) = mark(n.kind, t);
-        vec![Span::styled(mark, style), Span::raw(" "), Span::styled(n.label.clone(), BOLD), Span::raw("  "), Span::raw(n.detail.clone())]
-    } else {
-        Vec::new()
+    let selected = v.input_gone_notice().map(|n| notice_spans(&n, t)).or_else(|| v.capture_attention().map(|n| notice_spans(n, t)));
+    let spans = match (selected, c.refused) {
+        (Some(spans), _) => spans,
+        (None, Some(r)) => vec![Span::raw(r.to_string())],
+        (None, None) => v.notice.as_ref().map(|n| notice_spans(n, t)).unwrap_or_default(),
     };
     clip(spans, max, g.ellipsis)
+}
+
+/// One notice as the line draws it: its mark, its bold label, its detail.
+fn notice_spans(n: &crate::plain::Notice, t: &Theme) -> Vec<Span<'static>> {
+    let (mark, style) = mark(n.kind, t);
+    vec![Span::styled(mark, style), Span::raw(" "), Span::styled(n.label.clone(), BOLD), Span::raw("  "), Span::raw(n.detail.clone())]
 }
 
 fn keys(stage: Stage, t: &Theme) -> Vec<Span<'static>> {
@@ -1133,7 +1140,7 @@ mod tests {
         for (w, h) in [(0, 0), (1, 1), (0, 5), (5, 0), (1, 24), (200, 1), (40, 8), (59, 100), (1000, 3), (60, 15), (3, 2), (12, 3), (60, 16), (100, 19), (132, 28), (500, 200)] {
             for stage in [Stage::Listening, Stage::Stopping, Stage::StopWaiting] {
                 let mut v = view(stage);
-                v.notice = Some(plain::input_gone("UID"));
+                v.notice = Some(plain::input_gone("UID", false));
                 for theme in [Theme::new(TRUE, true), Theme::new(OFF, false)] {
                     let _ = drawn_with(w, h, &v, Some(SUSPEND), &theme);
                 }
@@ -1245,15 +1252,53 @@ mod tests {
         assert!(!l.join("").contains("^S"), "no capture key before Task 11");
     }
 
-    /// A refused stop outranks the view's notice, being about the keys just below it.
+    /// A refused key outranks the ordinary notice — it is about the keys just below it — but never
+    /// the persistent conditions above it (Task 12's layering).
     #[test]
-    fn a_refused_stop_outranks_the_notice() {
+    fn a_refused_stop_outranks_the_ordinary_notice() {
         let mut v = view(Stage::Listening);
-        v.notice = Some(plain::input_gone("Receiver_UID"));
+        v.notice = Some(plain::Notice { kind: "warn", label: "snapshot failed".into(), detail: "timed out".into() });
         let l = lines(&drawn(110, 32, &v, None));
-        assert!(l[29].starts_with(" ▲ input gone  Receiver_UID"), "{:?}", l[29]);
+        assert!(l[29].starts_with(" ▲ snapshot failed  timed out"), "{:?}", l[29]);
         let l = lines(&drawn(110, 32, &v, Some(SUSPEND)));
         assert_eq!(l[29], format!(" {SUSPEND}"));
+    }
+
+    /// Plan §H's notice-line priority, end to end through typed states (Task 12): input gone >
+    /// capture asking/denied > the reactor's own command error > the latest ordinary notice. The
+    /// higher layers do not erase the lower ones: each shows again the moment the one above it
+    /// clears. Nothing is decided by reading the words back.
+    #[test]
+    fn notice_priority_is_input_then_capture_then_command_then_latest() {
+        let refused = "The hint is at its 8 KiB limit.";
+        let mut v = View::new(Identity { kind: SourceKind::Input, ..identity() }, Hydration::empty(), Vec::new());
+        v.set_capture_host("Terminal");
+        let line = |v: &View, refused: Option<&str>| lines(&drawn(110, 32, v, refused))[29].clone();
+        // 1. the latest ordinary notice: a failed snapshot
+        v.reduce(&Event::SnapshotFailed("timed out".into()), Local::now());
+        assert!(line(&v, None).starts_with(" ▲ snapshot failed  timed out"), "{}", line(&v, None));
+        // 2. the UI-local command error takes it — priority three
+        assert_eq!(line(&v, Some(refused)), format!(" {refused}"));
+        // 3. capture asks for the person: priority two
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] }), Local::now());
+        assert!(line(&v, Some(refused)).starts_with(" ▲ asking  "), "the ask outranks the command error: {}", line(&v, Some(refused)));
+        assert!(line(&v, None).starts_with(" ▲ asking  "), "and the ordinary notice: {}", line(&v, None));
+        // a denial holds the same place
+        v.reduce(&Event::Capture(CaptureState::Denied), Local::now());
+        assert!(line(&v, Some(refused)).starts_with(" ▲ screen recording  "), "{}", line(&v, Some(refused)));
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] }), Local::now());
+        // 4. the single input goes: priority one, over capture and the command error
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), Local::now());
+        assert!(line(&v, Some(refused)).starts_with(" ▲ Receiver_UID  is unplugged. LectureLive waits for it and records nothing meanwhile."), "{}", line(&v, Some(refused)));
+        // 5. it returns while capture still asks: the ask shows again — it was never dropped
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), Local::now());
+        assert!(line(&v, Some(refused)).starts_with(" ▲ asking  "), "the ask survived the input's round trip: {}", line(&v, Some(refused)));
+        // 6. capture healthy again: the still-current command error shows
+        v.reduce(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), Local::now());
+        assert_eq!(line(&v, Some(refused)), format!(" {refused}"));
+        // 7. the command error cleared (Task 10's semantics): the latest ordinary notice renders —
+        //    by now that is the input's return, the newest ordinary thing that happened
+        assert!(line(&v, None).starts_with(" ✓ input back  Receiver_UID; recording continues in a new file"), "the ordinary notice waited underneath: {}", line(&v, None));
     }
 
     /// Below 60×16 only the safety view: the phase and clock, why, what size, the keys — and nothing
@@ -1360,6 +1405,179 @@ mod tests {
         for (w, h) in SIZES {
             let b = drawn(w, h, &v, None);
             assert!(b.content.iter().all(|c| c.bg == Color::Reset), "{w}×{h}");
+        }
+    }
+
+    // ---- failure words and styles (Task 12) ----------------------------------------------------
+
+    /// The connection's words in the header (plan §H): Connected is ordinary dim; every failing
+    /// status — retrying, refused, server, stopped — is signal red, and each in its own words, so
+    /// `NO_COLOR` still says which failure it is. No failure is flattened into "retrying".
+    #[test]
+    fn stt_failure_words_and_styles_in_the_header() {
+        let mut v = view(Stage::Listening);
+        for (status, words, failing) in [
+            (SttStatus::Connected, "transcribing", false),
+            (SttStatus::Retrying { after: Duration::from_secs(12), reason: "the socket closed after 30 s without data".into() }, "reconnecting in 12 s (the socket closed", true),
+            (SttStatus::Refused("bad key".into()), "refused: bad key", true),
+            (SttStatus::ServerError("500 again".into()), "server: 500 again", true),
+            (SttStatus::Stopped("the worker stopped".into()), "stopped: the worker stopped", true),
+        ] {
+            v.stt = Some(status);
+            for (paint, red) in [(TRUE, Some(SIGNAL)), (ANSI, Some(Color::Red)), (OFF, None)] {
+                let want = if failing { red } else { None };
+                let b = drawn_with(140, 40, &v, None, &Theme::new(paint, true)).backend().buffer().clone();
+                let (x, y) = at(&b, 1, words);
+                assert_eq!(b[(x, y)].fg, want.unwrap_or(Color::Reset), "{words} {paint:?}");
+                if failing {
+                    assert_eq!(b[(x, y)].modifier, Modifier::empty(), "red alone carries it");
+                } else {
+                    assert_eq!(b[(x, y)].modifier, Modifier::DIM, "ordinary words while connected");
+                }
+                assert!(lines(&b)[1].contains(words), "the words themselves say it: {:?}", lines(&b)[1]);
+            }
+        }
+    }
+
+    /// While the loopback is silent the meter's place is the warning itself, signal red and bold
+    /// (plan §H): colour-independent words, red where there is colour, and the phase still
+    /// Listening — recording goes on.
+    #[test]
+    fn the_no_signal_health_is_signal_red_while_silent() {
+        let mut v = view(Stage::Listening);
+        v.silence = true;
+        for (paint, want) in [(TRUE, Some(SIGNAL)), (ANSI, Some(Color::Red)), (OFF, None)] {
+            let b = drawn_with(140, 40, &v, None, &Theme::new(paint, true)).backend().buffer().clone();
+            let (x, y) = at(&b, 1, "no signal");
+            assert_eq!(b[(x, y)].fg, want.unwrap_or(Color::Reset));
+            assert!(b[(x, y)].modifier.contains(Modifier::BOLD), "bold with or without colour");
+            assert!(lines(&b)[0].contains("Listening"), "recording goes on through the silence");
+        }
+    }
+
+    /// A lecture whose transcription is reconnecting while a transcript gap waits (plan §H's
+    /// reconnecting + gaps state): the phase and the meter stay alive, the reason is whole, and
+    /// the notice line carries the gap's own truth — recovery pending, no false session failure.
+    fn reconnecting() -> View {
+        let mut v = view(Stage::Listening);
+        v.reduce(&Event::Session(Notification::Gap(Gap::new(Default::default(), 120_000, None, GapKind::SttOffline))), fixed());
+        v.stt = Some(SttStatus::Retrying { after: Duration::from_secs(12), reason: "the socket closed after 30 s without data".into() });
+        v
+    }
+
+    /// Plan Task 12's reconnecting + gaps goldens: the canonical size and the person's real Apple
+    /// Terminal window.
+    #[test]
+    fn goldens_for_reconnecting_and_gaps() {
+        let theme = Theme::new(TRUE, true);
+        for (w, h) in [(110, 32), (80, 25)] {
+            golden(&format!("failure_reconnecting_gaps_{w}x{h}"), &drawn_with(w, h, &reconnecting(), None, &theme));
+        }
+    }
+
+    /// The reconnecting + gaps frame's styles (plan §H): the failing connection's words and the
+    /// gap count in signal red, the phase still Listening, the meter still live — and under
+    /// `NO_COLOR` the words alone carry every one of those facts.
+    #[test]
+    fn reconnecting_gaps_styles_and_words() {
+        for (paint, red) in [(TRUE, Some(SIGNAL)), (ANSI, Some(Color::Red)), (OFF, None)] {
+            let b = drawn_with(110, 32, &reconnecting(), None, &Theme::new(paint, true)).backend().buffer().clone();
+            let l = lines(&b);
+            assert!(l[0].contains("Listening") && l[1].contains("■"), "the phase and the meter live: {:?} {:?}", l[0], l[1]);
+            let (sx, sy) = at(&b, 1, "reconnecting in 12 s");
+            assert_eq!(b[(sx, sy)].fg, red.unwrap_or(Color::Reset), "the failure's words");
+            let (gx, gy) = at(&b, 1, "1 gap");
+            assert_eq!(b[(gx, gy)].fg, red.unwrap_or(Color::Reset), "the waiting count");
+            assert!(l[1].contains("1 gap"), "the count is words too");
+            let n = l.iter().position(|r| r.contains("no transcription of 7.5 s onward")).expect("the gap's own truth on the notice line");
+            assert!(l[n].contains("recovery fills"), "pending, truthfully: {}", l[n]);
+            assert!(!l.join("\n").contains("session failed"), "no false session failure");
+        }
+    }
+
+    /// A failure-rich session for the activity overlay (plan §H, Task 12): several kinds of
+    /// failure, a dim busy line, the input going and coming back — the one-line notice moved on
+    /// many times; the ring keeps all of it, newest last, under its times.
+    fn failing_day() -> View {
+        let moment = |m: u32, s: u32| chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 10, m, s).unwrap();
+        let mut v = View::new(Identity { kind: SourceKind::Input, ..identity() }, Hydration::empty(), Vec::new());
+        v.set_capture_host("Terminal");
+        v.level = Some(0.05);
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Retrying { after: Duration::from_secs(5), reason: "socket closed".into() })), moment(41, 3));
+        v.reduce(&Event::Session(Notification::Gap(Gap::new(Default::default(), 32_000, Some(48_000), GapKind::SttOffline))), moment(41, 17));
+        v.reduce(&Event::Session(Notification::RecoveryFailed("the recovery server was busy".into())), moment(41, 44));
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), moment(42, 2));
+        v.reduce(&Event::Busy("snapshot, 12 words to the model".into()), moment(42, 20));
+        v.reduce(&Event::SnapshotFailed("the model refused; everything is kept for the next one".into()), moment(42, 41));
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "Zoom Meeting is 1280 × 720 now; it was 1600 × 900".into(), candidates: vec![] }), moment(42, 58));
+        v.reduce(&Event::Session(Notification::SpendFailed("the ledger could not be written".into())), moment(43, 9));
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), moment(43, 21));
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), moment(43, 40));
+        v.phase = Stage::Listening;
+        v
+    }
+
+    /// Plan Task 12's failure-rich activity goldens: the records stay inspectable after the
+    /// notice line has moved on — time gutter, warning marks, the dim busy line, several failure
+    /// kinds, newest last.
+    #[test]
+    fn goldens_for_the_failure_activity() {
+        let theme = Theme::new(TRUE, true);
+        for (w, h) in [(110, 32), (80, 25)] {
+            golden(&format!("failure_activity_{w}x{h}"), &looked(w, h, &failing_day(), &Look { overlay: Overlay::Activity, ..Look::default() }, &theme).0);
+        }
+    }
+
+    /// The failure activity keeps every failure inspectable: warning marks red, the busy line
+    /// dim, the times dim in the gutter, newest last — and the marks read without colour.
+    #[test]
+    fn the_failure_activity_reads_and_marks() {
+        let theme = Theme::new(TRUE, true);
+        let (t, drawn) = looked(110, 32, &failing_day(), &Look { overlay: Overlay::Activity, ..Look::default() }, &theme);
+        let b = t.backend().buffer().clone();
+        let l = lines(&b);
+        let body = drawn.activity.unwrap();
+        let rows = &l[body.y as usize..body.bottom() as usize];
+        let row = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("{needle:?} in {rows:?}"));
+        // newest last: the input's return after the spend failure after the asking …
+        assert!(row("input back") > row("spend") && row("spend") > row("asking") && row("asking") > row("snapshot failed"), "{rows:?}");
+        let warn_row = row("recovery") as u16 + body.y;
+        let (x, y) = at(&b, warn_row, "▲");
+        assert_eq!(b[(x, y)].fg, SIGNAL, "a failure's mark");
+        let busy_row = row("snapshot, 12 words") as u16 + body.y;
+        assert_eq!(b[(1, busy_row)].modifier, Modifier::DIM, "the time gutter");
+        let (bx, by) = at(&b, busy_row, "…");
+        assert_eq!((b[(bx, by)].fg, b[(bx, by)].modifier), (Color::Reset, Modifier::DIM), "the busy line is dim, never a warning");
+        // without colour, the words and marks still separate failure from good news
+        let (t, _) = looked(80, 25, &failing_day(), &Look { overlay: Overlay::Activity, ..Look::default() }, &Theme::new(OFF, true));
+        let plain = lines(t.backend().buffer());
+        let text = plain.join("\n");
+        assert!(text.contains("▲ recovery") && text.contains("▲ snapshot failed") && text.contains("… snapshot, 12 words"), "the words carry it: {text}");
+    }
+
+    /// The TUI's own half of `display_text_cannot_emit_terminal_controls`: hostile text reduced
+    /// into the view — transcript, open utterance, a notice, a slide's file, a capture state —
+    /// and the frame rendered: no cell ever holds a character that could act on the terminal.
+    #[test]
+    fn hostile_text_renders_without_terminal_controls() {
+        let hostile = "\x1b[31msay\x1b[0m\x1b[2J\x1b[H\x1b]0;owned\x07\x1b]52;c;cGF5\x07\x1b]8;;https://evil.example\x1b\\click\x1b]8;;\x1b\\\x07part\rwholed\x7f";
+        let mut v = view(Stage::Listening);
+        v.set_capture_host("Terminal");
+        v.reduce(&Event::Session(Notification::Open { stable: hostile.into(), tentative: String::new() }), fixed());
+        v.reduce(&said(0, (10, 0, 0), hostile, SegmentSource::Live), fixed());
+        v.reduce(&Event::Preview(hostile.into()), fixed());
+        v.reduce(&Event::SnapshotFailed(hostile.into()), fixed());
+        v.reduce(&Event::Slide { index: 1, file: format!("slides/{hostile}.png").into(), auto: true, uncertain: false, shown_at: fixed() }, fixed());
+        v.reduce(&Event::Capture(CaptureState::Paused { window: hostile.into(), reason: hostile.into() }), fixed());
+        for (w, h) in [(140, 40), (80, 25)] {
+            let b = drawn(w, h, &v, None);
+            for cell in b.content.iter() {
+                let s = cell.symbol();
+                assert!(s.chars().all(|c| !c.is_control()), "{w}×{h}: a control reached a cell: {s:?}");
+            }
+            let text = lines(&b).join("\n");
+            assert!(!text.contains('\x1b'), "{w}×{h}");
+            assert!(text.contains("sayclick"), "{w}×{h}: the words it carried still show: {text:?}");
         }
     }
 

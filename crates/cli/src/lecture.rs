@@ -161,7 +161,10 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     };
     #[cfg(not(debug_assertions))]
     let fixture: Option<()> = None;
-    let p = plain::paint();
+    // The plain display's context, read once (plan Task 12): how lines are painted, and whether
+    // stdout is a terminal — an independent fact that decides whether untrusted text is cleaned.
+    let out = plain::Display::stdout();
+    let p = out.paint;
     let app_ledger = if fixture.is_some() {
         // A name in the scripted lecture's own folder, never written: the scripted session spends nothing.
         lecture_dir(a.dir.clone())?.join("fixture-spend.jsonl")
@@ -212,13 +215,13 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         // `lecture page`: the page from the notes as they are, without recording or polishing.
         anyhow::ensure!(files.notes.exists(), "No notes to typeset: {} is not in this folder.", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         let _lock = FolderLock::acquire(&dir)?;
-        plain::say(&mut std::io::stdout().lock(), p, "page", "page", &format!("distilling {} with {}, a few minutes", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), chat::MODEL));
+        plain::say(&mut std::io::stdout().lock(), out, "page", "page", &format!("distilling {} with {}, a few minutes", files.notes.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), chat::MODEL));
         let printer = tokio::spawn({
             let words = capture::Words::new(&course);
             async move {
                 let mut none = None;
                 while let Some(e) = ev_rx.recv().await {
-                    plain::show(&mut std::io::stdout().lock(), p, &e, &mut none, &words);
+                    plain::show(&mut std::io::stdout().lock(), out, &e, &mut none, &words, false);
                 }
             }
         });
@@ -249,9 +252,9 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             println!("  undid a canary route left behind; default output restored: {restored}");
         }
     }
-    let mut announce = |stem: &str| plain::say(&mut std::io::stdout().lock(), p, "notes", "recovering", &format!("{stem}'s transcript gaps, before today's session"));
+    let mut announce = |stem: &str| plain::say(&mut std::io::stdout().lock(), out, "notes", "recovering", &format!("{stem}'s transcript gaps, before today's session"));
     let ready = start::prepare(&files, &title, a.rebuild, a.keep_days.map_or(Retention::KeepAll, Retention::KeepDays), &recovery, Some(spend.clone()), &mut announce).await?;
-    plain::print_prepared(&mut std::io::stdout().lock(), p, &ready, &files, &course, &name, &input_name);
+    plain::print_prepared(&mut std::io::stdout().lock(), out, &ready, &files, &course, &name, &input_name);
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     // Capture on by default (plan Task 11): the course's saved window is loaded before the engine
@@ -352,17 +355,18 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         // The terminal is given back before this returns, so the summary prints on the ordinary screen.
         let (engine, events) = engine(cmd_rx, ev_tx)?;
         let report = tui::run(session, engine, cmd_tx, events, a.secs).await?;
-        plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);
+        plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
         return Ok(());
     }
     plain::read_commands(cmd_tx.clone());
     let stop = Arc::new(Mutex::new(StopController::default()));
-    plain::stop_on_ctrl_c(cmd_tx.clone(), p, stop.clone());
+    plain::stop_on_ctrl_c(cmd_tx.clone(), out, stop.clone());
     if let Some(limit) = a.secs {
-        plain::stop_after_secs(limit, cmd_tx.clone(), p, stop);
+        plain::stop_after_secs(limit, cmd_tx.clone(), out, stop);
     }
     drop(cmd_tx);
-    let mut watch = (uid == loopback::BLACKHOLE_UID || uid.starts_with("mixed:")).then(|| SilenceWatch::new(-60.0, 10));
+    let mixed = uid.starts_with("mixed:");
+    let mut watch = (uid == loopback::BLACKHOLE_UID || mixed).then(|| SilenceWatch::new(-60.0, 10));
     let (engine, mut events) = engine(cmd_rx, ev_tx)?;
     let words = capture::Words::new(&course);
     let printer = tokio::spawn(async move {
@@ -372,16 +376,16 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
                 // failure last — never a bare "found again" that implies it was saved
                 capture::CapturePersistence::MovedSaveFailed { error } => {
                     let (kind, label, detail) = capture::unsaved_words(error);
-                    plain::say(&mut std::io::stdout().lock(), p, kind, label, &detail);
+                    plain::say(&mut std::io::stdout().lock(), out, kind, label, &detail);
                 }
-                _ => plain::show(&mut std::io::stdout().lock(), p, &f.event, &mut watch, &words),
+                _ => plain::show(&mut std::io::stdout().lock(), out, &f.event, &mut watch, &words, mixed),
             }
         }
     });
     let result = engine.await;
     printer.await?;
     let report = result?;
-    plain::print_end(&mut std::io::stdout().lock(), p, &files, &report, &spend);
+    plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
     Ok(())
 }
 

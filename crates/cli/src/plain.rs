@@ -15,6 +15,7 @@ use lecturelive_core::session::folder::How;
 use lecturelive_core::session::lecture::{Command as LectureCommand, Event, Op};
 use lecturelive_core::session::notesfile::Recovered;
 use lecturelive_core::session::segments::SegmentSource;
+use lecturelive_core::session::sidecar::Gap;
 use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::session::start;
 
@@ -35,8 +36,36 @@ pub(crate) fn paint() -> spend::Paint {
     spend::Paint { color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(), truecolor: matches!(std::env::var("COLORTERM").as_deref(), Ok("truecolor" | "24bit")) }
 }
 
-/// The CLI's `say`: one event line, its mark, what it is, what happened.
-pub(crate) fn say(out: &mut impl Write, p: spend::Paint, kind: &str, label: &str, detail: &str) {
+/// The plain frontend's output context (plan §C 11, Task 12): how its lines are painted, and
+/// whether the stream they go to is a terminal — two independent facts. A TTY cleans untrusted
+/// text of terminal controls whatever `NO_COLOR` says (safety is not colour); a pipe keeps the
+/// bytes exactly as they were, controls and all, so every ordinary control-free line is
+/// byte-identical to what the CLI printed before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Display {
+    pub(crate) paint: spend::Paint,
+    pub(crate) tty: bool,
+}
+
+impl Display {
+    /// The session's context, read once as the command starts: colour as the plain CLI has always
+    /// decided it, and stdout's terminal-ness from `IsTerminal` — never from the colour choice.
+    pub(crate) fn stdout() -> Display {
+        use std::io::IsTerminal;
+        Display { tty: std::io::stdout().is_terminal(), paint: paint() }
+    }
+
+    /// Untrusted text on its way to this display: unchanged, byte for byte, when it is not a
+    /// terminal; cleaned whole when it is — before any painting of our own, so LectureLive's own
+    /// styling survives and injected sequences do not.
+    fn safe<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.tty { std::borrow::Cow::Owned(clean(text)) } else { std::borrow::Cow::Borrowed(text) }
+    }
+}
+
+/// The CLI's `say`: one event line, its mark, what it is, what happened. The label and detail are
+/// the event's own words — cleaned of terminal controls first when the display is a TTY.
+pub(crate) fn say(out: &mut impl Write, d: Display, kind: &str, label: &str, detail: &str) {
     let (mark, colour) = match kind {
         "slide" => ("▣", "teal"),
         "notes" => ("◆", "teal"),
@@ -44,7 +73,9 @@ pub(crate) fn say(out: &mut impl Write, p: spend::Paint, kind: &str, label: &str
         "done" => ("✓", "teal"),
         _ => ("▲", "red"),
     };
-    writeln!(out, "{}", format!("  {} {}  {detail}", p.paint(mark, &[colour]), p.paint(label, &["bold"])).trim_end()).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    let label = d.safe(label);
+    let detail = d.safe(detail);
+    writeln!(out, "{}", format!("  {} {}  {detail}", d.paint.paint(mark, &[colour]), d.paint.paint(&label, &["bold"])).trim_end()).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
 /// An event's own wording, without any terminal styling of its own: which mark, what it is, what
@@ -138,10 +169,35 @@ fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
-/// The input-gone notice (plan §H's notice line, top priority): the fixed sentence. The plain CLI
-/// appends its offer of the other inputs after it; the TUI shows the sentence as it is.
-pub(crate) fn input_gone(uid: &str) -> Notice {
-    Notice { kind: "warn", label: "input gone".into(), detail: format!("{uid}; waiting for it to return, and nothing switches by itself") }
+/// The input-gone notice (plan §H's notice line, top priority). A single source's fixed sentence
+/// says both facts: LectureLive waits, and nothing is recorded from it meanwhile. A mixed source
+/// says the other truth — one input of two is away and Zoom's loopback keeps recording — so the
+/// single-source promise is never said where it is false. The uid is the label, the one bold slot
+/// the line has, as the plan bolds it. The plain CLI appends its offer of the other inputs after
+/// either; the TUI shows the sentence as it is.
+pub(crate) fn input_gone(uid: &str, mixed: bool) -> Notice {
+    let detail = if mixed { "is unplugged. LectureLive waits for it; Zoom's audio still records meanwhile." } else { "is unplugged. LectureLive waits for it and records nothing meanwhile." };
+    Notice { kind: "warn", label: uid.to_string(), detail: detail.into() }
+}
+
+/// A gap's interval as the notices say it: "0.2–1.0 s", or "2.0 s onward" while it is still open.
+fn gap_span(g: &Gap) -> String {
+    match g.end_sample {
+        Some(end) => format!("{:.1}–{:.1} s", secs(g.start_sample), secs(end)),
+        None => format!("{:.1} s onward", secs(g.start_sample)),
+    }
+}
+
+/// One gap in the words both frontends share (spec §5.4): a transcript gap still has its audio, so
+/// it waits for recovery to fill the words in; an audio gap's recording was lost for the interval
+/// and nothing can transcribe what was never captured — so it is never said to be waiting for
+/// recovery. No kind is named by its `Debug` vocabulary.
+pub(crate) fn gap_words(g: &Gap) -> Notice {
+    if g.kind.is_transcript() {
+        Notice { kind: "warn", label: "gap".into(), detail: format!("no transcription of {} of recording {}; recovery fills it in when it can", gap_span(g), g.recording_id) }
+    } else {
+        Notice { kind: "warn", label: "gap".into(), detail: format!("the recording's audio was lost for {} of recording {}; it cannot be recovered from the recording", gap_span(g), g.recording_id) }
+    }
 }
 
 /// The loopback silence warning (spec §4.3), as both frontends' watches say it.
@@ -182,20 +238,22 @@ fn page_detail(outcome: &PageOutcome, usd: f64, p: spend::Paint) -> String {
     detail
 }
 
-/// One notice in the CLI's line: `say`, from the shared wording.
-fn say_notice(out: &mut impl Write, p: spend::Paint, n: &Notice) {
-    say(out, p, n.kind, &n.label, &n.detail);
+/// One notice in the CLI's line: `say`, from the shared wording, cleaned when the display is a TTY.
+fn say_notice(out: &mut impl Write, d: Display, n: &Notice) {
+    say(out, d, n.kind, &n.label, &n.detail);
 }
 
 /// An event as a notice, in the plain CLI's own words (the TUI's activity and notice line show the
 /// same wording, with `p` colour-off so no styling enters the view). Capture states and
 /// relocations use the terminal's own words ([`capture::state_words`]), not the desktop's.
-pub(crate) fn notice(e: &Event, p: spend::Paint, words: &capture::Words) -> Option<Notice> {
+/// `mixed` says whether a gone input is one of two (Zoom's loopback keeps recording), which alone
+/// changes the input-gone sentence.
+pub(crate) fn notice(e: &Event, p: spend::Paint, words: &capture::Words, mixed: bool) -> Option<Notice> {
     let n = |kind: &'static str, label: &str, detail: String| Some(Notice { kind, label: label.into(), detail });
     match e {
         Event::Session(m) => match m {
-            Notification::Gap(g) => n("warn", "gap", format!("{:?} from sample {} to {:?} of {}", g.kind, g.start_sample, g.end_sample, g.recording_id)),
-            Notification::DeviceGone { uid } => Some(input_gone(uid)),
+            Notification::Gap(g) => Some(gap_words(g)),
+            Notification::DeviceGone { uid } => Some(input_gone(uid, mixed)),
             Notification::DeviceBack { uid } => n("done", "input back", format!("{uid}; recording continues in a new file")),
             Notification::Failed(m) => n("warn", "session failed", m.clone()),
             Notification::Stt(s) => match s {
@@ -205,7 +263,11 @@ pub(crate) fn notice(e: &Event, p: spend::Paint, words: &capture::Words) -> Opti
                 SttStatus::Stopped(m) => n("warn", "transcription stopped", m.clone()),
                 SttStatus::Connected => None,
             },
-            Notification::Recovered(g) => n("done", "recovered", format!("the transcript of {:.1}–{:.1} s of recording {}", secs(g.start_sample), g.end_sample.map_or(0.0, secs), g.recording_id)),
+            // Core resolves a transcript gap by saying so. A `Recovered` for an audio gap — which
+            // core never sends, they are born resolved — is answered with the truth instead: the
+            // interval's audio was lost, so there is no transcript to recover (plan Task 12).
+            Notification::Recovered(g) if g.kind.is_transcript() => n("done", "recovered", format!("the transcript of {} of recording {}", gap_span(g), g.recording_id)),
+            Notification::Recovered(g) => n("warn", "gap", format!("the recording's audio for {} of recording {} was lost; there is no transcript to recover", gap_span(g), g.recording_id)),
             Notification::RecoveryFailed(m) => n("warn", "recovery", m.clone()),
             Notification::SpendFailed(m) => n("warn", "spend", m.clone()),
             _ => None,
@@ -252,40 +314,45 @@ pub(crate) fn other_inputs(gone: &str) -> String {
 
 /// Prints the lecture's events in the CLI's lines; the loopback silence warning as `record` gives it.
 /// The say-lines come from [`notice`], so the TUI's activity says the same things (M7 plan §F);
-/// capture states arrive in the terminal's own `words`.
-pub(crate) fn show(out: &mut impl Write, p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>, words: &capture::Words) {
+/// capture states arrive in the terminal's own `words`. Every event-sourced string is cleaned
+/// before it is written when `d` is a TTY (plan §C 12, Task 12); a pipe sees the bytes as they are.
+pub(crate) fn show(out: &mut impl Write, d: Display, e: &Event, watch: &mut Option<SilenceWatch>, words: &capture::Words, mixed: bool) {
     // The plain CLI's own lines first — the transcript, the recording path, a first `transcribing`,
     // the busy text — and the events whose wording needs the machine (the gone input's offer).
     match e {
         Event::Session(Notification::Segment(s)) => {
-            let tag = if s.source == SegmentSource::Recovered { p.paint("  (recovered)", &["dim"]) } else { String::new() };
-            writeln!(out, "  {}  {}{tag}", p.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), s.text).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+            let tag = if s.source == SegmentSource::Recovered { d.paint.paint("  (recovered)", &["dim"]) } else { String::new() };
+            let text = d.safe(&s.text);
+            writeln!(out, "  {}  {}{tag}", d.paint.paint(&s.said_at.format("%H:%M:%S").to_string(), &["dim"]), text.as_ref()).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
         }
         Event::Session(Notification::Level(l)) => {
             if watch.as_mut().is_some_and(|w| w.observe(*l)) {
-                say_notice(out, p, &no_signal());
+                say_notice(out, d, &no_signal());
             }
         }
-        Event::Session(Notification::Recording { path }) => { writeln!(out, "{}", p.paint(&format!("  recording to {}", path.display()), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
+        Event::Session(Notification::Recording { path }) => {
+            let shown = d.safe(&path.display().to_string()).into_owned();
+            writeln!(out, "{}", d.paint.paint(&format!("  recording to {shown}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+        }
         // The notice is the fixed sentence; the offer of the other inputs is the plain CLI's own.
         Event::Session(Notification::DeviceGone { uid }) => {
-            let n = input_gone(uid);
-            say(out, p, n.kind, &n.label, &format!("{}. {}", n.detail, other_inputs(uid)));
+            let n = input_gone(uid, mixed);
+            say(out, d, n.kind, &n.label, &format!("{}. {}", sentence(&n.detail), other_inputs(uid)));
         }
-        Event::Session(Notification::Stt(SttStatus::Connected)) => { writeln!(out, "{}", p.paint("  transcribing", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
-        Event::Busy(m) => { writeln!(out, "{}", p.paint(&format!("  … {m}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
+        Event::Session(Notification::Stt(SttStatus::Connected)) => { writeln!(out, "{}", d.paint.paint("  transcribing", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
+        Event::Busy(m) => { writeln!(out, "{}", d.paint.paint(&format!("  … {}", d.safe(m)), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}")); }
         Event::Preview(_) => {} // the committed block is printed instead, as the CLI does
         Event::Committed { block, .. } => {
             for line in block.trim().lines().filter(|l| !l.starts_with("<!-- ")) {
-                writeln!(out, "  {} {}", p.paint("│", &["teal"]), p.paint(line, &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+                writeln!(out, "  {} {}", d.paint.paint("│", &["teal"]), d.paint.paint(d.safe(line).as_ref(), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
             }
-            if let Some(n) = notice(e, p, words) {
-                say_notice(out, p, &n);
+            if let Some(n) = notice(e, d.paint, words, mixed) {
+                say_notice(out, d, &n);
             }
         }
         _ => {
-            if let Some(n) = notice(e, p, words) {
-                say_notice(out, p, &n);
+            if let Some(n) = notice(e, d.paint, words, mixed) {
+                say_notice(out, d, &n);
             }
         }
     }
@@ -341,37 +408,40 @@ pub(crate) fn startup_records(ready: &start::Prepared, files: &LectureFiles) -> 
 }
 
 /// The start-up report after `prepare`: what launch did to the recordings, what the folder's
-/// initialisation found, then the lecture's header lines.
-pub(crate) fn print_prepared(out: &mut impl Write, p: spend::Paint, ready: &start::Prepared, files: &LectureFiles, course: &str, name: &str, input_name: &str) {
+/// initialisation found, then the lecture's header lines. The lecture's own names — course, folder,
+/// input — are as untrusted as anything else the folder says, so they are cleaned on a TTY.
+pub(crate) fn print_prepared(out: &mut impl Write, d: Display, ready: &start::Prepared, files: &LectureFiles, course: &str, name: &str, input_name: &str) {
     for n in startup_records(ready, files) {
-        say_notice(out, p, &n);
+        say_notice(out, d, &n);
     }
     let init = &ready.init;
+    let (course, name, input_name) = (&d.safe(course), &d.safe(name), &d.safe(input_name));
 
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
-    writeln!(out, "  {}  {}  {name}", p.paint(course, &["bold"]), p.paint("›", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "  {}  {}  {name}", d.paint.paint(course, &["bold"]), d.paint.paint("›", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     let waiting = if init.pending_segments > 0 || init.pending_slides > 0 {
         format!(", resumed with {} and {} for the next snapshot", plural(init.pending_segments as usize, "line"), plural(init.pending_slides, "slide"))
     } else {
         String::new()
     };
-    writeln!(out, "{}", p.paint(&format!("  listening on {input_name}{waiting}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
-    writeln!(out, "{}", p.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "{}", d.paint.paint(&format!("  listening on {input_name}{waiting}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "{}", d.paint.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
-/// The end summary: what was saved, what still waits for the next session, and what the lecture cost today.
-pub(crate) fn print_end(out: &mut impl Write, p: spend::Paint, files: &LectureFiles, report: &StopReport, spend: &Spend) {
-    let file_name = |f: &Path| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+/// The end summary: what was saved, what still waits for the next session, and what the lecture cost
+/// today. The file names are the folder's own words; the failure is core's — both cleaned on a TTY.
+pub(crate) fn print_end(out: &mut impl Write, d: Display, files: &LectureFiles, report: &StopReport, spend: &Spend) {
+    let file_name = |f: &Path| d.safe(&f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).into_owned();
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
-    writeln!(out, "  {} {}  {}  {}", p.paint("✓", &["teal"]), p.paint("saved", &["bold"]), file_name(&files.notes), file_name(&files.transcript)).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "  {} {}  {}  {}", d.paint.paint("✓", &["teal"]), d.paint.paint("saved", &["bold"]), file_name(&files.notes), file_name(&files.transcript)).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     if let Some(e) = &report.last_snapshot {
-        say(out, p, "warn", "notes", &format!("the last snapshot failed ({e}); the next session in this folder adds what it missed"));
+        say(out, d, "warn", "notes", &format!("the last snapshot failed ({e}); the next session in this folder adds what it missed"));
     }
     if report.unresolved > 0 {
-        writeln!(out, "{}", p.paint(&format!("    {} still to recover; the next session in this folder does it", plural(report.unresolved, "transcript gap")), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+        writeln!(out, "{}", d.paint.paint(&format!("    {} still to recover; the next session in this folder does it", plural(report.unresolved, "transcript gap")), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     }
-    writeln!(out, "{}", p.paint(&format!("    {} spent on this lecture today; `lecture spend` has the rest", spend::money(spend.lecture_total())), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "{}", d.paint.paint(&format!("    {} spent on this lecture today; `lecture spend` has the rest", spend::money(spend.lecture_total())), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
@@ -387,15 +457,16 @@ pub(crate) fn read_commands(stdin_tx: tokio::sync::mpsc::UnboundedSender<Lecture
 }
 
 /// One stop request as plain handles it (M7 plan §G): the shared controller's next stage, its words,
-/// then the `Stop`s it asks for. Stage 3 sends nothing; the caller quits.
-pub(crate) fn request_stop(out: &mut impl Write, p: spend::Paint, controller: &mut StopController, origin: Origin, stop_tx: &tokio::sync::mpsc::UnboundedSender<LectureCommand>) -> Result<Step, tokio::sync::mpsc::error::SendError<LectureCommand>> {
+/// then the `Stop`s it asks for. Stage 3 sends nothing; the caller quits. Its words are all the
+/// CLI's own, so the display context is only for the line itself.
+pub(crate) fn request_stop(out: &mut impl Write, d: Display, controller: &mut StopController, origin: Origin, stop_tx: &tokio::sync::mpsc::UnboundedSender<LectureCommand>) -> Result<Step, tokio::sync::mpsc::error::SendError<LectureCommand>> {
     let step = controller.advance(origin, Instant::now());
     match step {
-        Step::Advance { stage: Stage::Stopping, .. } => say(out, p, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)"),
-        Step::Advance { stage: Stage::StopWaiting, .. } => say(out, p, "warn", "stopping", "no longer waiting for recovery or queued requests; its gaps wait for the next session (Ctrl-C again quits at once)"),
+        Step::Advance { stage: Stage::Stopping, .. } => say(out, d, "notes", "stopping", "finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)"),
+        Step::Advance { stage: Stage::StopWaiting, .. } => say(out, d, "warn", "stopping", "no longer waiting for recovery or queued requests; its gaps wait for the next session (Ctrl-C again quits at once)"),
         // The recording is durable to its last second and gaps and journals are on disk: the next
         // session in this folder repairs, recovers and notes what is left.
-        Step::Quit => say(out, p, "warn", "quit", "stopped at once; the next session in this folder picks up what was left"),
+        Step::Quit => say(out, d, "warn", "quit", "stopped at once; the next session in this folder picks up what was left"),
         Step::Advance { stage: Stage::Listening, .. } | Step::Ignored(_) => {}
     }
     if let Step::Advance { stops_to_send, .. } = step {
@@ -408,10 +479,10 @@ pub(crate) fn request_stop(out: &mut impl Write, p: spend::Paint, controller: &m
 
 /// Ctrl-C as the plain CLI counts it, on the controller the `--secs` timer shares: the first stop,
 /// then stopping the wait for recovery, then quitting at once.
-pub(crate) fn stop_on_ctrl_c(stop_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, p: spend::Paint, controller: Arc<Mutex<StopController>>) {
+pub(crate) fn stop_on_ctrl_c(stop_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, d: Display, controller: Arc<Mutex<StopController>>) {
     tokio::spawn(async move {
         while tokio::signal::ctrl_c().await.is_ok() {
-            let step = request_stop(&mut std::io::stdout().lock(), p, &mut controller.lock().expect("the stop controller"), Origin::Signal, &stop_tx);
+            let step = request_stop(&mut std::io::stdout().lock(), d, &mut controller.lock().expect("the stop controller"), Origin::Signal, &stop_tx);
             match step {
                 Ok(Step::Quit) => std::process::exit(130),
                 Ok(_) => {}
@@ -422,10 +493,10 @@ pub(crate) fn stop_on_ctrl_c(stop_tx: tokio::sync::mpsc::UnboundedSender<Lecture
 }
 
 /// The `--secs` timer: the first stop when the limit passes, silent as it has always been.
-pub(crate) fn stop_after_secs(limit: u64, timer_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, p: spend::Paint, controller: Arc<Mutex<StopController>>) {
+pub(crate) fn stop_after_secs(limit: u64, timer_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, d: Display, controller: Arc<Mutex<StopController>>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(limit)).await;
-        let _ = request_stop(&mut std::io::sink(), p, &mut controller.lock().expect("the stop controller"), Origin::Timer, &timer_tx);
+        let _ = request_stop(&mut std::io::sink(), d, &mut controller.lock().expect("the stop controller"), Origin::Timer, &timer_tx);
     });
 }
 
@@ -443,21 +514,31 @@ mod goldens {
     use lecturelive_core::session::folder::InitReport;
     use lecturelive_core::session::launch::LaunchReport;
     use lecturelive_core::session::segments::{self, Segment};
-    use lecturelive_core::session::sidecar::{Gap, Sidecar};
+    use lecturelive_core::session::sidecar::{Gap, GapKind, Sidecar};
     use lecturelive_core::session::spend::SpendKind;
 
     const OFF: spend::Paint = spend::Paint { color: false, truecolor: false };
     const ANSI: spend::Paint = spend::Paint { color: true, truecolor: false };
     const TRUE: spend::Paint = spend::Paint { color: true, truecolor: true };
 
-    fn shown(p: spend::Paint, e: &Event, watch: &mut Option<SilenceWatch>) -> String {
+    /// The plain display a pipe gives: no colour, and no cleaning — bytes as they are.
+    fn pipe(p: spend::Paint) -> Display {
+        Display { paint: p, tty: false }
+    }
+
+    /// The plain display a terminal gives: colour as decided, cleaning on.
+    fn term(p: spend::Paint) -> Display {
+        Display { paint: p, tty: true }
+    }
+
+    fn shown(d: Display, e: &Event, watch: &mut Option<SilenceWatch>) -> String {
         let mut out = Vec::new();
-        show(&mut out, p, e, watch, &words());
+        show(&mut out, d, e, watch, &words(), false);
         String::from_utf8(out).unwrap()
     }
 
     fn plain(e: &Event) -> String {
-        shown(OFF, e, &mut None)
+        shown(pipe(OFF), e, &mut None)
     }
 
     /// The words the tests print capture states in: a fixed course and host, so no test depends on
@@ -467,7 +548,8 @@ mod goldens {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lecturelive-goldens-{}-{name}", std::process::id()));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("lecturelive-goldens-{}-{name}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -496,10 +578,15 @@ mod goldens {
         let rec = segment("recovered");
         assert_eq!(plain(&Event::Session(Notification::Segment(rec.clone()))), format!("  {}  gradient descent  (recovered)\n", rec.said_at.format("%H:%M:%S")));
         assert_eq!(plain(&Event::Session(Notification::Recording { path: PathBuf::from("/tmp/lec/recordings/session_1.wav") })), "  recording to /tmp/lec/recordings/session_1.wav\n");
-        assert_eq!(plain(&Event::Session(Notification::Gap(gap()))), "  ▲ gap  RecorderOverflow from sample 3200 to Some(16000) of 11111111-1111-1111-1111-111111111111\n");
+        // Task 12: user-facing gap words, one sentence for each kind of truth — never `Debug`.
+        assert_eq!(plain(&Event::Session(Notification::Gap(gap()))), "  ▲ gap  the recording's audio was lost for 0.2–1.0 s of recording 11111111-1111-1111-1111-111111111111; it cannot be recovered from the recording\n");
+        let transcript = Gap { kind: GapKind::SttOffline, ..gap() };
+        assert_eq!(plain(&Event::Session(Notification::Gap(transcript.clone()))), "  ▲ gap  no transcription of 0.2–1.0 s of recording 11111111-1111-1111-1111-111111111111; recovery fills it in when it can\n");
         assert_eq!(plain(&Event::Session(Notification::DeviceBack { uid: "BlackHole-UID".into() })), "  ✓ input back  BlackHole-UID; recording continues in a new file\n");
         assert_eq!(plain(&Event::Session(Notification::Failed("disk full".into()))), "  ▲ session failed  disk full\n");
-        assert_eq!(plain(&Event::Session(Notification::Recovered(gap()))), "  ✓ recovered  the transcript of 0.2–1.0 s of recording 11111111-1111-1111-1111-111111111111\n");
+        assert_eq!(plain(&Event::Session(Notification::Recovered(transcript))), "  ✓ recovered  the transcript of 0.2–1.0 s of recording 11111111-1111-1111-1111-111111111111\n");
+        // a `Recovered` for an audio gap, which core never sends, is answered with the truth
+        assert_eq!(plain(&Event::Session(Notification::Recovered(gap()))), "  ▲ gap  the recording's audio for 0.2–1.0 s of recording 11111111-1111-1111-1111-111111111111 was lost; there is no transcript to recover\n");
         assert_eq!(plain(&Event::Session(Notification::RecoveryFailed("server busy".into()))), "  ▲ recovery  server busy\n");
         assert_eq!(plain(&Event::Session(Notification::SpendFailed("ledger unwritable".into()))), "  ▲ spend  ledger unwritable\n");
         assert_eq!(plain(&Event::Session(Notification::Open { stable: "gra".into(), tentative: "descent".into() })), "", "the terminal shows closed utterances only");
@@ -522,12 +609,12 @@ mod goldens {
         let mut watch = Some(SilenceWatch::new(-60.0, 10));
         let mut seen = String::new();
         for _ in 0..9 {
-            seen += &shown(OFF, &Event::Session(Notification::Level(quiet)), &mut watch);
+            seen += &shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch);
         }
         assert_eq!(seen, "");
-        seen += &shown(OFF, &Event::Session(Notification::Level(quiet)), &mut watch);
+        seen += &shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch);
         assert_eq!(seen, "  ▲ no signal  10 s of silence on BlackHole: is Zoom's Speaker \"LectureLive Loopback\"?\n");
-        seen += &shown(OFF, &Event::Session(Notification::Level(quiet)), &mut watch);
+        seen += &shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch);
         assert_eq!(seen, "  ▲ no signal  10 s of silence on BlackHole: is Zoom's Speaker \"LectureLive Loopback\"?\n", "one warning per silent stretch");
     }
 
@@ -535,13 +622,38 @@ mod goldens {
     #[test]
     fn device_gone_keeps_a_stable_prefix_before_the_machine_input_list() {
         let line = plain(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }));
-        let prefix = "  ▲ input gone  Gone-UID; waiting for it to return, and nothing switches by itself. ";
+        let prefix = "  ▲ Gone-UID  is unplugged. LectureLive waits for it and records nothing meanwhile. ";
         let rest = line.strip_prefix(prefix).unwrap_or_else(|| panic!("the stable prefix was lost: {line:?}"));
         assert!(
             rest == "No other input is connected; Ctrl-C stops."
                 || rest.starts_with("To record from another input, stop (Ctrl-C) and start again with --device <UID>: "),
             "the machine's inputs follow the fixed offer: {rest:?}"
         );
+    }
+    /// Plan §H's input-gone sentences, by source: a single input records nothing while it is away;
+    /// a mixed source's missing mic never implies Zoom stopped. The uid is the label — the line's
+    /// one bold slot — and nothing switches by itself in either case.
+    #[test]
+    fn input_gone_says_what_still_records_by_source() {
+        let single = input_gone("Receiver_UID", false);
+        assert_eq!((single.kind, single.label.as_str()), ("warn", "Receiver_UID"));
+        assert_eq!(single.detail, "is unplugged. LectureLive waits for it and records nothing meanwhile.");
+        let mixed = input_gone("Receiver_UID", true);
+        assert_eq!(mixed.label, "Receiver_UID");
+        assert_eq!(mixed.detail, "is unplugged. LectureLive waits for it; Zoom's audio still records meanwhile.");
+        assert!(!mixed.detail.contains("records nothing"), "a missing mic is not the loopback stopping");
+    }
+
+    /// A mixed source's gone input prints its own sentence and the same offer, never the
+    /// single-source promise that nothing is recorded.
+    #[test]
+    fn a_mixed_source_gone_input_does_not_say_recording_stopped() {
+        let mut out = Vec::new();
+        show(&mut out, pipe(OFF), &Event::Session(Notification::DeviceGone { uid: "Mic-UID".into() }), &mut None, &words(), true);
+        let line = String::from_utf8(out).unwrap();
+        let prefix = "  ▲ Mic-UID  is unplugged. LectureLive waits for it; Zoom's audio still records meanwhile. ";
+        let rest = line.strip_prefix(prefix).unwrap_or_else(|| panic!("{line:?}"));
+        assert!(rest == "No other input is connected; Ctrl-C stops." || rest.starts_with("To record from another input"), "{rest:?}");
     }
 
     #[test]
@@ -601,28 +713,28 @@ mod goldens {
     #[test]
     fn capture_denied_names_the_host() {
         let mut out = Vec::new();
-        show(&mut out, OFF, &Event::Capture(CaptureState::Denied), &mut None, &capture::Words { course: "Machine Learning".into(), host: "iTerm" });
+        show(&mut out, pipe(OFF), &Event::Capture(CaptureState::Denied), &mut None, &capture::Words { course: "Machine Learning".into(), host: "iTerm" }, false);
         assert_eq!(String::from_utf8(out).unwrap(), "  ▲ screen recording  Screen Recording is off for iTerm: System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen iTerm.\n");
         let mut out = Vec::new();
-        show(&mut out, OFF, &Event::Capture(CaptureState::Unbound), &mut None, &capture::Words { course: "Statistics".into(), host: "this terminal app" });
+        show(&mut out, pipe(OFF), &Event::Capture(CaptureState::Unbound), &mut None, &capture::Words { course: "Statistics".into(), host: "this terminal app" }, false);
         assert_eq!(String::from_utf8(out).unwrap(), "  ▣ no window  No Zoom window chosen for Statistics yet: choose it once in the LectureLive app. Screenshots (⌘⇧4) still become slides.\n");
     }
 
     #[test]
     fn say_paints_its_marks_and_labels() {
-        assert_eq!(shown(ANSI, &Event::NothingNew, &mut None), "  \u{1b}[36m◆\u{1b}[0m \u{1b}[1msnapshot\u{1b}[0m  nothing new since the last one\n");
-        assert_eq!(shown(TRUE, &Event::NothingNew, &mut None), "  \u{1b}[38;2;93;184;192m◆\u{1b}[0m \u{1b}[1msnapshot\u{1b}[0m  nothing new since the last one\n");
-        assert_eq!(shown(ANSI, &Event::SnapshotFailed("the model refused".into()), &mut None), "  \u{1b}[31m▲\u{1b}[0m \u{1b}[1msnapshot failed\u{1b}[0m  the model refused\n");
-        assert_eq!(shown(TRUE, &Event::SnapshotFailed("the model refused".into()), &mut None), "  \u{1b}[38;2;242;118;107m▲\u{1b}[0m \u{1b}[1msnapshot failed\u{1b}[0m  the model refused\n");
+        assert_eq!(shown(pipe(ANSI), &Event::NothingNew, &mut None), "  \u{1b}[36m◆\u{1b}[0m \u{1b}[1msnapshot\u{1b}[0m  nothing new since the last one\n");
+        assert_eq!(shown(pipe(TRUE), &Event::NothingNew, &mut None), "  \u{1b}[38;2;93;184;192m◆\u{1b}[0m \u{1b}[1msnapshot\u{1b}[0m  nothing new since the last one\n");
+        assert_eq!(shown(pipe(ANSI), &Event::SnapshotFailed("the model refused".into()), &mut None), "  \u{1b}[31m▲\u{1b}[0m \u{1b}[1msnapshot failed\u{1b}[0m  the model refused\n");
+        assert_eq!(shown(pipe(TRUE), &Event::SnapshotFailed("the model refused".into()), &mut None), "  \u{1b}[38;2;242;118;107m▲\u{1b}[0m \u{1b}[1msnapshot failed\u{1b}[0m  the model refused\n");
     }
 
     #[test]
     fn dim_and_teal_run_through_the_block_and_busy_lines() {
-        assert_eq!(shown(ANSI, &Event::Busy("polishing 40 words".into()), &mut None), "\u{1b}[2m  … polishing 40 words\u{1b}[0m\n");
-        assert_eq!(shown(TRUE, &Event::Busy("polishing 40 words".into()), &mut None), "\u{1b}[2m  … polishing 40 words\u{1b}[0m\n");
-        assert_eq!(shown(ANSI, &Event::Session(Notification::Stt(SttStatus::Connected)), &mut None), "\u{1b}[2m  transcribing\u{1b}[0m\n");
+        assert_eq!(shown(pipe(ANSI), &Event::Busy("polishing 40 words".into()), &mut None), "\u{1b}[2m  … polishing 40 words\u{1b}[0m\n");
+        assert_eq!(shown(pipe(TRUE), &Event::Busy("polishing 40 words".into()), &mut None), "\u{1b}[2m  … polishing 40 words\u{1b}[0m\n");
+        assert_eq!(shown(pipe(ANSI), &Event::Session(Notification::Stt(SttStatus::Connected)), &mut None), "\u{1b}[2m  transcribing\u{1b}[0m\n");
         let e = Event::Committed { words: 486, slides: 2, block: "<!-- 10:42:03 -->\n## Sampling".into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision: 3 };
-        assert_eq!(shown(TRUE, &e, &mut None), "  \u{1b}[38;2;93;184;192m│\u{1b}[0m \u{1b}[2m## Sampling\u{1b}[0m\n  \u{1b}[38;2;93;184;192m◆\u{1b}[0m \u{1b}[1mnotes\u{1b}[0m  486 words and 2 slides folded in  \u{1b}[2m$0.02\u{1b}[0m\n");
+        assert_eq!(shown(pipe(TRUE), &e, &mut None), "  \u{1b}[38;2;93;184;192m│\u{1b}[0m \u{1b}[2m## Sampling\u{1b}[0m\n  \u{1b}[38;2;93;184;192m◆\u{1b}[0m \u{1b}[1mnotes\u{1b}[0m  486 words and 2 slides folded in  \u{1b}[2m$0.02\u{1b}[0m\n");
     }
 
     #[test]
@@ -649,7 +761,7 @@ mod goldens {
 
     fn rendered(ready: &start::Prepared) -> String {
         let mut out = Vec::new();
-        print_prepared(&mut out, OFF, ready, &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
+        print_prepared(&mut out, pipe(OFF), ready, &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
         String::from_utf8(out).unwrap()
     }
 
@@ -710,13 +822,13 @@ mod goldens {
     #[test]
     fn print_prepared_paints_the_header() {
         let mut out = Vec::new();
-        print_prepared(&mut out, TRUE, &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
+        print_prepared(&mut out, pipe(TRUE), &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
         assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[1mMachine Learning\u{1b}[0m  \u{1b}[2m›\u{1b}[0m  Week 03 — Optimisation\n\u{1b}[2m  listening on BlackHole 2ch\u{1b}[0m\n\u{1b}[2m  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop\u{1b}[0m\n\n");
     }
 
     fn ended(report: StopReport, spend: &Spend) -> String {
         let mut out = Vec::new();
-        print_end(&mut out, OFF, &files(), &report, spend);
+        print_end(&mut out, pipe(OFF), &files(), &report, spend);
         String::from_utf8(out).unwrap()
     }
 
@@ -741,7 +853,7 @@ mod goldens {
     #[test]
     fn print_end_paints_the_saved_line() {
         let mut out = Vec::new();
-        print_end(&mut out, TRUE, &files(), &StopReport::default(), &ledger());
+        print_end(&mut out, pipe(TRUE), &files(), &StopReport::default(), &ledger());
         assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[38;2;93;184;192m✓\u{1b}[0m \u{1b}[1msaved\u{1b}[0m  lecture_notes_20260926.md  lecture_transcript_20260926.txt\n\u{1b}[2m    $-0.00 spent on this lecture today; `lecture spend` has the rest\u{1b}[0m\n\n");
     }
 
@@ -760,25 +872,25 @@ mod goldens {
     #[test]
     #[should_panic(expected = "failed printing to stdout")]
     fn a_failed_say_line_panics_as_println_did() {
-        say(&mut Broken, OFF, "notes", "notes", "nothing new");
+        say(&mut Broken, pipe(OFF), "notes", "notes", "nothing new");
     }
 
     #[test]
     #[should_panic(expected = "failed printing to stdout")]
     fn a_failed_show_line_panics_as_println_did() {
-        show(&mut Broken, OFF, &Event::Busy("polishing 40 words".into()), &mut None, &words());
+        show(&mut Broken, pipe(OFF), &Event::Busy("polishing 40 words".into()), &mut None, &words(), false);
     }
 
     #[test]
     #[should_panic(expected = "failed printing to stdout")]
     fn a_failed_prepared_line_panics_as_println_did() {
-        print_prepared(&mut Broken, OFF, &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
+        print_prepared(&mut Broken, pipe(OFF), &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
     }
 
     #[test]
     #[should_panic(expected = "failed printing to stdout")]
     fn a_failed_end_line_panics_as_println_did() {
-        print_end(&mut Broken, OFF, &files(), &StopReport::default(), &ledger());
+        print_end(&mut Broken, pipe(OFF), &files(), &StopReport::default(), &ledger());
     }
 
     const STOPPING: &str = "  ◆ stopping  finishing the transcript and recovery, then a last snapshot (Ctrl-C again stops waiting for recovery)\n";
@@ -789,7 +901,7 @@ mod goldens {
     fn ctrl_c(controller: &mut StopController) -> (String, usize, Step) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut out = Vec::new();
-        let step = request_stop(&mut out, OFF, controller, Origin::Signal, &tx).unwrap();
+        let step = request_stop(&mut out, pipe(OFF), controller, Origin::Signal, &tx).unwrap();
         let mut sent = 0;
         while let Ok(LectureCommand::Stop) = rx.try_recv() {
             sent += 1;
@@ -811,7 +923,7 @@ mod goldens {
     fn secs_then_ctrl_c_prints_the_stop_waiting_line() {
         let mut controller = StopController::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let step = request_stop(&mut std::io::sink(), OFF, &mut controller, Origin::Timer, &tx).unwrap();
+        let step = request_stop(&mut std::io::sink(), pipe(OFF), &mut controller, Origin::Timer, &tx).unwrap();
         assert_eq!(step, Step::Advance { stage: Stage::Stopping, stops_to_send: 1 });
         assert!(matches!(rx.try_recv(), Ok(LectureCommand::Stop)) && rx.try_recv().is_err());
         assert_eq!(ctrl_c(&mut controller), (STOP_WAITING.into(), 1, Step::Advance { stage: Stage::StopWaiting, stops_to_send: 1 }));
@@ -871,6 +983,105 @@ mod goldens {
         }
     }
 
+    /// One payload carrying every hostile sequence the boundary must neutralise: a CSI colour and
+    /// a clear-screen, OSC title (BEL- and ST-terminated), an OSC 52 clipboard write, an OSC 8
+    /// hyperlink with its target, BEL, CR and DEL.
+    const HOSTILE: &str = "say\x1b[31mthis\x1b[0m\x1b[2J\x1b[H\x1b]0;owned title\x07\x1b]52;c;cGF5bWU\x07\x1b]8;;https://evil.example\x1b\\click\x1b]8;;\x1b\\\x07part\rwholed\x7f";
+
+    /// The visible words that survive the payload above, as `clean` leaves them.
+    const HOSTILE_LEFT: &str = "saythisclickpart\nwholed";
+
+    /// Plan §C 12 / Task 12: `NO_COLOR` is not "no safety". On a TTY whose colour is off — exactly
+    /// the `NO_COLOR` case — every hostile sequence still goes from every dynamic line plain
+    /// prints: transcript text, the recording path, busy text, failure notices, a committed block,
+    /// the input uid, a slide's file, capture states, and the start-up and end reports. Not one
+    /// executable control, and not one ESC, survives.
+    #[test]
+    fn plain_tty_cleans_controls_with_no_color() {
+        let d = term(OFF);
+        let mut watch = None;
+        let cases: Vec<Event> = vec![
+            Event::Session(Notification::Segment(Segment { id: 0, recording_id: Default::default(), start_sample: 0, end_sample: 1, said_at: segment("live").said_at, start: segment("live").start, end: segment("live").end, text: HOSTILE.into(), words: Vec::new(), source: SegmentSource::Live })),
+            Event::Session(Notification::Recording { path: PathBuf::from(format!("/tmp/{}/rec.wav", HOSTILE)) }),
+            Event::Busy(HOSTILE.into()),
+            Event::SnapshotFailed(HOSTILE.into()),
+            Event::PolishFailed(HOSTILE.into()),
+            Event::PageFailed(HOSTILE.into()),
+            Event::Session(Notification::Failed(HOSTILE.into())),
+            Event::Session(Notification::RecoveryFailed(HOSTILE.into())),
+            Event::Session(Notification::SpendFailed(HOSTILE.into())),
+            Event::Session(Notification::Stt(SttStatus::Retrying { after: Duration::from_secs(2), reason: HOSTILE.into() })),
+            Event::Session(Notification::DeviceGone { uid: HOSTILE.into() }),
+            Event::Slide { index: 1, file: format!("slides/{HOSTILE}.png").into(), auto: true, uncertain: false, shown_at: chrono::Local::now() },
+            Event::Capture(CaptureState::Paused { window: HOSTILE.into(), reason: HOSTILE.into() }),
+            Event::CaptureMoved { selection: Selection { descriptor: Descriptor { bundle_id: None, app: HOSTILE.into(), title: HOSTILE.into(), width: 1, height: 1 }, region: Region::WHOLE, leave_out: vec![], sizes: vec![] }, note: HOSTILE.into() },
+            Event::Warning(HOSTILE.into()),
+            Event::Committed { words: 1, slides: 0, block: format!("<!-- 10:00:00 -->\n{HOSTILE}\n"), usd: 0.0, confirmed: true, removed: 0, missing: 0, revision: 1 },
+        ];
+        for e in &cases {
+            let mut out = Vec::new();
+            show(&mut out, d, e, &mut watch, &words(), false);
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains('\x1b') && !text.contains('\x07') && !text.contains('\r') && !text.contains('\x7f'), "{e:?} left a control: {text:?}");
+            assert!(text.contains("saythis") || text.contains("click"), "{e:?} lost the visible words: {text:?}");
+        }
+        // the start-up report's own names and the end summary's files and failure
+        let mut ready = prepared(InitReport::default());
+        ready.launch.missing = vec![PathBuf::from(format!("/tmp/lec/{HOSTILE}.wav"))];
+        let mut out = Vec::new();
+        print_prepared(&mut out, d, &ready, &files(), HOSTILE, HOSTILE, HOSTILE);
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\x1b') && !text.contains('\x07') && !text.contains('\r'), "{text:?}");
+        assert!(text.contains(&clean(HOSTILE)), "the names are cleaned, not dropped: {text:?}");
+        let mut out = Vec::new();
+        print_end(&mut out, d, &files(), &StopReport { last_snapshot: Some(HOSTILE.into()), ..Default::default() }, &ledger());
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\x1b') && !text.contains('\x07') && !text.contains('\r'), "{text:?}");
+        assert!(text.contains("the last snapshot failed (saythis"), "{text:?}");
+        // the cleaner itself has already proved what a payload reduces to; the boundary agrees
+        assert_eq!(clean(HOSTILE), HOSTILE_LEFT);
+    }
+
+    /// Cleaning happens before painting, so our own styling survives and the payload's sequences
+    /// do not: with colour on, a TTY line still carries LectureLive's escapes (the mark's, the
+    /// label's) while every hostile CSI, OSC and control from the event is gone. Were cleaning run
+    /// on the painted output, our own sequences would be stripped with the rest.
+    #[test]
+    fn plain_tty_cleans_untrusted_text_before_painting() {
+        let d = term(TRUE);
+        let mut out = Vec::new();
+        show(&mut out, d, &Event::SnapshotFailed(HOSTILE.into()), &mut None, &words(), false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\u{1b}[38;2;242;118;107m▲\u{1b}[0m \u{1b}[1msnapshot failed\u{1b}[0m"), "our own paint is intact: {text:?}");
+        assert!(!text.contains("\x1b[31m") && !text.contains("\x1b[2J") && !text.contains("\x1b]0;") && !text.contains("\x1b]52;") && !text.contains("\x1b]8;"), "the payload's sequences are gone: {text:?}");
+        assert!(!text.contains('\x07') && !text.contains('\r') && !text.contains('\x7f'));
+        assert!(text.contains("saythis"), "the words it carried stay: {text:?}");
+        // the transcript's own line keeps its dim time but never the payload's controls
+        let mut out = Vec::new();
+        show(&mut out, d, &Event::Session(Notification::Segment(Segment { id: 0, recording_id: Default::default(), start_sample: 0, end_sample: 1, said_at: segment("live").said_at, start: segment("live").start, end: segment("live").end, text: HOSTILE.into(), words: Vec::new(), source: SegmentSource::Live })), &mut None, &words(), false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\u{1b}[2m"), "our own dim time: {text:?}");
+        assert!(!text.contains("\x1b[31m") && !text.contains("\x1b]"), "none of the payload's: {text:?}");
+    }
+
+    /// A pipe is not a terminal: the same hostile bytes reach it untouched, exactly as the CLI
+    /// printed them before Task 12, so ordinary control-free output is byte-identical and the
+    /// pipe tests' zero-escape guarantee keeps its meaning (nothing new is injected either).
+    #[test]
+    fn a_pipe_leaves_the_bytes_as_they_are() {
+        let mut out = Vec::new();
+        show(&mut out, pipe(OFF), &Event::SnapshotFailed(HOSTILE.into()), &mut None, &words(), false);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, format!("  ▲ snapshot failed  {HOSTILE}\n"), "not a terminal: no cleaning, byte for byte");
+        // and control-free lines are identical either way
+        for e in [Event::NothingNew, Event::SnapshotFailed("timed out".into())] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            show(&mut a, pipe(OFF), &e, &mut None, &words(), false);
+            show(&mut b, term(OFF), &e, &mut None, &words(), false);
+            assert_eq!(a, b, "control-free text is the same on a TTY and a pipe");
+        }
+    }
+
     /// The shared wording, unstyled: what the TUI's activity and notice line hold, and what `show`
     /// then paints (already pinned byte for byte by the goldens above).
     #[test]
@@ -879,20 +1090,21 @@ mod goldens {
         let on = spend::Paint { color: true, truecolor: true };
         let w = &words();
         let e = Event::Committed { words: 486, slides: 2, block: "<!-- 10:42:03 -->\n## Sampling".into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision: 3 };
-        let n = notice(&e, off, w).unwrap();
+        let n = notice(&e, off, w, false).unwrap();
         assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("notes", "notes", "486 words and 2 slides folded in  $0.02"));
         assert!(!n.detail.contains('\x1b'), "the TUI's wording carries no styling");
-        assert_eq!(notice(&e, on, w).unwrap().detail, "486 words and 2 slides folded in  \x1b[2m$0.02\x1b[0m", "the plain CLI's own paint is unchanged");
-        assert_eq!(notice(&Event::Session(Notification::Open { stable: "a".into(), tentative: "b".into() }), off, w), None);
-        assert_eq!(notice(&Event::Busy("snapshot, 12 words".into()), off, w), None, "busy text is shown verbatim, never a notice");
-        assert_eq!(notice(&Event::Session(Notification::Stt(SttStatus::Connected)), off, w), None);
-        let gone = notice(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }), off, w).unwrap();
-        assert_eq!((gone.kind, gone.label.as_str()), ("warn", "input gone"));
-        assert_eq!(gone.detail, "Gone-UID; waiting for it to return, and nothing switches by itself", "the offer is the plain CLI's own addition");
+        assert_eq!(notice(&e, on, w, false).unwrap().detail, "486 words and 2 slides folded in  \x1b[2m$0.02\x1b[0m", "the plain CLI's own paint is unchanged");
+        assert_eq!(notice(&Event::Session(Notification::Open { stable: "a".into(), tentative: "b".into() }), off, w, false), None);
+        assert_eq!(notice(&Event::Busy("snapshot, 12 words".into()), off, w, false), None, "busy text is shown verbatim, never a notice");
+        assert_eq!(notice(&Event::Session(Notification::Stt(SttStatus::Connected)), off, w, false), None);
+        let gone = notice(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }), off, w, false).unwrap();
+        assert_eq!((gone.kind, gone.label.as_str()), ("warn", "Gone-UID"));
+        assert_eq!(gone.detail, "is unplugged. LectureLive waits for it and records nothing meanwhile.", "the offer is the plain CLI's own addition");
+        assert_eq!(notice(&Event::Session(Notification::DeviceGone { uid: "Gone-UID".into() }), off, w, true).unwrap().detail, "is unplugged. LectureLive waits for it; Zoom's audio still records meanwhile.");
         // capture states use the terminal's wording, unstyled
-        let n = notice(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), on, w).unwrap();
+        let n = notice(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), on, w, false).unwrap();
         assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("slide", "watching", "Zoom Meeting"));
-        let n = notice(&Event::Capture(CaptureState::Denied), on, w).unwrap();
+        let n = notice(&Event::Capture(CaptureState::Denied), on, w, false).unwrap();
         assert_eq!(n.detail, "Screen Recording is off for Terminal: System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen Terminal.", "no styling and no host guessing");
     }
 
