@@ -5,6 +5,7 @@
 //! Every way out goes through [`leave`], which gives the terminal back before anything is printed.
 
 pub(crate) mod hydrate;
+mod markdown;
 mod panes;
 pub(crate) mod state;
 pub(crate) mod terminal;
@@ -62,6 +63,8 @@ struct Ui {
     /// The transcript's body as last drawn; none while it is not on screen, when reading keys
     /// leave its place alone.
     reading: Option<Rect>,
+    /// The preview as last parsed for drawing: at most every [`panes::PREVIEW_EVERY`], never per delta.
+    preview: panes::Preview,
     view: View,
 }
 
@@ -76,7 +79,7 @@ enum Act {
 
 impl Ui {
     fn new(view: View) -> Ui {
-        Ui { stop: StopController::default(), events: 0, notice: None, focus: view::Pane::Transcript, transcript: panes::Scroll::default(), reading: None, view }
+        Ui { stop: StopController::default(), events: 0, notice: None, focus: view::Pane::Transcript, transcript: panes::Scroll::default(), reading: None, preview: panes::Preview::default(), view }
     }
 
     /// One stop request through the shared controller; the view's phase follows the stage it reached.
@@ -270,6 +273,8 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let (mut dirty, mut drawn_at) = (true, started - FRAME);
     let (mut hydrating, mut again) = (false, false);
+    // When the preview, throttled to ten parses a second, is next due for another look.
+    let mut preview_due: Option<Instant> = None;
     loop {
         tokio::select! {
             biased;
@@ -352,10 +357,16 @@ async fn react(mut io: Io, view: View, started: Instant, secs: Option<u64>) -> E
                 dirty = true;
             }
             _ = clock.tick() => dirty = true,
+            _ = sleep_until(preview_due.unwrap_or(started)), if preview_due.is_some() => {
+                preview_due = None;
+                dirty = true;
+            }
             _ = sleep_until(drawn_at + FRAME), if dirty => {}
         }
         if dirty && Instant::now() >= drawn_at + FRAME {
-            let chrome = view::Chrome { elapsed: started.elapsed(), refused: ui.notice, focus: ui.focus, transcript: &ui.transcript, theme: &theme };
+            // An ended preview is dropped here, before the frame that shows its commit.
+            preview_due = ui.preview.refresh(&ui.view.notes, std::time::Instant::now()).map(Instant::from_std);
+            let chrome = view::Chrome { elapsed: started.elapsed(), refused: ui.notice, focus: ui.focus, transcript: &ui.transcript, preview: &ui.preview, theme: &theme };
             let mut reading = ui.reading;
             if let Err(e) = terminal::draw(&mut io.screen, |f| reading = view::render(f, &ui.view, &chrome)) {
                 return Exit::DrawFailed(e);
@@ -503,7 +514,8 @@ mod tests {
     fn frame(ui: &mut Ui, width: u16, height: u16) -> Vec<String> {
         let theme = view::Theme::new(lecturelive_core::session::spend::Paint { color: true, truecolor: true }, true);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        let chrome = view::Chrome { elapsed: Duration::from_secs(60), refused: None, focus: ui.focus, transcript: &ui.transcript, theme: &theme };
+        ui.preview.refresh(&ui.view.notes, std::time::Instant::now());
+        let chrome = view::Chrome { elapsed: Duration::from_secs(60), refused: None, focus: ui.focus, transcript: &ui.transcript, preview: &ui.preview, theme: &theme };
         let mut reading = None;
         terminal.draw(|f| reading = view::render(f, &ui.view, &chrome)).unwrap();
         ui.reading = reading;

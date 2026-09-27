@@ -2,7 +2,7 @@
 " BlackHole 2ch  ■■■■■□□□  transcribing  0 gaps                                                    $0.18 today "
 " ──────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " Transcript   Slides                        │ Notes                                                           "
-"           sample can mislead, so today is  │ The notes show here.                                            "
+"           sample can mislead, so today is  │ Nothing written yet.                                            "
 "           about what happens when we       │                                                                 "
 "           repeat the experiment.           │                                                                 "
 " 10:41:05  Imagine drawing a hundred        │                                                                 "

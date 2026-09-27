@@ -2,7 +2,7 @@
 " BlackHole 2ch  ■■■■■□□□  transcribing  0 gaps                                                    $0.18 today "
 " ──────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " Transcript   Slides       2 new   Esc live │ Notes                                                           "
-"           numbers, is the whole of today.  │ The notes show here.                                            "
+"           numbers, is the whole of today.  │ Nothing written yet.                                            "
 " 10:40:20  Keep the picture of the          │                                                                 "
 "           histogram from the lab in mind.  │                                                                 "
 " 10:40:52  Last week we saw how a single    │                                                                 "

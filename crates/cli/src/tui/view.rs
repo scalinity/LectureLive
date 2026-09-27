@@ -22,8 +22,8 @@ use lecturelive_core::session::spend::{self, Paint};
 
 use crate::stop::Stage;
 
-use super::panes::{self, Scroll};
-use super::state::View;
+use super::panes::{self, Preview, Scroll};
+use super::state::{Lane, View};
 
 pub(crate) const SUSPEND: &str = "Suspending would stop the recording. Stop the lecture first (Ctrl-C).";
 
@@ -206,10 +206,12 @@ pub(crate) struct Glyphs {
     meter_off: &'static str,
     /// The live edge: the open utterance's rows.
     edge: &'static str,
+    /// A bullet list item's mark.
+    bullet: &'static str,
 }
 
-const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□", edge: "▎" };
-const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-", edge: "|" };
+const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□", edge: "▎", bullet: "•" };
+const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-", edge: "|", bullet: "-" };
 
 /// Whether the effective locale is UTF-8: the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set
 /// and not empty decides, as the C library's own lookup does.
@@ -368,6 +370,8 @@ pub(crate) struct Chrome<'a> {
     pub(crate) refused: Option<&'a str>,
     pub(crate) focus: Pane,
     pub(crate) transcript: &'a Scroll,
+    /// The preview as last parsed, at most ten times a second.
+    pub(crate) preview: &'a Preview,
     pub(crate) theme: &'a Theme,
 }
 
@@ -397,21 +401,33 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Option<Rect> {
         }
     }
     for col in &l.columns {
-        let tabs = heading(col, v, c);
-        let room = (col.heading.width as usize).saturating_sub(width(&tabs) + 2);
+        let (tabs, named) = heading(col, v, c);
+        let room = (col.heading.width as usize).saturating_sub(named + 2);
         frame.render_widget(Line::from(tabs), col.heading);
-        if col.shown(c.focus) == Pane::Transcript {
-            if let Some(lane) = c.transcript.unseen(v).and_then(|n| reading_lane(n, room, c.theme)) {
-                frame.render_widget(Line::from(lane).right_aligned(), col.heading);
+        match col.shown(c.focus) {
+            Pane::Transcript => {
+                if let Some(lane) = c.transcript.unseen(v).and_then(|n| reading_lane(n, room, c.theme)) {
+                    frame.render_widget(Line::from(lane).right_aligned(), col.heading);
+                }
+                panes::transcript(frame.buffer_mut(), col.body, v, c.transcript, g.edge, c.theme.teal());
+                reading = Some(col.body);
             }
-            panes::transcript(frame.buffer_mut(), col.body, v, c.transcript, g.edge, c.theme.teal());
-            reading = Some(col.body);
-        } else if col.body.height > 0 {
-            let text = match col.shown(c.focus) {
-                Pane::Notes => "The notes show here.",
-                Pane::Transcript | Pane::Slides => "Slides show here.",
-            };
-            frame.render_widget(Span::styled(fit(text, col.body.width as usize, g.ellipsis), DIM), Rect { height: 1, ..col.body });
+            Pane::Notes => {
+                // stacked's heading is a rule: a space ends the rule before the lane
+                let gap = usize::from(col.ruled);
+                if let Some(mut lane) = work_lane(v, room.saturating_sub(gap), c.theme) {
+                    if col.ruled {
+                        lane.insert(0, Span::raw(" "));
+                    }
+                    frame.render_widget(Line::from(lane).right_aligned(), col.heading);
+                }
+                let ink = panes::Ink { edge: g.edge, bullet: g.bullet, quote: g.bar, slide: g.slide, rule: g.rule, teal: c.theme.teal() };
+                panes::notes(frame.buffer_mut(), col.body, v, c.preview, &ink);
+            }
+            Pane::Slides if col.body.height > 0 => {
+                frame.render_widget(Span::styled(fit("Slides show here.", col.body.width as usize, g.ellipsis), DIM), Rect { height: 1, ..col.body });
+            }
+            Pane::Slides => {}
         }
     }
     frame.render_widget(Line::from(notice(v, c, l.notice.width as usize)), l.notice);
@@ -436,6 +452,36 @@ fn reading_lane(new: usize, room: usize, t: &Theme) -> Option<Vec<Span<'static>>
         ]
     };
     forms.into_iter().find(|f| width(f) <= room)
+}
+
+/// The notes heading's lane, right of its name: what the notes work is doing — this TUI's own
+/// request at the head (teal: it is live), how many wait behind it, and the study page
+/// typesetting. From typed state only (plan §C 13). As the heading narrows the page goes first,
+/// then the queue; the head's state goes last.
+fn work_lane(v: &View, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
+    let w = &v.work;
+    let head = match w.lane() {
+        Lane::Idle => None,
+        Lane::Snapshot => Some("snapshot: writing"),
+        Lane::PolishSnapshotFirst => Some("polish: snapshot first"),
+        Lane::Polishing => Some("polishing"),
+        Lane::LastSnapshot => Some("last snapshot: writing"),
+    }
+    .map(|s| Span::styled(s, t.teal()));
+    let queued = (w.queued() > 0).then(|| Span::styled(format!("{} queued", w.queued()), DIM));
+    let page = w.page().then(|| Span::styled("study page: typesetting", DIM));
+    let join = |parts: [&Option<Span<'static>>; 3]| {
+        let mut spans = Vec::new();
+        for s in parts.into_iter().flatten() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("   "));
+            }
+            spans.push(s.clone());
+        }
+        spans
+    };
+    let none = None;
+    [join([&head, &queued, &page]), join([&head, &queued, &none]), join([&head, &none, &none])].into_iter().filter(|f| !f.is_empty()).find(|f| width(f) <= room)
 }
 
 /// Header row 1: the recording dot, the phase, then the course and lecture — or, while stopping,
@@ -524,7 +570,8 @@ fn second_row(v: &View, t: &Theme, max: usize) -> (Vec<Span<'static>>, Option<Ve
 
 /// A column's heading: the pane's name, or its tabs with the one shown bold in teal and the others
 /// dim. Slides carry their count once there is one. Stacked's notes heading is a rule with its name in it.
-fn heading(col: &Column, v: &View, c: &Chrome) -> Vec<Span<'static>> {
+/// Returns the spans and the cells the names take, before any rule after them.
+fn heading(col: &Column, v: &View, c: &Chrome) -> (Vec<Span<'static>>, usize) {
     let t = c.theme;
     let name = |p: Pane| match p {
         Pane::Transcript => "Transcript".to_string(),
@@ -549,11 +596,12 @@ fn heading(col: &Column, v: &View, c: &Chrome) -> Vec<Span<'static>> {
         }
         spans.push(Span::styled(name(p), style(p)));
     }
+    let named = width(&spans);
     if col.ruled {
-        let rest = (col.heading.width as usize).saturating_sub(width(&spans) + 1);
+        let rest = (col.heading.width as usize).saturating_sub(named + 1);
         spans.push(Span::styled(format!(" {}", t.glyphs.rule.repeat(rest)), DIM));
     }
-    spans
+    (spans, named)
 }
 
 /// The notice line: a refused stop first — it is about the keys just below — else the view's
@@ -662,7 +710,7 @@ mod tests {
 
     fn drawn_scrolled(width: u16, height: u16, v: &View, scroll: &Scroll, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus: Pane::Transcript, transcript: scroll, theme };
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus: Pane::Transcript, transcript: scroll, preview: &Preview::default(), theme };
         terminal.draw(|f| {
             render(f, v, &chrome);
         })
@@ -874,7 +922,7 @@ mod tests {
         // too narrow for any phrasing: the phase and the clock alone, no fragment
         let mut b = Buffer::empty(Rect::new(0, 0, 30, 1));
         let theme = Theme::new(TRUE, true);
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: None, focus: Pane::Transcript, theme: &theme, transcript: &Scroll::default() };
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: None, focus: Pane::Transcript, theme: &theme, transcript: &Scroll::default(), preview: &Preview::default() };
         ratatui::widgets::Widget::render(Line::from(first_row(&view(Stage::StopWaiting), &chrome, 30)), b.area, &mut b);
         assert_eq!(lines(&b)[0], "● Stop waiting");
     }
@@ -1233,5 +1281,241 @@ mod tests {
             }
         }
         golden("listening_ascii_80x24", &drawn_with(80, 24, &view(Stage::Listening), None, &Theme::new(OFF, false)));
+    }
+
+    // ---- the notes pane (Task 9) --------------------------------------------------------------
+
+    /// The notes of the lecture `live()` transcribes, as LectureLive writes them.
+    const NOTES: &str = "# Statistics — Week 04 — Sampling\n\n<!-- 10:39:12 -->\n## Sampling distributions\n### Standard error\n\
+- Larger samples reduce **standard error**, by \\( \\sigma / \\sqrt{n} \\).\n  - Quadrupling *n* only halves it.\n\
+- Distinct from the spread of the observations: `sd` versus `se`.\n\n![Slide 17](slides/slide_17_103941.png)\n\n\
+> Keep the histogram from the lab in mind.\n\n```\nse = sd / sqrt(n)\n```\n\n| n | se |\n|---|---|\n| 25 | 2.0 |\n| 100 | 1.0 |\n\n\
+<!-- 10:41:52 -->\n## Sample statistic and parameter\n- The **statistic** is computed from the sample; the parameter belongs to the population.\n\
+- 標本平均 is the sample mean 🎓\n";
+
+    const PROVISIONAL: &str = "## Provisional heading\n- tentative words the model is still writing about quadrupling ";
+    const REAL: &str = "\n<!-- 10:43:05 -->\n## Confidence intervals\n- An interval built to cover the mean in repeated samples.\n";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Work {
+        Committed,
+        Writing,
+        AfterCommit,
+        PolishFirst,
+        Polishing,
+        Page,
+    }
+
+    fn commit(v: &mut View, block: &str, revision: u64) {
+        v.reduce(&Event::Committed { words: 60, slides: 0, block: block.into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision }, Local::now());
+    }
+
+    /// The live lecture with its notes, the notes work in state `w`.
+    fn noted(w: Work) -> View {
+        use crate::tui::hydrate::NotesSnapshot;
+        use crate::tui::state::OwnOp;
+        let mut v = live();
+        v.merge(Hydration { notes: NotesSnapshot::At { revision: 1, document: NOTES.into() }, ..Hydration::empty() });
+        v.reduce(&Event::Slide { index: 17, file: "slides/slide_17_103941.png".into(), auto: true, uncertain: false, shown_at: chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 10, 39, 41).unwrap() }, Local::now());
+        v.notice = None;
+        let preview = |v: &mut View| v.reduce(&Event::Preview(PROVISIONAL.into()), Local::now());
+        match w {
+            Work::Committed => {}
+            Work::Writing => {
+                v.work.submit(OwnOp::Snapshot);
+                preview(&mut v);
+            }
+            Work::AfterCommit => {
+                v.work.submit(OwnOp::Snapshot);
+                preview(&mut v);
+                commit(&mut v, REAL, 2);
+            }
+            Work::PolishFirst => {
+                v.work.submit(OwnOp::Polish);
+                v.work.submit(OwnOp::Snapshot);
+                preview(&mut v);
+            }
+            Work::Polishing => {
+                v.work.submit(OwnOp::Polish);
+                preview(&mut v);
+                commit(&mut v, REAL, 2);
+            }
+            Work::Page => {
+                v.work.submit(OwnOp::Polish);
+                v.reduce(&Event::NothingNew, Local::now());
+                v.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.04, revision: 2 }, Local::now());
+                v.work.submit(OwnOp::Snapshot);
+                v.work.submit(OwnOp::Snapshot);
+            }
+        }
+        v
+    }
+
+    /// A frame as the reactor draws it: the preview refreshed first, `focus` the reading pane.
+    fn framed(width: u16, height: u16, v: &View, focus: Pane, theme: &Theme) -> Terminal<TestBackend> {
+        let mut preview = Preview::default();
+        preview.refresh(&v.notes, std::time::Instant::now());
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: None, focus, transcript: &Scroll::default(), preview: &preview, theme };
+        terminal.draw(|f| {
+            render(f, v, &chrome);
+        })
+        .unwrap();
+        terminal
+    }
+
+    /// Narrow shows one pane: there the notes are drawn with the notes as the tab shown.
+    fn focus_for(w: u16, h: u16) -> Pane {
+        if variant(w, h) == Variant::Narrow { Pane::Notes } else { Pane::Transcript }
+    }
+
+    /// The notes body in a frame, as rows: the column the notes are in.
+    fn notes_rows(b: &Buffer, w: u16, h: u16) -> Vec<String> {
+        let l = layout(Rect::new(0, 0, w, h));
+        let col = l.columns.iter().find(|c| c.tabs.contains(&Pane::Notes)).unwrap();
+        col.body.rows().map(|r| {
+            let (mut s, mut x) = (String::new(), r.x);
+            while x < r.right() {
+                let sym = b[(x, r.y)].symbol();
+                s.push_str(sym);
+                x += (Span::raw(sym).width() as u16).max(1); // a wide glyph once, not its covered cell
+            }
+            s.trim_end().to_string()
+        })
+        .collect()
+    }
+
+    /// Plan Task 9's goldens: committed notes at every size (narrow with the notes tab shown), the
+    /// snapshot being written, after its commit, and the polish and page lanes.
+    #[test]
+    fn goldens_for_the_notes() {
+        let theme = Theme::new(TRUE, true);
+        let all = [(140, 40), (110, 32), (127, 36), (80, 24), (80, 25), (72, 45), (60, 16)];
+        for (work, name, sizes) in [
+            (Work::Committed, "committed", &all[..]),
+            (Work::Writing, "writing", &[(140, 40), (110, 32), (127, 36), (80, 25), (72, 45), (60, 16)][..]),
+            (Work::AfterCommit, "after_commit", &[(140, 40), (80, 25), (72, 45)][..]),
+            (Work::PolishFirst, "polish_first", &[(110, 32), (72, 45)][..]),
+            (Work::Polishing, "polishing", &[(110, 32), (60, 16)][..]),
+            (Work::Page, "page", &[(140, 40), (80, 25)][..]),
+        ] {
+            for &(w, h) in sizes {
+                golden(&format!("notes_{name}_{w}x{h}"), &framed(w, h, &noted(work), focus_for(w, h), &theme));
+            }
+        }
+        golden("notes_ascii_80x25", &framed(80, 25, &noted(Work::Writing), Pane::Notes, &Theme::new(OFF, false)));
+    }
+
+    /// The notes fill their pane in every layout that shows them, and the transcript is not
+    /// disturbed where both are on screen.
+    #[test]
+    fn the_notes_fill_their_pane_in_every_layout() {
+        for (w, h) in TRANSCRIPT_SIZES {
+            let b = framed(w, h, &noted(Work::Writing), focus_for(w, h), &Theme::new(TRUE, true)).backend().buffer().clone();
+            let text = lines(&b).join("\n");
+            if variant(w, h) == Variant::TooSmall {
+                assert!(!text.contains("writing") && !text.contains("statistic"), "{w}×{h}: nothing of the notes in the safety view");
+                continue;
+            }
+            let rows = notes_rows(&b, w, h);
+            let last = rows.iter().rposition(|r| !r.is_empty()).unwrap();
+            assert!(rows[last].contains('▎'), "{w}×{h}: following ends on the preview: {rows:?}");
+            assert!(!text.contains("Nothing written yet"), "{w}×{h}");
+            if variant(w, h) != Variant::Narrow {
+                assert!(text.contains("10:42:11"), "{w}×{h}: the transcript is still there");
+            }
+        }
+    }
+
+    /// Plan Task 9's gate: after a commit's update, not one cell of the preview remains, and the
+    /// committed chunk is there — whether or not the parsed preview was refreshed before the draw.
+    #[test]
+    fn no_preview_cell_survives_its_commit() {
+        let (w, h) = (140, 40);
+        let theme = Theme::new(TRUE, true);
+        let mut v = noted(Work::Writing);
+        let mut stale = Preview::default();
+        stale.refresh(&v.notes, std::time::Instant::now());
+        let before = notes_rows(framed(w, h, &v, Pane::Transcript, &theme).backend().buffer(), w, h);
+        assert!(before.iter().any(|r| r.starts_with("writing ▎ Provisional heading")), "{before:?}");
+        assert!(before.iter().any(|r| r.contains("tentative words")));
+        commit(&mut v, REAL, 2);
+        let check = |b: &Buffer| {
+            let after = notes_rows(b, w, h);
+            let text = after.join("\n");
+            for gone in ["writing", "▎", "Provisional", "tentative", "still", "quadrupling"] {
+                assert!(!text.contains(gone), "{gone:?} survived the commit: {after:?}");
+            }
+            assert!(after.iter().any(|r| r == "10:43:05  Confidence intervals"), "{after:?}");
+            assert!(after.iter().any(|r| r.contains("An interval built to cover the mean")));
+        };
+        check(framed(w, h, &v, Pane::Transcript, &theme).backend().buffer());
+        // the reactor refreshes before it draws; even a frame drawn with the old parse shows none of it
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let chrome = Chrome { elapsed: Duration::ZERO, refused: None, focus: Pane::Transcript, transcript: &Scroll::default(), preview: &stale, theme: &theme };
+        terminal.draw(|f| {
+            render(f, &v, &chrome);
+        })
+        .unwrap();
+        check(terminal.backend().buffer());
+    }
+
+    /// The heading lane: the head's state teal, what waits and the page dim; at a narrower heading
+    /// the page goes first, then the queue — and it never pushes the heading's name.
+    #[test]
+    fn the_notes_heading_says_what_the_work_is_doing() {
+        let theme = Theme::new(TRUE, true);
+        for (work, want) in [
+            (Work::Committed, None),
+            (Work::Writing, Some("snapshot: writing")),
+            (Work::PolishFirst, Some("polish: snapshot first   1 queued")),
+            (Work::Polishing, Some("polishing")),
+            (Work::Page, Some("snapshot: writing   1 queued   study page: typesetting")),
+        ] {
+            let b = framed(140, 40, &noted(work), Pane::Transcript, &theme).backend().buffer().clone();
+            let row = &lines(&b)[3];
+            match want {
+                Some(want) => assert!(row.contains(&format!("{want} │ Slides")), "{work:?}: right-aligned in the notes heading: {row:?}"),
+                None => assert!(!row.contains("writing") && !row.contains("polish"), "{row:?}"),
+            }
+        }
+        let b = framed(140, 40, &noted(Work::Page), Pane::Transcript, &theme).backend().buffer().clone();
+        let (x, y) = at(&b, 3, "snapshot: writing");
+        assert_eq!(b[(x, y)].fg, TEAL);
+        let (x, y) = at(&b, 3, "1 queued");
+        assert_eq!(b[(x, y)].modifier, Modifier::DIM);
+        let (x, y) = at(&b, 3, "study page");
+        assert_eq!(b[(x, y)].modifier, Modifier::DIM);
+        // narrower: the page goes, then the queue
+        let l = lines(&framed(100, 24, &noted(Work::Page), Pane::Transcript, &theme).backend().buffer().clone());
+        assert!(l[3].contains("snapshot: writing   1 queued") && !l[3].contains("study page"), "{:?}", l[3]);
+        let l = lines(&framed(60, 16, &noted(Work::Page), Pane::Notes, &theme).backend().buffer().clone());
+        assert!(l[2].starts_with(" Transcript   Notes   Slides") && l[2].ends_with("snapshot: writing"), "{:?}", l[2]);
+        // stacked: the lane ends the notes rule
+        let l = lines(&framed(72, 45, &noted(Work::Writing), Pane::Transcript, &theme).backend().buffer().clone());
+        let rule = l.iter().find(|r| r.contains("── Notes ")).unwrap();
+        assert!(rule.ends_with("─ snapshot: writing"), "{rule:?}");
+    }
+
+    /// `NO_COLOR`: no colour, and the preview still reads as provisional by its word and its edge.
+    /// ASCII: the bullet, quote, slide and edge fall back; the notes' own words stay as written.
+    #[test]
+    fn the_notes_without_colour_and_in_ascii() {
+        let b = framed(140, 40, &noted(Work::Writing), Pane::Transcript, &Theme::new(OFF, true)).backend().buffer().clone();
+        assert!(b.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        let rows = notes_rows(&b, 140, 40);
+        assert!(rows.iter().any(|r| r.starts_with("writing ▎ Provisional")) && rows.iter().any(|r| r.contains("• Larger")), "{rows:?}");
+        let b = framed(80, 25, &noted(Work::Writing), Pane::Notes, &Theme::new(OFF, false)).backend().buffer().clone();
+        let rows = notes_rows(&b, 80, 25);
+        let text = rows.join("\n");
+        for want in ["writing | Provisional", "        | - tentative", "- 標本平均 is the sample mean 🎓", "| Keep the histogram"] {
+            assert!(text.contains(want), "{want:?} in {rows:?}");
+        }
+        assert!(!text.contains('▎') && !text.contains('•') && !text.contains('│'), "{rows:?}");
+        let b = framed(140, 40, &noted(Work::Committed), Pane::Transcript, &Theme::new(OFF, false)).backend().buffer().clone();
+        assert!(notes_rows(&b, 140, 40).iter().any(|r| r.contains("[] Slide 17  10:39:41")));
+        for (w, h) in TRANSCRIPT_SIZES {
+            assert!(framed(w, h, &noted(Work::Writing), focus_for(w, h), &Theme::new(TRUE, true)).backend().buffer().content.iter().all(|c| c.bg == Color::Reset), "{w}×{h}: no background");
+        }
     }
 }

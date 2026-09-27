@@ -2,7 +2,7 @@
 " BlackHole 2ch  ■■■■■□□□  transcribing  0 gaps                                                                                  $0.18 today "
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " Transcript         2 new below   Esc live │ Notes                                                           │ Slides                       "
-" 10:39:31  A different sample gives a      │ The notes show here.                                            │ Slides show here.            "
+" 10:39:31  A different sample gives a      │ Nothing written yet.                                            │ Slides show here.            "
 "           different mean.                 │                                                                 │                              "
 " 10:39:40  So the mean is itself a random  │                                                                 │                              "
 "           quantity, with a distribution   │                                                                 │                              "

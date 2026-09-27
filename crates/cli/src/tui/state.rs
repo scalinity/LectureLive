@@ -26,6 +26,7 @@ use crate::plain::{self, Notice};
 use crate::stop::Stage;
 
 use super::hydrate::{Hydration, NotesSnapshot};
+use super::markdown::{self, Chunk};
 
 /// The shared wording, unstyled: the TUI renders its own styles, so no styled string may enter the
 /// projection (plan §C 12).
@@ -75,15 +76,170 @@ pub(crate) struct OpenUtterance {
 }
 
 /// The notes as the projection holds them (plan §F): the canonical revision and the document it
-/// names, together, with the provisional preview beside them — never merged into them.
+/// names, together, and the document parsed into chunks once as it changes; the provisional
+/// preview beside them — never merged into them.
 #[derive(Debug, Default)]
 pub(crate) struct Notes {
     pub(crate) revision: u64,
     pub(crate) document: String,
+    /// The document split at its markers and parsed (plan §H Notes): rebuilt by a hydration that
+    /// moves the document, extended by a commit with its block alone, never by a draw.
+    pub(crate) chunks: Vec<Chunk>,
     /// The snapshot being written: the model's deltas in order, never dropped, cleared in the same
     /// update that ends the work (`Committed`, `NothingNew`, `SnapshotFailed`, `Cancelled`,
     /// `Polished`).
     pub(crate) preview: Option<String>,
+    /// Which preview this is: a new one begins at the first delta after one ended, so a display of
+    /// an earlier preview can never be taken for this one's.
+    pub(crate) epoch: u64,
+    /// This preview passed the display cap, and the notice saying so has been given.
+    capped: bool,
+}
+
+/// The most of a preview the notes pane shows (plan §F): a presentation cap, never a change to
+/// what the preview holds.
+pub(crate) const PREVIEW_CAP: usize = 1 << 20;
+
+impl Notes {
+    /// The work the preview belonged to ended: the preview goes in this same update.
+    fn end_preview(&mut self) {
+        self.preview = None;
+    }
+
+    /// The document as canonical state replaced it: parsed again, once.
+    fn replace(&mut self, revision: u64, document: String) {
+        self.revision = revision;
+        if document != self.document {
+            self.chunks = markdown::chunks(&document);
+            self.document = document;
+        }
+    }
+
+    /// A committed block appended: only the block is parsed.
+    fn append(&mut self, revision: u64, block: &str) {
+        let from = self.document.len();
+        self.document.push_str(block);
+        self.revision = revision;
+        markdown::extend(&mut self.chunks, &self.document, from);
+    }
+}
+
+/// A notes request this TUI submitted (plan §F work lanes): its own, in the order core runs them.
+/// The hint line (Task 10) submits them; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnOp {
+    Snapshot,
+    Polish,
+}
+
+/// What the notes lane is doing now, from typed events and this TUI's own submissions alone —
+/// never from Busy text (plan §C 13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    Idle,
+    /// Own snapshot at the head: `snapshot: writing`.
+    Snapshot,
+    /// Own polish at the head, its snapshot first: `polish: snapshot first`.
+    PolishSnapshotFirst,
+    /// Own polish at the head, its snapshot done: `polishing`.
+    Polishing,
+    /// Stopping, nothing of this TUI's at the head: core's last snapshot is writing.
+    LastSnapshot,
+}
+
+/// The exact warning core gives when the lecture ends while the study page is still typesetting
+/// (core `session/lecture.rs`): the page lane's one terminal condition without a typed event of
+/// its own. Recognised by equality for that lane alone; no other warning is ever read.
+pub(crate) const PAGE_ABORTED: &str = "the page was still being typeset; `lecture page` finishes it later";
+
+/// The work lanes (plan §F): this TUI's accepted submissions in order, the head in flight; the
+/// polish head's phase; core's last snapshot while stopping; the study page typesetting.
+/// Presentation state only — the notes themselves always follow canonical events.
+#[derive(Debug, Default)]
+pub(crate) struct Work {
+    fifo: VecDeque<OwnOp>,
+    /// The polish at the head has had its snapshot.
+    polishing: bool,
+    last: bool,
+    page: bool,
+}
+
+// Submitting, cancelling and hurrying are the hint line's (Task 10); until it lands only the tests
+// drive them.
+#[cfg_attr(not(test), allow(dead_code))]
+impl Work {
+    /// An op the frontend has sent: queued behind whatever is in flight, with no limit.
+    pub(crate) fn submit(&mut self, op: OwnOp) {
+        self.fifo.push_back(op);
+    }
+
+    /// Ctrl-X: core drops what is queued and stops what runs; nothing of this TUI's is pending any
+    /// more. Whether there was anything to cancel. The page and the last snapshot are not own
+    /// requests and are untouched.
+    pub(crate) fn cancel(&mut self) -> bool {
+        let had = !self.fifo.is_empty();
+        self.fifo.clear();
+        self.polishing = false;
+        had
+    }
+
+    /// Stop waiting: core drops the ops queued behind the one in flight, which still finishes.
+    pub(crate) fn hurry(&mut self) {
+        self.fifo.truncate(1);
+    }
+
+    pub(crate) fn mine(&self) -> bool {
+        !self.fifo.is_empty()
+    }
+
+    pub(crate) fn lane(&self) -> Lane {
+        match self.fifo.front() {
+            Some(OwnOp::Snapshot) => Lane::Snapshot,
+            Some(OwnOp::Polish) if self.polishing => Lane::Polishing,
+            Some(OwnOp::Polish) => Lane::PolishSnapshotFirst,
+            None if self.last => Lane::LastSnapshot,
+            None => Lane::Idle,
+        }
+    }
+
+    /// Own requests waiting behind the head.
+    pub(crate) fn queued(&self) -> usize {
+        self.fifo.len().saturating_sub(1)
+    }
+
+    /// The study page is typesetting.
+    pub(crate) fn page(&self) -> bool {
+        self.page
+    }
+
+    fn pop(&mut self) {
+        self.fifo.pop_front();
+        self.polishing = false;
+    }
+
+    /// One event's effect on the lanes. A terminal event with nothing of this TUI's to match is
+    /// the notice alone; while stopping, a snapshot with nothing of this TUI's at the head is the
+    /// last snapshot's.
+    fn event(&mut self, e: &Event, stopping: bool) {
+        let head = self.fifo.front().copied();
+        match (e, head) {
+            (Event::Preview(_), None) if stopping => self.last = true,
+            (Event::Committed { .. } | Event::NothingNew, Some(OwnOp::Snapshot)) | (Event::SnapshotFailed(_), Some(OwnOp::Snapshot)) => self.pop(),
+            // the polish's own snapshot is done; the polish itself goes on
+            (Event::Committed { .. } | Event::NothingNew, Some(OwnOp::Polish)) => self.polishing = true,
+            (Event::Polished { .. }, Some(OwnOp::Polish)) => {
+                self.pop();
+                self.page = true;
+            }
+            (Event::PolishStopped(_) | Event::PolishFailed(_), Some(OwnOp::Polish)) => self.pop(),
+            (Event::Cancelled(_), Some(_)) => self.pop(),
+            (Event::Committed { .. } | Event::NothingNew | Event::SnapshotFailed(_), None) => self.last = false,
+            (Event::Page { .. } | Event::PageFailed(_), _) => self.page = false,
+            (Event::Warning(w), _) if w == PAGE_ABORTED => self.page = false,
+            _ => {}
+        }
+    }
 }
 
 /// A registered slide (plan §F): what the slides pane will show.
@@ -192,6 +348,8 @@ pub(crate) struct View {
     pub(crate) open: Option<OpenUtterance>,
     pub(crate) notes: Notes,
     pub(crate) slides: Vec<SlideLine>,
+    /// The work lanes the notes heading shows: this TUI's own requests, the last snapshot, the page.
+    pub(crate) work: Work,
 
     // Sampled and display-only state.
     /// The lecture's spend today, sampled off the reactor at most once a second (plan §B 7). The
@@ -234,6 +392,7 @@ impl View {
             open: None,
             notes: Notes::default(),
             slides: Vec::new(),
+            work: Work::default(),
             spend: None,
             activity: Ring::default(),
             notice: None,
@@ -253,17 +412,17 @@ impl View {
     /// cleaned as it enters (plan §C 12).
     pub(crate) fn reduce(&mut self, e: &Event, at: DateTime<Local>) -> Effect {
         let mut effect = Effect::default();
+        self.work.event(e, self.phase != Stage::Listening);
         match e {
             Event::Session(n) => self.session(n, at, &mut effect),
             // Busy text is presentation only: shown, never parsed for what is running (plan §C 13).
             Event::Busy(m) => self.activity.push(Activity { at, kind: "dim", label: "…".into(), detail: plain::clean(m) }),
-            // The preview accumulates in order and is never dropped; the update that ends the work clears it.
-            Event::Preview(d) => *self.notes.preview.get_or_insert_with(String::new) += &plain::clean(d),
-            Event::NothingNew | Event::SnapshotFailed(_) | Event::Cancelled(_) => self.notes.preview = None,
+            Event::Preview(d) => self.preview(d, at),
+            Event::NothingNew | Event::SnapshotFailed(_) | Event::Cancelled(_) => self.notes.end_preview(),
             Event::Committed { block, revision, .. } => self.committed(block, *revision, &mut effect),
             // The polished document is canonical only in the file; the event cannot rebuild it.
             Event::Polished { .. } => {
-                self.notes.preview = None;
+                self.notes.end_preview();
                 effect.hydrate = true;
             }
             Event::Slide { index, file, auto, uncertain, shown_at } => self.slide(*index, file, *auto, *uncertain, *shown_at),
@@ -396,14 +555,29 @@ impl View {
     /// (the document already holds it — though the work still ended), and a jump leaves the document
     /// alone and asks for the files, because no skipped revision is invented.
     fn committed(&mut self, block: &str, revision: u64, effect: &mut Effect) {
-        self.notes.preview = None;
+        // The parsed block replaces the preview in this one update: no frame holds both.
+        self.notes.end_preview();
         match revision.cmp(&(self.notes.revision + 1)) {
-            Ordering::Equal => {
-                self.notes.document.push_str(&plain::clean(block));
-                self.notes.revision = revision;
-            }
+            Ordering::Equal => self.notes.append(revision, &plain::clean(block)),
             Ordering::Less => {}
             Ordering::Greater => effect.hydrate = true,
+        }
+    }
+
+    /// A preview delta: appended in order and never dropped. The first delta after a preview ended
+    /// begins a new one. Past the display cap the preview still grows here; the pane shows its
+    /// first [`PREVIEW_CAP`] bytes, and the notice says so once.
+    fn preview(&mut self, delta: &str, at: DateTime<Local>) {
+        let n = &mut self.notes;
+        if n.preview.is_none() {
+            n.epoch += 1;
+            n.capped = false;
+        }
+        let text = n.preview.get_or_insert_with(String::new);
+        text.push_str(&plain::clean(delta));
+        if text.len() > PREVIEW_CAP && !n.capped {
+            n.capped = true;
+            self.record(Notice { kind: "warn", label: "preview".into(), detail: "the snapshot being written is longer than 1 MiB; only its first 1 MiB is shown until it is committed".into() }, at);
         }
     }
 
@@ -447,10 +621,11 @@ impl View {
         // Notes: a coherent pair at or past the held revision (an equal revision is the same
         // document by its fingerprint). A stale pair keeps what is held; an incoherent one keeps it
         // too — the next discontinuity re-reads, nothing retries on its own.
+        // The read document enters the view cleaned, as every committed block does (plan §C 12),
+        // and is parsed once here.
         if let NotesSnapshot::At { revision, document } = h.notes {
             if revision >= self.notes.revision {
-                self.notes.revision = revision;
-                self.notes.document = document;
+                self.notes.replace(revision, plain::clean(&document));
             }
         }
 
@@ -1031,6 +1206,220 @@ mod tests {
         assert!(!v.slides[0].uncertain, "the same index refreshed, not duplicated");
         v.reduce(&Event::Slide { index: 3, file: "slides/slide_03_100000.png".into(), auto: false, uncertain: false, shown_at: at() }, at());
         assert_eq!(v.slides.iter().map(|s| s.index).collect::<Vec<_>>(), vec![1, 3], "in index order");
+    }
+
+    // ---- notes and work lanes (Task 9) ---------------------------------------------------------
+
+    fn preview(d: &str) -> Event {
+        Event::Preview(d.into())
+    }
+
+    /// Plan §J: the committed block replaces the preview in one update — after it, the preview is
+    /// gone and the block is canonical, parsed into its chunk, with the document holding it once.
+    #[test]
+    fn preview_then_commit_replaces_atomically() {
+        let mut v = view();
+        v.work.submit(OwnOp::Snapshot);
+        v.reduce(&preview("## Provisional heading\n- unconfirmed "), at());
+        assert!(v.notes.preview.is_some() && v.notes.chunks.is_empty());
+        assert_eq!(v.work.lane(), Lane::Snapshot);
+        let epoch = v.notes.epoch;
+        v.reduce(&committed(1), at());
+        assert_eq!(v.notes.preview, None, "the preview ended in the commit's own update");
+        assert_eq!(v.notes.revision, 1);
+        assert_eq!(v.notes.chunks.len(), 1);
+        assert_eq!((v.notes.chunks[0].time.as_deref(), v.notes.chunks[0].blocks[0].text.as_str()), (Some("10:00:00"), "Block 1"));
+        assert_eq!(v.work.lane(), Lane::Idle, "the snapshot is done");
+        // the next preview is a new one, never the old one's continuation
+        v.reduce(&preview("next"), at());
+        assert_eq!((v.notes.preview.as_deref(), v.notes.epoch), (Some("next"), epoch + 1));
+    }
+
+    /// A contiguous commit parses its own block, not the document; a hydration that moves the
+    /// document parses it once; a draw never does (the pane's tests).
+    #[test]
+    fn committed_notes_are_parsed_once_per_change() {
+        let mut v = view();
+        v.merge(hydration(NotesSnapshot::At { revision: 1, document: "# Title\n\n<!-- 09:00:00 -->\n## Long ago\n".repeat(1) + &"- a bullet from earlier\n".repeat(400) }));
+        let doc = v.notes.document.len();
+        markdown::PARSED.with(|n| n.set(0));
+        v.reduce(&committed(2), at());
+        let block = format!("\n<!-- 10:00:00 -->\n## Block 2\n").len();
+        assert!(markdown::PARSED.with(|n| n.get()) <= block, "only the block: {} of a {doc}-byte document", markdown::PARSED.with(|n| n.get()));
+        assert_eq!(v.notes.chunks, markdown::chunks(&v.notes.document), "the same as parsing it all");
+        // a hydration of the same revision and document parses nothing
+        markdown::PARSED.with(|n| n.set(0));
+        v.merge(hydration(NotesSnapshot::At { revision: 2, document: v.notes.document.clone() }));
+        assert_eq!(markdown::PARSED.with(|n| n.get()), 0);
+        // a polished document replaces it all, parsed once
+        v.merge(hydration(NotesSnapshot::At { revision: 3, document: "# Title\n\n<!-- 09:00:00 -->\n## Polished\n".into() }));
+        assert_eq!(v.notes.chunks.iter().flat_map(|c| &c.blocks).map(|b| b.text.as_str()).collect::<Vec<_>>(), vec!["Title", "Polished"]);
+    }
+
+    /// Plan §J: a failed snapshot ends its preview and leaves the canonical notes as they were.
+    #[test]
+    fn preview_then_fail_keeps_notes() {
+        let mut v = view();
+        v.reduce(&committed(1), at());
+        let (doc, chunks) = (v.notes.document.clone(), v.notes.chunks.clone());
+        v.work.submit(OwnOp::Snapshot);
+        v.reduce(&preview("## Never written "), at());
+        v.reduce(&Event::SnapshotFailed("timed out; everything is kept for the next one".into()), at());
+        assert_eq!(v.notes.preview, None);
+        assert_eq!((v.notes.revision, &v.notes.document, &v.notes.chunks), (1, &doc, &chunks));
+        assert_eq!(v.work.lane(), Lane::Idle);
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("snapshot failed"));
+    }
+
+    /// Plan §J: a cancel ends the preview; nothing was written.
+    #[test]
+    fn preview_then_cancel_clears_preview() {
+        let mut v = view();
+        v.work.submit(OwnOp::Snapshot);
+        v.work.submit(OwnOp::Snapshot);
+        v.reduce(&preview("## Half "), at());
+        v.reduce(&Event::Cancelled("the snapshot".into()), at());
+        assert_eq!(v.notes.preview, None);
+        assert_eq!((v.notes.revision, v.notes.chunks.len()), (0, 0));
+        assert_eq!(v.work.lane(), Lane::Snapshot, "the matched head went; the next is at the head");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("cancelled"));
+    }
+
+    /// Plan §J: a commit that won the race with Ctrl-X is still reality. The TUI's own requests
+    /// are gone, the commit is unmatched — and the notes take it all the same.
+    #[test]
+    fn cancel_then_commit_accepts_committed_reality() {
+        let mut v = view();
+        v.work.submit(OwnOp::Snapshot);
+        v.work.submit(OwnOp::Polish);
+        v.reduce(&preview("## Racing "), at());
+        assert!(v.work.cancel(), "there was something of this TUI's to cancel");
+        assert_eq!((v.work.lane(), v.work.queued()), (Lane::Idle, 0));
+        assert!(!v.work.cancel(), "and now there is nothing");
+        v.reduce(&committed(1), at());
+        assert_eq!(v.notes.revision, 1, "canonical wins");
+        assert!(v.notes.document.contains("Block 1") && v.notes.chunks.len() == 1);
+        assert_eq!(v.notes.preview, None);
+        assert_eq!(v.work.lane(), Lane::Idle);
+        // the in-flight op's own cancellation, arriving later, is a notice and nothing more
+        v.reduce(&Event::Cancelled("the snapshot".into()), at());
+        assert_eq!((v.notes.revision, v.work.lane()), (1, Lane::Idle));
+    }
+
+    /// Plan §J: a polish goes snapshot-first, then polishing, and its success starts the page,
+    /// which only its own results — or core's one fixed warning — end.
+    #[test]
+    fn polish_lane_and_page_lane() {
+        let mut v = view();
+        v.work.submit(OwnOp::Polish);
+        v.work.submit(OwnOp::Snapshot);
+        assert_eq!((v.work.lane(), v.work.queued()), (Lane::PolishSnapshotFirst, 1));
+        v.reduce(&preview("## The polish's snapshot "), at());
+        assert_eq!(v.work.lane(), Lane::PolishSnapshotFirst);
+        v.reduce(&committed(1), at());
+        assert_eq!(v.work.lane(), Lane::Polishing, "its snapshot committed; the polish is not done");
+        assert_eq!(v.work.queued(), 1);
+        assert!(!v.work.page());
+        assert!(v.reduce(&Event::Polished { backup: "l/.live_notes/backup.md".into(), usd: 0.04, revision: 2 }, at()).hydrate);
+        assert_eq!((v.work.lane(), v.work.queued(), v.work.page()), (Lane::Snapshot, 0, true), "the queued snapshot runs; the page typesets");
+        v.reduce(&Event::NothingNew, at());
+        assert_eq!(v.work.lane(), Lane::Idle);
+        assert!(v.work.page(), "a snapshot's result does not end the page");
+        v.reduce(&Event::Warning("slide 3 (slides/x.png) is no longer on disk; left out of the notes".into()), at());
+        assert!(v.work.page(), "no other warning is read");
+        v.reduce(&Event::Warning(PAGE_ABORTED.into()), at());
+        assert!(!v.work.page(), "the lecture ended with the page still typesetting");
+        // the typed endings
+        for end in [Event::PageFailed("the model refused".into()), Event::Page { outcome: page_outcome(), usd: 0.3 }] {
+            let mut v = view();
+            v.work.submit(OwnOp::Polish);
+            v.reduce(&Event::NothingNew, at());
+            assert_eq!(v.work.lane(), Lane::Polishing, "nothing new is still the snapshot done");
+            v.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.0, revision: 1 }, at());
+            assert!(v.work.page());
+            v.reduce(&end, at());
+            assert!(!v.work.page());
+        }
+        // a polish that stops or fails ends without a page
+        for end in [Event::PolishStopped("the snapshot before it failed".into()), Event::PolishFailed("timed out".into()), Event::Cancelled("the polish".into())] {
+            let mut v = view();
+            v.work.submit(OwnOp::Polish);
+            v.reduce(&end, at());
+            assert_eq!((v.work.lane(), v.work.page()), (Lane::Idle, false));
+        }
+    }
+
+    fn page_outcome() -> lecturelive_core::notes::page::PageOutcome {
+        lecturelive_core::notes::page::PageOutcome { path: "lecture_page.html".into(), words: 900, budget: 1200, cached: false, missing: Vec::new() }
+    }
+
+    /// Plan §J: the page's progress arrives as Busy text; it moves neither lane.
+    #[test]
+    fn page_busy_does_not_touch_notes_lane() {
+        let mut v = view();
+        v.work.submit(OwnOp::Polish);
+        v.reduce(&Event::NothingNew, at());
+        v.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.0, revision: 1 }, at());
+        v.work.submit(OwnOp::Snapshot);
+        for busy in ["typesetting the study page", "snapshot, 40 words to grok", "polishing 900 words", "the snapshot is done", "cancelled"] {
+            v.reduce(&Event::Busy(busy.into()), at());
+            assert_eq!((v.work.lane(), v.work.queued(), v.work.page()), (Lane::Snapshot, 0, true), "{busy:?}");
+        }
+    }
+
+    /// Plan §J: stopping, with nothing of this TUI's at the head, a preview is core's last
+    /// snapshot; with an own snapshot still at the head, it is that one's.
+    #[test]
+    fn last_snapshot_attributed_while_stopping() {
+        let mut v = view();
+        v.reduce(&preview("while listening "), at());
+        assert_eq!(v.work.lane(), Lane::Idle, "listening, an unmatched preview is no lane");
+        v.reduce(&Event::NothingNew, at());
+        v.phase = Stage::Stopping;
+        v.work.submit(OwnOp::Snapshot);
+        v.reduce(&preview("mine "), at());
+        assert_eq!(v.work.lane(), Lane::Snapshot, "the queued own snapshot still runs while stopping");
+        v.reduce(&committed(1), at());
+        assert_eq!(v.work.lane(), Lane::Idle);
+        v.reduce(&preview("## What was left "), at());
+        assert_eq!(v.work.lane(), Lane::LastSnapshot);
+        assert!(!v.work.mine(), "the last snapshot is not the person's own work");
+        v.reduce(&committed(2), at());
+        assert_eq!(v.work.lane(), Lane::Idle);
+        // and its failure ends it too
+        v.reduce(&preview("again "), at());
+        v.reduce(&Event::SnapshotFailed("timed out".into()), at());
+        assert_eq!(v.work.lane(), Lane::Idle);
+    }
+
+    /// Stop waiting: core drops what is queued behind the one in flight, which still finishes.
+    #[test]
+    fn hurry_keeps_only_what_is_in_flight() {
+        let mut v = view();
+        for op in [OwnOp::Polish, OwnOp::Snapshot, OwnOp::Snapshot] {
+            v.work.submit(op);
+        }
+        v.work.hurry();
+        assert_eq!((v.work.lane(), v.work.queued()), (Lane::PolishSnapshotFirst, 0));
+        v.work.hurry();
+        assert!(v.work.mine(), "the in-flight polish is not claimed aborted");
+    }
+
+    /// The display cap: past 1 MiB the preview keeps growing (nothing is dropped) and the notice
+    /// says once that only its first 1 MiB is shown.
+    #[test]
+    fn a_preview_past_the_cap_says_so_once() {
+        let mut v = view();
+        let chunk = "word ".repeat(1 << 14);
+        for _ in 0..(PREVIEW_CAP / chunk.len() + 2) {
+            v.reduce(&preview(&chunk), at());
+        }
+        assert!(v.notes.preview.as_ref().unwrap().len() > PREVIEW_CAP, "nothing dropped");
+        assert_eq!(v.activity.records().iter().filter(|a| a.label == "preview").count(), 1);
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("preview"));
+        v.reduce(&Event::NothingNew, at());
+        v.reduce(&preview(&chunk.repeat(70)), at());
+        assert_eq!(v.activity.records().iter().filter(|a| a.label == "preview").count(), 2, "a new preview can say it again");
     }
 
     fn tested_with(identity: Identity, seed: Vec<Notice>) -> View {

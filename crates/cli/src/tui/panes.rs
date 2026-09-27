@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use lecturelive_core::session::segments::SegmentSource;
 use ratatui::buffer::Buffer;
@@ -17,7 +18,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::state::{Line, View};
+use super::markdown::{self, Block, Chunk, Kind, Lead};
+use super::state::{Line, Notes, View, PREVIEW_CAP};
 
 /// The time gutter: `HH:MM:SS`.
 const TIME: usize = 8;
@@ -436,6 +438,325 @@ pub(crate) fn transcript(buf: &mut Buffer, body: Rect, v: &View, scroll: &Scroll
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The notes (Task 9).
+//
+// Committed chunks are parsed once, when the canonical notes change (`state.rs`); the preview is
+// parsed here at most every [`PREVIEW_EVERY`]. A draw only wraps the blocks it shows: following,
+// from the last block upward, as the transcript does. The walker below names a place as a block and
+// a row within it, so a scroll anchor (Task 10) can hold a block and a byte of its text.
+
+/// The notes' chrome glyphs and live accent: the theme's, so `NO_COLOR` and ASCII hold here too.
+pub(crate) struct Ink<'a> {
+    pub(crate) edge: &'a str,
+    pub(crate) bullet: &'a str,
+    pub(crate) quote: &'a str,
+    pub(crate) slide: &'a str,
+    pub(crate) rule: &'a str,
+    pub(crate) teal: Style,
+}
+
+/// The preview is parsed at most this often (plan §F: ≤10 Hz), however fast its deltas come.
+pub(crate) const PREVIEW_EVERY: Duration = Duration::from_millis(100);
+
+/// The preview as last parsed, for drawing (UI-local, the reactor's): which preview it is, how much
+/// of it was seen, when it was parsed, and the blocks.
+#[derive(Debug, Default)]
+pub(crate) struct Preview {
+    epoch: u64,
+    /// The preview's length when last looked at, and the length of what was shown of it.
+    raw: usize,
+    shown: usize,
+    at: Option<Instant>,
+    blocks: Vec<Block>,
+}
+
+impl Preview {
+    /// Brings the parsed preview up to `notes`' at `now`, unless the last parse is under
+    /// [`PREVIEW_EVERY`] old; then returns when to look again. A preview that ended is dropped at
+    /// once, and a new one never shows an earlier one's blocks.
+    pub(crate) fn refresh(&mut self, notes: &Notes, now: Instant) -> Option<Instant> {
+        let Some(text) = &notes.preview else {
+            *self = Preview::default();
+            return None;
+        };
+        if self.epoch != notes.epoch {
+            *self = Preview { epoch: notes.epoch, ..Preview::default() };
+        }
+        if self.at.is_some() && self.raw == text.len() {
+            return None;
+        }
+        if let Some(due) = self.at.map(|at| at + PREVIEW_EVERY).filter(|due| now < *due) {
+            return Some(due);
+        }
+        self.raw = text.len();
+        let shown = shown(text);
+        if self.at.is_none() || shown.len() != self.shown {
+            self.blocks = markdown::parse(shown);
+            self.shown = shown.len();
+        }
+        self.at = Some(now);
+        None
+    }
+
+    /// The blocks to draw for `notes`' preview: none unless they were parsed from this very one.
+    fn blocks<'a>(&'a self, notes: &Notes) -> &'a [Block] {
+        if notes.preview.is_some() && self.epoch == notes.epoch {
+            &self.blocks
+        } else {
+            &[]
+        }
+    }
+}
+
+/// What of a preview is shown: its first [`PREVIEW_CAP`] bytes at most, up to the last whitespace in
+/// them, so a word the model is still extending never flashes half-written.
+fn shown(text: &str) -> &str {
+    let mut cap = text.len().min(PREVIEW_CAP);
+    while !text.is_char_boundary(cap) {
+        cap -= 1;
+    }
+    let t = &text[..cap];
+    t.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or("", |(i, c)| &t[..i + c.len_utf8()])
+}
+
+/// A notes block: a committed chunk's `(chunk, block)`, or the preview's at `chunk == chunks.len()`.
+type Item = (usize, usize);
+/// A row: the block, and the row within it.
+type NotePos = (Item, usize);
+
+/// A block's row: blank (the space before a chunk or a `##`), or a stretch of its text.
+#[derive(Clone, Debug, PartialEq)]
+enum NoteRow {
+    Blank,
+    Text(Range<usize>),
+}
+
+/// The notes at one text width: the committed chunks, then the preview's blocks, each block wrapped
+/// only when a walk reaches it.
+struct NoteRows<'a> {
+    chunks: &'a [Chunk],
+    preview: &'a [Block],
+    width: usize,
+    bullet: usize,
+}
+
+impl<'a> NoteRows<'a> {
+    fn block(&self, (c, b): Item) -> Option<&'a Block> {
+        match c.cmp(&self.chunks.len()) {
+            std::cmp::Ordering::Less => self.chunks[c].blocks.get(b),
+            std::cmp::Ordering::Equal => self.preview.get(b),
+            std::cmp::Ordering::Greater => None,
+        }
+    }
+
+    fn blocks_in(&self, c: usize) -> usize {
+        if c < self.chunks.len() {
+            self.chunks[c].blocks.len()
+        } else {
+            self.preview.len()
+        }
+    }
+
+    fn next(&self, (c, b): Item) -> Option<Item> {
+        if b + 1 < self.blocks_in(c) {
+            return Some((c, b + 1));
+        }
+        (c + 1..=self.chunks.len()).find(|&c| self.blocks_in(c) > 0).map(|c| (c, 0))
+    }
+
+    fn prev(&self, (c, b): Item) -> Option<Item> {
+        if b > 0 {
+            return Some((c, b - 1));
+        }
+        (0..c).rev().find(|&c| self.blocks_in(c) > 0).map(|c| (c, self.blocks_in(c) - 1))
+    }
+
+    fn last(&self) -> Option<Item> {
+        (0..=self.chunks.len()).rev().find(|&c| self.blocks_in(c) > 0).map(|c| (c, self.blocks_in(c) - 1))
+    }
+
+    fn preview(&self, (c, _): Item) -> bool {
+        c == self.chunks.len()
+    }
+
+    /// A blank row before a chunk's first block (none before the very first) and before a `#` or
+    /// `##` inside one: the notes' sections breathe; `###` and below do not.
+    fn separated(&self, item: Item) -> bool {
+        match item.1 {
+            0 => self.prev(item).is_some(),
+            _ => self.block(item).is_some_and(|b| matches!(b.kind, Kind::Heading(l) if l <= 2)),
+        }
+    }
+
+    /// Where a block's text begins in the lane, and its lead (a bullet or number) with the cell it
+    /// starts at: quotes first, two cells each, then two cells a list level; a list item's text
+    /// hangs after its lead. Clamped so a deep nesting still leaves half the lane for text.
+    fn geometry(&self, b: &Block) -> (usize, Option<(usize, String)>) {
+        let quote = b.quote as usize * 2;
+        let level = b.depth.saturating_sub(1) as usize * 2;
+        let (hang, lead) = match &b.kind {
+            Kind::Item(lead) => {
+                let (text, w) = match lead {
+                    Lead::Bullet => (String::new(), self.bullet),
+                    Lead::Number(n) => (format!("{n}."), format!("{n}.").len()),
+                };
+                (quote + level + w + 1, Some((quote + level, text)))
+            }
+            Kind::Code(indent) => (quote + level + if b.depth > 0 { 2 } else { 0 } + 2 + *indent as usize, None),
+            _ => (quote + level + if b.depth > 0 { 2 } else { 0 }, None),
+        };
+        (hang.min(self.width / 2), lead.map(|(at, t)| (at.min(self.width / 2), t)))
+    }
+
+    fn of(&self, item: Item) -> Vec<NoteRow> {
+        let Some(b) = self.block(item) else { return vec![NoteRow::Blank] };
+        let mut rows = Vec::new();
+        if self.separated(item) {
+            rows.push(NoteRow::Blank);
+        }
+        match b.kind {
+            Kind::Slide { .. } | Kind::Rule => rows.push(NoteRow::Text(0..b.text.len())),
+            _ => {
+                let (hang, _) = self.geometry(b);
+                rows.extend(wrap(&b.text, self.width.saturating_sub(hang).max(1)).into_iter().map(NoteRow::Text));
+            }
+        }
+        rows
+    }
+
+    fn up(&self, (mut item, mut row): NotePos, mut k: usize) -> NotePos {
+        while k > 0 {
+            if row > 0 {
+                let step = row.min(k);
+                (row, k) = (row - step, k - step);
+            } else if let Some(p) = self.prev(item) {
+                (item, row, k) = (p, self.of(p).len() - 1, k - 1);
+            } else {
+                break;
+            }
+        }
+        (item, row)
+    }
+
+    /// The top row while following: `height` rows above the end, or the first row.
+    fn live_top(&self, height: usize) -> Option<NotePos> {
+        let last = self.last()?;
+        Some(self.up((last, self.of(last).len() - 1), height - 1))
+    }
+}
+
+/// The time a slide embed was shown: the registered slide whose file it names (by its path, or its
+/// file name when the notes live in another folder); none when no registered slide matches.
+fn slide_time(v: &View, dest: &str) -> Option<String> {
+    let name = std::path::Path::new(dest).file_name()?;
+    v.slides.iter().find(|s| s.file == dest || std::path::Path::new(&s.file).file_name() == Some(name)).map(|s| s.shown_at.format("%H:%M:%S").to_string())
+}
+
+/// The notes into `body`, following their end: the committed chunks under their times, then the
+/// preview being written on the live edge — `writing` in the gutter, the edge on its every row, its
+/// text dim — so it is never taken for notes. Empty, it says so.
+pub(crate) fn notes(buf: &mut Buffer, body: Rect, v: &View, preview: &Preview, ink: &Ink) {
+    let Some((width, height)) = text_size(body) else { return };
+    let rows = NoteRows { chunks: &v.notes.chunks, preview: preview.blocks(&v.notes), width, bullet: ink.bullet.width() };
+    let Some((mut item, mut row)) = rows.live_top(height) else {
+        buf.set_stringn(body.x, body.y, "Nothing written yet.", body.width as usize, DIM);
+        return;
+    };
+    let (x, text_x) = (body.x, body.x + LANE as u16);
+    let mut y = body.y;
+    loop {
+        let Some(b) = rows.block(item) else { break };
+        let separated = rows.separated(item);
+        let preview = rows.preview(item);
+        for (i, r) in rows.of(item).into_iter().enumerate().skip(row) {
+            if y >= body.bottom() {
+                return;
+            }
+            let first = i == usize::from(separated);
+            if preview {
+                if !(separated && i == 0) {
+                    buf.set_stringn(x + TIME as u16, y, ink.edge, 1, ink.teal);
+                }
+                if first && item.1 == 0 {
+                    buf.set_stringn(x, y, "writing", TIME - 1, ink.teal);
+                }
+            } else if first && item.1 == 0 {
+                if let Some(t) = &rows.chunks[item.0].time {
+                    buf.set_stringn(x, y, t, TIME, DIM);
+                }
+            }
+            if let NoteRow::Text(range) = r {
+                note_row(buf, (text_x, y), width, &rows, b, range, first, preview, v, ink);
+            }
+            y += 1;
+        }
+        row = 0;
+        match rows.next(item) {
+            Some(n) if y < body.bottom() => item = n,
+            _ => break,
+        }
+    }
+}
+
+/// One row of a block's text at `(x, y)` in a lane `width` wide: its quote rules, its lead on the
+/// first row, then the text by its marks — headings and table heads bold, code dim, emphasis
+/// italic — all of it dim in the preview.
+#[allow(clippy::too_many_arguments)]
+fn note_row(buf: &mut Buffer, (x, y): (u16, u16), width: usize, rows: &NoteRows, b: &Block, range: Range<usize>, first: bool, preview: bool, v: &View, ink: &Ink) {
+    let over = if preview { DIM } else { Style::new() };
+    for q in 0..b.quote as usize {
+        if q * 2 < width {
+            buf.set_stringn(x + (q * 2) as u16, y, ink.quote, 1, DIM);
+        }
+    }
+    let (hang, lead) = rows.geometry(b);
+    if let (true, Some((at, number))) = (first, lead) {
+        let mark = if number.is_empty() { ink.bullet } else { number.as_str() };
+        buf.set_stringn(x + at as u16, y, mark, width.saturating_sub(at), DIM);
+    }
+    let end = x + width as u16;
+    let mut at = x + hang as u16;
+    match &b.kind {
+        Kind::Slide { dest } => {
+            let (after, _) = buf.set_stringn(at, y, ink.slide, (end.saturating_sub(at)) as usize, ink.teal.patch(over));
+            let (after, _) = buf.set_stringn(after, y, format!(" {}", b.text), (end.saturating_sub(after)) as usize, over);
+            if let Some(t) = slide_time(v, dest) {
+                buf.set_stringn(after, y, format!("  {t}"), (end.saturating_sub(after)) as usize, DIM);
+            }
+        }
+        Kind::Rule => {
+            buf.set_stringn(at, y, ink.rule.repeat(width.saturating_sub(hang)), (end.saturating_sub(at)) as usize, DIM);
+        }
+        kind => {
+            let base = match kind {
+                Kind::Heading(_) | Kind::Row { head: true } => Style::new().add_modifier(Modifier::BOLD),
+                Kind::Code(_) => DIM,
+                _ => Style::new(),
+            }
+            .patch(over);
+            // one span per change of mark inside the row
+            let mut from = range.start;
+            let bounds = b.marks.iter().map(|(at, _)| *at).filter(|at| *at > range.start && *at < range.end).chain([range.end]);
+            for to in bounds {
+                let m = b.mark_at(from);
+                let mut style = base;
+                if m.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if m.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if m.code {
+                    style = style.add_modifier(Modifier::DIM);
+                }
+                let (after, _) = buf.set_stringn(at, y, drawn(&b.text[from..to]), (end.saturating_sub(at)) as usize, style);
+                (at, from) = (after, to);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,5 +1116,239 @@ mod tests {
         assert_eq!(s.anchor(), Some(held), "a resize does not move the anchor");
         assert_eq!(draw(&v, &s, 140, 30), before, "back at 140, the same rows");
         assert!(!s.following());
+    }
+
+    // ---- the notes (Task 9) -------------------------------------------------------------------
+
+    /// Notes shaped as LectureLive writes them: a title, then chunks under their markers.
+    pub(crate) const NOTES: &str = "# Statistics — Week 04\n\n<!-- 10:39:12 -->\n## Sampling distributions\n### Standard error\n\
+- Larger samples reduce **standard error**.\n  - by \\( \\sigma / \\sqrt{n} \\)\n- Distinct from the *spread* of `observations`.\n\n\
+![Slide 17](slides/slide_17_103941.png)\n\n> the lecturer's aside\n\n```\nse = sd / sqrt(n)\n    indented\n```\n\n\
+| n | se |\n|---|---|\n| 25 | 2.0 |\n\n<!-- 10:41:52 -->\n## Sample size\n- 標本サイズ 🎓\n";
+
+    const NOTE_INK: Ink<'static> = Ink { edge: "▎", bullet: "•", quote: "│", slide: "▣", rule: "─", teal: TEAL };
+
+    fn notes_view(doc: &str) -> View {
+        use crate::tui::hydrate::NotesSnapshot;
+        let mut v = View::new(identity(), Hydration::empty(), Vec::new());
+        v.merge(Hydration { notes: NotesSnapshot::At { revision: 1, document: doc.into() }, ..Hydration::empty() });
+        v.reduce(&Event::Slide { index: 17, file: "slides/slide_17_103941.png".into(), auto: true, uncertain: false, shown_at: Local.with_ymd_and_hms(2026, 9, 26, 10, 39, 41).unwrap() }, at(0));
+        v
+    }
+
+    fn draw_notes(v: &View, p: &Preview, width: u16, height: u16) -> (Buffer, Vec<String>) {
+        let mut b = Buffer::empty(Rect::new(0, 0, width, height));
+        let area = b.area;
+        notes(&mut b, area, v, p, &NOTE_INK);
+        (b.clone(), (0..height).map(|y| row_text(&b, y)).collect())
+    }
+
+    /// A buffer row as it reads: a wide glyph once, not followed by the cell it covers.
+    fn row_text(b: &Buffer, y: u16) -> String {
+        let (mut s, mut x) = (String::new(), 0);
+        while x < b.area.width {
+            let sym = b[(x, y)].symbol();
+            s.push_str(sym);
+            x += (sym.width() as u16).max(1);
+        }
+        s.trim_end().to_string()
+    }
+
+    fn parsed(v: &View) -> Preview {
+        let mut p = Preview::default();
+        p.refresh(&v.notes, Instant::now());
+        p
+    }
+
+    /// Plan §H's mapping, row by row: the title untimed; each chunk's time on its first row; `##`
+    /// and `###` bold with a blank row before a chunk; bullets with a hanging indent, nested by two;
+    /// the slide embed as its label and time; the quote on its rule; code indented; a table row as
+    /// cells two spaces apart; TeX and Unicode as they are.
+    #[test]
+    fn committed_notes_draw_as_restrained_markdown() {
+        let v = notes_view(NOTES);
+        let (_, l) = draw_notes(&v, &Preview::default(), 60, 20);
+        assert_eq!(
+            l[..17],
+            [
+                "          Statistics — Week 04",
+                "",
+                "10:39:12  Sampling distributions",
+                "          Standard error",
+                "          • Larger samples reduce standard error.",
+                "            • by \\( \\sigma / \\sqrt{n} \\)",
+                "          • Distinct from the spread of observations.",
+                "          ▣ Slide 17  10:39:41",
+                "          │ the lecturer's aside",
+                "            se = sd / sqrt(n)",
+                "                indented",
+                "          n  se",
+                "          25  2.0",
+                "",
+                "10:41:52  Sample size",
+                "          • 標本サイズ 🎓",
+                "",
+            ]
+        );
+        // wrapped, a bullet's text hangs after its bullet
+        let (_, l) = draw_notes(&v, &Preview::default(), 36, 30);
+        let r = l.iter().position(|r| r.contains("• Larger")).unwrap();
+        assert_eq!(l[r..r + 2], ["          • Larger samples reduce", "            standard error."]);
+    }
+
+    /// The styles, as cells: time dim; headings bold; bullets dim; bold, italic and inline code as
+    /// marked; code blocks dim; the quote rule dim, its words ink; the slide mark teal, its time dim.
+    #[test]
+    fn committed_notes_styles() {
+        let v = notes_view(NOTES);
+        let (b, l) = draw_notes(&v, &Preview::default(), 60, 20);
+        let cell = |row: usize, text: &str| {
+            let x = l[row].find(text).map(|i| l[row][..i].chars().map(|c| c.to_string().width()).sum::<usize>()).unwrap_or_else(|| panic!("{text:?} in {:?}", l[row]));
+            &b[(x as u16, row as u16)]
+        };
+        assert_eq!(cell(2, "10:39:12").modifier, Modifier::DIM, "the chunk's time");
+        assert_eq!(cell(2, "Sampling").modifier, Modifier::BOLD, "##");
+        assert_eq!(cell(3, "Standard").modifier, Modifier::BOLD, "###");
+        assert_eq!(cell(0, "Statistics").modifier, Modifier::BOLD, "#");
+        assert_eq!(cell(4, "•").modifier, Modifier::DIM, "the bullet");
+        assert_eq!(cell(4, "Larger").modifier, Modifier::empty());
+        assert_eq!(cell(4, "standard").modifier, Modifier::BOLD);
+        assert_eq!(cell(6, "spread").modifier, Modifier::ITALIC);
+        assert_eq!(cell(6, "observations").modifier, Modifier::DIM, "inline code");
+        let slide = cell(7, "▣");
+        assert_eq!((slide.fg, slide.modifier), (ratatui::style::Color::Cyan, Modifier::empty()), "the slide mark teal");
+        assert_eq!(cell(7, "Slide").modifier, Modifier::empty());
+        assert_eq!(cell(7, "10:39:41").modifier, Modifier::DIM);
+        assert_eq!(cell(8, "│").modifier, Modifier::DIM, "the quote rule");
+        assert_eq!(cell(8, "the lecturer").modifier, Modifier::empty(), "quoted words in ink");
+        assert_eq!(cell(9, "se =").modifier, Modifier::DIM, "a code block");
+        assert_eq!(cell(11, "n").modifier, Modifier::BOLD, "the table's head");
+        assert_eq!(cell(12, "25").modifier, Modifier::empty());
+        assert!(b.content.iter().all(|c| c.bg == ratatui::style::Color::Reset), "no background");
+    }
+
+    /// A slide the notes embed that is not registered keeps its label and invents no time.
+    #[test]
+    fn an_unregistered_slide_has_no_time() {
+        let mut v = View::new(identity(), Hydration::empty(), Vec::new());
+        v.merge(Hydration { notes: crate::tui::hydrate::NotesSnapshot::At { revision: 1, document: "<!-- 10:00:00 -->\n![Slide 9](slides/slide_09_100000.png)\n".into() }, ..Hydration::empty() });
+        assert_eq!(draw_notes(&v, &Preview::default(), 60, 2).1[0], "10:00:00  ▣ Slide 9");
+        // and one registered under the notes' folder matches by its file name
+        v.reduce(&Event::Slide { index: 9, file: "../slides/slide_09_100000.png".into(), auto: false, uncertain: false, shown_at: at(61) }, at(0));
+        assert_eq!(draw_notes(&v, &Preview::default(), 60, 2).1[0], "10:00:00  ▣ Slide 9  10:01:01");
+    }
+
+    /// Following, the newest material sits at the bottom; empty, the pane says so.
+    #[test]
+    fn the_notes_follow_their_end() {
+        let v = notes_view(NOTES);
+        let (_, l) = draw_notes(&v, &Preview::default(), 60, 5);
+        assert_eq!(l[3..], ["10:41:52  Sample size", "          • 標本サイズ 🎓"]);
+        let empty = View::new(identity(), Hydration::empty(), Vec::new());
+        assert_eq!(draw_notes(&empty, &Preview::default(), 40, 2).1, ["Nothing written yet.", ""]);
+    }
+
+    /// The preview on the live edge: `writing` teal in the gutter of its first row, the teal edge
+    /// on every one of its rows, its words dim — under the committed notes, with no time.
+    #[test]
+    fn the_preview_is_written_on_the_live_edge() {
+        let mut v = notes_view(NOTES);
+        v.reduce(&Event::Preview("## Confidence intervals\n- An interval that covers the mean in **95%** of samples ".into()), at(0));
+        let p = parsed(&v);
+        let (b, l) = draw_notes(&v, &p, 50, 10);
+        assert_eq!(l[6..], ["", "writing ▎ Confidence intervals", "        ▎ • An interval that covers the mean in", "        ▎   95% of samples"]);
+        for y in 7..10 {
+            assert_eq!(b[(8, y)].fg, ratatui::style::Color::Cyan, "the edge on row {y}");
+            for x in 10..50 {
+                let c = &b[(x, y)];
+                assert!(c.symbol() == " " || c.modifier.contains(Modifier::DIM), "preview text is dim at {x},{y}: {:?}", c.symbol());
+            }
+        }
+        assert_eq!(b[(8, 6)].symbol(), " ", "the blank before the preview is not its row");
+        assert!((0..7).all(|x| b[(x, 7)].fg == ratatui::style::Color::Cyan), "writing, teal");
+        assert!(b[(10, 7)].modifier.contains(Modifier::BOLD | Modifier::DIM), "a heading being written: bold, and dim");
+    }
+
+    /// Only whole words: the preview shows up to its last whitespace, and nothing before any.
+    #[test]
+    fn the_preview_shows_only_complete_words() {
+        assert_eq!(shown("the half-writ"), "the ");
+        assert_eq!(shown("ends clean "), "ends clean ");
+        assert_eq!(shown("line\nnext"), "line\n");
+        assert_eq!(shown("nospace"), "");
+        assert_eq!(shown(""), "");
+        assert_eq!(shown("標本 サイ"), "標本 ");
+    }
+
+    /// Past the cap only the first 1 MiB is shown, cut at a character and a word, never inside one.
+    #[test]
+    fn the_preview_display_is_capped() {
+        let text = "é ".repeat(PREVIEW_CAP); // 3 bytes each, so the cap falls inside a character
+        let s = shown(&text);
+        assert!(s.len() <= PREVIEW_CAP && s.len() > PREVIEW_CAP - 4 && s.ends_with(' '));
+    }
+
+    /// Plan §F: the preview is parsed at most every 100 ms however fast its deltas come; a new
+    /// preview is parsed at once and never shows an earlier one's blocks; an ended one drops at once.
+    #[test]
+    fn the_preview_is_parsed_at_most_ten_times_a_second() {
+        let mut v = notes_view("");
+        let mut p = Preview::default();
+        let t0 = Instant::now();
+        markdown::PARSED.with(|n| n.set(0));
+        let mut parses = 0;
+        // 500 deltas over one second, one every 2 ms, a frame looked at after each
+        for k in 0..500u64 {
+            v.reduce(&Event::Preview(format!("w{k} ")), at(0));
+            let before = markdown::PARSED.with(|n| n.get());
+            let due = p.refresh(&v.notes, t0 + Duration::from_millis(2 * k));
+            if markdown::PARSED.with(|n| n.get()) != before {
+                parses += 1;
+            } else {
+                assert!(due.is_some_and(|d| d > t0 + Duration::from_millis(2 * k)), "a skipped parse says when to look again");
+            }
+        }
+        assert!((10..=11).contains(&parses), "{parses} parses in a second");
+        // the same preview, nothing new: nothing to do
+        let later = t0 + Duration::from_secs(5);
+        p.refresh(&v.notes, later);
+        let before = markdown::PARSED.with(|n| n.get());
+        assert_eq!(p.refresh(&v.notes, later + Duration::from_secs(1)), None);
+        assert_eq!(markdown::PARSED.with(|n| n.get()), before);
+        // the preview ends: gone at once, whatever the clock
+        v.reduce(&Event::NothingNew, at(0));
+        assert!(p.blocks(&v.notes).is_empty());
+        p.refresh(&v.notes, later);
+        // a new one, 1 ms later: parsed at once, and it is its own
+        v.reduce(&Event::Preview("fresh words ".into()), at(0));
+        assert!(p.blocks(&v.notes).is_empty(), "the old parse is never drawn for the new preview");
+        p.refresh(&v.notes, later + Duration::from_millis(1));
+        assert_eq!(p.blocks(&v.notes)[0].text, "fresh words");
+    }
+
+    /// A draw wraps; it never parses — committed chunks were parsed when they changed, the preview
+    /// when it was refreshed.
+    #[test]
+    fn a_draw_never_parses() {
+        let mut v = notes_view(&NOTES.repeat(20));
+        v.reduce(&Event::Preview("## being written now ".into()), at(0));
+        let p = parsed(&v);
+        markdown::PARSED.with(|n| n.set(0));
+        for (w, h) in [(140, 40), (60, 10), (80, 24)] {
+            draw_notes(&v, &p, w, h);
+        }
+        assert_eq!(markdown::PARSED.with(|n| n.get()), 0);
+    }
+
+    /// Tiny and odd bodies draw nothing past their edge and never panic.
+    #[test]
+    fn notes_in_narrow_bodies_never_panic() {
+        let mut v = notes_view(&(NOTES.to_string() + "- a\n  - b\n    - c\n      - d\n        - e\n          - f\n            - g\n              - h\n"));
+        v.reduce(&Event::Preview("> > > deep\n1. one ".into()), at(0));
+        let p = parsed(&v);
+        for (w, h) in [(0, 0), (1, 1), (10, 3), (11, 3), (12, 5), (20, 30), (0, 5), (40, 0)] {
+            let mut b = Buffer::empty(Rect::new(0, 0, w.max(1), h.max(1)));
+            notes(&mut b, Rect::new(0, 0, w, h), &v, &p, &NOTE_INK);
+        }
     }
 }
