@@ -66,6 +66,19 @@ impl Display {
 /// The CLI's `say`: one event line, its mark, what it is, what happened. The label and detail are
 /// the event's own words — cleaned of terminal controls first when the display is a TTY.
 pub(crate) fn say(out: &mut impl Write, d: Display, kind: &str, label: &str, detail: &str) {
+    say_line(out, d, kind, label, detail, true)
+}
+
+/// A say-line whose detail already embeds the CLI's own painting and was built from cleaned
+/// fragments — the committed, polished and page results. Only its label is cleaned here: cleaning
+/// the detail again would strip LectureLive's own styling along with everyone else's sequences,
+/// inverting the order plan §C 12 asks (clean, then paint).
+fn say_painted(out: &mut impl Write, d: Display, kind: &str, label: &str, detail: &str) {
+    say_line(out, d, kind, label, detail, false)
+}
+
+/// One say-line, its detail cleaned on a TTY unless it was built pre-cleaned and painted.
+fn say_line(out: &mut impl Write, d: Display, kind: &str, label: &str, detail: &str, clean_detail: bool) {
     let (mark, colour) = match kind {
         "slide" => ("▣", "teal"),
         "notes" => ("◆", "teal"),
@@ -74,7 +87,7 @@ pub(crate) fn say(out: &mut impl Write, d: Display, kind: &str, label: &str, det
         _ => ("▲", "red"),
     };
     let label = d.safe(label);
-    let detail = d.safe(detail);
+    let detail = clean_detail.then(|| d.safe(detail).into_owned()).unwrap_or_else(|| detail.to_string());
     writeln!(out, "{}", format!("  {} {}  {detail}", d.paint.paint(mark, &[colour]), d.paint.paint(&label, &["bold"])).trim_end()).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
@@ -206,9 +219,11 @@ pub(crate) fn no_signal() -> Notice {
 }
 
 /// The committed line's detail: what was folded in and what it cost. The amount is painted dim by
-/// the plain CLI and plain for the TUI — the same words either way.
-fn committed_detail(words: usize, slides: usize, usd: f64, confirmed: bool, missing: usize, p: spend::Paint) -> String {
-    let mut detail = format!("{} and {} folded in  {}", plural(words, "word"), plural(slides, "slide"), p.paint(&spend::money(usd), &["dim"]));
+/// the plain CLI and plain for the TUI — the same words either way. Every fragment here is the
+/// CLI's own (counts and money), so there is nothing to clean; the paint embeds as it is built,
+/// after cleaning, never under it.
+fn committed_detail(words: usize, slides: usize, usd: f64, confirmed: bool, missing: usize, d: Display) -> String {
+    let mut detail = format!("{} and {} folded in  {}", plural(words, "word"), plural(slides, "slide"), d.paint.paint(&spend::money(usd), &["dim"]));
     if missing > 0 {
         detail += &format!("  ({} not placed by the model, listed at the end)", plural(missing, "slide"));
     }
@@ -218,22 +233,26 @@ fn committed_detail(words: usize, slides: usize, usd: f64, confirmed: bool, miss
     detail
 }
 
-/// The polished line's detail: where the previous version went, and what the polish cost.
-fn polished_detail(backup: &Path, usd: f64, p: spend::Paint) -> String {
-    let name = backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    format!("previous version in .live_notes/{name}  {}", p.paint(&spend::money(usd), &["dim"]))
+/// The polished line's detail: where the previous version went, and what the polish cost. The
+/// backup's name is the folder's own word for it, cleaned as it enters on a TTY — before the
+/// money's paint, so our own styling is never cleaned away with anyone else's.
+fn polished_detail(backup: &Path, usd: f64, d: Display) -> String {
+    let name = d.safe(&backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).into_owned();
+    format!("previous version in .live_notes/{name}  {}", d.paint.paint(&spend::money(usd), &["dim"]))
 }
 
-/// The page line's detail: what was typeset, how long it came out, what it cost.
-fn page_detail(outcome: &PageOutcome, usd: f64, p: spend::Paint) -> String {
-    let name = outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let length = p.paint(&format!("{} words of {} allowed", outcome.words, outcome.budget), &[if outcome.words > outcome.budget as usize { "red" } else { "dim" }]);
-    let mut detail = format!("{name}  {length}  {}", p.paint(&spend::money(usd), &["dim"]));
+/// The page line's detail: what was typeset, how long it came out, what it cost. The page's name
+/// and the missing list are cleaned first on a TTY; the length keeps its over-budget red and the
+/// money its dim, embedded after the cleaning.
+fn page_detail(outcome: &PageOutcome, usd: f64, d: Display) -> String {
+    let name = d.safe(&outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).into_owned();
+    let length = d.paint.paint(&format!("{} words of {} allowed", outcome.words, outcome.budget), &[if outcome.words > outcome.budget as usize { "red" } else { "dim" }]);
+    let mut detail = format!("{name}  {length}  {}", d.paint.paint(&spend::money(usd), &["dim"]));
     if outcome.cached {
         detail += "  (notes unchanged since they were typeset: only the design reapplied, free)";
     }
     if !outcome.missing.is_empty() {
-        detail += &format!("  (missing: {})", outcome.missing.join(", "));
+        detail += &format!("  (missing: {})", d.safe(&outcome.missing.join(", ")));
     }
     detail
 }
@@ -243,12 +262,19 @@ fn say_notice(out: &mut impl Write, d: Display, n: &Notice) {
     say(out, d, n.kind, &n.label, &n.detail);
 }
 
+/// One notice whose detail already embeds the CLI's own painting (the committed, polished and page
+/// results): its untrusted fragments were cleaned as it was built, so only the label is cleaned
+/// again here.
+fn say_notice_painted(out: &mut impl Write, d: Display, n: &Notice) {
+    say_painted(out, d, n.kind, &n.label, &n.detail);
+}
+
 /// An event as a notice, in the plain CLI's own words (the TUI's activity and notice line show the
-/// same wording, with `p` colour-off so no styling enters the view). Capture states and
-/// relocations use the terminal's own words ([`capture::state_words`]), not the desktop's.
-/// `mixed` says whether a gone input is one of two (Zoom's loopback keeps recording), which alone
-/// changes the input-gone sentence.
-pub(crate) fn notice(e: &Event, p: spend::Paint, words: &capture::Words, mixed: bool) -> Option<Notice> {
+/// same wording, with `d` colour-off and never a TTY, so no styling enters the view and the TUI
+/// cleans at its own boundary as it records). Capture states and relocations use the terminal's
+/// own words ([`capture::state_words`]), not the desktop's. `mixed` says whether a gone input is
+/// one of two (Zoom's loopback keeps recording), which alone changes the input-gone sentence.
+pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool) -> Option<Notice> {
     let n = |kind: &'static str, label: &str, detail: String| Some(Notice { kind, label: label.into(), detail });
     match e {
         Event::Session(m) => match m {
@@ -273,13 +299,13 @@ pub(crate) fn notice(e: &Event, p: spend::Paint, words: &capture::Words, mixed: 
             _ => None,
         },
         Event::NothingNew => n("notes", "snapshot", "nothing new since the last one".into()),
-        Event::Committed { words, slides, usd, confirmed, missing, .. } => n("notes", "notes", committed_detail(*words, *slides, *usd, *confirmed, *missing, p)),
+        Event::Committed { words, slides, usd, confirmed, missing, .. } => n("notes", "notes", committed_detail(*words, *slides, *usd, *confirmed, *missing, d)),
         Event::SnapshotFailed(m) => n("warn", "snapshot failed", m.clone()),
-        Event::Polished { backup, usd, .. } => n("done", "polished", polished_detail(backup, *usd, p)),
+        Event::Polished { backup, usd, .. } => n("done", "polished", polished_detail(backup, *usd, d)),
         Event::PolishStopped(m) => n("warn", "polish stopped", m.clone()),
         Event::PolishFailed(m) => n("warn", "polish failed", m.clone()),
         Event::Cancelled(what) => n("warn", "cancelled", format!("{what}; nothing was written, everything is kept for the next snapshot")),
-        Event::Page { outcome, usd } => n("done", "page", page_detail(outcome, *usd, p)),
+        Event::Page { outcome, usd } => n("done", "page", page_detail(outcome, *usd, d)),
         Event::PageFailed(m) => n("warn", "page failed", m.clone()),
         Event::Slide { index, file, auto, uncertain, .. } => {
             let how = match (auto, uncertain) {
@@ -346,12 +372,20 @@ pub(crate) fn show(out: &mut impl Write, d: Display, e: &Event, watch: &mut Opti
             for line in block.trim().lines().filter(|l| !l.starts_with("<!-- ")) {
                 writeln!(out, "  {} {}", d.paint.paint("│", &["teal"]), d.paint.paint(d.safe(line).as_ref(), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
             }
-            if let Some(n) = notice(e, d.paint, words, mixed) {
-                say_notice(out, d, &n);
+            if let Some(n) = notice(e, d, words, mixed) {
+                say_notice_painted(out, d, &n);
+            }
+        }
+        // The polished and page results embed the CLI's own painting (the money's dim, the page
+        // length's red), built from fragments already cleaned above: whole-detail cleaning would
+        // strip our own styling with everyone else's sequences.
+        Event::Polished { .. } | Event::Page { .. } => {
+            if let Some(n) = notice(e, d, words, mixed) {
+                say_notice_painted(out, d, &n);
             }
         }
         _ => {
-            if let Some(n) = notice(e, d.paint, words, mixed) {
+            if let Some(n) = notice(e, d, words, mixed) {
                 say_notice(out, d, &n);
             }
         }
@@ -1086,8 +1120,8 @@ mod goldens {
     /// then paints (already pinned byte for byte by the goldens above).
     #[test]
     fn notice_carries_the_plain_words_without_styling() {
-        let off = spend::Paint { color: false, truecolor: false };
-        let on = spend::Paint { color: true, truecolor: true };
+        let off = Display { paint: spend::Paint { color: false, truecolor: false }, tty: false };
+        let on = Display { paint: spend::Paint { color: true, truecolor: true }, tty: false };
         let w = &words();
         let e = Event::Committed { words: 486, slides: 2, block: "<!-- 10:42:03 -->\n## Sampling".into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision: 3 };
         let n = notice(&e, off, w, false).unwrap();
@@ -1106,6 +1140,38 @@ mod goldens {
         assert_eq!((n.kind, n.label.as_str(), n.detail.as_str()), ("slide", "watching", "Zoom Meeting"));
         let n = notice(&Event::Capture(CaptureState::Denied), on, w, false).unwrap();
         assert_eq!(n.detail, "Screen Recording is off for Terminal: System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen Terminal.", "no styling and no host guessing");
+    }
+
+    /// Task 12's order, proven on the real combination: a colour TTY. The committed, polished and
+    /// page lines embed the CLI's own painting, and their untrusted fragments are cleaned as the
+    /// detail is built — so on a terminal with colour our own escapes survive (the dim money, the
+    /// over-budget red) while a hostile payload's do not.
+    #[test]
+    fn our_own_paint_survives_tty_cleaning_and_theirs_does_not() {
+        let e = Event::Committed { words: 486, slides: 2, block: "<!-- 10:42:03 -->\n## Sampling".into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision: 3 };
+        assert_eq!(shown(term(TRUE), &e, &mut None), "  \u{1b}[38;2;93;184;192m│\u{1b}[0m \u{1b}[2m## Sampling\u{1b}[0m\n  \u{1b}[38;2;93;184;192m◆\u{1b}[0m \u{1b}[1mnotes\u{1b}[0m  486 words and 2 slides folded in  \u{1b}[2m$0.02\u{1b}[0m\n");
+        assert_eq!(shown(term(ANSI), &e, &mut None), "  \u{1b}[36m│\u{1b}[0m \u{1b}[2m## Sampling\u{1b}[0m\n  \u{1b}[36m◆\u{1b}[0m \u{1b}[1mnotes\u{1b}[0m  486 words and 2 slides folded in  \u{1b}[2m$0.02\u{1b}[0m\n", "ANSI colour keeps the dim money too");
+        // the page over budget keeps its red length
+        let over = Event::Page { outcome: PageOutcome { path: PathBuf::from("/tmp/lec/study_page.html"), words: 1600, budget: 1500, cached: false, missing: vec![] }, usd: 0.03 };
+        let line = shown(term(ANSI), &over, &mut None);
+        assert!(line.contains("\u{1b}[31m1600 words of 1500 allowed\u{1b}[0m") && line.contains("\u{1b}[2m$0.03\u{1b}[0m"), "{line:?}");
+        // the polished backup's name is the folder's own word: cleaned on the TTY, painted after
+        // (a slash-free payload, so the path's own file_name sees one component either way)
+        let name = "notes_say\x1b[31mthis\x1b]0;owned\x07\x1b]52;c;cGF5\x07click\x07part\rwholed\x7f";
+        let hostile = Event::Polished { backup: PathBuf::from(format!("/tmp/lec/.live_notes/{name}.md")), usd: 0.04, revision: 5 };
+        let line = shown(term(ANSI), &hostile, &mut None);
+        assert!(line.contains("notes_saythisclickpart") && !line.contains("\x1b]"), "the payload's sequences are gone from the name: {line:?}");
+        assert!(line.contains("\u{1b}[2m$0.04\u{1b}[0m"), "our own dim money survives it: {line:?}");
+        // and control-free painted lines are byte-identical on a TTY and a pipe
+        let same = |e: &Event| {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            show(&mut a, pipe(ANSI), e, &mut None, &words(), false);
+            show(&mut b, term(ANSI), e, &mut None, &words(), false);
+            a == b
+        };
+        assert!(same(&e) && same(&over), "control-free painted lines do not differ on a TTY");
+        assert!(!same(&hostile), "the hostile name is the one thing a TTY cleans");
+        assert_eq!(shown(pipe(ANSI), &hostile, &mut None), format!("  \u{1b}[36m✓\u{1b}[0m \u{1b}[1mpolished\u{1b}[0m  previous version in .live_notes/{name}.md  \u{1b}[2m$0.04\u{1b}[0m\n"), "a pipe keeps the bytes as they were");
     }
 
     /// The start-up records are what `print_prepared` prints — the pinned goldens cover the printing —

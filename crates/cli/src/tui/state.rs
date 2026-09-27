@@ -33,6 +33,11 @@ use super::markdown::{self, Chunk};
 /// projection (plan §C 12).
 const WORDS: Paint = Paint { color: false, truecolor: false };
 
+/// The display context the shared wording is built in: colour-off, so no styling enters the view,
+/// and never a TTY — the TUI cleans each notice at its own projection boundary as it is recorded
+/// (plan Task 12's separation of the two adapters' cleaning).
+const SHARED: plain::Display = plain::Display { paint: WORDS, tty: false };
+
 /// What the lecture records from (plan §F): which silence to watch, and what a gone input means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceKind {
@@ -371,9 +376,10 @@ pub(crate) struct View {
     /// The latest ordinary notice (plan §H's fourth priority): the last thing that happened,
     /// whatever higher-priority condition may be holding the line above it.
     pub(crate) notice: Option<Notice>,
-    /// The notice line holds a transcription-connection notice (interrupted, server, stopped,
-    /// refused): a real `Connected` makes it untrue, so that one clears the line — and only then.
-    /// Set from the event's type as the notice is recorded, never read back from its words.
+    /// The ordinary notice slot holds a transcription-connection notice (interrupted, server,
+    /// stopped, refused): a real `Connected` makes it untrue, so that one clears the slot — and
+    /// only then, whatever layer the line itself is showing. Set from the event's type as the
+    /// notice is recorded, never read back from its words.
     stt_notice: bool,
     /// Capture's persistent ask for the person (plan §H's second priority): the notice an Asking
     /// or Denied state raised, held until healthy watching or a relocation resolves it — never
@@ -456,19 +462,22 @@ impl View {
         // conditions drawn above the latest ordinary notice, and neither erases the other — the
         // frame picks between the typed conditions (View::input_gone_notice,
         // View::capture_attention, View::notice).
+        // The capture wording alone needs the course and host; one clone per event is nothing
+        // at these rates, and every notice arm shares it (plan §F).
         let words = self.capture_words();
         let mixed = self.identity.kind == SourceKind::Mixed;
         match e {
-            // capture needs the person: the ask holds until core resolves it
+            // capture needs the person: the ask holds until core resolves it — cleaned as it
+            // enters, like every other notice the projection keeps (plan §C 12)
             Event::Capture(CaptureState::Asking { .. } | CaptureState::Denied) => {
-                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
-                    self.capture_hold = Some(n.clone());
+                if let Some(n) = plain::notice(e, SHARED, &words, mixed) {
+                    self.capture_hold = Some(Self::cleaned(n.clone()));
                     self.to_ring(n, at);
                 }
             }
             // healthy watching is telemetry: the ring keeps it, the hold it ended is gone
             Event::Capture(CaptureState::Watching { .. }) => {
-                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                if let Some(n) = plain::notice(e, SHARED, &words, mixed) {
                     self.to_ring(n, at);
                 }
                 self.capture_hold = None;
@@ -478,12 +487,12 @@ impl View {
                 // hold was asking for is resolved even before the next Watching telemetry, and
                 // the relocation's own good news takes the ordinary slot.
                 self.capture_hold = None;
-                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                if let Some(n) = plain::notice(e, SHARED, &words, mixed) {
                     self.record(n, at);
                 }
             }
             _ => {
-                if let Some(n) = plain::notice(e, WORDS, &words, mixed) {
+                if let Some(n) = plain::notice(e, SHARED, &words, mixed) {
                     self.record(n, at);
                     // the flag tracks the line itself: only a real Connected clears what the
                     // connection raised, and only when this notice is what holds it
@@ -541,11 +550,15 @@ impl View {
                 self.open = Some(OpenUtterance { stable: plain::clean(stable), tentative: plain::clean(tentative) });
             }
             // One `Recovered` resolves the gap core says it resolved, by its identity; the transcript
-            // is never called whole on the strength of one telemetry event.
-            Notification::Recovered(g) => {
+            // is never called whole on the strength of one telemetry event. An audio gap — born
+            // resolved, with no audio to recover — never waits, and must not mark its identity
+            // resolved either: a transcript gap can share its recording and first sample, and it
+            // would then be born resolved too (plan Task 12).
+            Notification::Recovered(g) if g.kind.is_transcript() => {
                 self.waiting.remove(&gap_key(g));
                 self.resolved.insert(gap_key(g));
             }
+            Notification::Recovered(_) => {}
             Notification::Recording { .. } | Notification::Failed(_) | Notification::RecoveryFailed(_) | Notification::SpendFailed(_) | Notification::SourceEnded => {}
         }
     }
@@ -598,11 +611,12 @@ impl View {
     }
 
     /// The notice line's first priority (plan §H), from the typed condition alone: the single
-    /// input that is gone, while it is gone. A mixed source never holds the line for a missing
-    /// mic — its wording says the loopback keeps recording and it rides as an ordinary notice.
+    /// input that is gone, while it is gone. Only a single source ever sets the mark, so the
+    /// sentence is always the single-source one; a mixed source's missing mic never holds the
+    /// line — its wording says the loopback keeps recording and rides as an ordinary notice.
     pub(crate) fn input_gone_notice(&self) -> Option<Notice> {
         let uid = self.input_gone.as_ref()?;
-        Some(plain::input_gone(uid, self.identity.kind != SourceKind::Input))
+        Some(plain::input_gone(uid, false))
     }
 
     /// The notice line's second priority: capture's ask for the person — asking, or Screen
@@ -744,7 +758,7 @@ impl View {
     /// notice waits underneath them and shows as soon as they clear — never lost, never displacing
     /// a condition that still stands.
     fn record(&mut self, n: Notice, at: DateTime<Local>) {
-        let n = Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) };
+        let n = Self::cleaned(n);
         self.activity.push(Activity { at, kind: n.kind, label: n.label.clone(), detail: n.detail.clone() });
         self.notice = Some(n);
         self.stt_notice = false;
@@ -752,8 +766,14 @@ impl View {
 
     /// One notice into the ring alone: the line is not touched.
     fn to_ring(&mut self, n: Notice, at: DateTime<Local>) {
-        let n = Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) };
+        let n = Self::cleaned(n);
         self.activity.push(Activity { at, kind: n.kind, label: n.label, detail: n.detail });
+    }
+
+    /// One notice as the projection keeps it: its words cleaned, shape kept (plan §C 12) — no
+    /// notice the frame may draw, on the line or in the ring, holds a terminal control.
+    fn cleaned(n: Notice) -> Notice {
+        Notice { kind: n.kind, label: plain::clean(&n.label), detail: plain::clean(&n.detail) }
     }
 }
 
@@ -1212,6 +1232,27 @@ mod tests {
         assert_eq!((c.app.as_str(), c.title.as_str()), ("zoom.us", "Zoom Meeting"));
         assert_eq!((c.id, c.bundle_id.as_deref(), c.width, c.height, c.on_screen), (4242, Some("us.zoom.xos"), 1280, 800, true), "identity untouched");
         assert_eq!(hostile.title, "\x1b[2JZoom Meeting\x1b]52;c;cGF5\x07", "the event's own data is not mutated");
+        // the hold the same asking raised is drawn on the notice line: cleaned like every other
+        // notice the projection keeps, never raw (plan §C 12)
+        let n = v.capture_attention().expect("the ask holds");
+        assert!(!n.label.chars().chain(n.detail.chars()).any(|c| c != '\n' && c != '\t' && c.is_control()), "{n:?}");
+        assert!(n.detail.contains("moved") && n.detail.contains("“Zoom”"), "{}", n.detail);
+    }
+
+    /// A transcription notice recorded while capture holds the line (plan §H's layers): the ask
+    /// keeps the line, the interruption waits underneath, and the `Connected` that resolves it
+    /// clears that slot alone — the ask is still what shows.
+    #[test]
+    fn a_connection_notice_under_the_capture_hold_clears_with_its_connected() {
+        let mut v = view();
+        v.reduce(&Event::Capture(CaptureState::Asking { window: "Zoom Meeting".into(), reason: "it is not where it was".into(), candidates: vec![] }), at());
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Retrying { after: std::time::Duration::from_secs(5), reason: "socket closed".into() })), at());
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"), "the ask still holds the line");
+        assert_eq!(v.notice.as_ref().map(|n| n.label.as_str()), Some("transcription interrupted"), "the interruption waits underneath");
+        v.reduce(&Event::Session(Notification::Stt(SttStatus::Connected)), at());
+        assert_eq!(v.notice, None, "the connection notice it raised is cleared");
+        assert_eq!(v.capture_attention().map(|n| n.label.as_str()), Some("asking"), "the ask was never the connection's to clear");
+        assert!(v.activity.records().iter().any(|a| a.label == "transcription interrupted"), "the history keeps it");
     }
 
     /// Plan §J `capture_lost_then_found`: watching → asking → watching replaces the typed state,
@@ -1396,6 +1437,14 @@ mod tests {
         v.reduce(&Event::Session(Notification::Gap(transcript_gap())), at());
         let n = v.notice.as_ref().unwrap();
         assert!(n.detail.contains("recovery fills it in when it can"), "{}", n.detail);
+        // the synthetic recovery did not mark the audio gap's identity resolved either: a
+        // transcript gap can share its recording and first sample, and must still wait
+        let mut w = view();
+        let mut resolved_audio = audio_gap();
+        resolved_audio.resolved = true;
+        w.reduce(&Event::Session(Notification::Recovered(resolved_audio)), at());
+        w.reduce(&Event::Session(Notification::Gap(Gap { kind: GapKind::SttOffline, resolved: false, ..audio_gap() })), at());
+        assert_eq!(w.gaps(), 1, "the transcript gap at the audio gap's place still waits");
     }
 
     /// `RecoveryFailed` (plan §H): a warning notice and activity, the gap stays open, and nothing

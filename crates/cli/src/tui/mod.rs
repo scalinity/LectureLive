@@ -376,7 +376,7 @@ impl Ui {
         match reply {
             CaptureReply::Now(Ok(())) => Act::Nothing,
             CaptureReply::Now(Err(m)) => self.say(format!("The capture did not happen: {}", plain::sentence(&plain::clean(&m)))),
-            CaptureReply::WatchFailed(e) => self.say(format!("The window was not watched: saving its region failed ({}).", plain::sentence(&format!("{e:#}")))),
+            CaptureReply::WatchFailed(e) => self.say(format!("The window was not watched: saving its region failed ({}).", plain::sentence(&plain::clean(&format!("{e:#}"))))),
             CaptureReply::Watched { selection, bound } => {
                 if let Some(ctx) = &mut self.capture {
                     ctx.saved = Some(selection); // persisted is persisted, bound or not

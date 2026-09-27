@@ -361,6 +361,38 @@ fn a_failed_session_restores_the_terminal_then_errors() {
     assert!(untouched(&l.home), "the person's data folder was never touched");
 }
 
+/// Plan Task 12's `failures` scenario: the non-fatal walk through the failure table, in order,
+/// while the lecture stays alive — each failure's own words reach the notice line, the activity
+/// overlay keeps them all after the line has moved on, and the session still ends cleanly with
+/// nothing of the person's data touched.
+#[test]
+fn the_failures_scenario_walks_the_table_and_keeps_it_inspectable() {
+    let mut l = tui("failures", &["--secs", "20"], 110, 32);
+    let listening = l.listening();
+    // the walk, one failure every 2 s: gap → recovery failed → spend → reconnect → snapshot → page
+    let mut at = l.pty.wait_for("2.0–3.0", listening, Duration::from_secs(20));
+    at = l.pty.wait_for("backlog", at, SOON);
+    at = l.pty.wait_for("spend", at, SOON);
+    at = l.pty.wait_for("reconnecting", at, SOON);
+    at = l.pty.wait_for("snapshot failed", at, SOON);
+    l.pty.wait_for("page failed", at, SOON);
+    // Ctrl-O: the activity keeps the walk after the line has moved on — its first frame draws
+    // the whole overlay, so its rows arrive whole (which words survive the cell diff whole
+    // depends on the transcript beneath; these three did, and the ring's full inventory is the
+    // unit suite's to pin)
+    l.pty.write(b"\x0f");
+    let overlay = l.pty.wait_for("Activity", listening, SOON);
+    for still_there in ["backlog", "ledger", "interrupted"] {
+        assert!(find(l.out(), still_there.as_bytes(), overlay).is_some(), "{still_there:?} left the activity:\n{}", visible(l.out()));
+    }
+    // the lecture was alive throughout (only --secs ended it), and ends as any clean session
+    let status = l.pty.wait(Duration::from_secs(20));
+    assert_eq!(code(status, &l), Some(0));
+    let after = l.restored(listening);
+    l.at("saved", after);
+    assert!(untouched(&l.home), "the person's data folder was never touched");
+}
+
 /// The `ops` fixture's command log: every command the TUI sent, one line each, in order.
 fn commands(l: &Lecture) -> Vec<String> {
     std::fs::read_to_string(l.dir.join("fixture-commands.log")).unwrap_or_default().lines().map(str::to_string).collect()

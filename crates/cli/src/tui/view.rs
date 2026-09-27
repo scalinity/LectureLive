@@ -1558,6 +1558,8 @@ mod tests {
     /// The TUI's own half of `display_text_cannot_emit_terminal_controls`: hostile text reduced
     /// into the view — transcript, open utterance, a notice, a slide's file, a capture state —
     /// and the frame rendered: no cell ever holds a character that could act on the terminal.
+    /// The asking state matters most of all: its notice is the one the notice line holds as a
+    /// persistent condition (plan §H's second priority), drawn from the window server's own words.
     #[test]
     fn hostile_text_renders_without_terminal_controls() {
         let hostile = "\x1b[31msay\x1b[0m\x1b[2J\x1b[H\x1b]0;owned\x07\x1b]52;c;cGF5\x07\x1b]8;;https://evil.example\x1b\\click\x1b]8;;\x1b\\\x07part\rwholed\x7f";
@@ -1569,6 +1571,10 @@ mod tests {
         v.reduce(&Event::SnapshotFailed(hostile.into()), fixed());
         v.reduce(&Event::Slide { index: 1, file: format!("slides/{hostile}.png").into(), auto: true, uncertain: false, shown_at: fixed() }, fixed());
         v.reduce(&Event::Capture(CaptureState::Paused { window: hostile.into(), reason: hostile.into() }), fixed());
+        // the asking hold: the notice line keeps this one until core resolves it
+        v.reduce(&Event::Capture(CaptureState::Asking { window: hostile.into(), reason: hostile.into(), candidates: vec![] }), fixed());
+        v.reduce(&Event::Session(Notification::DeviceGone { uid: "Receiver_UID".into() }), fixed());
+        v.reduce(&Event::Session(Notification::DeviceBack { uid: "Receiver_UID".into() }), fixed());
         for (w, h) in [(140, 40), (80, 25)] {
             let b = drawn(w, h, &v, None);
             for cell in b.content.iter() {
@@ -1577,6 +1583,9 @@ mod tests {
             }
             let text = lines(&b).join("\n");
             assert!(!text.contains('\x1b'), "{w}×{h}");
+            // the asking hold owns the line again now the input is back: its cleaned words show
+            let notice_row = (h - 3) as usize;
+            assert!(lines(&b)[notice_row].contains("▲ asking"), "{w}×{h}: {:?}", lines(&b)[notice_row]);
             assert!(text.contains("sayclick"), "{w}×{h}: the words it carried still show: {text:?}");
         }
     }
