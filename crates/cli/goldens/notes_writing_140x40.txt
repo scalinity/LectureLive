@@ -36,5 +36,5 @@
 "         ▎ halves                          │                                                                 │                              "
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 "                                                                                                                                            "
-" ◆ a hint, or ⏎ for a snapshot                                                                                                              "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^G help   ^C stop                                                              "
+" ◆  a hint, or ⏎ for a snapshot                                                                                                             "
+" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^H help   ^C stop                                                              "

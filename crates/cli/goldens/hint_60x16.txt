@@ -13,4 +13,4 @@
 "         ▎ n, so quadrupling the sample only halves         "
 "                                                            "
 " ◆ focus on treatment differences and the 95% interval      "
-" ⏎ snapshot   polish⏎   ^X cancel   ^G help   ^C stop       "
+" ⏎ snapshot   polish⏎   ^X cancel   ^H help   ^C stop       "

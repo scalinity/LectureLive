@@ -12,5 +12,5 @@
 " 10:43:05  ▲ snapshot failed  the model timed out after 600 "
 "             s; everything is kept for the next one         "
 " ▲ snapshot failed  the model timed out after 600 s; every… "
-" ◆ a hint, or ⏎ for a snapshot                              "
+" ◆  a hint, or ⏎ for a snapshot                             "
 " ↑↓ scroll   Esc close   ^C stop                            "

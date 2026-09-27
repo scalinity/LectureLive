@@ -21,5 +21,5 @@
 " writing | Provisional heading                                                  "
 "         | - tentative words the model is still writing about quadrupling       "
 "                                                                                "
-" * a hint, or Enter for a snapshot                                              "
-" Enter snapshot   polish Enter   ^X cancel   Tab pane   ^G help   ^C stop       "
+" *  a hint, or Enter for a snapshot                                             "
+" Enter snapshot   polish Enter   ^X cancel   Tab pane   ^H help   ^C stop       "

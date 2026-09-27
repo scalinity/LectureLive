@@ -21,5 +21,5 @@
 " 10:41:44  The spread is the interesting part.                                  "
 " 10:42:03  We distinguish the sample statistic from the population parameter.   "
 "                                                                                "
-" ◆ a hint, or ⏎ for a snapshot                                                  "
-" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^G help   ^C stop              "
+" ◆  a hint, or ⏎ for a snapshot                                                 "
+" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop              "

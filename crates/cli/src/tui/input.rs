@@ -40,7 +40,7 @@ pub(crate) enum Key {
     Clear,
     /// Ctrl-X: cancel this TUI's notes requests.
     Cancel,
-    /// Ctrl-G or F1.
+    /// Ctrl-H or F1. (Ctrl-G is taken by a system-wide shortcut on the person's Mac.)
     Help,
     /// Ctrl-O.
     Activity,
@@ -72,7 +72,7 @@ pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
                 'z' => Key::Suspend,
                 'l' => Key::Clear,
                 'x' => Key::Cancel,
-                'g' => Key::Help,
+                'h' => Key::Help,
                 'o' => Key::Activity,
                 't' => Key::Zoom,
                 's' => Key::Nothing,
@@ -200,7 +200,7 @@ mod tests {
     /// Ctrl-A/E/W/U/K still edit; Ctrl-S does nothing yet.
     #[test]
     fn app_chords_are_taken_before_the_editor() {
-        for (c, want) in [('c', Key::Stop), ('z', Key::Suspend), ('l', Key::Clear), ('x', Key::Cancel), ('g', Key::Help), ('o', Key::Activity), ('t', Key::Zoom), ('s', Key::Nothing)] {
+        for (c, want) in [('c', Key::Stop), ('z', Key::Suspend), ('l', Key::Clear), ('x', Key::Cancel), ('h', Key::Help), ('o', Key::Activity), ('t', Key::Zoom), ('s', Key::Nothing)] {
             assert_eq!(classify(&ctrl(c), Overlay::None), want, "^{c}");
             assert_eq!(classify(&ctrl(c), Overlay::Help), want, "^{c} with help open");
         }
@@ -209,6 +209,12 @@ mod tests {
         }
         assert_eq!(classify(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL | KeyModifiers::ALT), Overlay::None), Key::Edit, "AltGr text");
         assert_eq!(classify(&key(KeyCode::F(1)), Overlay::None), Key::Help);
+        // Ctrl-H (0x08) is help; Backspace arrives as its own key (Terminal sends 0x7F) and still edits
+        assert_eq!(classify(&key(KeyCode::Backspace), Overlay::None), Key::Edit);
+        let mut h = typed("ab");
+        h.edit(key(KeyCode::Backspace)).unwrap();
+        assert_eq!(h.value(), "a");
+        assert_eq!(classify(&ctrl('g'), Overlay::None), Key::Edit, "Ctrl-G no longer opens help");
         let mut release = ctrl('c');
         release.kind = KeyEventKind::Release;
         assert_eq!(classify(&release, Overlay::None), Key::Nothing);

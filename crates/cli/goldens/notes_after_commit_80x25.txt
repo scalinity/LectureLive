@@ -21,5 +21,5 @@
 " 10:43:05  Confidence intervals                                                 "
 "           • An interval built to cover the mean in repeated samples.           "
 " ◆ notes  60 words and 0 slides folded in  $0.02                                "
-" ◆ a hint, or ⏎ for a snapshot                                                  "
-" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^G help   ^C stop              "
+" ◆  a hint, or ⏎ for a snapshot                                                 "
+" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop              "

@@ -12,5 +12,5 @@
 "         ▎ The denominator changes with the square root of  "
 "         ▎ n, so quadrupling the sample only halves         "
 "                                                            "
-" ◆ a hint, or ⏎ for a snapshot                              "
-" ⏎ snapshot   polish⏎   Tab pane   ^G help   ^C stop        "
+" ◆  a hint, or ⏎ for a snapshot                             "
+" ⏎ snapshot   polish⏎   Tab pane   ^H help   ^C stop        "

@@ -12,5 +12,5 @@
 " │ PgUp PgDn  a page                                      │ "
 " └────────────────────────────────────────────── ↑↓ more ─┘ "
 "                                                            "
-" ◆ a hint, or ⏎ for a snapshot                              "
+" ◆  a hint, or ⏎ for a snapshot                             "
 " ↑↓ scroll   Esc close   ^C stop                            "

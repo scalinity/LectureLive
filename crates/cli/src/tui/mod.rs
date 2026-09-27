@@ -1027,7 +1027,7 @@ mod tests {
         ui.key(key(KeyCode::PageUp), Instant::now());
         let held = ui.transcript.anchor();
         assert!(held.is_some());
-        assert_eq!(ui.key(ctrl('g'), Instant::now()), Act::Redraw);
+        assert_eq!(ui.key(ctrl('h'), Instant::now()), Act::Redraw);
         assert_eq!(ui.overlay, input::Overlay::Help);
         frame(&mut ui, 110, 32);
         for k in [key(KeyCode::Up), key(KeyCode::Down), key(KeyCode::PageUp), key(KeyCode::Tab), ctrl('t')] {
@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(ui.transcript.anchor(), held, "and did not touch the transcript");
         ui.key(key(KeyCode::Esc), Instant::now());
         assert!(ui.transcript.following(), "the next Esc goes back to live");
-        // F1 is help too; ^G again closes it; ^O swaps to activity
+        // F1 is help too; ^H again closes it; ^O swaps to activity
         ui.key(key(KeyCode::F(1)), Instant::now());
         assert_eq!(ui.overlay, input::Overlay::Help);
         ui.key(ctrl('o'), Instant::now());
@@ -1047,7 +1047,7 @@ mod tests {
         ui.key(ctrl('o'), Instant::now());
         assert_eq!(ui.overlay, input::Overlay::None);
         // app chords still work behind an overlay
-        ui.key(ctrl('g'), Instant::now());
+        ui.key(ctrl('h'), Instant::now());
         assert_eq!(ui.key(ctrl('l'), Instant::now()), Act::Clear);
         assert!(matches!(ui.key(ctrl('c'), Instant::now()), Act::Stop(_)));
     }
@@ -1104,7 +1104,7 @@ mod tests {
         assert!(ui.drawn.small);
         type_in(&mut ui, "invisible", Instant::now(), &tx);
         assert_eq!(ui.paste("pasted"), Act::Nothing);
-        for k in [key(KeyCode::Enter), key(KeyCode::Tab), ctrl('x'), ctrl('t'), ctrl('g')] {
+        for k in [key(KeyCode::Enter), key(KeyCode::Tab), ctrl('x'), ctrl('t'), ctrl('h')] {
             assert_eq!(press(&mut ui, k, Instant::now(), &tx), Act::Nothing, "{k:?}");
         }
         assert_eq!(ui.hint.value(), "");

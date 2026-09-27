@@ -41,5 +41,5 @@
 "                                                                        "
 "                                                                        "
 "                                                                        "
-" ◆ stopping: the last snapshot takes what is left                       "
-" Tab pane   ^O activity   ^G help   ^C quit at once                     "
+" ◆  stopping: the last snapshot takes what is left                      "
+" Tab pane   ^O activity   ^H help   ^C quit at once                     "

@@ -37,4 +37,4 @@
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 "                                                                                                                                            "
 " ◆ focus on treatment differences and the 95% interval                                                                                      "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^G help   ^C stop                                                              "
+" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^H help   ^C stop                                                              "

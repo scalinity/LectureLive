@@ -36,5 +36,5 @@
 "                                                                                                                                            "
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 "                                                                                                                                            "
-" ◆ a hint, or ⏎ for a snapshot                                                                                                              "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^T back   ^O activity   ^G help   ^C stop                                                    "
+" ◆  a hint, or ⏎ for a snapshot                                                                                                             "
+" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^T back   ^O activity   ^H help   ^C stop                                                    "

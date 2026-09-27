@@ -374,7 +374,7 @@ fn footer(v: &View, c: &Chrome, room: usize) -> Vec<Span<'static>> {
                 parts.push((3, chord("^T", "back", DIM)));
             }
             parts.push((6, chord("^O", "activity", DIM)));
-            parts.push((1, chord("^G", "help", DIM)));
+            parts.push((1, chord("^H", "help", DIM)));
         }
     }
     let stop = if v.phase == Stage::StopWaiting { t.signal() } else { DIM };
@@ -572,7 +572,7 @@ pub(crate) fn mark(kind: &str, t: &Theme) -> (&'static str, Style) {
 }
 
 /// The hint line (plan §H): the mark, then the hint as typed — scrolled so the cursor stays in the
-/// field — or, empty, what Enter does now. The terminal's own cursor sits where the next character
+/// field — or, empty, what Enter does now, one cell after the cursor. The terminal's own cursor sits where the next character
 /// goes, counted in cells as `tui-input` counts them.
 fn prompt(frame: &mut Frame, rect: Rect, v: &View, c: &Chrome) {
     let (t, g) = (c.theme, c.theme.glyphs);
@@ -585,7 +585,10 @@ fn prompt(frame: &mut Frame, rect: Rect, v: &View, c: &Chrome) {
     let value = c.hint.value();
     if value.is_empty() {
         let words = if v.phase == Stage::Listening { format!("a hint, or {} for a snapshot", g.enter) } else { STOPPING_PROMPT.to_string() };
-        frame.render_widget(Span::styled(fit(&words, field, g.ellipsis), DIM), Rect::new(x0, rect.y, field as u16, 1));
+        // the cursor waits on its own cell, so its block never hides the placeholder's first letter
+        if field > 1 {
+            frame.render_widget(Span::styled(fit(&words, field - 1, g.ellipsis), DIM), Rect::new(x0 + 1, rect.y, field as u16 - 1, 1));
+        }
         frame.set_cursor_position((x0, rect.y));
         return;
     }
@@ -654,7 +657,7 @@ fn help_lines(g: &Glyphs, inner: usize) -> Vec<Line<'static>> {
         ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests, running and queued")]),
         ("Reading", vec![(g.updown, "a row in the focused pane"), ("PgUp PgDn", "a page"), (tabs.as_str(), "the next or previous pane"), ("Esc", "back to live"), ("^T", "the focused pane fills the body; again to go back")]),
         ("Slides", vec![("Tab", "reaches the Slides pane")]),
-        ("App", vec![("^O", "activity: this session's notices"), ("^G F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
+        ("App", vec![("^O", "activity: this session's notices"), ("^H F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
         (
             "Stopping",
             vec![
@@ -1208,16 +1211,16 @@ mod tests {
     #[test]
     fn the_footer_follows_the_stop_stage() {
         for (stage, keys, safety) in [
-            (Stage::Listening, " ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^G help   ^C stop", " ^L redraw   ^C stop"),
-            (Stage::Stopping, " Tab pane   ^O activity   ^G help   ^C stop waiting", " ^L redraw   ^C stop waiting"),
-            (Stage::StopWaiting, " Tab pane   ^O activity   ^G help   ^C quit at once", " ^L redraw   ^C quit at once"),
+            (Stage::Listening, " ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop", " ^L redraw   ^C stop"),
+            (Stage::Stopping, " Tab pane   ^O activity   ^H help   ^C stop waiting", " ^L redraw   ^C stop waiting"),
+            (Stage::StopWaiting, " Tab pane   ^O activity   ^H help   ^C quit at once", " ^L redraw   ^C quit at once"),
         ] {
             assert_eq!(lines(&drawn(110, 32, &view(stage), None))[31], keys, "while stopping Enter takes nothing, and the footer does not offer it");
             assert_eq!(lines(&drawn(40, 8, &view(stage), None))[7], safety, "the safety view keeps the keys that work there");
         }
         let l = lines(&drawn(110, 32, &view(Stage::Listening), None));
-        assert_eq!(l[30], " ◆ a hint, or ⏎ for a snapshot", "the empty hint line says what Enter does");
-        assert_eq!(lines(&drawn(110, 32, &view(Stage::Stopping), None))[30], format!(" ◆ {STOPPING_PROMPT}"));
+        assert_eq!(l[30], " ◆  a hint, or ⏎ for a snapshot", "the empty hint line says what Enter does, one cell after the cursor");
+        assert_eq!(lines(&drawn(110, 32, &view(Stage::Stopping), None))[30], format!(" ◆  {STOPPING_PROMPT}"));
         assert!(!l.join("").contains("^S"), "no capture key before Task 11");
     }
 
@@ -1369,7 +1372,7 @@ mod tests {
         assert!(l[0].starts_with(" * Listening   Machine Learning > Week 03 — Optimisation"), "{:?}", l[0]);
         assert!(l[1].contains("BlackHole 2ch  #####---  transcribing"), "{:?}", l[1]);
         assert!(l[2].trim().chars().all(|c| c == '-') && l[4].contains(" | "), "{:?} {:?}", l[2], l[4]);
-        assert!(l[37].starts_with(" [] slide 3") && l[38].starts_with(" * a hint, or Enter for a snapshot"), "{:?} {:?}", l[37], l[38]);
+        assert!(l[37].starts_with(" [] slide 3") && l[38].starts_with(" *  a hint, or Enter for a snapshot"), "{:?} {:?}", l[37], l[38]);
         assert_eq!(lines(drawn_with(40, 8, &v, None, &Theme::new(TRUE, false)).backend().buffer())[2], " 60x16 needed. Recording goes on.");
     }
 
@@ -1871,8 +1874,11 @@ mod tests {
         let b = t.backend().buffer();
         assert_eq!(b[(1, 30)].fg, TEAL);
         assert_eq!((b[(3, 30)].symbol(), b[(3, 30)].modifier), ("f", Modifier::empty()));
-        let (t, _) = looked(110, 32, &view(Stage::Listening), &Look::default(), &theme);
-        assert_eq!(t.backend().buffer()[(3, 30)].modifier, Modifier::DIM);
+        let (mut t, _) = looked(110, 32, &view(Stage::Listening), &Look::default(), &theme);
+        assert_eq!(t.get_cursor_position().unwrap(), ratatui::layout::Position::new(3, 30));
+        let b = t.backend().buffer();
+        assert_eq!(b[(3, 30)].symbol(), " ", "the cursor's cell is empty: its block hides no letter");
+        assert_eq!((b[(4, 30)].symbol(), b[(4, 30)].modifier), ("a", Modifier::DIM), "the placeholder starts after it");
     }
 
     /// The activity with enough history to have let some go.
@@ -1933,7 +1939,7 @@ mod tests {
         assert_eq!(width, 64);
         assert_eq!(x - 1, (138 - 64) / 2, "centred in the body");
         let text = l[top..=bottom].join("\n");
-        for want in ["Notes", "a snapshot now", "hint ⏎", "polish⏎", "^X", "Reading", "PgUp PgDn", "Tab ⇧Tab", "^T", "Slides", "App", "^O", "^G F1", "^L", "^Z", "Stopping", "^C once", "^C twice", "^C thrice", "Spend is this lecture's cost today;", "recording closes."] {
+        for want in ["Notes", "a snapshot now", "hint ⏎", "polish⏎", "^X", "Reading", "PgUp PgDn", "Tab ⇧Tab", "^T", "Slides", "App", "^O", "^H F1", "^L", "^Z", "Stopping", "^C once", "^C twice", "^C thrice", "Spend is this lecture's cost today;", "recording closes."] {
             assert!(text.contains(want), "{want:?} in\n{text}");
         }
         let prose: String = l[top + 1..bottom].iter().map(|r| r.chars().skip(x + 2).take(60).collect::<String>().trim().to_string()).collect::<Vec<_>>().join(" ");
