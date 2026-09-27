@@ -23,14 +23,20 @@ use lecturelive_core::session::lecture::{CaptureSetup, Event};
 pub(crate) const FILE: &str = "capture.json";
 
 /// What adapting capture needs to know about the lecture (plan Task 11): where the course's
-/// selection is saved, and the selection as it was loaded before the lecture started — the same
-/// state core's worker revalidates. The reactor holds a copy for Ctrl-S; nothing rereads the file
-/// while the lecture runs, and core's own relocations are the only thing that updates it.
+/// selection is saved, the selection as it was loaded before the lecture started — the same
+/// state core's worker revalidates — and the capture state as core last emitted it. The reactor
+/// alone holds one; nothing rereads the file while the lecture runs, and core's own relocations
+/// and this frontend's own kept binds are the only things that update it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Context {
     pub(crate) path: PathBuf,
     pub(crate) course: String,
     pub(crate) saved: Option<Selection>,
+    /// The capture state exactly as core emitted it, for the functional decisions (Ctrl-S's
+    /// watch-it): never rendered, never cleaned. A candidate's id, bundle id, app, title and
+    /// size are its identity when binding (spec §7.1), and display cleaning must never become
+    /// persistence identity — so the presentation copy in the view is a different one.
+    pub(crate) current: Option<CaptureState>,
 }
 
 /// The course's saved selection, loaded off the reactor before the engine starts: a missing file
@@ -49,27 +55,56 @@ pub(crate) fn keep_selection(path: &Path, course: &str, sel: &Selection) -> Resu
     all.save(path)
 }
 
+/// What the adapter hands a frontend beside the event itself: whether a relocation it carried
+/// was actually kept for the course. The outcome travels in the same ordered stream as the
+/// event, so neither frontend infers persistence from wording, and no ordering can diverge.
+#[derive(Debug)]
+pub(crate) enum CapturePersistence {
+    /// The event carried no relocation.
+    None,
+    /// A relocation kept for the course: this exact selection is on disk.
+    MovedSaved(Selection),
+    /// A relocation the running session still holds, but the preference could not be written.
+    MovedSaveFailed { error: String },
+}
+
+/// One core event as a frontend receives it: the event, and what the adapter did about any
+/// relocation in it. Both frontends share this single stream.
+#[derive(Debug)]
+pub(crate) struct Forwarded {
+    pub(crate) event: Event,
+    pub(crate) capture_persistence: CapturePersistence,
+}
+
+/// The one line both frontends say when a relocation could not be kept (plan Task 11): the
+/// session found the region again — that truth stands — while the saved selection does not have
+/// it, and the failure is the last word.
+pub(crate) fn unsaved_words(error: &str) -> (&'static str, &'static str, String) {
+    ("warn", "found again", format!("Capture found the slide again, but the new region could not be saved: {error}"))
+}
+
 /// The capture event adapter (plan Task 11): the one place core's capture events pass through on
 /// their way to whichever frontend is running. A relocation is saved for the course — off this
 /// task, on a blocking thread — before the event continues, so a frontend that says "found again"
-/// is always behind a region it has already kept. A save that fails is a warning of its own and
-/// the worker's event still arrives: this session found the region even though the preference
-/// could not be written. Without a context (a scripted session without capture) it only forwards,
-/// and it ends when core's channel closes, so the engine's future resolves only after every
-/// final event has been handed on.
-pub(crate) async fn forward(ctx: Option<Context>, mut from: UnboundedReceiver<Event>, to: UnboundedSender<Event>) {
+/// is always behind a region it has already kept; whether the save happened arrives beside the
+/// event, so a failure is never dressed as a success. Without a context (a scripted session
+/// without capture) it only forwards, and it ends when core's channel closes, so the engine's
+/// future resolves only after every final event has been handed on.
+pub(crate) async fn forward(ctx: Option<Context>, mut from: UnboundedReceiver<Event>, to: UnboundedSender<Forwarded>) {
     while let Some(e) = from.recv().await {
+        let mut persistence = CapturePersistence::None;
         if let (Some(ctx), Event::CaptureMoved { selection, .. }) = (&ctx, &e) {
             let kept = tokio::task::spawn_blocking({
                 let (path, course, sel) = (ctx.path.clone(), ctx.course.clone(), selection.clone());
                 move || keep_selection(&path, &course, &sel)
             })
             .await;
-            if let Err(err) = kept.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
-                let _ = to.send(Event::Warning(format!("the region found again could not be saved: {err:#}")));
-            }
+            persistence = match kept.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                Ok(()) => CapturePersistence::MovedSaved(selection.clone()),
+                Err(err) => CapturePersistence::MovedSaveFailed { error: format!("{err:#}") },
+            };
         }
-        if to.send(e).is_err() {
+        if to.send(Forwarded { event: e, capture_persistence: persistence }).is_err() {
             return; // the frontend is gone: nothing is kept for a reader that is not there
         }
     }
@@ -258,7 +293,8 @@ mod tests {
 
     /// Plan §J `capture_moved_is_saved_before_notice`: two courses are saved; a relocation for one
     /// arrives through the adapter; by the time the frontend sees the event, the file already
-    /// holds the moved selection for that course and the other course exactly as it was.
+    /// holds the moved selection for that course and the other course exactly as it was — and the
+    /// outcome arrives beside the event, typed, so the frontend never guesses.
     #[tokio::test]
     async fn capture_moved_is_saved_before_notice() {
         let dir = tempfile::tempdir().unwrap();
@@ -270,13 +306,16 @@ mod tests {
         all.save(&path).unwrap();
 
         let moved = saved().with_size(1920, 1200, Region { x: 0.02, y: 0.03, w: 0.95, h: 0.9 });
-        let ctx = Context { path: path.clone(), course: "Machine Learning".into(), saved: Some(saved()) };
+        let ctx = Context { path: path.clone(), course: "Machine Learning".into(), saved: Some(saved()), current: None };
         let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
         let (fe_tx, mut fe_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(forward(Some(ctx), core_rx, fe_tx));
         core_tx.send(Event::CaptureMoved { selection: moved.clone(), note: "the slide moved with the window; watching it at the new size".into() }).unwrap();
         match fe_rx.recv().await.unwrap() {
-            Event::CaptureMoved { note, .. } => assert_eq!(note, "the slide moved with the window; watching it at the new size"),
+            Forwarded { event: Event::CaptureMoved { note, .. }, capture_persistence: CapturePersistence::MovedSaved(kept) } => {
+                assert_eq!(note, "the slide moved with the window; watching it at the new size");
+                assert_eq!(kept, moved, "the persisted selection travels with the outcome");
+            }
             other => panic!("{other:?}"),
         }
         // The save has already happened: the file, read now, holds the moved selection and the
@@ -286,27 +325,33 @@ mod tests {
         assert_eq!(after.get("Statistics"), Some(&statistics), "another course is never replaced by a one-course save");
     }
 
-    /// A relocation that cannot be saved is a warning before the event, and the event still
-    /// arrives: the session found the region even though the preference could not be written.
+    /// A relocation that cannot be saved arrives with the failure typed beside it — no synthetic
+    /// warning event, nothing for a frontend to infer from wording — and the event still arrives:
+    /// the session found the region even though the preference could not be written.
     #[tokio::test]
-    async fn a_save_failure_is_a_warning_and_the_event_still_arrives() {
+    async fn a_save_failure_arrives_typed_with_the_event() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
         std::fs::write(&path, "{ not json").unwrap(); // unreadable: the save fails
-        let ctx = Context { path, course: "Machine Learning".into(), saved: Some(saved()) };
+        let ctx = Context { path, course: "Machine Learning".into(), saved: Some(saved()), current: None };
         let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
         let (fe_tx, mut fe_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(forward(Some(ctx), core_rx, fe_tx));
         core_tx.send(Event::CaptureMoved { selection: saved(), note: "found at the new size".into() }).unwrap();
         match fe_rx.recv().await.unwrap() {
-            Event::Warning(w) => assert!(w.starts_with("the region found again could not be saved: "), "{w}"),
-            other => panic!("the warning comes first: {other:?}"),
+            Forwarded { event: Event::CaptureMoved { .. }, capture_persistence: CapturePersistence::MovedSaveFailed { error } } => {
+                assert!(error.starts_with("read "), "{error}");
+            }
+            other => panic!("the failure rides with the event: {other:?}"),
         }
-        assert!(matches!(fe_rx.recv().await.unwrap(), Event::CaptureMoved { .. }));
+        assert!(fe_rx.try_recv().is_err(), "exactly one forwarded thing: no warning event was invented");
+        // nothing was written: the file is still the broken one it started as
+        assert_eq!(std::fs::read_to_string(dir.path().join(FILE)).unwrap(), "{ not json");
     }
 
     /// Without a context the adapter only forwards: a scripted session with no capture never
-    /// touches a file, and its events arrive in order, with the channel closing only after the last.
+    /// touches a file, and its events arrive in order with nothing beside them, with the channel
+    /// closing only after the last.
     #[tokio::test]
     async fn without_a_context_nothing_is_saved_and_events_pass_through() {
         let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -315,15 +360,55 @@ mod tests {
         core_tx.send(Event::CaptureMoved { selection: saved(), note: "n".into() }).unwrap();
         core_tx.send(Event::NothingNew).unwrap();
         drop(core_tx);
-        assert!(matches!(fe_rx.recv().await.unwrap(), Event::CaptureMoved { .. }));
-        assert!(matches!(fe_rx.recv().await.unwrap(), Event::NothingNew));
+        match fe_rx.recv().await.unwrap() {
+            Forwarded { event: Event::CaptureMoved { .. }, capture_persistence: CapturePersistence::None } => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(fe_rx.recv().await.unwrap().event, Event::NothingNew));
         assert!(fe_rx.recv().await.is_none(), "the channel closes only after the last event");
+    }
+
+    /// Identity is functional, never display: a candidate whose app and title contain what
+    /// `plain::clean` would strip still binds against the same raw saved identity, and two raw
+    /// identities that would clean to the same words are not the same window (plan Task 11).
+    #[test]
+    fn action_reads_raw_identity_not_display_identity() {
+        // raw app/title, hostile but equal on both sides: binds
+        let hostile = "Zoom\x1b]0;owned\x07Meeting";
+        let mut raw_saved = saved();
+        raw_saved.descriptor.app = hostile.into();
+        raw_saved.descriptor.title = hostile.into();
+        raw_saved.descriptor.bundle_id = None; // identity falls to the app name, the rawest form
+        let raw_candidate = WindowInfo { id: 9, app: hostile.into(), bundle_id: None, title: hostile.into(), width: 1280, height: 720, on_screen: true };
+        let asking = CaptureState::Asking { window: hostile.into(), reason: "resized".into(), candidates: vec![raw_candidate] };
+        assert!(matches!(action(Some(&asking), Some(&raw_saved)), Action::Watch { .. }), "raw equals raw, whatever display would make of it");
+        // display-equivalent but raw-different: never bound
+        for (a, b) in [
+            ("Zoom\x1b]0;a\x07Meeting", "Zoom\x1b]0;b\x07Meeting"), // both clean to “ZoomMeeting”
+            ("Zoom\rMeeting", "Zoom\nMeeting"),                     // both clean to “Zoom\nMeeting”
+        ] {
+            assert_eq!(crate::plain::clean(a), crate::plain::clean(b), "the pair really is display-equivalent: {a:?} {b:?}");
+            let mut saved_a = saved();
+            saved_a.descriptor.bundle_id = None;
+            saved_a.descriptor.app = "zoom.us".into();
+            saved_a.descriptor.title = a.into();
+            let candidate_b = WindowInfo { id: 9, app: "zoom.us".into(), bundle_id: None, title: b.into(), width: 1280, height: 720, on_screen: true };
+            let asking = CaptureState::Asking { window: a.into(), reason: "resized".into(), candidates: vec![candidate_b] };
+            assert_eq!(action(Some(&asking), Some(&saved_a)), Action::Refused(Refusal::AskingOther), "render identity is not bind identity: {a:?} vs {b:?}");
+        }
+    }
+
+    /// The one shared sentence for a relocation that could not be kept: both truths, failure last.
+    #[test]
+    fn an_unsaved_relocation_says_both_truths() {
+        let (kind, label, detail) = unsaved_words("read capture.json: not json");
+        assert_eq!((kind, label), ("warn", "found again"));
+        assert_eq!(detail, "Capture found the slide again, but the new region could not be saved: read capture.json: not json");
     }
 
     /// The host is named only when it is certainly Apple Terminal or iTerm (plan §H).
     #[test]
-    fn the_host_is_narrowly_detected() {
-        assert_eq!(host_from(Some("Apple_Terminal")), "Terminal");
+    fn the_host_is_narrowly_detected() {        assert_eq!(host_from(Some("Apple_Terminal")), "Terminal");
         assert_eq!(host_from(Some("iTerm.app")), "iTerm");
         assert_eq!(host_from(Some("iTerm2")), "iTerm");
         for other in [None, Some(""), Some("vscode"), Some("tmux"), Some("Hyper"), Some("apple_terminal")] {

@@ -110,14 +110,19 @@ enum Act {
 }
 
 /// What a Ctrl-S comes back as, off the reactor: the oneshot's answer to a capture-now, or the
-/// watch-it save's outcome. Nothing here is a slide; slides are core's own events.
+/// watch-it save's outcome. `Watched` carries the selection because it is now genuinely on disk —
+/// the reactor's saved truth moves to it without rereading the file — and says whether the `Bind`
+/// went out; a worker `CaptureState::Watching` event remains the only authority for live
+/// watching either way. Nothing here is a slide; slides are core's own events.
 #[derive(Debug)]
 enum CaptureReply {
     Now(Result<(), String>),
-    /// The watch-it save failed: no `Bind` was sent.
+    /// The watch-it save failed: nothing was bound, nothing was persisted.
     WatchFailed(anyhow::Error),
-    /// The watch-it save succeeded and the `Bind` went out; watching arrives as its own event.
-    Watched,
+    /// The watch-it selection is persisted. `bound` is false when the `Bind` could not be sent —
+    /// the lecture had ended — so the selection stays saved for the next session without the
+    /// current worker ever being claimed to watch it.
+    Watched { selection: Selection, bound: bool },
 }
 
 /// Enter while stopping: nothing is sent, and what was typed stays (plan §H).
@@ -174,19 +179,42 @@ impl Ui {
     }
 
     /// Every event is drained and reduced into the view; the audio's own end is a stop the controller
-    /// must know of. A relocation the adapter has already saved also becomes this TUI's saved
-    /// selection, without rereading the file. Returns the stop step, if any, and whether a re-read
-    /// of the files was asked for.
+    /// must know of. The functional capture state is taken first, exactly as core emitted it and
+    /// before the event is cleaned into the view's presentation copy (plan Task 11): a candidate's
+    /// id, bundle id, app, title and size are binding identity, and display-cleaned text must never
+    /// become it. The reactor feeds [`Self::forwarded`]; the tests drive this seam.
     fn event(&mut self, e: &Event, now: std::time::Instant) -> (Option<Step>, bool) {
         self.events += 1;
-        if let Event::CaptureMoved { selection, .. } = e {
+        if let Event::Capture(s) = e {
             if let Some(ctx) = &mut self.capture {
-                ctx.saved = Some(selection.clone());
+                ctx.current = Some(s.clone()); // raw, functional, never rendered
             }
         }
         let effect = self.view.reduce(e, Local::now());
         let step = matches!(e, Event::Session(Notification::SourceEnded)).then(|| self.stop(Origin::SourceEnded, now));
         (step, effect.hydrate)
+    }
+
+    /// One adapted event as the reactor receives it: a relocation moves the saved selection only
+    /// when the save genuinely happened — the outcome rides with the event, so nothing is inferred
+    /// from wording — and a relocation that could not be kept is said as the failure it is while
+    /// the session's own found-again truth stays in the ring.
+    fn forwarded(&mut self, f: &capture::Forwarded, now: std::time::Instant) -> (Option<Step>, bool) {
+        match &f.capture_persistence {
+            capture::CapturePersistence::None => {}
+            capture::CapturePersistence::MovedSaved(selection) => {
+                if let Some(ctx) = &mut self.capture {
+                    ctx.saved = Some(selection.clone()); // this exact selection is on disk
+                }
+            }
+            // a relocation that could not be kept: `saved` must not move (said below)
+            capture::CapturePersistence::MovedSaveFailed { .. } => {}
+        }
+        let (step, hydrate) = self.event(&f.event, now);
+        if let capture::CapturePersistence::MovedSaveFailed { error } = &f.capture_persistence {
+            self.view.relocation_unsaved(error, Local::now());
+        }
+        (step, hydrate)
     }
 
     /// Captured, so the terminal reports it here instead of scrolling its own viewport. The wheel
@@ -301,12 +329,17 @@ impl Ui {
     }
 
     /// What Ctrl-S does now (plan Task 11): nothing once the lecture is stopping — core drops
-    /// capture at the first stop, so no manual capture can happen then either.
+    /// capture at the first stop, so no manual capture can happen then either. The state it
+    /// reads is the functional one, exactly as core emitted it; the view's cleaned copy is for
+    /// drawing only.
     fn capture_action(&self) -> capture::Action {
         if self.view.phase != Stage::Listening {
             return capture::Action::Refused(capture::Refusal::None);
         }
-        capture::action(self.view.capture.as_ref(), self.capture.as_ref().and_then(|c| c.saved.as_ref()))
+        match &self.capture {
+            Some(ctx) => capture::action(ctx.current.as_ref(), ctx.saved.as_ref()),
+            None => capture::action(None, None),
+        }
     }
 
     /// Ctrl-S, by what capture is doing (plan §H): a watched window captures now; the one window
@@ -337,12 +370,23 @@ impl Ui {
 
     /// A Ctrl-S reply landing back on the reactor: a capture-now that failed says why; one that
     /// succeeded says nothing, because the slide itself arrives only as core's own `Event::Slide`.
+    /// A watch-it that saved moves the saved truth to exactly what is on disk; one whose `Bind`
+    /// could not be sent says the lecture has ended without ever claiming the worker watches it.
     fn capture_reply(&mut self, reply: CaptureReply) -> Act {
         match reply {
             CaptureReply::Now(Ok(())) => Act::Nothing,
             CaptureReply::Now(Err(m)) => self.say(format!("The capture did not happen: {}", plain::sentence(&plain::clean(&m)))),
-            CaptureReply::Watched => Act::Nothing,
             CaptureReply::WatchFailed(e) => self.say(format!("The window was not watched: saving its region failed ({}).", plain::sentence(&format!("{e:#}")))),
+            CaptureReply::Watched { selection, bound } => {
+                if let Some(ctx) = &mut self.capture {
+                    ctx.saved = Some(selection); // persisted is persisted, bound or not
+                }
+                if bound {
+                    Act::Nothing // watching arrives as the worker's own event
+                } else {
+                    self.say(ENDED)
+                }
+            }
         }
     }
 
@@ -429,14 +473,18 @@ impl Ui {
                     let saved = match ctx {
                         Some(ctx) => {
                             let sel = selection.clone();
-                            tokio::task::spawn_blocking(move || capture::keep_selection(&ctx.path, &ctx.course, &sel)).await
+                            let path = ctx.path.clone();
+                            let course = ctx.course.clone();
+                            tokio::task::spawn_blocking(move || capture::keep_selection(&path, &course, &sel)).await
                         }
                         None => Ok(Ok(())),
                     };
                     match saved.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
                         Ok(()) => {
-                            let _ = commands.send(Command::Bind { window, selection });
-                            let _ = replies.send(CaptureReply::Watched).await;
+                            // persisted is persisted: the saved truth moves even if the Bind below
+                            // cannot be sent, and `bound` says which it was — never Watched blindly
+                            let bound = commands.send(Command::Bind { window, selection: selection.clone() }).is_ok();
+                            let _ = replies.send(CaptureReply::Watched { selection, bound }).await;
                         }
                         Err(e) => {
                             let _ = replies.send(CaptureReply::WatchFailed(e)).await;
@@ -476,7 +524,7 @@ enum Exit {
 /// one revision is an ordinary error with nothing started and nothing taken over. Then the signals,
 /// the panic hook, the terminal, the lecture and the keyboard, in that order, and the reactor until
 /// one of them ends it.
-pub(crate) async fn run(session: Session, engine: impl Future<Output = Result<StopReport>> + Send + 'static, commands: UnboundedSender<Command>, events: UnboundedReceiver<Event>, secs: Option<u64>) -> Result<StopReport> {
+pub(crate) async fn run(session: Session, engine: impl Future<Output = Result<StopReport>> + Send + 'static, commands: UnboundedSender<Command>, events: UnboundedReceiver<capture::Forwarded>, secs: Option<u64>) -> Result<StopReport> {
     let hydration = hydrate::read(&session.files).await?;
     let hydration = hydration.coherent().ok_or_else(|| anyhow::anyhow!("the notes and their state in {} could not be read as one revision; the lecture was not started", session.files.dir.display()))?;
     let interrupt = signal(SignalKind::interrupt())?;
@@ -523,7 +571,9 @@ struct Io {
     screen: Screen,
     keys: EventStream,
     lecture: tokio::task::JoinHandle<Result<StopReport>>,
-    events: UnboundedReceiver<Event>,
+    /// The lecture's events as the capture adapter handed them on: each with whether any
+    /// relocation it carried was actually persisted.
+    events: UnboundedReceiver<capture::Forwarded>,
     commands: UnboundedSender<Command>,
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
@@ -609,17 +659,17 @@ async fn react(mut io: Io, view: View, capture: Option<capture::Context>, starte
                 None => return Exit::Lost(io::Error::other("the keyboard stream ended")),
             },
             ended = &mut io.lecture => {
-                while let Ok(e) = io.events.try_recv() {
-                    let _ = ui.event(&e, std::time::Instant::now());
+                while let Ok(f) = io.events.try_recv() {
+                    let _ = ui.forwarded(&f, std::time::Instant::now());
                 }
                 return Exit::Ended(ended);
             }
-            Some(e) = io.events.recv() => {
+            Some(f) = io.events.recv() => {
                 let mut want = false;
-                let mut next = Some(e);
+                let mut next = Some(f);
                 for _ in 0..BATCH {
-                    let Some(e) = next.take() else { break };
-                    let (step, hydrate) = ui.event(&e, std::time::Instant::now());
+                    let Some(f) = next.take() else { break };
+                    let (step, hydrate) = ui.forwarded(&f, std::time::Instant::now());
                     if let Some(step) = step {
                         send_stops(&io.commands, step);
                     }
@@ -1326,8 +1376,14 @@ mod tests {
     /// as it was loaded before the lecture started.
     fn capture_ui(dir: &tempfile::TempDir) -> Ui {
         let mut ui = ui();
-        ui.capture = Some(crate::capture::Context { path: dir.path().join("capture.json"), course: identity().course, saved: Some(saved_selection()) });
+        ui.capture = Some(crate::capture::Context { path: dir.path().join("capture.json"), course: identity().course, saved: Some(saved_selection()), current: None });
         ui
+    }
+
+    /// A relocation as the adapter hands it on: saved for the course, or not.
+    fn moved(selection: Selection, saved: bool) -> capture::Forwarded {
+        let persistence = if saved { capture::CapturePersistence::MovedSaved(selection.clone()) } else { capture::CapturePersistence::MovedSaveFailed { error: "read capture.json: not json".into() } };
+        capture::Forwarded { event: Event::CaptureMoved { selection, note: "the slide moved with the window; watching it at the new size".into() }, capture_persistence: persistence }
     }
 
     /// Ctrl-S while watching: exactly one `CaptureNow`; a successful reply alone fabricates no
@@ -1407,10 +1463,241 @@ mod tests {
         let kept = after.get("Machine Learning").unwrap();
         assert_eq!((kept.descriptor.width, kept.descriptor.height, kept.region), (1280, 720, Region { x: 0.05, y: 0.12, w: 0.9, h: 0.7 }));
         assert_eq!(after.get("Statistics"), Some(&other));
-        // a relocation updates the TUI's own saved selection, without rereading the file
-        let moved = saved_selection().with_size(1920, 1200, Region { x: 0.02, y: 0.02, w: 0.96, h: 0.96 });
-        ui.event(&Event::CaptureMoved { selection: moved.clone(), note: "found again".into() }, Instant::now());
-        assert_eq!(ui.capture.as_ref().unwrap().saved, Some(moved));
+    }
+
+    /// The watch-it that saved also moves the reactor's saved truth to exactly what is on disk
+    /// (no reread), and the next functional decision uses it.
+    #[tokio::test]
+    async fn watch_it_success_updates_saved_context() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&asking(vec![candidate(42, 1280, 720)]), Instant::now());
+        let act = ui.key(ctrl('s'), Instant::now());
+        let Act::CaptureWatch { selection, .. } = &act else { panic!("{act:?}") };
+        let bound = selection.clone();
+        ui.send(act, &tx, &replies);
+        let sent = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(sent, Command::Bind { window: 42, .. }), "{sent:?}");
+        let replied = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(ui.capture_reply(replied), Act::Nothing);
+        assert_eq!(ui.capture.as_ref().unwrap().saved, Some(bound.clone()), "the saved truth is exactly what was persisted");
+        assert_eq!(Selections::load(&dir.path().join("capture.json")).unwrap().get("Machine Learning"), Some(&bound), "and exactly what is on disk");
+        // the next functional decision reads that in-memory truth, not the file: remove the file,
+        // and a safe offering at the remembered size still resolves
+        std::fs::remove_file(dir.path().join("capture.json")).unwrap();
+        ui.event(&asking(vec![candidate(42, 1600, 900)]), Instant::now());
+        let watch = ui.capture_action();
+        let capture::Action::Watch { selection, .. } = watch else { panic!("{watch:?}") };
+        assert_eq!(selection.descriptor.title, "Zoom Meeting");
+        assert!(selection.sizes.iter().any(|s| s.width == 1280 && s.height == 720), "the bound selection's remembered size, not the pre-bind one");
+    }
+
+    /// A Bind that could not be sent (the lecture had ended) is reported truthfully: the
+    /// selection is still persisted and becomes the saved truth, but the worker is never claimed
+    /// to be watching it — the notice is the normal ended one.
+    #[tokio::test]
+    async fn a_watch_it_with_a_dead_command_channel_is_truthful() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx); // the lecture is gone
+        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&asking(vec![candidate(42, 1280, 720)]), Instant::now());
+        let act = ui.key(ctrl('s'), Instant::now());
+        let Act::CaptureWatch { selection, .. } = &act else { panic!("{act:?}") };
+        let bound = selection.clone();
+        ui.send(act, &tx, &replies);
+        let replied = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv()).await.unwrap().unwrap();
+        match &replied {
+            CaptureReply::Watched { selection, bound: false } => assert_eq!(selection, &bound),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(ui.capture_reply(replied), Act::Redraw);
+        assert_eq!(ui.notice.as_deref(), Some(ENDED));
+        assert_eq!(ui.capture.as_ref().unwrap().saved, Some(bound.clone()), "persisted is persisted, bind or not");
+        assert_eq!(Selections::load(&dir.path().join("capture.json")).unwrap().get("Machine Learning"), Some(&bound));
+        assert!(matches!(ui.view.capture, Some(CaptureState::Asking { .. })), "no watching is claimed: the worker's own word has not arrived");
+    }
+
+    /// A relocation the adapter kept: by the time the frontend handles it, the selection is on
+    /// disk (that is the adapter's guarantee, pinned in capture.rs), and the reactor's saved
+    /// truth moves to it — no reread — while another course stays untouched.
+    #[test]
+    fn capture_moved_success_updates_saved_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved_sel = saved_selection().with_size(1920, 1200, Region { x: 0.02, y: 0.03, w: 0.95, h: 0.9 });
+        // the adapter has already saved B and left the other course alone
+        let mut all = Selections::default();
+        let statistics = Selection { descriptor: Descriptor { bundle_id: None, app: "TextEdit".into(), title: "Deck".into(), width: 1000, height: 700 }, region: Region::WHOLE, leave_out: vec![], sizes: vec![] };
+        all.set("Statistics", statistics.clone());
+        all.set("Machine Learning", moved_sel.clone());
+        all.save(&dir.path().join("capture.json")).unwrap();
+        let mut ui = capture_ui(&dir);
+        ui.forwarded(&moved(moved_sel.clone(), true), Instant::now());
+        assert_eq!(ui.capture.as_ref().unwrap().saved, Some(moved_sel.clone()), "the persisted selection, without rereading the file");
+        let after = Selections::load(&dir.path().join("capture.json")).unwrap();
+        assert_eq!(after.get("Machine Learning"), Some(&moved_sel));
+        assert_eq!(after.get("Statistics"), Some(&statistics), "another course is never replaced");
+        assert_eq!(ui.view.notice.as_ref().map(|n| n.label.as_str()), Some("found again"), "kept is said as kept");
+    }
+
+    /// A relocation whose preference could not be written: the worker's relocation is still true
+    /// for the running session, but the saved truth does not move, the disk does not gain what
+    /// was never written, and the visible notice is the failure — not a found-again that reads
+    /// as kept.
+    #[test]
+    fn capture_moved_save_failure_does_not_update_saved_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut all = Selections::default();
+        let statistics = Selection { descriptor: Descriptor { bundle_id: None, app: "TextEdit".into(), title: "Deck".into(), width: 1000, height: 700 }, region: Region::WHOLE, leave_out: vec![], sizes: vec![] };
+        all.set("Statistics", statistics.clone());
+        all.set("Machine Learning", saved_selection());
+        all.save(&dir.path().join("capture.json")).unwrap();
+        let mut ui = capture_ui(&dir);
+        ui.forwarded(&moved(saved_selection().with_size(999, 600, Region::WHOLE), false), Instant::now());
+        // the saved truth is still the loaded selection A
+        assert_eq!(ui.capture.as_ref().unwrap().saved, Some(saved_selection()), "a selection that was never persisted is not saved");
+        let after = Selections::load(&dir.path().join("capture.json")).unwrap();
+        assert_eq!(after.get("Machine Learning"), Some(&saved_selection()), "the disk does not contain B");
+        assert_eq!(after.get("Statistics"), Some(&statistics));
+        // the visible notice is the persistence failure, in both truths
+        let n = ui.view.notice.as_ref().expect("a notice");
+        assert_eq!((n.kind, n.label.as_str()), ("warn", "found again"));
+        assert_eq!(n.detail, "Capture found the slide again, but the new region could not be saved: read capture.json: not json");
+        // and the ring keeps both truths: the found-again record and the failure beside it
+        let details: Vec<&str> = ui.view.activity.records().iter().map(|a| a.detail.as_str()).collect();
+        assert!(details.iter().any(|d| d.starts_with("the slide moved")), "the session's found-again truth stays: {details:?}");
+        assert!(details.iter().any(|d| d.starts_with("Capture found the slide again, but")), "{details:?}");
+    }
+
+    /// Ctrl-S's watch-it reads the raw functional identity, not the display copy: a candidate
+    /// whose app and title contain what cleaning strips still binds against the same raw saved
+    /// identity, while the view holds only cleaned words for drawing. One Bind follows, off the
+    /// reactor's thread, once the save has happened.
+    #[tokio::test]
+    async fn raw_identity_survives_sanitization_for_watch_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, _) = tokio::sync::mpsc::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        // one raw identity, hostile to displays, equal on both the saved and the offered side
+        let hostile = "Zoom\x1b]0;owned\x07Meeting";
+        let mut saved = saved_selection();
+        saved.descriptor.bundle_id = None;
+        saved.descriptor.app = hostile.into();
+        saved.descriptor.title = hostile.into();
+        ui.capture.as_mut().unwrap().saved = Some(saved.clone());
+        let raw = WindowInfo { id: 42, app: hostile.into(), bundle_id: None, title: hostile.into(), width: 1280, height: 720, on_screen: true };
+        ui.event(&Event::Capture(CaptureState::Asking { window: hostile.into(), reason: "it is not where it was".into(), candidates: vec![raw] }), Instant::now());
+        // the view cleans for display; the functional state stays exactly as core emitted it
+        let Some(CaptureState::Asking { candidates, .. }) = &ui.view.capture else { panic!("{:?}", ui.view.capture) };
+        assert_eq!(candidates[0].title, "ZoomMeeting", "the presentation copy is cleaned");
+        assert_eq!(candidates[0].title, plain::clean(hostile));
+        let Some(CaptureState::Asking { candidates, .. }) = &ui.capture.as_ref().unwrap().current else { panic!("raw state") };
+        assert_eq!(candidates[0].title, hostile, "the functional copy is raw");
+        // and the decision binds: raw equals raw, whatever display would make of it
+        let Act::CaptureWatch { window, selection } = ui.key(ctrl('s'), Instant::now()) else { panic!("{:?}", ui.notice) };
+        assert_eq!(window, 42);
+        assert_eq!(selection.descriptor.title, hostile, "the bind's identity is the raw one");
+        ui.send(Act::CaptureWatch { window, selection }, &tx, &replies);
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(c) = rx.try_recv() {
+                    return c;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Bind went out");
+        assert!(matches!(sent, Command::Bind { window: 42, .. }));
+        assert!(rx.try_recv().is_err(), "one key, one Bind");
+    }
+
+    /// Two windows whose app/title clean to the same words are not the same window: the
+    /// presentation may safely clean both, the functional decision refuses, and no Bind goes out.
+    #[test]
+    fn display_equivalent_but_different_windows_do_not_bind() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        for (a, b) in [
+            ("Zoom\x1b]0;a\x07Meeting", "Zoom\x1b]0;b\x07Meeting"), // both clean to “ZoomMeeting”
+            ("Zoom\rMeeting", "Zoom\nMeeting"),                     // both clean to “Zoom\nMeeting”
+        ] {
+            assert_eq!(plain::clean(a), plain::clean(b), "the pair really is display-equivalent");
+            let mut saved = saved_selection();
+            saved.descriptor.bundle_id = None;
+            saved.descriptor.app = "zoom.us".into();
+            saved.descriptor.title = a.into();
+            ui.capture.as_mut().unwrap().saved = Some(saved.clone());
+            let raw = WindowInfo { id: 9, app: "zoom.us".into(), bundle_id: None, title: b.into(), width: 1280, height: 720, on_screen: true };
+            ui.event(&Event::Capture(CaptureState::Asking { window: a.into(), reason: "it is not where it was".into(), candidates: vec![raw] }), Instant::now());
+            // both copies hold a title; they are merely cleaned differently
+            let (Some(view), Some(raw_state)) = (&ui.view.capture, &ui.capture.as_ref().unwrap().current) else { panic!() };
+            let (CaptureState::Asking { candidates: shown, .. }, CaptureState::Asking { candidates: functional, .. }) = (view, raw_state) else { panic!() };
+            assert_eq!(plain::clean(&functional[0].title), shown[0].title, "the display copy is the cleaned functional one");
+            // the functional decision does not treat them as the same saved window
+            assert_eq!(ui.key(ctrl('s'), Instant::now()), Act::Redraw, "refused");
+            assert_eq!(ui.notice.as_deref(), Some("The window offered is not the one saved; choose in the LectureLive app."));
+        }
+        assert!(rx.try_recv().is_err(), "no Bind was ever sent");
+    }
+
+    /// One physical Ctrl-S — a press, its repeats, its release — is one command: one CaptureNow
+    /// while watching, one Bind on a safe offering, and nothing at all from the repeats.
+    #[tokio::test]
+    async fn held_ctrl_s_press_sequence_sends_one_command_each() {
+        let press = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let mut repeat = press;
+        repeat.kind = KeyEventKind::Repeat;
+        let mut release = press;
+        release.kind = KeyEventKind::Release;
+        // watching: one CaptureNow
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, _) = tokio::sync::mpsc::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), Instant::now());
+        assert_eq!(ui.key(press, Instant::now()), Act::CaptureNow);
+        ui.send(Act::CaptureNow, &tx, &replies);
+        for _ in 0..6 {
+            assert_eq!(ui.key(repeat, Instant::now()), Act::Nothing, "a repeat is not a new press");
+        }
+        assert_eq!(ui.key(release, Instant::now()), Act::Nothing);
+        assert!(matches!(rx.recv().await.unwrap(), Command::CaptureNow(_)));
+        assert!(rx.try_recv().is_err(), "one press sequence, one capture");
+        // a safe offering: one Bind, and the repeats never even reach the decision
+        let mut ui = capture_ui(&dir);
+        frame(&mut ui, 110, 32);
+        ui.event(&asking(vec![candidate(42, 1280, 720)]), Instant::now());
+        assert!(matches!(ui.key(press, Instant::now()), Act::CaptureWatch { .. }));
+        assert_eq!(ui.key(repeat, Instant::now()), Act::Nothing);
+        assert_eq!(ui.key(repeat, Instant::now()), Act::Nothing);
+        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
+        let act = ui.key(press, Instant::now()); // a second, real press: a second deliberate action
+        assert!(matches!(act, Act::CaptureWatch { .. }));
+        ui.send(act, &tx, &replies);
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(c) = rx.try_recv() {
+                    return c;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Bind went out");
+        assert!(matches!(sent, Command::Bind { .. }));
+        assert!(rx.try_recv().is_err(), "one press sequence, one Bind");
+        let _ = reply_rx.recv().await; // the reply is drained elsewhere; nothing retries on its own
     }
 
     /// Every state that cannot act says why and sends nothing: unbound, paused, denied, failing,

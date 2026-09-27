@@ -713,6 +713,15 @@ impl View {
         self.record(Notice { kind: "warn", label: "re-read".into(), detail: format!("the lecture's files could not be read again ({e:#}); what is shown still holds") }, at, false);
     }
 
+    /// A relocation whose preference could not be kept (plan Task 11): the activity keeps the
+    /// failure beside the found-again record, and the notice line says the failure — the session
+    /// still holds the region; the saved selection does not. A gone input keeps the line (plan
+    /// §H's first priority); the ring keeps both truths either way.
+    pub(crate) fn relocation_unsaved(&mut self, error: &str, at: DateTime<Local>) {
+        let (kind, label, detail) = crate::capture::unsaved_words(error);
+        self.record(Notice { kind, label: label.into(), detail }, at, false);
+    }
+
     /// One notice into the ring and the notice line: the input that is gone holds the line while it
     /// is gone (plan §H's first priority); a notice saying capture needs the person holds it
     /// against ordinary ones (the second); otherwise the latest notice is the line.

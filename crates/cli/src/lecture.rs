@@ -17,7 +17,7 @@ use lecturelive_core::session::audit;
 use lecturelive_core::session::coordinator::{SessionConfig, StopReport};
 use lecturelive_core::session::files::{course_from_path, LectureFiles};
 use lecturelive_core::session::launch::{self, Retention};
-use lecturelive_core::session::lecture::{self, Event, Lecture, SlideWatch};
+use lecturelive_core::session::lecture::{self, Lecture, SlideWatch};
 use lecturelive_core::session::lock::FolderLock;
 use lecturelive_core::session::spend::{self, Spend};
 use lecturelive_core::session::start;
@@ -265,20 +265,22 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
                 path: files.state_dir().join(fixture::CAPTURE_JSON),
                 course: course.clone(),
                 saved: Some(fixture::saved_selection()),
+                current: None, // core's first raw state arrives with the lecture's events
             })
         }
         #[cfg(not(debug_assertions))]
         { None }
     } else {
         let path = data_dir()?.join(capture::FILE);
-        Some(capture::Context { path: path.clone(), course: course.clone(), saved: capture::load(&path, &course).await? })
+        Some(capture::Context { path: path.clone(), course: course.clone(), saved: capture::load(&path, &course).await?, current: None })
     };
     // The session, run by the frontend: `lecture::run`, or in debug builds the scripted stand-in.
     // Nothing runs until it is awaited or spawned. Both run behind the capture adapter, so Plain
-    // and the TUI see the same already-adapted events, and the engine's future resolves only after
-    // every final event has been handed on.
+    // and the TUI see the same already-adapted events — each with whether any relocation it
+    // carried was actually persisted — and the engine's future resolves only after every final
+    // event has been handed on.
     let engine_uid = uid.clone();
-    let engine = |cmd_rx, ev_tx| -> Result<(Engine, tokio::sync::mpsc::UnboundedReceiver<Event>)> {
+    let engine = |cmd_rx, ev_tx| -> Result<(Engine, tokio::sync::mpsc::UnboundedReceiver<capture::Forwarded>)> {
         let (fe_tx, fe_rx) = tokio::sync::mpsc::unbounded_channel();
         let forward = tokio::spawn(capture::forward(capture.clone(), ev_rx, fe_tx));
         Ok(match fixture {
@@ -364,8 +366,16 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let (engine, mut events) = engine(cmd_rx, ev_tx)?;
     let words = capture::Words::new(&course);
     let printer = tokio::spawn(async move {
-        while let Some(e) = events.recv().await {
-            plain::show(&mut std::io::stdout().lock(), p, &e, &mut watch, &words);
+        while let Some(f) = events.recv().await {
+            match &f.capture_persistence {
+                // a relocation the session found but could not keep: one line, both truths, the
+                // failure last — never a bare "found again" that implies it was saved
+                capture::CapturePersistence::MovedSaveFailed { error } => {
+                    let (kind, label, detail) = capture::unsaved_words(error);
+                    plain::say(&mut std::io::stdout().lock(), p, kind, label, &detail);
+                }
+                _ => plain::show(&mut std::io::stdout().lock(), p, &f.event, &mut watch, &words),
+            }
         }
     });
     let result = engine.await;

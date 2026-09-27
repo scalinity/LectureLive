@@ -60,9 +60,14 @@ pub(crate) enum Key {
 }
 
 /// A key's meaning (plan §H), in priority order: a release is nothing; the app's Ctrl chords are
-/// taken before the editor can see them (Ctrl-S is Task 11's capture action); F1 is help; Esc
-/// closes an overlay before it means "back to live"; then the reading keys, Tab, Enter, and the
-/// editor's keys last. A key with Ctrl and Alt together is text (AltGr), not a chord.
+/// taken before the editor can see them; F1 is help; Esc closes an overlay before it means "back
+/// to live"; then the reading keys, Tab, Enter, and the editor's keys last. A key with Ctrl and
+/// Alt together is text (AltGr), not a chord.
+///
+/// Ctrl-S takes only a real `Press`: a key held down reports repeats, and one held press must be
+/// one capture (plan §C 8), with no timing debounce to guess at. (Terminals that cannot report
+/// key kinds — Apple Terminal among them — send every repeat as a plain press; where the kind is
+/// reported, it is honoured. Ctrl-C keeps its own controller, Enter its own quiet interval.)
 pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
     if key.kind == KeyEventKind::Release {
         return Key::Nothing;
@@ -77,7 +82,8 @@ pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
                 'h' => Key::Help,
                 'o' => Key::Activity,
                 't' => Key::Zoom,
-                's' => Key::Capture,
+                's' if key.kind == KeyEventKind::Press => Key::Capture,
+                's' => Key::Nothing, // a repeat of a held Ctrl-S: the press was the action
                 _ => Key::Edit,
             };
         }
@@ -237,6 +243,27 @@ mod tests {
         for k in [KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End, KeyCode::Backspace, KeyCode::Delete, KeyCode::Char('q')] {
             assert_eq!(classify(&key(k), Overlay::None), Key::Edit, "{k:?}");
         }
+    }
+
+    /// Ctrl-S takes one Press; a held key's repeats and the release do nothing. A held Ctrl-C is
+    /// still the stop controller's to count, and a held Enter still its own quiet interval.
+    #[test]
+    fn held_ctrl_s_sends_one_capture_action() {
+        let mut press = ctrl('s');
+        press.kind = KeyEventKind::Press;
+        let mut repeat = ctrl('s');
+        repeat.kind = KeyEventKind::Repeat;
+        assert_eq!(classify(&press, Overlay::None), Key::Capture);
+        for _ in 0..8 {
+            assert_eq!(classify(&repeat, Overlay::None), Key::Nothing, "a repeat is not a new press");
+        }
+        let mut release = ctrl('s');
+        release.kind = KeyEventKind::Release;
+        assert_eq!(classify(&release, Overlay::None), Key::Nothing);
+        // the other chords keep accepting repeats, as before: Ctrl-C has its controller
+        let mut held = ctrl('c');
+        held.kind = KeyEventKind::Repeat;
+        assert_eq!(classify(&held, Overlay::None), Key::Stop);
     }
 
     /// tui-input's editing, as the hint line uses it.
