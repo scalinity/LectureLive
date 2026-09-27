@@ -12,5 +12,5 @@
 "                                                            "
 "                                                            "
 "                                                            "
-" ◆ hints and snapshots are not taken here yet               "
-" ^L redraw   ^C stop                                        "
+" ◆ a hint, or ⏎ for a snapshot                              "
+" ⏎ snapshot   polish⏎   Tab pane   ^G help   ^C stop        "

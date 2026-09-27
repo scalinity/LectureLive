@@ -38,6 +38,8 @@ const STOP_DWELL: Duration = Duration::from_millis(2300);
 struct Lecture {
     pty: Pty,
     home: PathBuf,
+    /// The lecture folder, in the temporary directory.
+    dir: PathBuf,
     /// The terminal's modes before the child ran.
     before: Termios,
     _tmp: tempfile::TempDir,
@@ -61,7 +63,7 @@ fn tui(scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
         .env("LECTURELIVE_CLI_FIXTURE", scenario)
         .current_dir(&home);
     pty.spawn(cmd);
-    Lecture { pty, home, before, _tmp: tmp }
+    Lecture { pty, home, dir, before, _tmp: tmp }
 }
 
 impl Lecture {
@@ -342,4 +344,70 @@ fn a_failed_draw_gives_the_terminal_back_before_the_error() {
     assert_eq!(code(status, &l), Some(1));
     let after = l.restored(listening);
     l.at("Error: the terminal stopped accepting output: a failure injected by the debug fixture; the next session in this folder picks up what was left", after);
+}
+
+/// The `ops` fixture's command log: every command the TUI sent, one line each, in order.
+fn commands(l: &Lecture) -> Vec<String> {
+    std::fs::read_to_string(l.dir.join("fixture-commands.log")).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+/// Waits until the log holds `n` commands, then returns them.
+fn wait_commands(l: &Lecture, n: usize) -> Vec<String> {
+    let deadline = std::time::Instant::now() + SOON;
+    loop {
+        let got = commands(l);
+        if got.len() >= n || std::time::Instant::now() >= deadline {
+            assert_eq!(got.len(), n, "commands so far: {got:?}\n{}", visible(l.out()));
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// More than the 300 ms Enter debounce: the next Enter is a new press, not a held key's repeat.
+const ENTER_GAP: Duration = Duration::from_millis(400);
+
+/// Plan Task 10 (PTY scenario 7): in one real TUI, typed keys and a real bracketed paste. An empty
+/// Enter sends exactly one snapshot; a typed hint and Enter one hinted snapshot; `polish` and Enter
+/// one polish; a paste holding "polish", a newline and a Ctrl-C byte sends nothing — no op, no stop —
+/// until a real Enter; Ctrl-X during a stalled request sends exactly one cancel. The fixture's own
+/// log is the count, not the screen. The terminal is given back as ever.
+#[test]
+fn the_hint_line_sends_exactly_what_was_asked() {
+    let mut l = tui("ops", &[], 110, 32);
+    let listening = l.listening();
+    l.pty.write(b"\r");
+    assert_eq!(wait_commands(&l, 1), ["snapshot\t"]);
+    std::thread::sleep(ENTER_GAP);
+    l.pty.write("focus on treatment 漢字".as_bytes());
+    l.pty.write(b"\r");
+    assert_eq!(wait_commands(&l, 2)[1], "snapshot\tfocus on treatment 漢字");
+    std::thread::sleep(ENTER_GAP);
+    l.pty.write(b"polish\r");
+    assert_eq!(wait_commands(&l, 3)[2], "polish");
+    // a real bracketed paste: text, never keys
+    std::thread::sleep(ENTER_GAP);
+    l.pty.write(b"\x1b[200~polish\r\n\x03and more\x1b[201~");
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(commands(&l).len(), 3, "the paste sent nothing");
+    assert!(find(l.out(), b"Stopping", listening).is_none(), "the pasted Ctrl-C byte is no stop");
+    l.pty.write(b"\r");
+    assert_eq!(wait_commands(&l, 4)[3], "snapshot\tpolish and more", "a real Enter sends the pasted text, as one line");
+    // a request that writes until it is cancelled, queued behind the others
+    std::thread::sleep(ENTER_GAP);
+    l.pty.write(b"stall\r");
+    assert_eq!(wait_commands(&l, 5)[4], "snapshot\tstall");
+    let stalled = l.pty.wait_for("Stalled", listening, Duration::from_secs(20));
+    l.pty.write(b"\x18"); // Ctrl-X
+    assert_eq!(wait_commands(&l, 6)[5], "cancel");
+    l.pty.wait_for("cancelled", stalled, SOON);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(commands(&l).len(), 6, "one Ctrl-X, one cancel");
+    // one Ctrl-C: the stop, then the drain and the last snapshot, and the terminal back
+    l.pty.write(CTRL_C);
+    let status = l.pty.wait(Duration::from_secs(20));
+    assert_eq!(code(status, &l), Some(0));
+    assert_eq!(commands(&l), ["snapshot\t", "snapshot\tfocus on treatment 漢字", "polish", "snapshot\tpolish and more", "snapshot\tstall", "cancel", "stop"]);
+    let after = l.restored(listening);
+    l.at("saved", after);
 }

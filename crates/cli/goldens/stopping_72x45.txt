@@ -41,5 +41,5 @@
 "                                                                        "
 "                                                                        "
 "                                                                        "
-" ◆ hints and snapshots are not taken here yet                           "
-" ^L redraw   ^C stop waiting                                            "
+" ◆ stopping: the last snapshot takes what is left                       "
+" Tab pane   ^O activity   ^G help   ^C stop waiting                     "

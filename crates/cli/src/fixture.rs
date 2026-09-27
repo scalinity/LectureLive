@@ -36,6 +36,12 @@ pub(crate) enum Scenario {
     InitFail,
     /// As quiet; the TUI's second draw fails.
     DrawFail,
+    /// The hint line's check (plan Task 10): notes already committed as rich Markdown, then each
+    /// request runs in turn — a snapshot streams its preview and commits; a polish runs its snapshot,
+    /// polishes and typesets a page; a snapshot hinted `stall` writes until one `Cancel` — and every
+    /// command received is logged, one line each, to `fixture-commands.log` in the lecture folder.
+    /// The first stop drains for up to 8 s (a second stop ends it), long enough to try Enter while stopping, then a last snapshot runs.
+    Ops,
 }
 
 impl Scenario {
@@ -49,7 +55,8 @@ impl Scenario {
             "init-fail-mouse" => Ok(Scenario::InitFailMouse),
             "init-fail" => Ok(Scenario::InitFail),
             "draw-fail" => Ok(Scenario::DrawFail),
-            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\" and \"draw-fail\""),
+            "ops" => Ok(Scenario::Ops),
+            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\" and \"ops\""),
         }
     }
 }
@@ -68,6 +75,40 @@ const SENTENCES: [&str; 8] = [
     "Not for the mean with a reasonable sample, and that is the central limit theorem.",
     "Let's check it with the simulation from the lab rather than take my word for it.",
 ];
+
+/// The `ops` scenario's command log, in the lecture folder the test made: one line per command.
+pub(crate) const COMMAND_LOG: &str = "fixture-commands.log";
+
+/// A command received, as the `ops` log records it: `snapshot<TAB>hint`, `polish`, `cancel`, `stop`.
+fn log_command(files: &LectureFiles, c: &Command) {
+    use std::io::Write;
+    let line = match c {
+        Command::Op(Op::Snapshot(hint)) => format!("snapshot\t{hint}"),
+        Command::Op(Op::Polish) => "polish".into(),
+        Command::Cancel => "cancel".into(),
+        Command::Stop => "stop".into(),
+        other => format!("{other:?}"),
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(files.dir.join(COMMAND_LOG)) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// The notes a scripted snapshot writes: the shapes the notes pane draws — headings, emphasis, TeX,
+/// a nested list, a quote, code, a table and a slide embed — and the hint it was asked to focus on.
+fn scripted_notes(n: u32, hint: &str) -> String {
+    let focus = if hint.is_empty() { String::new() } else { format!("- Focus asked for: *{hint}*.\n") };
+    format!(
+        "## Snapshot {n}: sampling and spread\n- The **standard error** shrinks with the sample, as \\( \\sigma / \\sqrt{{n}} \\).\n  - Quadrupling the sample only halves it.\n{focus}\
+> The lecturer: keep the histogram from the lab in mind.\n\n```\nse = sd / sqrt(n)\n```\n\n| Term | Meaning |\n|---|---|\n| SE | spread of the mean |\n\n![Slide 1](slides/slide_01_100000.png)\n"
+    )
+}
+
+/// A request the `ops` scenario is running, and how far it has got.
+struct Job {
+    op: Op,
+    step: u32,
+}
 
 /// The release build's abort on panic, in a dev build: a panic cannot unwind out of an `extern "C"` function,
 /// so the panic hook runs and the process aborts, with no destructor between.
@@ -106,9 +147,82 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     let mut segment = interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     let panic_at = tokio::time::sleep(Duration::from_secs(1));
     tokio::pin!(panic_at);
+    // The `ops` scenario: notes already committed, a slide they embed, and requests run in turn.
+    let ops = scenario == Scenario::Ops;
+    let (mut job, mut queued, mut snapshots): (Option<Job>, std::collections::VecDeque<Op>, u32) = (None, Default::default(), 0);
+    let mut work = interval(Duration::from_millis(120));
+    let mut page_at: Option<Instant> = None;
+    if ops {
+        let shown_at = Local::now();
+        let _ = events.send(Event::Slide { index: 1, file: "slides/slide_01_100000.png".into(), auto: true, uncertain: false, shown_at });
+        revision += 1;
+        snapshots += 1;
+        let block = format!("\n<!-- {} -->\n{}", shown_at.format("%H:%M:%S"), scripted_notes(snapshots, ""));
+        let _ = events.send(Event::Committed { words: 120, slides: 1, block, usd: 0.0, confirmed: true, removed: 0, missing: 0, revision });
+    }
     loop {
         tokio::select! {
             _ = &mut panic_at, if scenario == Scenario::Panic => panic_without_unwinding(),
+            _ = work.tick(), if job.is_some() => {
+                let Job { op, step } = job.as_mut().expect("a job");
+                *step += 1;
+                let notes = |n, hint: &str| scripted_notes(n, hint);
+                let finished = match op {
+                    Op::Snapshot(hint) if hint == "stall" => {
+                        if *step == 1 {
+                            let _ = events.send(Event::Busy("snapshot, stalled until it is cancelled".into()));
+                            let _ = events.send(Event::Preview("Stalled until cancelled: this request waits for Ctrl-X ".into()));
+                        }
+                        false
+                    }
+                    Op::Snapshot(hint) => {
+                        let text = notes(snapshots + 1, hint);
+                        let parts: Vec<&str> = text.split_inclusive(' ').collect();
+                        let per = parts.len().div_ceil(6);
+                        match *step {
+                            1 => { let _ = events.send(Event::Busy(format!("snapshot, {words} words to the script"))); false }
+                            2..=7 => {
+                                let k = (*step - 2) as usize * per;
+                                let _ = events.send(Event::Preview(parts[k.min(parts.len())..(k + per).min(parts.len())].concat()));
+                                false
+                            }
+                            _ => {
+                                (revision, snapshots) = (revision + 1, snapshots + 1);
+                                let block = format!("\n<!-- {} -->\n{text}", Local::now().format("%H:%M:%S"));
+                                let _ = events.send(Event::Committed { words, slides: 0, block, usd: 0.01, confirmed: true, removed: 0, missing: 0, revision });
+                                words = 0;
+                                true
+                            }
+                        }
+                    }
+                    Op::Polish => match *step {
+                        1 => { let _ = events.send(Event::Busy("snapshot before the polish".into())); false }
+                        2..=4 => { let _ = events.send(Event::Preview(format!("The polish's own snapshot, part {} ", *step - 1))); false }
+                        5 => {
+                            (revision, snapshots) = (revision + 1, snapshots + 1);
+                            let block = format!("\n<!-- {} -->\n{}", Local::now().format("%H:%M:%S"), notes(snapshots, "before the polish"));
+                            let _ = events.send(Event::Committed { words, slides: 0, block, usd: 0.01, confirmed: true, removed: 0, missing: 0, revision });
+                            let _ = events.send(Event::Busy("polishing the notes with the script".into()));
+                            false
+                        }
+                        6..=14 => false,
+                        _ => {
+                            revision += 1;
+                            let _ = events.send(Event::Polished { backup: files.state_dir().join("notes_before_polish.md"), usd: 0.03, revision });
+                            page_at = Some(Instant::now() + Duration::from_secs(3));
+                            true
+                        }
+                    },
+                };
+                if finished {
+                    job = queued.pop_front().map(|op| Job { op, step: 0 });
+                }
+            }
+            _ = tokio::time::sleep_until(page_at.unwrap_or_else(Instant::now)), if page_at.is_some() => {
+                page_at = None;
+                let outcome = lecturelive_core::notes::page::PageOutcome { path: files.dir.join("lecture_page.html"), words: 900, budget: 1200, cached: false, missing: Vec::new() };
+                let _ = events.send(Event::Page { outcome, usd: 0.05 });
+            }
             _ = level.tick() => { let _ = events.send(Event::Session(Notification::Level(0.05))); }
             _ = happen.tick() => {
                 step += 1;
@@ -159,6 +273,22 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                 next += 1;
             }
             c = commands.recv(), if open => match c {
+                Some(c) if ops && !matches!(c, Command::Stop) => {
+                    log_command(files, &c);
+                    match c {
+                        Command::Op(op) if job.is_none() => job = Some(Job { op, step: 0 }),
+                        Command::Op(op) => queued.push_back(op),
+                        // as core: what runs stops with its own event, and what waits is dropped silently
+                        Command::Cancel => {
+                            if let Some(j) = job.take() {
+                                let what = if j.op == Op::Polish { "the polish" } else { "the snapshot" };
+                                let _ = events.send(Event::Cancelled(what.into()));
+                            }
+                            queued.clear();
+                        }
+                        _ => {}
+                    }
+                }
                 Some(Command::Op(op)) => {
                     let (busy, what, detail) = match op {
                         Op::Snapshot(hint) => (format!("snapshot, {words} words to the script"), "snapshot", if hint.is_empty() { "no focus hint".to_string() } else { format!("focus: {hint}") }),
@@ -173,13 +303,42 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                     let _ = events.send(Event::Committed { words, slides: 0, block, usd: 0.0, confirmed: true, removed: 0, missing: 0, revision });
                     words = 0;
                 }
-                Some(Command::Stop) => break,
+                Some(Command::Stop) => {
+                    if ops {
+                        log_command(files, &Command::Stop);
+                    }
+                    break;
+                }
                 Some(_) => {}
                 None => open = false, // input closed: the session runs until it is stopped
             },
         }
     }
     let _ = events.send(Event::Session(Notification::SourceEnded));
+    if ops {
+        // The drain, until a second stop or 8 s; then the last snapshot, which writes a while.
+        if let Ok(Some(c)) = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                match commands.recv().await {
+                    Some(c) if matches!(c, Command::Stop) => return Some(c),
+                    Some(c) => log_command(files, &c),
+                    None => return None,
+                }
+            }
+        })
+        .await
+        {
+            log_command(files, &c);
+        }
+        let _ = events.send(Event::Busy("snapshot, the last of the lecture".into()));
+        for part in ["## What was left\n", "- The last words of the ", "lecture, folded in ", "by the last snapshot. "] {
+            let _ = events.send(Event::Preview(part.into()));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        revision += 1;
+        let block = format!("\n<!-- {} -->\n## What was left\n- The last words of the lecture, folded in by the last snapshot.\n", Local::now().format("%H:%M:%S"));
+        let _ = events.send(Event::Committed { words, slides: 0, block, usd: 0.0, confirmed: true, removed: 0, missing: 0, revision });
+    }
     if scenario == Scenario::SlowStop {
         // The drain, until core has counted a second stop; then the last snapshot, which no stop cuts short.
         while let Some(c) = commands.recv().await {

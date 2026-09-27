@@ -80,7 +80,7 @@ fn units(text: &str) -> impl Iterator<Item = (usize, usize, Unit)> + '_ {
 /// they can, and a word wider than the row is cut between glyphs, never inside one; a newline
 /// always breaks. Spaces at a row's ends are not drawn. A glyph wider than the row still gets a row
 /// of its own, so every row makes progress; the pane clips it. Always at least one row.
-fn wrap(text: &str, width: usize) -> Vec<Range<usize>> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<Range<usize>> {
     let width = width.max(1);
     let mut rows = Vec::new();
     // The row being filled: where it begins, the cells used so far (spaces included), whether it
@@ -538,8 +538,10 @@ struct NoteRows<'a> {
     chunks: &'a [Chunk],
     preview: &'a [Block],
     width: usize,
-    bullet: usize,
 }
+
+/// A bullet's cells: `•` and its ASCII `-` alike, so scrolling and drawing agree on every row.
+const BULLET: usize = 1;
 
 impl<'a> NoteRows<'a> {
     fn block(&self, (c, b): Item) -> Option<&'a Block> {
@@ -598,7 +600,7 @@ impl<'a> NoteRows<'a> {
         let (hang, lead) = match &b.kind {
             Kind::Item(lead) => {
                 let (text, w) = match lead {
-                    Lead::Bullet => (String::new(), self.bullet),
+                    Lead::Bullet => (String::new(), BULLET),
                     Lead::Number(n) => (format!("{n}."), format!("{n}.").len()),
                 };
                 (quote + level + w + 1, Some((quote + level, text)))
@@ -644,6 +646,253 @@ impl<'a> NoteRows<'a> {
         let last = self.last()?;
         Some(self.up((last, self.of(last).len() - 1), height - 1))
     }
+
+    fn down(&self, (mut item, mut row): NotePos, mut k: usize) -> NotePos {
+        let mut len = self.of(item).len();
+        while k > 0 {
+            if row + 1 < len {
+                let step = (len - 1 - row).min(k);
+                (row, k) = (row + step, k - step);
+            } else if let Some(n) = self.next(item) {
+                (item, row, k) = (n, 0, k - 1);
+                len = self.of(item).len();
+            } else {
+                break;
+            }
+        }
+        (item, row)
+    }
+
+    /// Whether everything from `p` to the end fits in `height` rows: counts no further than that.
+    fn ends_within(&self, (item, row): NotePos, height: usize) -> bool {
+        let mut n = self.of(item).len() - row;
+        let mut at = item;
+        while let Some(next) = self.next(at) {
+            if n > height {
+                return false;
+            }
+            n += self.of(next).len();
+            at = next;
+        }
+        n <= height
+    }
+
+    /// The anchor's row, today. A chunk the notes no longer hold (a polish replaced them all) is
+    /// nowhere: the reader goes back to live; a block past a chunk's end is its last.
+    fn find(&self, a: NoteAnchor) -> Option<NotePos> {
+        let blocks = self.chunks.get(a.chunk)?.blocks.len();
+        let item = (a.chunk, a.block.min(blocks.checked_sub(1)?));
+        let rows = self.of(item);
+        let row = match a.at {
+            _ if item.1 != a.block => rows.len() - 1,
+            None => 0,
+            Some(at) => rows.iter().rposition(|r| matches!(r, NoteRow::Text(t) if t.start <= at)).unwrap_or(0),
+        };
+        Some((item, row))
+    }
+
+    /// The anchor naming `p`. The preview is no place to hold — it is replaced when it commits —
+    /// so a row in it holds at the last committed row instead.
+    fn anchor(&self, (item, row): NotePos) -> Option<NoteAnchor> {
+        let (item, row) = if self.preview(item) { (self.prev(item).filter(|p| !self.preview(*p))?, usize::MAX) } else { (item, row) };
+        let rows = self.of(item);
+        let at = match &rows[row.min(rows.len() - 1)] {
+            NoteRow::Blank => None,
+            NoteRow::Text(r) => Some(r.start),
+        };
+        Some(NoteAnchor { chunk: item.0, block: item.1, at })
+    }
+}
+
+/// The reader's place in the notes (plan §F, UI-local): following the end, or held at an anchor.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct NoteScroll {
+    held: Option<NoteAnchor>,
+}
+
+/// The notes' top row while scrolled: a committed block — its chunk and its place in the chunk —
+/// and the byte of its text where the row begins (none: the blank row before it). No row number
+/// and no width is kept, so a rewrap at any width puts the same words at the top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NoteAnchor {
+    pub(crate) chunk: usize,
+    pub(crate) block: usize,
+    pub(crate) at: Option<usize>,
+}
+
+impl NoteScroll {
+    /// Whether the reader has left the notes' end.
+    pub(crate) fn scrolled(&self) -> bool {
+        self.held.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn anchor(&self) -> Option<NoteAnchor> {
+        self.held
+    }
+
+    /// One reading move through the notes in `body`, as last drawn: as the transcript's (up leaves
+    /// the end, down to it follows again, Esc goes back). Returns whether anything changed; the
+    /// notes are only read, never parsed.
+    pub(crate) fn apply(&mut self, m: Move, v: &View, preview: &Preview, body: Rect) -> bool {
+        if m == Move::Live {
+            return self.held.take().is_some();
+        }
+        let Some((width, height)) = text_size(body) else { return false };
+        let page = height.saturating_sub(2).max(1);
+        let rows = NoteRows { chunks: &v.notes.chunks, preview: preview.blocks(&v.notes), width };
+        let k = match m {
+            Move::PageUp | Move::PageDown => page,
+            _ => m.rows(),
+        };
+        match (m, self.held) {
+            (Move::Up(_) | Move::PageUp, held) => {
+                let at = match held {
+                    Some(a) => match rows.find(a) {
+                        Some(at) => at,
+                        None => return self.held.take().is_some(),
+                    },
+                    None => match rows.live_top(height) {
+                        Some(top) if top.1 > 0 || rows.prev(top.0).is_some() => top,
+                        _ => return false, // it all fits: nothing above
+                    },
+                };
+                let Some(anchor) = rows.anchor(rows.up(at, k)) else { return false };
+                let moved = Some(anchor) != self.held;
+                self.held = Some(anchor);
+                moved
+            }
+            (Move::Down(_) | Move::PageDown, Some(a)) => {
+                let Some(at) = rows.find(a) else { return self.held.take().is_some() };
+                let to = rows.down(at, k);
+                if rows.preview(to.0) || rows.ends_within(to, height) {
+                    self.held = None;
+                    return true;
+                }
+                let Some(anchor) = rows.anchor(to) else { return false };
+                self.held = Some(anchor);
+                anchor != a
+            }
+            (Move::Down(_) | Move::PageDown, None) | (Move::Live, _) => false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The activity overlay (Task 10): the ring's records, newest last, each under its time with the
+// notice line's mark, label and detail. The ring holds at most 500 records, so the overlay wraps
+// all of them when it draws — bounded work, unlike the notes.
+
+/// What the overlay says first once the ring has let records go.
+pub(crate) const OLDER_GONE: &str = "Older notices are not kept";
+
+/// The reader's place in the activity: following the newest, or held at a record — by the number
+/// the ring gives it, which a newer record never changes — and a row within it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ActivityScroll {
+    held: Option<(u64, usize)>,
+}
+
+/// A record's mark and its style, by the notice kind: the frame's own (the notice line's).
+pub(crate) type Sign<'a> = &'a dyn Fn(&str) -> (&'a str, Style);
+
+/// One overlay row: a record's number (the truncation line is the number before the first kept),
+/// the row within it, and the stretch of its text.
+struct ActivityRow {
+    id: u64,
+    row: usize,
+    text: Range<usize>,
+}
+
+/// A record's text as the overlay sets it: `label  detail`, or the busy text alone.
+fn record_text(a: &super::state::Activity) -> String {
+    if a.kind == "dim" {
+        a.detail.clone()
+    } else {
+        format!("{}  {}", a.label, a.detail)
+    }
+}
+
+fn activity_rows(ring: &super::state::Ring, width: usize, sign: Sign) -> Vec<ActivityRow> {
+    let mut rows = Vec::new();
+    if ring.wrapped() {
+        rows.push(ActivityRow { id: ring.first() - 1, row: 0, text: 0..0 });
+    }
+    for (k, a) in ring.iter().enumerate() {
+        let hang = sign(a.kind).0.width() + 1;
+        for (row, text) in wrap(&record_text(a), width.saturating_sub(hang).max(1)).into_iter().enumerate() {
+            rows.push(ActivityRow { id: ring.first() + k as u64, row, text });
+        }
+    }
+    rows
+}
+
+impl ActivityScroll {
+    /// The index of the top row: the held one, or the last screenful while following.
+    fn top(&self, rows: &[ActivityRow], height: usize) -> usize {
+        match self.held {
+            Some((id, row)) => rows.iter().position(|r| (r.id, r.row) >= (id, row)).unwrap_or(0),
+            None => rows.len().saturating_sub(height),
+        }
+    }
+
+    /// One reading move in the overlay's `body`: as the panes' (up leaves the newest; down to the
+    /// end follows again). New records arriving while held move nothing.
+    pub(crate) fn apply(&mut self, m: Move, ring: &super::state::Ring, body: Rect, sign: Sign) -> bool {
+        if m == Move::Live {
+            return self.held.take().is_some();
+        }
+        let Some((width, height)) = text_size(body) else { return false };
+        let rows = activity_rows(ring, width, sign);
+        let top = self.top(&rows, height);
+        let k = match m {
+            Move::PageUp | Move::PageDown => height.saturating_sub(2).max(1),
+            _ => m.rows(),
+        };
+        let to = match m {
+            Move::Up(_) | Move::PageUp => top.saturating_sub(k),
+            _ => top + k,
+        };
+        if to + height >= rows.len() {
+            return self.held.take().is_some();
+        }
+        let held = Some((rows[to].id, rows[to].row));
+        let moved = held != self.held;
+        self.held = held;
+        moved
+    }
+}
+
+/// The activity into `body`: records under their times, marked as the notice line marks them, the
+/// label bold and the detail after it; busy text dim. First, once records have gone, a line saying so.
+pub(crate) fn activity(buf: &mut Buffer, body: Rect, ring: &super::state::Ring, scroll: &ActivityScroll, sign: Sign) {
+    let Some((width, height)) = text_size(body) else { return };
+    let rows = activity_rows(ring, width, sign);
+    if rows.is_empty() {
+        buf.set_stringn(body.x, body.y, "Nothing has happened yet.", body.width as usize, DIM);
+        return;
+    }
+    let (x, text_x) = (body.x, body.x + LANE as u16);
+    let records: Vec<&super::state::Activity> = ring.iter().collect();
+    for (y, r) in (body.y..body.bottom()).zip(&rows[scroll.top(&rows, height)..]) {
+        let Some(a) = r.id.checked_sub(ring.first()).and_then(|k| records.get(k as usize)) else {
+            buf.set_stringn(x, y, OLDER_GONE, body.width as usize, DIM);
+            continue;
+        };
+        let (glyph, style) = sign(a.kind);
+        if r.row == 0 {
+            buf.set_stringn(x, y, a.at.format("%H:%M:%S").to_string(), TIME, DIM);
+            buf.set_stringn(text_x, y, glyph, width, style);
+        }
+        let at = text_x + glyph.width() as u16 + 1;
+        let room = (body.right().saturating_sub(at)) as usize;
+        let text = record_text(a);
+        let bold = if a.kind == "dim" { 0 } else { a.label.len() };
+        let (b, rest) = (r.text.start.min(bold).max(r.text.start), r.text.end.min(bold).max(r.text.start));
+        let body_style = if a.kind == "dim" { DIM } else { Style::new() };
+        let (after, _) = buf.set_stringn(at, y, drawn(&text[b..rest]), room, Style::new().add_modifier(Modifier::BOLD));
+        buf.set_stringn(after, y, drawn(&text[rest..r.text.end]), room.saturating_sub((after - at) as usize), body_style);
+    }
 }
 
 /// The time a slide embed was shown: the registered slide whose file it names (by its path, or its
@@ -653,13 +902,15 @@ fn slide_time(v: &View, dest: &str) -> Option<String> {
     v.slides.iter().find(|s| s.file == dest || std::path::Path::new(&s.file).file_name() == Some(name)).map(|s| s.shown_at.format("%H:%M:%S").to_string())
 }
 
-/// The notes into `body`, following their end: the committed chunks under their times, then the
-/// preview being written on the live edge — `writing` in the gutter, the edge on its every row, its
-/// text dim — so it is never taken for notes. Empty, it says so.
-pub(crate) fn notes(buf: &mut Buffer, body: Rect, v: &View, preview: &Preview, ink: &Ink) {
+/// The notes into `body`: from the anchor down while scrolled, else following their end — the
+/// committed chunks under their times, then the preview being written on the live edge (`writing`
+/// in the gutter, the edge on its every row, its text dim) so it is never taken for notes. Empty,
+/// it says so.
+pub(crate) fn notes(buf: &mut Buffer, body: Rect, v: &View, preview: &Preview, scroll: &NoteScroll, ink: &Ink) {
     let Some((width, height)) = text_size(body) else { return };
-    let rows = NoteRows { chunks: &v.notes.chunks, preview: preview.blocks(&v.notes), width, bullet: ink.bullet.width() };
-    let Some((mut item, mut row)) = rows.live_top(height) else {
+    let rows = NoteRows { chunks: &v.notes.chunks, preview: preview.blocks(&v.notes), width };
+    let top = scroll.held.and_then(|a| rows.find(a)).or_else(|| rows.live_top(height));
+    let Some((mut item, mut row)) = top else {
         buf.set_stringn(body.x, body.y, "Nothing written yet.", body.width as usize, DIM);
         return;
     };
@@ -1139,7 +1390,7 @@ mod tests {
     fn draw_notes(v: &View, p: &Preview, width: u16, height: u16) -> (Buffer, Vec<String>) {
         let mut b = Buffer::empty(Rect::new(0, 0, width, height));
         let area = b.area;
-        notes(&mut b, area, v, p, &NOTE_INK);
+        notes(&mut b, area, v, p, &NoteScroll::default(), &NOTE_INK);
         (b.clone(), (0..height).map(|y| row_text(&b, y)).collect())
     }
 
@@ -1348,7 +1599,75 @@ mod tests {
         let p = parsed(&v);
         for (w, h) in [(0, 0), (1, 1), (10, 3), (11, 3), (12, 5), (20, 30), (0, 5), (40, 0)] {
             let mut b = Buffer::empty(Rect::new(0, 0, w.max(1), h.max(1)));
-            notes(&mut b, Rect::new(0, 0, w, h), &v, &p, &NOTE_INK);
+            notes(&mut b, Rect::new(0, 0, w, h), &v, &p, &NoteScroll::default(), &NOTE_INK);
         }
+    }
+
+    /// The notes' place is semantic: a block and a byte of its text. A resize rewraps from the
+    /// same words; up and back down to the end follows again; a document replaced whole (a polish)
+    /// returns the reader to live rather than pointing into what is gone.
+    #[test]
+    fn notes_scroll_holds_its_words_across_resize_and_replacement() {
+        let v = notes_view(&NOTES.repeat(6));
+        let p = Preview::default();
+        let mut s = NoteScroll::default();
+        let body = |w, h| Rect::new(0, 0, w, h);
+        assert!(!s.apply(Move::Down(1), &v, &p, body(80, 12)), "following: nothing below");
+        assert!(s.apply(Move::Up(20), &v, &p, body(80, 12)));
+        let held = s.anchor().unwrap();
+        let draw = |s: &NoteScroll, w: u16, h: u16| {
+            let mut b = Buffer::empty(Rect::new(0, 0, w, h));
+            let area = b.area;
+            notes(&mut b, area, &v, &p, s, &NOTE_INK);
+            (0..h).map(|y| row_text(&b, y)).collect::<Vec<_>>()
+        };
+        let at80 = draw(&s, 80, 12);
+        let at140 = draw(&s, 140, 30);
+        let top = |rows: &[String]| rows[0].trim_start().chars().take(12).collect::<String>();
+        assert_eq!(top(&at80), top(&at140), "the same words on top at either width");
+        assert_eq!(draw(&s, 80, 12), at80, "140 → 80: the same rows");
+        assert_eq!(s.anchor(), Some(held), "a resize moves no anchor");
+        // down to the end follows again
+        for _ in 0..200 {
+            s.apply(Move::PageDown, &v, &p, body(80, 12));
+        }
+        assert!(!s.scrolled());
+        // held while a commit appends below: the place does not move
+        s.apply(Move::PageUp, &v, &p, body(80, 12));
+        let before = draw(&s, 80, 12);
+        let mut more = notes_view(&NOTES.repeat(6));
+        more.reduce(&Event::Committed { words: 1, slides: 0, block: "\n<!-- 11:00:00 -->\n## Appended\n".into(), usd: 0.0, confirmed: true, removed: 0, missing: 0, revision: 2 }, at(0));
+        let mut b = Buffer::empty(Rect::new(0, 0, 80, 12));
+        let area = b.area;
+        notes(&mut b, area, &more, &p, &s, &NOTE_INK);
+        assert_eq!((0..12).map(|y| row_text(&b, y)).collect::<Vec<_>>(), before);
+        // a polished document replaces them all: an anchor into a chunk that is gone goes live
+        let mut polished = notes_view("# Polished\n\n<!-- 09:00:00 -->\n## Short now\n");
+        polished.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.0, revision: 3 }, at(0));
+        let mut far = s.clone();
+        far.held = Some(NoteAnchor { chunk: 40, block: 3, at: Some(10) });
+        let mut b = Buffer::empty(Rect::new(0, 0, 80, 12));
+        let area = b.area;
+        notes(&mut b, area, &polished, &p, &far, &NOTE_INK);
+        assert!((0..12).any(|y| row_text(&b, y).contains("Short now")), "drawn from the live end, not from memory");
+        assert!(far.apply(Move::Up(1), &polished, &p, body(80, 12)) || !far.scrolled());
+        // a block index past its chunk's end holds at the chunk's last block
+        let rows = NoteRows { chunks: &v.notes.chunks, preview: &[], width: 70 };
+        let (item, _) = rows.find(NoteAnchor { chunk: 1, block: 999, at: Some(0) }).unwrap();
+        assert_eq!(item, (1, v.notes.chunks[1].blocks.len() - 1));
+    }
+
+    /// The preview is no place to hold: a move that would anchor in it holds at the last
+    /// committed row, and a move down into it follows.
+    #[test]
+    fn the_preview_is_never_an_anchor() {
+        let mut v = notes_view(NOTES);
+        v.reduce(&Event::Preview("## being written\n- a\n- b\n- c\n- d\n- e\n- f ".into()), at(0));
+        let p = parsed(&v);
+        let mut s = NoteScroll::default();
+        assert!(s.apply(Move::Up(1), &v, &p, Rect::new(0, 0, 60, 6)));
+        let a = s.anchor().unwrap();
+        assert!(a.chunk < v.notes.chunks.len(), "{a:?}");
+        assert!(s.apply(Move::Down(1), &v, &p, Rect::new(0, 0, 60, 6)) && !s.scrolled());
     }
 }

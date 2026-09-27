@@ -28,5 +28,5 @@
 "                                            │                                                                 "
 " ──────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 "                                                                                                              "
-" ◆ hints and snapshots are not taken here yet                                                                 "
-" ^L redraw   ^C quit at once                                                                                  "
+" ◆ stopping: the last snapshot takes what is left                                                             "
+" Tab pane   ^O activity   ^G help   ^C quit at once                                                           "

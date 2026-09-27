@@ -28,5 +28,5 @@
 "         ▎ the sample only halves           │             samples.                                            "
 " ──────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " ◆ notes  60 words and 0 slides folded in  $0.02                                                              "
-" ◆ hints and snapshots are not taken here yet                                                                 "
-" ^L redraw   ^C stop                                                                                          "
+" ◆ a hint, or ⏎ for a snapshot                                                                                "
+" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^G help   ^C stop                                "

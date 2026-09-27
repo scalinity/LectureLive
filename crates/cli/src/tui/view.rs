@@ -22,7 +22,8 @@ use lecturelive_core::session::spend::{self, Paint};
 
 use crate::stop::Stage;
 
-use super::panes::{self, Preview, Scroll};
+use super::input::{Hint, Overlay};
+use super::panes::{self, ActivityScroll, NoteScroll, Preview, Scroll};
 use super::state::{Lane, View};
 
 pub(crate) const SUSPEND: &str = "Suspending would stop the recording. Stop the lecture first (Ctrl-C).";
@@ -208,10 +209,17 @@ pub(crate) struct Glyphs {
     edge: &'static str,
     /// A bullet list item's mark.
     bullet: &'static str,
+    /// Keys as the footer and help name them.
+    enter: &'static str,
+    polish: &'static str,
+    updown: &'static str,
+    backtab: &'static str,
+    /// The help overlay's border corners: top left, top right, bottom left, bottom right.
+    corners: [&'static str; 4],
 }
 
-const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□", edge: "▎", bullet: "•" };
-const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-", edge: "|", bullet: "-" };
+const UNICODE: Glyphs = Glyphs { dot: "●", warn: "▲", notes: "◆", slide: "▣", page: "✦", done: "✓", ellipsis: "…", rule: "─", bar: "│", times: "×", chevron: "›", meter_on: "■", meter_off: "□", edge: "▎", bullet: "•", enter: "⏎", polish: "polish⏎", updown: "↑↓", backtab: "⇧Tab", corners: ["┌", "┐", "└", "┘"] };
+const ASCII: Glyphs = Glyphs { dot: "*", warn: "!", notes: "*", slide: "[]", page: "*", done: "+", ellipsis: "...", rule: "-", bar: "|", times: "x", chevron: ">", meter_on: "#", meter_off: "-", edge: "|", bullet: "-", enter: "Enter", polish: "polish Enter", updown: "Up/Down", backtab: "Shift-Tab", corners: ["+", "+", "+", "+"] };
 
 /// Whether the effective locale is UTF-8: the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set
 /// and not empty decides, as the C library's own lookup does.
@@ -286,8 +294,7 @@ fn meaning(stage: Stage) -> &'static [&'static str] {
     }
 }
 
-/// The keys this build acts on, in footer order: `^C` sits last, where it stays as later tasks add
-/// keys before it. The footer is generated from this table, so it cannot offer what does nothing.
+/// The safety view's keys: what still works below the minimum size (typing is ignored there).
 const KEYS: [(&str, fn(Stage) -> &'static str); 2] = [("^L", redraw), ("^C", stop_key)];
 
 fn redraw(_: Stage) -> &'static str {
@@ -302,8 +309,78 @@ fn stop_key(stage: Stage) -> &'static str {
     }
 }
 
-/// Typing does nothing yet (the hint line is Task 10's), and the line says so rather than offering it.
-const PROMPT: &str = "hints and snapshots are not taken here yet";
+/// The empty hint line, while stopping: Enter takes nothing now, and the line says what happens instead.
+const STOPPING_PROMPT: &str = "stopping: the last snapshot takes what is left";
+
+/// Parts of a line, each with a priority (0 is kept longest): the most that fit `room` in their
+/// own order, three spaces apart — the lowest priorities go first. None when not even the first
+/// fits.
+fn fit_parts(parts: Vec<(u8, Vec<Span<'static>>)>, room: usize) -> Option<Vec<Span<'static>>> {
+    let join = |keep: &[bool]| {
+        let mut spans = Vec::new();
+        for (part, _) in parts.iter().zip(keep).filter(|(_, k)| **k) {
+            if !spans.is_empty() {
+                spans.push(Span::raw("   "));
+            }
+            spans.extend(part.1.iter().cloned());
+        }
+        spans
+    };
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|&i| parts[i].0);
+    let mut keep = vec![false; parts.len()];
+    for i in order {
+        keep[i] = true;
+        if width(&join(&keep)) > room {
+            keep[i] = false;
+        }
+    }
+    let spans = join(&keep);
+    (!spans.is_empty()).then_some(spans)
+}
+
+/// A key and what it does, in the footer's vocabulary: the chord bold, the action dim.
+fn chord(key: &str, action: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(key.to_string(), BOLD)];
+    if !action.is_empty() {
+        spans.extend([Span::raw(" "), Span::styled(action.to_string(), style)]);
+    }
+    spans
+}
+
+/// The footer (plan §H): only keys that do something now, `^C` always last. Listening, Enter and
+/// `polish⏎`; `^X cancel` only while a request of this TUI's is running or queued; `^T back` while
+/// zoomed; with an overlay open, its own keys. As the line narrows the lower priorities go — the
+/// stop and help keys stay.
+fn footer(v: &View, c: &Chrome, room: usize) -> Vec<Span<'static>> {
+    let (t, g) = (c.theme, c.theme.glyphs);
+    let listening = v.phase == Stage::Listening;
+    let mut parts: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+    match c.overlay {
+        Overlay::Activity | Overlay::Help => {
+            parts.push((2, chord(g.updown, "scroll", DIM)));
+            parts.push((1, chord("Esc", "close", DIM)));
+        }
+        Overlay::None => {
+            if listening {
+                parts.push((2, chord(g.enter, "snapshot", DIM)));
+                parts.push((4, chord(g.polish, "", DIM)));
+            }
+            if v.work.mine() {
+                parts.push((2, chord("^X", "cancel", DIM)));
+            }
+            parts.push((5, chord("Tab", "pane", DIM)));
+            if c.zoom {
+                parts.push((3, chord("^T", "back", DIM)));
+            }
+            parts.push((6, chord("^O", "activity", DIM)));
+            parts.push((1, chord("^G", "help", DIM)));
+        }
+    }
+    let stop = if v.phase == Stage::StopWaiting { t.signal() } else { DIM };
+    parts.push((0, chord("^C", stop_key(v.phase), stop)));
+    fit_parts(parts, room).unwrap_or_else(|| clip(chord("^C", stop_key(v.phase), stop), room, g.ellipsis))
+}
 
 /// The spend as the header says it. A sum over nothing is `-0.0`, which `{:.2}` prints as "-0.00":
 /// anything that rounds to zero cents from at or below zero is zero. A real negative amount keeps
@@ -363,27 +440,66 @@ fn clip(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> Vec<Span<'stat
 // ---------------------------------------------------------------------------------------------
 // Drawing.
 
-/// What the frame shows besides the session view: the reactor's clock and refused-stop notice, the
-/// focused pane, the reader's place in the transcript, the theme.
+/// What the frame shows besides the session view: the reactor's clock and its own notice (a
+/// refused key or command), the focused pane and zoom, the reader's places in the transcript, the
+/// notes and the activity, the parsed preview, the hint line, the overlay, the theme.
 pub(crate) struct Chrome<'a> {
     pub(crate) elapsed: Duration,
     pub(crate) refused: Option<&'a str>,
     pub(crate) focus: Pane,
+    pub(crate) zoom: bool,
     pub(crate) transcript: &'a Scroll,
+    pub(crate) notes: &'a NoteScroll,
     /// The preview as last parsed, at most ten times a second.
     pub(crate) preview: &'a Preview,
+    pub(crate) hint: &'a Hint,
+    pub(crate) overlay: Overlay,
+    pub(crate) activity: &'a ActivityScroll,
+    /// The help overlay's first row shown.
+    pub(crate) help: usize,
     pub(crate) theme: &'a Theme,
 }
 
-/// Draws the frame. Returns the transcript's body when it was drawn, so reading moves count rows
-/// in the pane as the person sees it.
-pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Option<Rect> {
-    let l = layout(frame.area());
+/// What a frame drew where: the reading keys move what the person sees, in the rows they see it
+/// in; below the minimum size nothing is on screen and typing is ignored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Drawn {
+    pub(crate) small: bool,
+    pub(crate) transcript: Option<Rect>,
+    pub(crate) notes: Option<Rect>,
+    /// The activity overlay's body.
+    pub(crate) activity: Option<Rect>,
+    /// The furthest the help overlay can scroll at this size.
+    pub(crate) help_max: usize,
+}
+
+/// The rows between the header and the notice, across the whole width: where a zoomed pane and an
+/// overlay go.
+fn body_area(l: &Layout) -> Rect {
+    let top = l.columns.iter().map(|c| c.heading.y).min().unwrap_or(0);
+    let bottom = l.columns.iter().map(|c| c.body.bottom()).max().unwrap_or(top);
+    Rect::new(l.header[0].x, top, l.header[0].width, bottom - top)
+}
+
+/// Ctrl-T (plan §H): the focused pane fills the body — one column, its heading naming every pane,
+/// the header, notice, prompt and keys where they were. The breakpoints are untouched.
+fn zoom(l: &mut Layout) {
+    let area = body_area(l);
+    l.columns = vec![Column { heading: Rect { height: 1, ..area }, body: Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1)), tabs: &[Pane::Transcript, Pane::Notes, Pane::Slides], ruled: false }];
+    l.separators.clear();
+}
+
+/// Draws the frame, and says where the panes and the overlay went.
+pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Drawn {
+    let mut l = layout(frame.area());
     if l.variant == Variant::TooSmall {
         too_small(frame, v, c);
-        return None;
+        return Drawn { small: true, ..Drawn::default() };
     }
-    let mut reading = None;
+    if c.zoom {
+        zoom(&mut l);
+    }
+    let mut drawn = Drawn::default();
     let g = c.theme.glyphs;
     frame.render_widget(Line::from(first_row(v, c, l.header[0].width as usize)), l.header[0]);
     frame.render_widget(Line::from(clock(c.elapsed)).right_aligned(), l.header[0]);
@@ -410,19 +526,20 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Option<Rect> {
                     frame.render_widget(Line::from(lane).right_aligned(), col.heading);
                 }
                 panes::transcript(frame.buffer_mut(), col.body, v, c.transcript, g.edge, c.theme.teal());
-                reading = Some(col.body);
+                drawn.transcript = Some(col.body);
             }
             Pane::Notes => {
                 // stacked's heading is a rule: a space ends the rule before the lane
                 let gap = usize::from(col.ruled);
-                if let Some(mut lane) = work_lane(v, room.saturating_sub(gap), c.theme) {
+                if let Some(mut lane) = work_lane(v, c.notes.scrolled(), room.saturating_sub(gap), c.theme) {
                     if col.ruled {
                         lane.insert(0, Span::raw(" "));
                     }
                     frame.render_widget(Line::from(lane).right_aligned(), col.heading);
                 }
                 let ink = panes::Ink { edge: g.edge, bullet: g.bullet, quote: g.bar, slide: g.slide, rule: g.rule, teal: c.theme.teal() };
-                panes::notes(frame.buffer_mut(), col.body, v, c.preview, &ink);
+                panes::notes(frame.buffer_mut(), col.body, v, c.preview, c.notes, &ink);
+                drawn.notes = Some(col.body);
             }
             Pane::Slides if col.body.height > 0 => {
                 frame.render_widget(Span::styled(fit("Slides show here.", col.body.width as usize, g.ellipsis), DIM), Rect { height: 1, ..col.body });
@@ -430,10 +547,156 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Option<Rect> {
             Pane::Slides => {}
         }
     }
+    match c.overlay {
+        Overlay::None => {}
+        Overlay::Help => drawn.help_max = help(frame, body_area(&l), c),
+        Overlay::Activity => drawn.activity = Some(activity(frame, body_area(&l), v, c)),
+    }
     frame.render_widget(Line::from(notice(v, c, l.notice.width as usize)), l.notice);
-    frame.render_widget(Line::from(vec![Span::styled(g.notes, c.theme.teal()), Span::raw(" "), Span::styled(PROMPT, DIM)]), l.prompt);
-    frame.render_widget(Line::from(keys(v.phase, c.theme)), l.keys);
-    reading
+    prompt(frame, l.prompt, v, c);
+    frame.render_widget(Line::from(footer(v, c, l.keys.width as usize)), l.keys);
+    drawn
+}
+
+/// A notice kind's mark and its style: red for a warning, teal for good news, dim for busy text.
+pub(crate) fn mark(kind: &str, t: &Theme) -> (&'static str, Style) {
+    let g = t.glyphs;
+    match kind {
+        "notes" => (g.notes, t.teal()),
+        "slide" => (g.slide, t.teal()),
+        "page" => (g.page, t.teal()),
+        "done" => (g.done, t.teal()),
+        "dim" => (g.ellipsis, DIM),
+        _ => (g.warn, t.signal()),
+    }
+}
+
+/// The hint line (plan §H): the mark, then the hint as typed — scrolled so the cursor stays in the
+/// field — or, empty, what Enter does now. The terminal's own cursor sits where the next character
+/// goes, counted in cells as `tui-input` counts them.
+fn prompt(frame: &mut Frame, rect: Rect, v: &View, c: &Chrome) {
+    let (t, g) = (c.theme, c.theme.glyphs);
+    let mark_w = Span::raw(g.notes).width() as u16;
+    if rect.width <= mark_w + 1 {
+        return;
+    }
+    frame.render_widget(Span::styled(g.notes, t.teal()), rect);
+    let (x0, field) = (rect.x + mark_w + 1, (rect.width - mark_w - 1) as usize);
+    let value = c.hint.value();
+    if value.is_empty() {
+        let words = if v.phase == Stage::Listening { format!("a hint, or {} for a snapshot", g.enter) } else { STOPPING_PROMPT.to_string() };
+        frame.render_widget(Span::styled(fit(&words, field, g.ellipsis), DIM), Rect::new(x0, rect.y, field as u16, 1));
+        frame.set_cursor_position((x0, rect.y));
+        return;
+    }
+    // what scrolled off the left: whole characters, as `tui-input` counts its scroll
+    let scroll = c.hint.scroll(field);
+    let (mut skipped, mut from) = (0, 0);
+    for (i, ch) in value.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if skipped >= scroll && w > 0 {
+            break;
+        }
+        skipped += w;
+        from = i + ch.len_utf8();
+    }
+    frame.buffer_mut().set_stringn(x0, rect.y, &value[from..], field, INK);
+    let at = c.hint.cursor().saturating_sub(skipped).min(field - 1);
+    frame.set_cursor_position((x0 + at as u16, rect.y));
+}
+
+/// The help overlay (plan §H): one single-line border, at most 64 columns, centred in the body; the
+/// grammar and the keys by group, the three stop stages in §G's words, and the spend sentence. Taller
+/// than the body, it scrolls itself — nothing behind it moves. Returns how far it can scroll.
+fn help(frame: &mut Frame, area: Rect, c: &Chrome) -> usize {
+    let g = c.theme.glyphs;
+    let w = area.width.min(64);
+    if w < 12 || area.height < 3 {
+        return 0;
+    }
+    let inner = (w - 4) as usize;
+    let lines = help_lines(g, inner);
+    let h = (lines.len() + 2).min(area.height as usize) as u16;
+    let rect = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let visible = (h - 2) as usize;
+    let max = lines.len().saturating_sub(visible);
+    let first = c.help.min(max);
+    let [tl, tr, bl, br] = g.corners;
+    let title = format!("{}{} Help ", tl, g.rule);
+    let top = format!("{title}{}{tr}", g.rule.repeat((w as usize).saturating_sub(Span::raw(title.as_str()).width() + 1)));
+    frame.render_widget(Line::from(vec![Span::styled(title.clone(), DIM), Span::styled(top[title.len()..].to_string(), DIM)]), Rect { height: 1, ..rect });
+    frame.buffer_mut().set_stringn(rect.x + 3, rect.y, "Help", 4, BOLD);
+    let more = match (first > 0, first < max) {
+        (_, true) => format!(" {} more ", g.updown),
+        (true, false) => format!(" {} back ", g.updown),
+        (false, false) => " Esc closes ".to_string(),
+    };
+    let fill = (w as usize).saturating_sub(Span::raw(more.as_str()).width() + 3);
+    frame.render_widget(Span::styled(format!("{bl}{}{more}{}{br}", g.rule.repeat(fill), g.rule), DIM), Rect { y: rect.bottom() - 1, height: 1, ..rect });
+    for row in 1..h - 1 {
+        frame.buffer_mut().set_stringn(rect.x, rect.y + row, g.bar, 1, DIM);
+        frame.buffer_mut().set_stringn(rect.right() - 1, rect.y + row, g.bar, 1, DIM);
+    }
+    for (i, line) in lines.into_iter().skip(first).take(visible).enumerate() {
+        frame.render_widget(line, Rect::new(rect.x + 2, rect.y + 1 + i as u16, inner as u16, 1));
+    }
+    max
+}
+
+/// The help's rows at `inner` cells: group names bold — they part the groups, so no blank rows do —
+/// each key bold in a column with what it does
+/// wrapped beside it, the spend sentence dim at the end.
+fn help_lines(g: &Glyphs, inner: usize) -> Vec<Line<'static>> {
+    let hint = format!("hint {}", g.enter);
+    let tabs = format!("Tab {}", g.backtab);
+    let groups: [(&str, Vec<(&str, &str)>); 5] = [
+        ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests, running and queued")]),
+        ("Reading", vec![(g.updown, "a row in the focused pane"), ("PgUp PgDn", "a page"), (tabs.as_str(), "the next or previous pane"), ("Esc", "back to live"), ("^T", "the focused pane fills the body; again to go back")]),
+        ("Slides", vec![("Tab", "reaches the Slides pane")]),
+        ("App", vec![("^O", "activity: this session's notices"), ("^G F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
+        (
+            "Stopping",
+            vec![
+                ("^C once", "stop: finish the transcript and recovery, then a last snapshot"),
+                ("^C twice", "stop waiting: recovery and queued requests wait for the next session; what runs now and the last snapshot still finish"),
+                ("^C thrice", "quit at once; the next session in this folder picks up what was left"),
+            ],
+        ),
+    ];
+    let mut out = Vec::new();
+    // the key column: the widest key and two cells, so no key ever runs into what it does
+    let widest = groups.iter().flat_map(|(_, keys)| keys.iter().map(|(k, _)| Span::raw(*k).width())).max().unwrap_or(0);
+    let key = (widest + 2).min(inner / 2);
+    for (group, keys) in groups {
+        out.push(Line::from(Span::styled(group, BOLD)));
+        for (k, what) in keys {
+            for (j, r) in panes::wrap(what, inner.saturating_sub(key).max(1)).into_iter().enumerate() {
+                let left = if j == 0 { format!("{k}{}", " ".repeat(key.saturating_sub(Span::raw(k).width()))) } else { " ".repeat(key) };
+                out.push(Line::from(vec![Span::styled(left, BOLD), Span::raw(what[r].to_string())]));
+            }
+        }
+    }
+    out.push(Line::from(""));
+    for r in panes::wrap(SPEND, inner) {
+        out.push(Line::from(Span::styled(SPEND[r].to_string(), DIM)));
+    }
+    out
+}
+
+/// Plan §H's one sentence on spend.
+const SPEND: &str = "Spend is this lecture's cost today; speech-to-text is added when a recording closes.";
+
+/// The activity overlay (plan §H): it fills the body — a heading, then the records under their
+/// times, newest last. Returns its body, where the reading keys move it.
+fn activity(frame: &mut Frame, area: Rect, v: &View, c: &Chrome) -> Rect {
+    let t = c.theme;
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Span::styled("Activity", t.teal().add_modifier(Modifier::BOLD)), Rect { height: 1, ..area });
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+    let sign = |kind: &str| mark(kind, t);
+    panes::activity(frame.buffer_mut(), body, &v.activity, c.activity, &sign);
+    body
 }
 
 /// The scrolled transcript's heading lane, right of its tabs: what arrived below and how to get
@@ -456,9 +719,10 @@ fn reading_lane(new: usize, room: usize, t: &Theme) -> Option<Vec<Span<'static>>
 
 /// The notes heading's lane, right of its name: what the notes work is doing — this TUI's own
 /// request at the head (teal: it is live), how many wait behind it, and the study page
-/// typesetting. From typed state only (plan §C 13). As the heading narrows the page goes first,
-/// then the queue; the head's state goes last.
-fn work_lane(v: &View, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
+/// typesetting — and, while the reader is scrolled up, the way back. From typed state only (plan §C 13).
+/// As the heading narrows the page goes first, then the queue, then the way back; the head's state
+/// goes last.
+fn work_lane(v: &View, scrolled: bool, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
     let w = &v.work;
     let head = match w.lane() {
         Lane::Idle => None,
@@ -466,22 +730,21 @@ fn work_lane(v: &View, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
         Lane::PolishSnapshotFirst => Some("polish: snapshot first"),
         Lane::Polishing => Some("polishing"),
         Lane::LastSnapshot => Some("last snapshot: writing"),
-    }
-    .map(|s| Span::styled(s, t.teal()));
-    let queued = (w.queued() > 0).then(|| Span::styled(format!("{} queued", w.queued()), DIM));
-    let page = w.page().then(|| Span::styled("study page: typesetting", DIM));
-    let join = |parts: [&Option<Span<'static>>; 3]| {
-        let mut spans = Vec::new();
-        for s in parts.into_iter().flatten() {
-            if !spans.is_empty() {
-                spans.push(Span::raw("   "));
-            }
-            spans.push(s.clone());
-        }
-        spans
     };
-    let none = None;
-    [join([&head, &queued, &page]), join([&head, &queued, &none]), join([&head, &none, &none])].into_iter().filter(|f| !f.is_empty()).find(|f| width(f) <= room)
+    let mut parts: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+    if let Some(head) = head {
+        parts.push((0, vec![Span::styled(head, t.teal())]));
+    }
+    if scrolled {
+        parts.push((1, chord("Esc", "live", DIM)));
+    }
+    if w.queued() > 0 {
+        parts.push((2, vec![Span::styled(format!("{} queued", w.queued()), DIM)]));
+    }
+    if w.page() {
+        parts.push((3, vec![Span::styled("study page: typesetting", DIM)]));
+    }
+    fit_parts(parts, room)
 }
 
 /// Header row 1: the recording dot, the phase, then the course and lecture — or, while stopping,
@@ -612,14 +875,7 @@ fn notice(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
     let spans = if let Some(r) = c.refused {
         vec![Span::raw(r.to_string())]
     } else if let Some(n) = &v.notice {
-        let (mark, style) = match n.kind {
-            "notes" => (g.notes, t.teal()),
-            "slide" => (g.slide, t.teal()),
-            "page" => (g.page, t.teal()),
-            "done" => (g.done, t.teal()),
-            "dim" => (g.ellipsis, DIM),
-            _ => (g.warn, t.signal()),
-        };
+        let (mark, style) = mark(n.kind, t);
         vec![Span::styled(mark, style), Span::raw(" "), Span::styled(n.label.clone(), BOLD), Span::raw("  "), Span::raw(n.detail.clone())]
     } else {
         Vec::new()
@@ -704,13 +960,20 @@ mod tests {
         v.reduce(&Event::Session(Notification::Gap(Gap::new(Default::default(), start, None, GapKind::SttOffline))), Local::now());
     }
 
+    /// The frame's chrome as a test draws it: the hint empty, no overlay, the notes and activity
+    /// following, at 0:42:18.
+    fn chrome<'a>(theme: &'a Theme, transcript: &'a Scroll, preview: &'a Preview, focus: Pane, refused: Option<&'a str>) -> Chrome<'a> {
+        Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus, zoom: false, transcript, notes: Box::leak(Box::default()), preview, hint: Box::leak(Box::default()), overlay: Overlay::None, activity: Box::leak(Box::default()), help: 0, theme }
+    }
+
     fn drawn_with(width: u16, height: u16, v: &View, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
         drawn_scrolled(width, height, v, &Scroll::default(), refused, theme)
     }
 
     fn drawn_scrolled(width: u16, height: u16, v: &View, scroll: &Scroll, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus: Pane::Transcript, transcript: scroll, preview: &Preview::default(), theme };
+        let preview = Preview::default();
+        let chrome = chrome(theme, scroll, &preview, Pane::Transcript, refused);
         terminal.draw(|f| {
             render(f, v, &chrome);
         })
@@ -922,7 +1185,8 @@ mod tests {
         // too narrow for any phrasing: the phase and the clock alone, no fragment
         let mut b = Buffer::empty(Rect::new(0, 0, 30, 1));
         let theme = Theme::new(TRUE, true);
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: None, focus: Pane::Transcript, theme: &theme, transcript: &Scroll::default(), preview: &Preview::default() };
+        let (scroll, preview) = (Scroll::default(), Preview::default());
+        let chrome = chrome(&theme, &scroll, &preview, Pane::Transcript, None);
         ratatui::widgets::Widget::render(Line::from(first_row(&view(Stage::StopWaiting), &chrome, 30)), b.area, &mut b);
         assert_eq!(lines(&b)[0], "● Stop waiting");
     }
@@ -943,12 +1207,18 @@ mod tests {
     /// The footer offers only what this build does, generated from its key table.
     #[test]
     fn the_footer_follows_the_stop_stage() {
-        for (stage, hint) in [(Stage::Listening, " ^L redraw   ^C stop"), (Stage::Stopping, " ^L redraw   ^C stop waiting"), (Stage::StopWaiting, " ^L redraw   ^C quit at once")] {
-            assert_eq!(lines(&drawn(110, 32, &view(stage), None))[31], hint);
-            assert_eq!(lines(&drawn(40, 8, &view(stage), None))[7], hint, "the safety view keeps the keys");
+        for (stage, keys, safety) in [
+            (Stage::Listening, " ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^G help   ^C stop", " ^L redraw   ^C stop"),
+            (Stage::Stopping, " Tab pane   ^O activity   ^G help   ^C stop waiting", " ^L redraw   ^C stop waiting"),
+            (Stage::StopWaiting, " Tab pane   ^O activity   ^G help   ^C quit at once", " ^L redraw   ^C quit at once"),
+        ] {
+            assert_eq!(lines(&drawn(110, 32, &view(stage), None))[31], keys, "while stopping Enter takes nothing, and the footer does not offer it");
+            assert_eq!(lines(&drawn(40, 8, &view(stage), None))[7], safety, "the safety view keeps the keys that work there");
         }
         let l = lines(&drawn(110, 32, &view(Stage::Listening), None));
-        assert_eq!(l[30], format!(" ◆ {PROMPT}"), "the prompt offers nothing it does not do");
+        assert_eq!(l[30], " ◆ a hint, or ⏎ for a snapshot", "the empty hint line says what Enter does");
+        assert_eq!(lines(&drawn(110, 32, &view(Stage::Stopping), None))[30], format!(" ◆ {STOPPING_PROMPT}"));
+        assert!(!l.join("").contains("^S"), "no capture key before Task 11");
     }
 
     /// A refused stop outranks the view's notice, being about the keys just below it.
@@ -1099,7 +1369,7 @@ mod tests {
         assert!(l[0].starts_with(" * Listening   Machine Learning > Week 03 — Optimisation"), "{:?}", l[0]);
         assert!(l[1].contains("BlackHole 2ch  #####---  transcribing"), "{:?}", l[1]);
         assert!(l[2].trim().chars().all(|c| c == '-') && l[4].contains(" | "), "{:?} {:?}", l[2], l[4]);
-        assert!(l[37].starts_with(" [] slide 3") && l[38].starts_with(" * hints"), "{:?} {:?}", l[37], l[38]);
+        assert!(l[37].starts_with(" [] slide 3") && l[38].starts_with(" * a hint, or Enter for a snapshot"), "{:?} {:?}", l[37], l[38]);
         assert_eq!(lines(drawn_with(40, 8, &v, None, &Theme::new(TRUE, false)).backend().buffer())[2], " 60x16 needed. Recording goes on.");
     }
 
@@ -1293,6 +1563,11 @@ mod tests {
 <!-- 10:41:52 -->\n## Sample statistic and parameter\n- The **statistic** is computed from the sample; the parameter belongs to the population.\n\
 - 標本平均 is the sample mean 🎓\n";
 
+    /// One moment for every test event, so the activity's times are the same in every run.
+    fn fixed() -> chrono::DateTime<Local> {
+        chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 10, 43, 5).unwrap()
+    }
+
     const PROVISIONAL: &str = "## Provisional heading\n- tentative words the model is still writing about quadrupling ";
     const REAL: &str = "\n<!-- 10:43:05 -->\n## Confidence intervals\n- An interval built to cover the mean in repeated samples.\n";
 
@@ -1307,7 +1582,7 @@ mod tests {
     }
 
     fn commit(v: &mut View, block: &str, revision: u64) {
-        v.reduce(&Event::Committed { words: 60, slides: 0, block: block.into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision }, Local::now());
+        v.reduce(&Event::Committed { words: 60, slides: 0, block: block.into(), usd: 0.02, confirmed: true, removed: 0, missing: 0, revision }, fixed());
     }
 
     /// The live lecture with its notes, the notes work in state `w`.
@@ -1316,9 +1591,9 @@ mod tests {
         use crate::tui::state::OwnOp;
         let mut v = live();
         v.merge(Hydration { notes: NotesSnapshot::At { revision: 1, document: NOTES.into() }, ..Hydration::empty() });
-        v.reduce(&Event::Slide { index: 17, file: "slides/slide_17_103941.png".into(), auto: true, uncertain: false, shown_at: chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 10, 39, 41).unwrap() }, Local::now());
+        v.reduce(&Event::Slide { index: 17, file: "slides/slide_17_103941.png".into(), auto: true, uncertain: false, shown_at: chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 10, 39, 41).unwrap() }, fixed());
         v.notice = None;
-        let preview = |v: &mut View| v.reduce(&Event::Preview(PROVISIONAL.into()), Local::now());
+        let preview = |v: &mut View| v.reduce(&Event::Preview(PROVISIONAL.into()), fixed());
         match w {
             Work::Committed => {}
             Work::Writing => {
@@ -1342,8 +1617,8 @@ mod tests {
             }
             Work::Page => {
                 v.work.submit(OwnOp::Polish);
-                v.reduce(&Event::NothingNew, Local::now());
-                v.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.04, revision: 2 }, Local::now());
+                v.reduce(&Event::NothingNew, fixed());
+                v.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.04, revision: 2 }, fixed());
                 v.work.submit(OwnOp::Snapshot);
                 v.work.submit(OwnOp::Snapshot);
             }
@@ -1356,7 +1631,8 @@ mod tests {
         let mut preview = Preview::default();
         preview.refresh(&v.notes, std::time::Instant::now());
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: None, focus, transcript: &Scroll::default(), preview: &preview, theme };
+        let scroll = Scroll::default();
+        let chrome = chrome(theme, &scroll, &preview, focus, None);
         terminal.draw(|f| {
             render(f, v, &chrome);
         })
@@ -1452,7 +1728,8 @@ mod tests {
         check(framed(w, h, &v, Pane::Transcript, &theme).backend().buffer());
         // the reactor refreshes before it draws; even a frame drawn with the old parse shows none of it
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let chrome = Chrome { elapsed: Duration::ZERO, refused: None, focus: Pane::Transcript, transcript: &Scroll::default(), preview: &stale, theme: &theme };
+        let scroll = Scroll::default();
+        let chrome = chrome(&theme, &scroll, &stale, Pane::Transcript, None);
         terminal.draw(|f| {
             render(f, &v, &chrome);
         })
@@ -1517,5 +1794,265 @@ mod tests {
         for (w, h) in TRANSCRIPT_SIZES {
             assert!(framed(w, h, &noted(Work::Writing), focus_for(w, h), &Theme::new(TRUE, true)).backend().buffer().content.iter().all(|c| c.bg == Color::Reset), "{w}×{h}: no background");
         }
+    }
+
+    // ---- the hint line, overlays and zoom (Task 10) -------------------------------------------
+
+    /// What the reactor's own state shows, for a test frame.
+    #[derive(Default)]
+    struct Look {
+        focus: Option<Pane>,
+        zoom: bool,
+        overlay: Overlay,
+        hint: Hint,
+        help: usize,
+        activity: ActivityScroll,
+        notes: NoteScroll,
+        refused: Option<&'static str>,
+    }
+
+    fn looked(w: u16, h: u16, v: &View, look: &Look, theme: &Theme) -> (Terminal<TestBackend>, Drawn) {
+        let mut preview = Preview::default();
+        preview.refresh(&v.notes, std::time::Instant::now());
+        let scroll = Scroll::default();
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: look.refused, focus: look.focus.unwrap_or(Pane::Transcript), zoom: look.zoom, transcript: &scroll, notes: &look.notes, preview: &preview, hint: &look.hint, overlay: look.overlay, activity: &look.activity, help: look.help, theme };
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut drawn = Drawn::default();
+        terminal.draw(|f| drawn = render(f, v, &chrome)).unwrap();
+        (terminal, drawn)
+    }
+
+    fn typed(text: &str) -> Hint {
+        let mut h = Hint::default();
+        h.paste(text).unwrap();
+        h
+    }
+
+    /// Plan Task 10: the cursor the frame sets is where `tui-input`'s `visual_cursor()` says, in
+    /// cells after the prompt's mark — for ASCII, CJK, emoji and combining marks — and the text
+    /// drawn before it takes exactly those cells. A hint longer than the field scrolls, and the
+    /// cursor never leaves the prompt's row or its width.
+    #[test]
+    fn the_cursor_sits_where_tui_input_counts_it() {
+        let theme = Theme::new(TRUE, true);
+        for text in ["focus on treatment differences", "機械学習の最適化", "🎓 graduation ❤\u{FE0F}", "cafe\u{301} na\u{303}o", "👩\u{200D}🔬 lab"] {
+            let look = Look { hint: typed(text), ..Look::default() };
+            let (mut t, _) = looked(110, 32, &view(Stage::Listening), &look, &theme);
+            let cursor = t.get_cursor_position().unwrap();
+            assert_eq!((cursor.x, cursor.y), (3 + look.hint.cursor() as u16, 30), "{text:?}");
+            let b = t.backend().buffer();
+            let (mut drawn, mut x) = (String::new(), 3);
+            while x < cursor.x {
+                let sym = b[(x, 30)].symbol();
+                drawn.push_str(sym);
+                x += (Span::raw(sym).width() as u16).max(1); // a wide glyph once, not its covered cell
+            }
+            assert_eq!(x, cursor.x, "{text:?}: the cursor lands after a whole glyph");
+            assert_eq!(drawn, text, "the cells before the cursor hold the hint exactly");
+        }
+        // longer than the field: the cursor stays inside it, on the last cell at most
+        for w in [60, 80, 140] {
+            let look = Look { hint: typed(&"漢字 and words ".repeat(20)), ..Look::default() };
+            let (mut t, _) = looked(w, 24, &view(Stage::Listening), &look, &theme);
+            let cursor = t.get_cursor_position().unwrap();
+            assert!(cursor.x >= 3 && cursor.x < w - 1 && cursor.y == 22, "{w}: {cursor:?}");
+            assert_eq!(cursor.x as usize, 3 + look.hint.cursor() - look.hint.scroll(w as usize - 4), "{w}");
+        }
+        // the empty field: the cursor waits at its start
+        let (mut t, _) = looked(110, 32, &view(Stage::Listening), &Look::default(), &theme);
+        assert_eq!(t.get_cursor_position().unwrap(), ratatui::layout::Position::new(3, 30));
+    }
+
+    /// The hint in ink after the teal mark; empty, the dim placeholder.
+    #[test]
+    fn the_hint_line_styles() {
+        let theme = Theme::new(TRUE, true);
+        let (t, _) = looked(110, 32, &view(Stage::Listening), &Look { hint: typed("focus on treatment"), ..Look::default() }, &theme);
+        let b = t.backend().buffer();
+        assert_eq!(b[(1, 30)].fg, TEAL);
+        assert_eq!((b[(3, 30)].symbol(), b[(3, 30)].modifier), ("f", Modifier::empty()));
+        let (t, _) = looked(110, 32, &view(Stage::Listening), &Look::default(), &theme);
+        assert_eq!(t.backend().buffer()[(3, 30)].modifier, Modifier::DIM);
+    }
+
+    /// The activity with enough history to have let some go.
+    fn busy_day() -> View {
+        let mut v = noted(Work::Committed);
+        for k in 0..510 {
+            v.reduce(&Event::Warning(format!("warning number {k}")), fixed());
+            if k % 7 == 0 {
+                v.reduce(&Event::Busy(format!("snapshot, {k} words to the model")), fixed());
+            }
+        }
+        commit(&mut v, REAL, 2);
+        v.reduce(&Event::SnapshotFailed("the model timed out after 600 s; everything is kept for the next one".into()), fixed());
+        v
+    }
+
+    /// Plan Task 10's goldens: the hint with content, help, activity, the notes and slides as the
+    /// shown tab in narrow, and the zoomed transcript and notes.
+    #[test]
+    fn goldens_for_the_hint_overlays_and_zoom() {
+        let theme = Theme::new(TRUE, true);
+        let hint = || typed("focus on treatment differences and the 95% interval");
+        for (w, h) in [(140, 40), (60, 16)] {
+            golden(&format!("hint_{w}x{h}"), &looked(w, h, &noted(Work::Writing), &Look { hint: hint(), ..Look::default() }, &theme).0);
+        }
+        for (w, h) in [(140, 40), (110, 32), (127, 36), (80, 25), (72, 45), (60, 16)] {
+            golden(&format!("help_{w}x{h}"), &looked(w, h, &noted(Work::Writing), &Look { overlay: Overlay::Help, ..Look::default() }, &theme).0);
+        }
+        for (w, h) in [(140, 40), (80, 25), (60, 16)] {
+            golden(&format!("activity_{w}x{h}"), &looked(w, h, &busy_day(), &Look { overlay: Overlay::Activity, ..Look::default() }, &theme).0);
+        }
+        for (w, h) in [(80, 25), (60, 16)] {
+            golden(&format!("narrow_notes_{w}x{h}"), &looked(w, h, &noted(Work::Writing), &Look { focus: Some(Pane::Notes), ..Look::default() }, &theme).0);
+            golden(&format!("narrow_slides_{w}x{h}"), &looked(w, h, &noted(Work::Writing), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme).0);
+        }
+        for (w, h) in [(110, 32), (72, 45)] {
+            golden(&format!("zoom_transcript_{w}x{h}"), &looked(w, h, &noted(Work::Writing), &Look { zoom: true, ..Look::default() }, &theme).0);
+        }
+        for (w, h) in [(140, 40), (80, 25)] {
+            golden(&format!("zoom_notes_{w}x{h}"), &looked(w, h, &noted(Work::Writing), &Look { zoom: true, focus: Some(Pane::Notes), ..Look::default() }, &theme).0);
+        }
+        golden("help_ascii_80x25", &looked(80, 25, &noted(Work::Writing), &Look { overlay: Overlay::Help, ..Look::default() }, &Theme::new(OFF, false)).0);
+        golden("activity_ascii_80x25", &looked(80, 25, &busy_day(), &Look { overlay: Overlay::Activity, ..Look::default() }, &Theme::new(OFF, false)).0);
+    }
+
+    /// The help overlay: one border at most 64 wide, centred in the body; the grammar, the groups,
+    /// the stop stages and the spend sentence; no capture key yet; it scrolls itself when taller
+    /// than the body, and says so.
+    #[test]
+    fn the_help_overlay() {
+        let theme = Theme::new(TRUE, true);
+        let (t, drawn) = looked(140, 40, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
+        let l = lines(t.backend().buffer());
+        let top = l.iter().position(|r| r.contains("┌─ Help ")).unwrap();
+        let bottom = l.iter().rposition(|r| r.contains('┘')).unwrap();
+        let x = l[top].find('┌').unwrap();
+        let width = l[top][x..].chars().position(|c| c == '┐').unwrap() + 1;
+        assert_eq!(width, 64);
+        assert_eq!(x - 1, (138 - 64) / 2, "centred in the body");
+        let text = l[top..=bottom].join("\n");
+        for want in ["Notes", "a snapshot now", "hint ⏎", "polish⏎", "^X", "Reading", "PgUp PgDn", "Tab ⇧Tab", "^T", "Slides", "App", "^O", "^G F1", "^L", "^Z", "Stopping", "^C once", "^C twice", "^C thrice", "Spend is this lecture's cost today;", "recording closes."] {
+            assert!(text.contains(want), "{want:?} in\n{text}");
+        }
+        let prose: String = l[top + 1..bottom].iter().map(|r| r.chars().skip(x + 2).take(60).collect::<String>().trim().to_string()).collect::<Vec<_>>().join(" ");
+        let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(prose.contains("stop waiting: recovery and queued requests wait for the next session; what runs now and the last snapshot still finish"), "stage 2 never claims to abort what runs: {prose}");
+        assert!(prose.contains("Spend is this lecture's cost today; speech-to-text is added when a recording closes."), "{prose}");
+        assert!(!text.contains("^S"));
+        assert_eq!(drawn.help_max, 0, "it all fits at 140×40");
+        assert!(l[bottom].contains("Esc closes"));
+        // small: it scrolls, and the border says there is more
+        let (t, drawn) = looked(60, 16, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
+        assert!(drawn.help_max > 0);
+        assert!(lines(t.backend().buffer()).iter().any(|r| r.contains("↑↓ more")));
+        let (t, _) = looked(60, 16, &view(Stage::Listening), &Look { overlay: Overlay::Help, help: drawn.help_max, ..Look::default() }, &theme);
+        let l = lines(t.backend().buffer());
+        assert!(l.iter().any(|r| r.contains("recording closes.")), "scrolled to the end: {l:?}");
+        // ASCII border
+        let (t, _) = looked(80, 25, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &Theme::new(OFF, false));
+        let l = lines(t.backend().buffer());
+        let top = l.iter().position(|r| r.contains("+- Help ")).unwrap();
+        let bottom = l.iter().rposition(|r| r.contains("more -+") || r.contains("closes -+")).unwrap();
+        assert!(l[top..=bottom].iter().all(|r| r.is_ascii()), "the box is ASCII (the lecture's own title never is transliterated): {l:?}");
+        assert!(l.iter().any(|r| r.contains("| Tab Shift-Tab  the next or previous pane")), "a key never runs into what it does: {l:?}");
+        // header, notice, prompt and keys stay
+        let (t, _) = looked(110, 32, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
+        let l = lines(t.backend().buffer());
+        assert!(l[0].contains("Listening") && l[30].starts_with(" ◆ ") && l[31] == " ↑↓ scroll   Esc close   ^C stop", "{:?}", &l[29..]);
+    }
+
+    /// The activity overlay fills the body: newest last, under their times, marked as the notice
+    /// line marks them; the first line says older records are gone once the ring has wrapped.
+    #[test]
+    fn the_activity_overlay() {
+        let theme = Theme::new(TRUE, true);
+        let v = busy_day();
+        let (t, drawn) = looked(140, 40, &v, &Look { overlay: Overlay::Activity, ..Look::default() }, &theme);
+        let b = t.backend().buffer().clone();
+        let l = lines(&b);
+        let body = drawn.activity.unwrap();
+        assert_eq!((body.x, body.width), (1, 138), "the whole width");
+        assert!(l[3].starts_with(" Activity"), "{:?}", l[3]);
+        let last = (body.bottom() - 1) as usize;
+        assert!(l[last].contains("▲ snapshot failed  the model timed out"), "newest last: {:?}", l[last]);
+        let (x, y) = at(&b, last as u16, "▲");
+        assert_eq!(b[(x, y)].fg, SIGNAL);
+        let (x, y) = at(&b, last as u16, "snapshot failed");
+        assert_eq!(b[(x, y)].modifier, Modifier::BOLD);
+        assert_eq!(b[(1, last as u16)].modifier, Modifier::DIM, "the time gutter");
+        let rows = l[body.y as usize..last + 1].join("\n");
+        assert!(rows.contains("… snapshot, "), "busy text as it was said");
+        // scrolled to the top: the first line says what is gone
+        let mut s = ActivityScroll::default();
+        let sign = |kind: &str| mark(kind, &theme);
+        assert!(s.apply(panes::Move::Up(100_000), &v.activity, body, &sign));
+        let (t, _) = looked(140, 40, &v, &Look { overlay: Overlay::Activity, activity: s, ..Look::default() }, &theme);
+        assert_eq!(lines(t.backend().buffer())[body.y as usize], format!(" {}", panes::OLDER_GONE));
+        // a ring that never wrapped says nothing of the kind
+        let (t, _) = looked(140, 40, &noted(Work::Committed), &Look { overlay: Overlay::Activity, ..Look::default() }, &theme);
+        assert!(!lines(t.backend().buffer()).join("\n").contains(panes::OLDER_GONE));
+        // ASCII marks
+        let (t, _) = looked(80, 25, &v, &Look { overlay: Overlay::Activity, ..Look::default() }, &Theme::new(OFF, false));
+        let l = lines(t.backend().buffer());
+        assert!(l.iter().any(|r| r.contains("! snapshot failed")) && l.iter().any(|r| r.contains("... snapshot,")), "{l:?}");
+    }
+
+    /// Ctrl-T: the focused pane fills the body — its heading names every pane — while the header,
+    /// notice, prompt and keys stay where they were; the breakpoints are the ladder's.
+    #[test]
+    fn zoom_fills_the_body_with_the_focused_pane() {
+        let theme = Theme::new(TRUE, true);
+        for (w, h) in [(140, 40), (110, 32), (72, 45), (80, 25), (60, 16)] {
+            for focus in [Pane::Transcript, Pane::Notes] {
+                let v = noted(Work::Writing);
+                let (t, drawn) = looked(w, h, &v, &Look { zoom: true, focus: Some(focus), ..Look::default() }, &theme);
+                let (plain, _) = looked(w, h, &v, &Look { focus: Some(focus), ..Look::default() }, &theme);
+                let (l, p) = (lines(t.backend().buffer()), lines(plain.backend().buffer()));
+                let body = if focus == Pane::Transcript { drawn.transcript } else { drawn.notes }.unwrap();
+                assert_eq!((body.x, body.width), (1, w - 2), "{w}×{h} {focus:?}: the whole width");
+                assert!(drawn.transcript.is_none() || drawn.notes.is_none(), "one pane");
+                assert_eq!(l[..2], p[..2], "{w}×{h}: the header stays");
+                assert_eq!(l[h as usize - 3..h as usize - 1], p[h as usize - 3..h as usize - 1], "{w}×{h}: the notice and the prompt stay");
+                assert!(l[h as usize - 1].contains("^T back") && l[h as usize - 1].ends_with("^C stop"), "{w}×{h}: the keys say how to go back: {:?}", l[h as usize - 1]);
+                assert!(!l.join("").contains('│') || focus == Pane::Notes, "{w}×{h}: no column rule");
+            }
+        }
+        let (t, _) = looked(110, 32, &noted(Work::Writing), &Look { zoom: true, ..Look::default() }, &theme);
+        let l = lines(t.backend().buffer());
+        assert!(l[3].starts_with(" Transcript   Notes   Slides"), "{:?}", l[3]);
+        assert_eq!(layout(Rect::new(0, 0, 110, 32)).variant, Variant::Normal, "the ladder is unchanged");
+    }
+
+    /// Narrow shows only the focused pane; Slides is a placeholder until Task 11.
+    #[test]
+    fn narrow_shows_the_focused_pane() {
+        let theme = Theme::new(TRUE, true);
+        let (t, d) = looked(80, 25, &noted(Work::Writing), &Look { focus: Some(Pane::Slides), ..Look::default() }, &theme);
+        let l = lines(t.backend().buffer());
+        assert!(l[3].contains("Slides show here.") && d.transcript.is_none() && d.notes.is_none());
+        let (x, y) = at(t.backend().buffer(), 2, "Slides 1");
+        assert_eq!(t.backend().buffer()[(x, y)].fg, TEAL);
+    }
+
+    /// A scrolled notes pane says the way back in its heading.
+    #[test]
+    fn scrolled_notes_say_esc_live() {
+        let theme = Theme::new(TRUE, true);
+        let v = noted(Work::Writing);
+        let (_, drawn) = looked(80, 25, &v, &Look { focus: Some(Pane::Notes), ..Look::default() }, &theme);
+        let mut notes = NoteScroll::default();
+        let mut preview = Preview::default();
+        preview.refresh(&v.notes, std::time::Instant::now());
+        assert!(notes.apply(panes::Move::Up(3), &v, &preview, drawn.notes.unwrap()));
+        let (t, _) = looked(80, 25, &v, &Look { focus: Some(Pane::Notes), notes, ..Look::default() }, &theme);
+        assert!(lines(t.backend().buffer())[2].ends_with("snapshot: writing   Esc live"), "{:?}", lines(t.backend().buffer())[2]);
+    }
+
+    /// Both bullet glyphs are one cell: the notes walker counts them as one.
+    #[test]
+    fn bullets_are_one_cell() {
+        assert_eq!((Span::raw(UNICODE.bullet).width(), Span::raw(ASCII.bullet).width()), (1, 1));
     }
 }

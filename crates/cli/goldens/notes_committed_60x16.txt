@@ -12,5 +12,5 @@
 "             parameter belongs to the population.           "
 "           • 標本平均 is the sample mean 🎓                 " Hidden by multi-width symbols: [(14, " "), (16, " "), (18, " "), (20, " "), (42, " ")]
 "                                                            "
-" ◆ hints and snapshots are not taken here yet               "
-" ^L redraw   ^C stop                                        "
+" ◆ a hint, or ⏎ for a snapshot                              "
+" ⏎ snapshot   polish⏎   Tab pane   ^G help   ^C stop        "

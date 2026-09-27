@@ -21,6 +21,7 @@ lecturelive-core = { path = "../core" }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tui-input = { version = "0.15.4", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2.2"
 
 [dev-dependencies]

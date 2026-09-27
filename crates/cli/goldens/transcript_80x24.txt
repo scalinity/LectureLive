@@ -20,5 +20,5 @@
 "         ▎ The denominator changes with the square root of n, so quadrupling    "
 "         ▎ the sample only halves                                               "
 "                                                                                "
-" ◆ hints and snapshots are not taken here yet                                   "
-" ^L redraw   ^C stop                                                            "
+" ◆ a hint, or ⏎ for a snapshot                                                  "
+" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^G help   ^C stop              "

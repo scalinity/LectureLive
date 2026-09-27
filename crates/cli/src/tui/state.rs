@@ -125,8 +125,6 @@ impl Notes {
 }
 
 /// A notes request this TUI submitted (plan §F work lanes): its own, in the order core runs them.
-/// The hint line (Task 10) submits them; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnOp {
     Snapshot,
@@ -165,9 +163,6 @@ pub(crate) struct Work {
     page: bool,
 }
 
-// Submitting, cancelling and hurrying are the hint line's (Task 10); until it lands only the tests
-// drive them.
-#[cfg_attr(not(test), allow(dead_code))]
 impl Work {
     /// An op the frontend has sent: queued behind whatever is in flight, with no limit.
     pub(crate) fn submit(&mut self, op: OwnOp) {
@@ -264,9 +259,11 @@ pub(crate) struct Activity {
     pub(crate) detail: String,
 }
 
-/// The activity ring: at most [`Ring::CAPACITY`] records, the oldest falling off (plan §F).
+/// The activity ring: at most [`Ring::CAPACITY`] records, the oldest falling off (plan §F), and
+/// how many have fallen off — so each record has a number that never changes while it is kept,
+/// and the overlay can say that older ones are gone.
 #[derive(Debug, Default)]
-pub(crate) struct Ring(VecDeque<Activity>);
+pub(crate) struct Ring(VecDeque<Activity>, u64);
 
 impl Ring {
     pub(crate) const CAPACITY: usize = 500;
@@ -275,11 +272,25 @@ impl Ring {
         self.0.push_back(a);
         while self.0.len() > Self::CAPACITY {
             self.0.pop_front();
+            self.1 += 1;
         }
     }
 
-    /// The ring's readers exist for the tests and the activity overlay (Task 10): the Task-6 view
-    /// does not yet read the ring back.
+    /// Records have been discarded: the ring no longer starts at the session's first.
+    pub(crate) fn wrapped(&self) -> bool {
+        self.1 > 0
+    }
+
+    /// The number of the oldest record kept; each later one is one more.
+    pub(crate) fn first(&self) -> u64 {
+        self.1
+    }
+
+    /// The records kept, oldest first.
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &Activity> + ExactSizeIterator {
+        self.0.iter()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -1156,6 +1167,9 @@ mod tests {
         assert_eq!(v.activity.len(), Ring::CAPACITY);
         assert_eq!(v.activity.records().front().unwrap().detail, "number 2", "the oldest fell off");
         assert_eq!(v.activity.records().back().unwrap().detail, "number 501");
+        assert!(v.activity.wrapped(), "it knows older records were discarded");
+        assert_eq!(v.activity.first(), 2, "two fell off; the oldest kept is the third");
+        assert!(!view().activity.wrapped());
     }
 
     /// The projection's boundary cleans (plan §C 12): transcript text, open utterances, previews,

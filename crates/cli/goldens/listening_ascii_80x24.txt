@@ -20,5 +20,5 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-" * hints and snapshots are not taken here yet                                   "
-" ^L redraw   ^C stop                                                            "
+" * a hint, or Enter for a snapshot                                              "
+" Enter snapshot   polish Enter   Tab pane   ^O activity   ^G help   ^C stop     "
