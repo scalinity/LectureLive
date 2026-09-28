@@ -394,6 +394,11 @@ async fn burst_session(files: &LectureFiles, mut commands: UnboundedReceiver<Com
     let mut revision = Sidecar::load(&files.sidecar())?.map_or(0, |sc| sc.notes.revision);
     let base = Local::now();
     let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected)));
+    // the active burst begins exactly here: the marker is on disk before the stream's clock starts
+    let _ = std::fs::create_dir_all(files.state_dir());
+    let _ = std::fs::write(files.state_dir().join(BURST_STARTED), base.to_rfc3339());
+    #[cfg(test)]
+    burst_boundary(true);
     let t0 = Instant::now();
     let (mut sent, mut stopped) = (0u64, false);
     for delta in 0..BURST_DELTAS {
@@ -420,6 +425,11 @@ async fn burst_session(files: &LectureFiles, mut commands: UnboundedReceiver<Com
             let _ = events.send(Event::Session(Notification::Segment(s)));
         }
     }
+    // the active burst ends exactly here: its last delta is sent, and everything after this is the
+    // quiet post-burst state no measurement of the burst may include
+    let _ = std::fs::write(files.state_dir().join(BURST_FINISHED), sent.to_string());
+    #[cfg(test)]
+    burst_boundary(false);
     revision += 1;
     let _ = events.send(Event::Committed { words: BURST_SPEECH as usize * 10, slides: 0, block: format!("\n<!-- {} -->\n## The burst's notes\n\n- 5,000 deltas folded into one canonical commit.\n", base.format("%H:%M:%S")), usd: 0.01, confirmed: true, removed: 0, missing: 0, revision });
     let _ = events.send(Event::Warning("the scripted burst is complete and now quiet".into()));
@@ -434,6 +444,31 @@ async fn burst_session(files: &LectureFiles, mut commands: UnboundedReceiver<Com
     tokio::time::sleep(Duration::from_millis(200)).await;
     let speech = sent / (BURST_PER_SECOND / 2); // one closed segment per 500 ms of burst delivered
     Ok(StopReport { segments: speech, ..Default::default() })
+}
+
+/// The `burst` scenario's active-interval markers (plan Task 13's remediation): written into the
+/// lecture folder the test made — `started` immediately before the 5,000-delta stream begins its
+/// clock, `finished` immediately after its last delta has been sent — so a process-level harness
+/// can measure exactly the active burst, never the load-in or the quiet after it. Fixture
+/// artifacts only: never canonical lecture state, never production data.
+pub(crate) const BURST_STARTED: &str = "fixture-burst-started";
+pub(crate) const BURST_FINISHED: &str = "fixture-burst-finished";
+
+// The same boundaries for an in-process test (plan Task 13's remediation): recorded where the
+// burst itself begins and ends, at the source, so the reactor benchmarks filter their samples
+// by the fixture's own active interval instead of positional guesses. Test-only, and never
+// compiled into a build without test assertions; a current-thread runtime keeps the fixture and
+// its reader on one thread, which is what makes the observer exact rather than a shared global.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BURST_INTERVAL: std::cell::RefCell<Vec<(bool, std::time::Instant)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The burst's boundary as the fixture crossed it: `(began, when)`. Test-only instrumentation:
+/// nothing in production reads it, and no measurement depends on it outside tests.
+#[cfg(test)]
+fn burst_boundary(began: bool) {
+    BURST_INTERVAL.with(|b| b.borrow_mut().push((began, std::time::Instant::now())));
 }
 
 /// Runs `scenario` until the first `Stop`: then `SourceEnded`, and the end 200 ms later. Segment ids

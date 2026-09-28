@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
-use support::pty::{visible, Pty};
+use support::pty::Pty;
 
 const CTRL_C: &[u8] = b"\x03";
 /// Start-up (folder, `prepare`) to the first frame; generous for a loaded machine.
@@ -32,6 +32,9 @@ const LOADED: &str = "quiet";
 /// which is the point.
 struct Lecture {
     pty: Pty,
+    /// The lecture folder the child was given, so a test can watch the fixture's own
+    /// synchronization markers inside it (Task 13's remediation: the burst's active interval).
+    dir: PathBuf,
     /// Where the wrapper, if any, wrote its report.
     report: Option<PathBuf>,
     /// The temporary root holding the scratch `HOME` and the lecture folder, for the drop.
@@ -70,7 +73,19 @@ fn tui(wrapped_in: Option<&[&str]>, scenario: &str, cols: u16, rows: u16) -> Lec
         .env("LECTURELIVE_CLI_FIXTURE", scenario)
         .current_dir(&home);
     pty.spawn(cmd);
-    Lecture { pty, report, _tmp: tmp }
+    Lecture { pty, dir, report, _tmp: tmp }
+}
+
+impl Lecture {
+    /// The fixture's own marker inside the lecture folder it was given, once it exists. The
+    /// burst fixture writes `fixture-burst-started` immediately before its 5,000-delta clock
+    /// starts and `fixture-burst-finished` immediately after its last delta is sent, so a
+    /// harness can measure the active burst itself — never the load-in, never the quiet after.
+    fn marker(&self, name: &str) -> Option<std::time::SystemTime> {
+        let path = self.dir.join(".live_notes").join(name);
+        let meta = std::fs::metadata(path).ok()?;
+        meta.modified().ok()
+    }
 }
 
 /// Ends the session with one Ctrl-C and requires the clean exit 0 of a stopped lecture.
@@ -141,34 +156,83 @@ fn perf_cpu_ordinary() {
     assert!(mean < 5.0, "ordinary-stream CPU mean {mean:.2}% is not under 5% of one core");
 }
 
-/// CPU, burst (plan §L): the canonical burst is exactly 5,000 deltas at 500/s — ten seconds — and
-/// is never inflated. Thirty seconds of active sampling come from three independent runs, each
-/// sampled only during its own burst: the fixed rule, first sample one second after the session is
-/// up, ten samples a second apart, the same rule for every run. The combined mean of the thirty
-/// samples must stay under 20 % of a core.
+/// CPU, burst (plan §L, Task 13's remediation): the canonical burst is exactly 5,000 deltas at
+/// 500/s — ten seconds — and is never inflated. Thirty seconds of active sampling come from three
+/// independent runs, and every sample is demonstrably inside its own run's active burst: the
+/// fixture writes `fixture-burst-started` into the lecture folder immediately before its delta
+/// clock starts and `fixture-burst-finished` immediately after its last delta, and this harness
+/// reads both markers' own timestamps (the same system clock) to bound every `ps` sample in
+/// `[started, finished)`. The earlier harness slept once here *and* again inside its sampler,
+/// which pushed the first sample to ≈2 s and could have run past the end of the burst into the
+/// quiet after it; the schedule is now owned here alone: sample as soon as the burst starts, then
+/// once a second, and never after the finish marker appears. No sample is dropped afterwards.
 #[test]
 #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
 fn perf_cpu_burst() {
-    let mut all: Vec<f64> = Vec::with_capacity(30);
-    let mut run_means = Vec::with_capacity(3);
-    for run in 0..3 {
+    const RUNS: usize = 3;
+    const WANT: usize = 10; // one per second of a ten-second burst
+    let mut all: Vec<f64> = Vec::with_capacity(RUNS * WANT);
+    let mut run_means = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
         let mut l = tui(None, "burst", 140, 40);
-        l.pty.wait_for("Listening", 0, START);
+        l.pty.wait_for("Listening", 0, START); // the session is up; the burst's own clock is not yet
         let pid = l.pty.pid().as_raw_nonzero().get() as u32;
-        // the burst runs from the session's start: t = 1 s … t = 10 s is inside it, every run
-        std::thread::sleep(Duration::from_secs(1));
-        let samples = sample_cpu(pid, 10);
+
+        // the burst's own start, taken from the fixture's marker — never "Listening", never a sleep
+        let start = wait_for_marker(&l, "fixture-burst-started", START);
+        let mut samples: Vec<(std::time::SystemTime, f64)> = Vec::with_capacity(WANT);
+        let mut next = std::time::Instant::now();
+        for k in 0..WANT {
+            // schedule only, never sleep twice: the sampler's own sleep is the whole delay
+            let at = next;
+            let left = at.saturating_duration_since(std::time::Instant::now());
+            if !left.is_zero() {
+                std::thread::sleep(left);
+            }
+            next += Duration::from_secs(1);
+            // the interval is re-checked at the moment of the sample: once the fixture has
+            // finished, no further sample is taken, so no quiet sample can enter the mean
+            if l.marker("fixture-burst-finished").is_some() {
+                break;
+            }
+            let took = std::time::SystemTime::now();
+            if took < start {
+                continue; // not yet inside the active interval
+            }
+            let cpu = ps_cpu(pid);
+            println!("PERF burst_run{run}_sample{k}_offset_ms={:.3} cpu_pct={cpu}", took.duration_since(start).unwrap().as_secs_f64() * 1e3);
+            samples.push((took, cpu));
+        }
         stop_cleanly(&mut l);
-        let mean = mean(&samples);
-        run_means.push(mean);
-        println!("PERF burst_run{run}_cpu_pct={mean:.2}");
-        all.extend(samples);
+
+        let finished = l.marker("fixture-burst-finished").expect("the burst fixture wrote its finish marker");
+        let inside: Vec<f64> = samples.iter().filter(|(at, _)| *at >= start && *at < finished).map(|(_, c)| *c).collect();
+        assert!(inside.len() >= 8, "run {run} took only {} samples inside its active burst", inside.len());
+        assert_eq!(inside.len(), samples.len(), "every sample was inside the active interval, none after the finish");
+        let run_mean = mean(&inside);
+        run_means.push(run_mean);
+        println!("PERF burst_run{run}_cpu_pct={run_mean:.2}");
+        all.extend(inside);
     }
     let combined = mean(&all);
     println!("PERF burst_cpu_pct={combined:.2}");
     println!("PERF burst_cpu_samples_n={}", all.len());
-    assert_eq!(all.len(), 30, "three runs of ten active samples each");
+    assert_eq!(all.len(), RUNS * WANT, "three runs of ten active-burst samples each");
     assert!(combined < 20.0, "burst CPU mean {combined:.2}% is not under 20% of one core (runs: {run_means:?})");
+}
+
+/// Waits for the fixture's marker and returns the instant the fixture recorded for it (the
+/// file's own modification time, on the same system clock as this process), so offsets are
+/// measured from the burst itself and not from when this harness happened to notice.
+fn wait_for_marker(l: &Lecture, name: &str, within: Duration) -> std::time::SystemTime {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(at) = l.marker(name) {
+            return at;
+        }
+        assert!(std::time::Instant::now() < deadline, "{name} never appeared within {within:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// Maximum RSS, stress fixture (plan §L): `/usr/bin/time -l` around the `lecturelive` child while

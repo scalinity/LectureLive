@@ -1961,13 +1961,12 @@ mod task13 {
         }
     }
 
-    /// The gate a slow backend holds its draw in: entry is published, and the draw waits — for the
-    /// test's release, or a bound far longer than any flush — so the test knows, never guesses,
-    /// when the reactor is inside the flush and when it came out. The release is the test's own
-    /// and comes only after every send has returned, so the producer provably finished while the
-    /// flush still held the reactor; the bound (a 500 ms flush, padded so a test binary running
-    /// its whole suite around this proof cannot deschedule the producer past the flush's own end)
-    /// only keeps a broken test from hanging.
+    /// The gate a slow backend holds its draw in: entry is published, and the draw blocks **until
+    /// the test releases it** — the five-second bound below is only a hang guard for a broken
+    /// test, never the proof. Because the release is the test's own and happens only after every
+    /// send has returned, the producer provably finished while the draw still held the reactor,
+    /// and the test observes entry and completion from this state rather than from elapsed time:
+    /// no sleep, and no wall-clock budget, is part of this proof.
     #[derive(Default)]
     struct FlushGate {
         entered: AtomicBool,
@@ -2204,14 +2203,33 @@ mod task13 {
                 tokio::time::sleep(Duration::from_micros(200)).await;
             }
         }
+
+        /// The first draw that both began after `before` entries existed **and** started no
+        /// earlier than `floor`: a key can never be measured against a frame that was already
+        /// painting when the key was sent, so a latency is never measured to a negative or to a
+        /// frame the key did not cause.
+        async fn next_draw_after(&self, before: usize, floor: std::time::Instant, within: Duration) -> std::time::Instant {
+            let deadline = std::time::Instant::now() + within;
+            loop {
+                let draws = self.draws();
+                if let Some(at) = draws[before..].iter().map(|(at, _)| *at).find(|at| *at >= floor) {
+                    return at;
+                }
+                assert!(std::time::Instant::now() < deadline, "no draw came within {within:?}");
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+        }
     }
 
     // ---- the slow terminal (a correctness proof, not a timing benchmark) ------------------------
 
-    /// Plan Task 13: a terminal whose flush blocks holds nothing up. While the reactor is inside a
-    /// blocked flush, exactly 3,000 events — a four-event cycle 750 times: Segment, Preview,
-    /// Committed, Level — all enter the unbounded event channel production uses, and every send
-    /// returns before the flush is released: that is the proof, not a timing budget. Afterwards
+    /// Plan Task 13: a terminal whose draw blocks holds nothing up. The test backend's `draw`
+    /// waits on [`FlushGate`] and is released only by the test itself, so the reactor is held
+    /// inside its frame for exactly as long as the test needs — not for any fixed interval.
+    /// While the reactor is blocked there, exactly 3,000 events — a four-event cycle 750 times:
+    /// Segment, Preview, Committed, Level — all enter the unbounded event channel production
+    /// uses, and every send returns before the test releases the draw: that ordering, observed
+    /// through the gate's own state, is the proof, never a timing budget or a sleep. Afterwards
     /// the view holds all of it: every segment once and in order, every commit revision, the
     /// preview the last commit ended, and the last level's value.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2317,38 +2335,43 @@ mod task13 {
 
     // ---- frame-work p95, the burst through the real reactor --------------------------------------
 
-    /// Waits until the draw rate settles to the 1 Hz clock's (the burst is over), or panics on the
-    /// deadline: a 1.5 s window that gained at most three draws, twice in a row. The burst draws
-    /// at least ten times a second while it runs; only the clock remains after it.
-    async fn wait_until_draws_settle(r: &Reactor, within: Duration) {
+    /// The burst's own active interval, as the fixture recorded it at the source: the instant
+    /// immediately before its 5,000-delta clock starts, and the instant immediately after its last
+    /// delta has been sent (plan Task 13's remediation). Read from the fixture's test-only
+    /// observer — same thread, as the current-thread runtime runs the fixture and this test — so
+    /// nothing here is a settling heuristic, a sleep, or a positional guess.
+    async fn burst_interval(within: Duration) -> (std::time::Instant, std::time::Instant) {
         let deadline = std::time::Instant::now() + within;
-        let mut was = 0usize;
-        let mut calm = 0;
         loop {
-            assert!(std::time::Instant::now() < deadline, "the burst never settled");
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
-            let now = r.draws().len();
-            calm = if now - was <= 3 { calm + 1 } else { 0 };
-            was = now;
-            if calm >= 2 {
-                return;
+            let marks = fixture::BURST_INTERVAL.with(|m| m.borrow().clone());
+            if let (Some((true, start)), Some((false, end))) = (marks.first(), marks.iter().find(|(began, _)| !*began)) {
+                let (start, end) = (*start, *end);
+                assert!(end > start, "the burst finished before it started: {start:?} … {end:?}");
+                return (start, end);
             }
+            assert!(std::time::Instant::now() < deadline, "the fixture never reported its burst interval");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
     /// The burst through the real generic reactor (plan Task 13): the fixture paces its 5,000
     /// deltas at 500/s, the adapter forwards them as production's capture adapter does, and the
-    /// surface times each actual draw. The predeclared exclusion rule: the first three draws — the
-    /// session's initial paint, before any delta has landed — are dropped; every draw after them
-    /// counts. The preview's presentation parses are counted where they happen (panes::PRESENTED)
-    /// and gated at ≤10 a second over the burst, in half-open one-second windows.
+    /// surface times each actual draw. The sample is exactly the active burst — every draw that
+    /// started at or after the fixture's own start instant and before its own finish instant, and
+    /// no other: the session's first paint, the pre-burst load and the quiet frames after it are
+    /// all outside by construction, never by position. The preview's presentation parses are
+    /// counted where they happen (panes::PRESENTED), over that same interval, and gated at ≤10 a
+    /// second in half-open one-second windows.
     #[tokio::test]
     #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
     async fn perf_burst_frame_work_p95() {
         let mut runs: Vec<Vec<Duration>> = Vec::new();
         let mut worst_hz_window = 0usize;
         for run in 0..3 {
+            // each run measures its own burst: the observer and the parse probe start empty, so a
+            // run can never read the previous run's interval
             crate::tui::panes::PRESENTED.with(|p| p.borrow_mut().clear());
+            fixture::BURST_INTERVAL.with(|m| m.borrow_mut().clear());
             let probe: Probe = Arc::new(Mutex::new(Vec::new()));
             let r = reactor_on(
                 ProbeSurface { terminal: ratatui::Terminal::new(TestBackend::new(140, 40)).unwrap(), probe: probe.clone() },
@@ -2376,20 +2399,21 @@ mod task13 {
                     (engine, None)
                 },
             );
-            wait_until_draws_settle(&r, Duration::from_secs(90)).await;
+            let (burst_started, burst_finished) = burst_interval(Duration::from_secs(90)).await;
             let draws = r.draws();
             let _ = r.commands.send(Command::Stop);
             let (exit, ui) = r.finish().await;
             assert!(matches!(exit, Exit::Ended(_)), "the burst ended as the test stopped it");
             assert_eq!(ui.events, (fixture::BURST_DELTAS + fixture::BURST_SPEECH as usize + 4) as u64, "the whole burst: 5,000 deltas, 20 segments, the connection, the commit, its marker and the SourceEnded the drain takes");
-            // draw work: every draw after the first three (the initial paint)
-            runs.push(draws.iter().skip(3).map(|(_, d)| *d).collect());
-            // preview presentation: parses per half-open second over the burst, never the deltas
-            let parses = crate::tui::panes::PRESENTED.with(|p| p.borrow().clone());
+            // draw work: exactly the active burst, by the fixture's own instants
+            let active: Vec<Duration> = draws.iter().filter(|(at, _)| *at >= burst_started && *at < burst_finished).map(|(_, d)| *d).collect();
+            assert!(active.len() >= 50, "run {run} drew only {} frames inside the active burst ({burst_started:?} … {burst_finished:?})", active.len());
+            runs.push(active);
+            // preview presentation: the same active interval, never the incoming deltas
+            let parses: Vec<std::time::Instant> = crate::tui::panes::PRESENTED.with(|p| p.borrow().clone()).into_iter().filter(|at| *at >= burst_started && *at < burst_finished).collect();
             assert!(!parses.is_empty(), "the preview was presented");
-            let t0 = parses[0];
-            let span = *parses.last().unwrap() - t0;
-            let (window, hz) = per_second(&parses, t0, span + Duration::from_secs(1));
+            let (window, hz) = per_second(&parses, burst_started, burst_finished - burst_started);
+            println!("PERF burst_run{run}_active_draws={} burst_s={:.3}", runs[run].len(), (burst_finished - burst_started).as_secs_f64());
             println!("PERF burst_run{run}_preview_parses={} mean_hz={:.2} max_per_s={window}", parses.len(), hz);
             worst_hz_window = worst_hz_window.max(window);
         }
@@ -2401,28 +2425,33 @@ mod task13 {
 
     // ---- key-to-draw latency ----------------------------------------------------------------------
 
-    /// Plan Task 13: from the moment a key is sent into the synthetic keyboard stream to the start
-    /// of the first draw after the reactor processed it — one key at a time (each sample waits for
-    /// its own draw, so no draw is ever guessed to belong to a key), 100 samples a repetition,
-    /// three repetitions, gate on the worst p95. The keys are visible edits of the hint line,
-    /// sent at a person's typing cadence (deterministic 30–130 ms between keys, 8–33 a second):
-    /// the one-at-a-time rule exists to disambiguate draws, and the cadence samples the phases a
-    /// typist's keys actually meet — mid-frame keys wait for the boundary, keys past it draw at
-    /// once. (The back-to-back worst phase — a key the instant the frame before began — is the
-    /// frame cap itself and is recorded separately in the ledger: its p50 is FRAME exactly.)
+    /// Plan Task 13's corrected key-to-draw measurement: the **whole** 50 ms frame phase, not a
+    /// favoured part of it. The earlier harness slept 30–130 ms after each draw, so nearly every
+    /// key arrived past the 50 ms throttle deadline and drew at once — which measured the lucky
+    /// phases only. Here each sample reads the exact previous draw start from the surface, then
+    /// sends its key at a deterministic intended phase from that instant — 1 ms through 49 ms,
+    /// cycled over the 100 samples, so the phases are spread across the whole period — and waits
+    /// for its own draw. The latency is measured from the actual send, and the achieved phase is
+    /// recorded as evidence rather than assumed; the intended schedule is never used to skip a
+    /// sample. Keys are visible hint edits (a character, then Backspace): no command, no stop.
     #[tokio::test]
     #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
     async fn perf_key_to_draw_p95() {
+        const SAMPLES: usize = 100;
         let mut runs: Vec<Vec<Duration>> = Vec::new();
-        for run in 0..3u64 {
+        let mut achieved: Vec<Duration> = Vec::new();
+        for _run in 0..3 {
             let r = reactor(140, 40, view_of(&fixture::two_hour_events(0, 0)), false);
             r.next_draw(0, Duration::from_secs(5)).await; // the first frame is up
-            let mut samples = Vec::with_capacity(100);
-            let mut lcg = 0x2545F4914F6CDD1Du64 ^ run; // deterministic per run, no timing randomness
-            for k in 0..100u32 {
-                let gap = Duration::from_millis(30 + (lcg % 100));
-                lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-                tokio::time::sleep(gap).await;
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for k in 0..SAMPLES {
+                // the prior draw's exact start, as the surface recorded it: the phase reference
+                let prior = r.draws().last().expect("a frame is up").0;
+                let want = Duration::from_millis(1 + (k % 49) as u64);
+                let at = prior + want;
+                if at > std::time::Instant::now() {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                }
                 let before = r.draws().len();
                 let key = if k % 2 == 0 {
                     KeyEvent::new(KeyCode::Char((b'a' + (k % 26) as u8) as char), KeyModifiers::NONE)
@@ -2431,14 +2460,52 @@ mod task13 {
                 };
                 let sent = std::time::Instant::now();
                 r.keys.send(Ok(TermEvent::Key(key))).unwrap();
-                let drew = r.next_draw(before, Duration::from_secs(5)).await;
+                let drew = r.next_draw_after(before, sent, Duration::from_secs(5)).await;
+                achieved.push(sent - prior);
                 samples.push(drew - sent);
             }
             runs.push(samples);
             r.finish().await;
         }
+        // the phases actually reached, as evidence: their range and spread across the frame period
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let (lo, hi) = (achieved.iter().copied().min().unwrap(), achieved.iter().copied().max().unwrap());
+        let mut sorted = achieved.clone();
+        sorted.sort();
+        println!("PERF key_phase_achieved_min_ms={:.3} p50_ms={:.3} max_ms={:.3}", ms(lo), ms(sorted[sorted.len() / 2]), ms(hi));
         let worst = summarize("key_to_draw", &runs);
-        assert!(worst <= Duration::from_millis(50), "key-to-draw p95 {worst:?} exceeds the 50 ms budget");
+        assert!(worst <= Duration::from_millis(50), "key-to-draw p95 {worst:?} exceeds the 50 ms budget (phases reached: {lo:?} … {hi:?})");
+    }
+
+    /// The draw-start anchored scheduler itself, pinned (plan Task 13's remediation): every
+    /// consecutive pair of draw starts is at least [`FRAME`] apart. The ≤ 20 draws a second the
+    /// plan caps is therefore the scheduler's own invariant, proved directly, not only through
+    /// an aligned one-second window in a timing test.
+    #[tokio::test]
+    async fn draw_start_spacing_holds_the_frame_cap() {
+        let r = reactor(140, 40, view_of(&fixture::two_hour_events(0, 0)), false);
+        r.next_draw(0, Duration::from_secs(5)).await;
+        // a dozen accepted keys, each demanding its own frame
+        for k in 0..12u32 {
+            let before = r.draws().len();
+            let key = if k % 2 == 0 {
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            } else {
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            };
+            r.keys.send(Ok(TermEvent::Key(key))).unwrap();
+            r.next_draw(before, Duration::from_secs(5)).await;
+        }
+        let draws = r.draws();
+        r.finish().await;
+        assert!(draws.len() >= 12, "the keys produced {} frames", draws.len());
+        let mut smallest = Duration::MAX;
+        for pair in draws.windows(2) {
+            let gap = pair[1].0 - pair[0].0;
+            assert!(gap >= FRAME, "draws {} ms apart: below the {FRAME:?} frame cap", gap.as_secs_f64() * 1e3);
+            smallest = smallest.min(gap);
+        }
+        println!("PERF draw_start_min_gap_ms={:.3}", smallest.as_secs_f64() * 1e3);
     }
 
     // ---- event-to-draw latency ---------------------------------------------------------------------
