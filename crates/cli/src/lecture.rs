@@ -104,11 +104,13 @@ pub(crate) fn source_for(uid: &str) -> Box<dyn Source> {
     }
 }
 
-/// The frontend a live lecture shows itself in (plan §H).
+/// The frontend a live lecture shows itself in (plan §H). The TUI carries whether it was asked for
+/// by name: only an explicit `--tui` treats a terminal that cannot be taken over as an error, while
+/// an automatically chosen one says so and continues in plain (plan §G).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Plain,
-    Tui,
+    Tui { explicit: bool },
 }
 
 /// Which of the standard streams are terminals.
@@ -116,7 +118,6 @@ enum Mode {
 struct Ttys {
     stdin: bool,
     stdout: bool,
-    #[allow(dead_code)] // read by the automatic choice once the TUI becomes the default (plan Task 16)
     stderr: bool,
 }
 
@@ -127,18 +128,27 @@ impl Ttys {
     }
 }
 
-/// The frontend from the flags and the terminal (plan §H). Without a flag it is plain until the TUI is the default.
-/// `--tui` also needs stdin to be a terminal: the stdin grammar, and crossterm cannot read `/dev/tty` on macOS.
+/// A `TERM` the terminal frontend can draw on.
+fn drawable(term: Option<&str>) -> bool {
+    term.is_some_and(|t| t != "dumb")
+}
+
+/// The frontend from the flags and the terminal (plan §H).
+///
+/// With neither flag the terminal decides: the TUI where it can take all three streams and draw on
+/// it, plain everywhere else — a redirected stream or a `TERM` that cannot draw is a plain lecture
+/// by selection, never an error. An explicit `--tui` also needs stdin to be a terminal: the stdin
+/// grammar, and crossterm cannot read `/dev/tty` on macOS; stderr never decides either way.
 fn choose_mode(tui: bool, plain: bool, ttys: Ttys, term: Option<&str>) -> Result<Mode> {
-    if plain || !tui {
+    if plain {
         return Ok(Mode::Plain);
     }
-    anyhow::ensure!(ttys.stdin && ttys.stdout, "--tui needs a terminal on stdin and stdout");
-    match term {
-        None => anyhow::bail!("--tui needs a terminal that can draw: TERM is not set"),
-        Some("dumb") => anyhow::bail!("--tui needs a terminal that can draw: TERM is dumb"),
-        Some(_) => Ok(Mode::Tui),
+    if !tui {
+        return Ok(if ttys.stdin && ttys.stdout && ttys.stderr && drawable(term) { Mode::Tui { explicit: false } } else { Mode::Plain });
     }
+    anyhow::ensure!(ttys.stdin && ttys.stdout, "--tui needs a terminal on stdin and stdout");
+    anyhow::ensure!(drawable(term), "--tui needs a terminal that can draw: TERM is {}", if term.is_none() { "not set" } else { "dumb" });
+    Ok(Mode::Tui { explicit: true })
 }
 
 /// Names the scripted session that debug builds run in place of a recording (plan §H).
@@ -323,7 +333,12 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             }
         })
     };
-    if mode == Mode::Tui {
+    // The one session, built once and unstarted: the engine's future and the events behind the
+    // capture adapter. A terminal frontend that is told it cannot have the terminal hands both
+    // straight back, so the plain adapter below runs *this* lecture — prepared once, locked once,
+    // one engine — rather than building a second one.
+    let (mut engine, mut events) = engine(cmd_rx, ev_tx)?;
+    if let Mode::Tui { explicit } = mode {
         // Debug builds only: the terminal faults the PTY tests inject, named by the scenario.
         #[cfg(debug_assertions)]
         match fixture {
@@ -362,10 +377,23 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         // The terminal is given back before this returns, so the summary prints on the ordinary screen.
         // A fatal error's words are cleaned only as they leave for stderr — after the restoration
         // inside `tui::run`, so the engine → restore → `Error` order stands (Task 12's remediation).
-        let (engine, events) = engine(cmd_rx, ev_tx)?;
-        let report = tui::run(session, engine, cmd_tx, events, a.secs).await.map_err(plain::fatal)?;
-        plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
-        return Ok(());
+        let tui_cmds = cmd_tx.clone();
+        match tui::run(session, engine, tui_cmds, events, a.secs).await.map_err(plain::fatal)? {
+            tui::Started::Report(report) => {
+                plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
+                return Ok(());
+            }
+            // Nothing has started: no engine spawned, no key stream, no frame. An explicit `--tui`
+            // asked for this frontend by name, so it is that ordinary error and nothing else. One
+            // chosen by itself falls back to the same lecture in plain (plan §G).
+            tui::Started::NoTerminal { engine: back, events: back_events, error } => {
+                if explicit {
+                    return Err(plain::fatal(anyhow::anyhow!("the terminal could not be taken over ({error})")));
+                }
+                plain::say(&mut std::io::stdout().lock(), out, "warn", "plain", &format!("The terminal could not be taken over ({error}); continuing in plain mode."));
+                (engine, events) = (back, back_events);
+            }
+        }
     }
     plain::read_commands(cmd_tx.clone());
     let stop = Arc::new(Mutex::new(StopController::default()));
@@ -376,7 +404,6 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     drop(cmd_tx);
     let mixed = uid.starts_with("mixed:");
     let mut watch = (uid == loopback::BLACKHOLE_UID || mixed).then(|| SilenceWatch::new(-60.0, 10));
-    let (engine, mut events) = engine(cmd_rx, ev_tx)?;
     let words = capture::Words::new(&course);
     let printer = tokio::spawn(async move {
         while let Some(f) = events.recv().await {
@@ -424,18 +451,35 @@ mod tests {
         Ttys { stdin, stdout, stderr }
     }
 
-    /// Plan §H, until the TUI becomes the default (Task 16): no flag is plain whatever the terminal, `--plain` is plain,
-    /// and `--tui` is the TUI exactly when stdin and stdout are terminals and TERM can draw. Stderr never decides it.
+    /// Plan §H as built: with neither flag the TUI is chosen only where it can take the terminal and
+    /// draw on it — stdin, stdout and stderr all terminals, `TERM` set and not `dumb` — and
+    /// everything else is **plain by selection, never an error**. `--plain` is always plain, and
+    /// explicit `--tui` still refuses a piped stdin or stdout and a TERM that cannot draw, while
+    /// stderr never decides it.
     #[test]
     fn choose_mode_table() {
-        for (tui, plain) in [(false, false), (false, true), (true, false)] {
-            for stdin in [true, false] {
-                for stdout in [true, false] {
-                    for stderr in [true, false] {
-                        for term in [GOOD, Some("dumb"), None] {
-                            let got = choose_mode(tui, plain, ttys(stdin, stdout, stderr), term).map_err(|e| e.to_string());
-                            let want = if !tui { Ok(Mode::Plain) } else if !(stdin && stdout) { Err("--tui needs a terminal on stdin and stdout".to_string()) } else if term == GOOD { Ok(Mode::Tui) } else { Err(format!("--tui needs a terminal that can draw: TERM is {}", if term.is_none() { "not set" } else { "dumb" })) };
-                            assert_eq!(got, want, "tui {tui}, plain {plain}, stdin {stdin}, stdout {stdout}, stderr {stderr}, TERM {term:?}");
+        for tui in [false, true] {
+            for plain in [false, true] {
+                for stdin in [true, false] {
+                    for stdout in [true, false] {
+                        for stderr in [true, false] {
+                            for term in [GOOD, Some("dumb"), None] {
+                                let got = choose_mode(tui, plain, ttys(stdin, stdout, stderr), term).map_err(|e| e.to_string());
+                                let drawable = term.is_some_and(|t| t != "dumb");
+                                let want = if plain {
+                                    // clap refuses the pair; the plain flag is the one that answers
+                                    Ok(Mode::Plain)
+                                } else if !tui {
+                                    Ok(if stdin && stdout && stderr && drawable { Mode::Tui { explicit: false } } else { Mode::Plain })
+                                } else if !(stdin && stdout) {
+                                    Err("--tui needs a terminal on stdin and stdout".to_string())
+                                } else if !drawable {
+                                    Err(format!("--tui needs a terminal that can draw: TERM is {}", if term.is_none() { "not set" } else { "dumb" }))
+                                } else {
+                                    Ok(Mode::Tui { explicit: true })
+                                };
+                                assert_eq!(got, want, "tui {tui}, plain {plain}, stdin {stdin}, stdout {stdout}, stderr {stderr}, TERM {term:?}");
+                            }
                         }
                     }
                 }
@@ -446,14 +490,34 @@ mod tests {
     #[test]
     fn choose_mode_pins_the_cases_that_matter() {
         let all = ttys(true, true, true);
-        assert_eq!(choose_mode(false, false, all, GOOD).unwrap(), Mode::Plain, "the default stays plain on a full terminal");
+        // No flag: the TUI on a full terminal, and one step down from it each way.
+        assert_eq!(choose_mode(false, false, all, GOOD).unwrap(), Mode::Tui { explicit: false }, "a live lecture on a full terminal opens the TUI");
+        assert_eq!(choose_mode(false, false, ttys(false, true, true), GOOD).unwrap(), Mode::Plain, "stdin redirected");
+        assert_eq!(choose_mode(false, false, ttys(true, false, true), GOOD).unwrap(), Mode::Plain, "stdout redirected");
+        assert_eq!(choose_mode(false, false, ttys(true, true, false), GOOD).unwrap(), Mode::Plain, "stderr redirected");
+        assert_eq!(choose_mode(false, false, all, Some("dumb")).unwrap(), Mode::Plain, "a TERM that cannot draw");
+        assert_eq!(choose_mode(false, false, all, None).unwrap(), Mode::Plain, "no TERM at all");
+        // `--plain` / `--no-tui`: plain whatever the terminal, and never automatically the TUI.
         assert_eq!(choose_mode(false, true, all, GOOD).unwrap(), Mode::Plain);
-        assert_eq!(choose_mode(true, false, all, GOOD).unwrap(), Mode::Tui);
-        assert_eq!(choose_mode(true, false, ttys(true, true, false), GOOD).unwrap(), Mode::Tui, "stderr redirected does not refuse --tui");
+        assert_eq!(choose_mode(false, true, ttys(true, true, false), GOOD).unwrap(), Mode::Plain);
+        // Explicit `--tui`: stderr still does not refuse it; stdin, stdout and TERM still do.
+        assert_eq!(choose_mode(true, false, all, GOOD).unwrap(), Mode::Tui { explicit: true });
+        assert_eq!(choose_mode(true, false, ttys(true, true, false), GOOD).unwrap(), Mode::Tui { explicit: true }, "stderr redirected does not refuse --tui");
         assert_eq!(choose_mode(true, false, ttys(false, true, true), GOOD).unwrap_err().to_string(), "--tui needs a terminal on stdin and stdout");
         assert_eq!(choose_mode(true, false, ttys(true, false, true), GOOD).unwrap_err().to_string(), "--tui needs a terminal on stdin and stdout");
         assert_eq!(choose_mode(true, false, all, Some("dumb")).unwrap_err().to_string(), "--tui needs a terminal that can draw: TERM is dumb");
         assert_eq!(choose_mode(true, false, all, None).unwrap_err().to_string(), "--tui needs a terminal that can draw: TERM is not set");
+    }
+
+    /// Auto mode falls back by selection and never by failing: a redirected stream or a TERM that
+    /// cannot draw is a plain lecture, with the same exit codes a plain lecture has.
+    #[test]
+    fn auto_mode_never_fails_because_the_terminal_is_not_there() {
+        for ttys in [ttys(false, false, false), ttys(true, false, false), ttys(false, true, false), ttys(false, false, true), ttys(true, true, false)] {
+            for term in [GOOD, Some("dumb"), None] {
+                assert!(choose_mode(false, false, ttys, term).is_ok(), "stdin/out/err {ttys:?}, TERM {term:?}");
+            }
+        }
     }
 
     /// The flags conflict with each other and with the one-shots, as clap parses them.

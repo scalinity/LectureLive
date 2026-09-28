@@ -783,12 +783,17 @@ sends core commands. Every number it shows is either the projection or the canon
 
 #### 9.5.1 Mode
 
-- `--tui` selects the terminal frontend. It needs a terminal on stdin and stdout and a `TERM` that
-  can draw; anything else is an ordinary error before the lecture starts.
-- `--plain`, whose alias is `--no-tui`, keeps the line-by-line output.
-- With neither flag a live `lecture` is **plain**. Choosing the terminal frontend automatically when
-  stdin, stdout and stderr are terminals is not in place yet; that switch is the last behaviour
-  change of this milestone, after `--tui` has passed its gates.
+- With neither frontend flag, a live `lecture` opens the terminal UI automatically **iff** stdin,
+  stdout **and** stderr are all terminals and `TERM` is set and is not `dumb`. Anything else — a
+  redirected stream, a missing or `dumb` `TERM` — is a plain lecture by selection, never an error.
+- `--tui` asks for the terminal frontend by name. It still needs a terminal on stdin and stdout and
+  a `TERM` that can draw; anything else is an ordinary error before the lecture starts, and it is
+  **not** weakened by the automatic choice. Redirecting stderr alone does not forbid it.
+- `--plain`, whose alias is `--no-tui`, keeps the line-by-line output, even on a terminal.
+- If an **automatically chosen** terminal UI cannot take the terminal, whatever was taken is given
+  back, one plain line says `The terminal could not be taken over (…); continuing in plain mode.`,
+  and the same lecture — one `prepare`, one folder lock, one engine — continues through the plain
+  adapter. An **explicit** `--tui` treats the same failure as that ordinary error and starts nothing.
 - `lecture page`, `lecture spend` and `lecture audit` are always conventional. `record`, `inputs`,
   `outputs`, `loopback` and `canary` are unaffected.
 

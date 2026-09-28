@@ -550,19 +550,38 @@ enum Exit {
     DrawFailed(io::Error),
 }
 
+/// How a run in the terminal ended. The one case that is not a failure and not a report is the
+/// terminal itself refusing to be taken: nothing has started — no engine spawned, no key stream
+/// opened, no frame drawn — so the engine and the events are handed straight back for the caller to
+/// run as a plain lecture instead (plan §G). Only the caller knows whether the TUI was asked for by
+/// name, so only the caller decides whether that is an error or a fallback.
+pub(crate) enum Started<E> {
+    /// The lecture ended, and the terminal is back.
+    Report(StopReport),
+    /// The terminal could not be taken over; whatever it had taken is given back.
+    NoTerminal { engine: E, events: UnboundedReceiver<capture::Forwarded>, error: io::Error },
+}
+
 /// Runs the lecture in the terminal. The canonical files are read back first, while the folder lock
 /// is still held and the terminal still cooked, so a folder whose notes and state cannot be read as
 /// one revision is an ordinary error with nothing started and nothing taken over. Then the signals,
 /// the panic hook, the terminal, the lecture and the keyboard, in that order, and the reactor until
 /// one of them ends it.
-pub(crate) async fn run(session: Session, engine: impl Future<Output = Result<StopReport>> + Send + 'static, commands: UnboundedSender<Command>, events: UnboundedReceiver<capture::Forwarded>, secs: Option<u64>) -> Result<StopReport> {
+pub(crate) async fn run<E>(session: Session, engine: E, commands: UnboundedSender<Command>, events: UnboundedReceiver<capture::Forwarded>, secs: Option<u64>) -> Result<Started<E>>
+where
+    E: Future<Output = Result<StopReport>> + Send + 'static,
+{
     let hydration = hydrate::read(&session.files).await?;
     let hydration = hydration.coherent().ok_or_else(|| anyhow::anyhow!("the notes and their state in {} could not be read as one revision; the lecture was not started", session.files.dir.display()))?;
     let interrupt = signal(SignalKind::interrupt())?;
     let terminate = signal(SignalKind::terminate())?;
     let hangup = signal(SignalKind::hangup())?;
     terminal::install_panic_hook();
-    let screen = terminal::enter().map_err(|e| anyhow::anyhow!("the terminal could not be taken over ({e})"))?;
+    // The lease is one-use per process and has already given back whatever it managed to take.
+    let screen = match terminal::enter() {
+        Ok(screen) => screen,
+        Err(error) => return Ok(Started::NoTerminal { engine, events, error }),
+    };
     let started = Instant::now();
     let view = state::View::new(session.identity, hydration, session.seed);
     let lecture = tokio::spawn(engine);
@@ -575,7 +594,7 @@ pub(crate) async fn run(session: Session, engine: impl Future<Output = Result<St
     let (hydrate_tx, hydrate_rx) = tokio::sync::mpsc::channel::<anyhow::Result<hydrate::Hydration>>(1);
     let (capture_tx, capture_rx) = tokio::sync::mpsc::channel::<CaptureReply>(4);
     let (exit, _) = react(Io { screen, keys, lecture, events, commands, interrupt, terminate, hangup, files: session.files, hydrate_tx, hydrate_rx, spend_rx, capture_tx, capture_rx }, view, session.capture, started, secs).await;
-    leave(exit)
+    leave(exit).map(Started::Report)
 }
 
 /// Samples the lecture's spend today off the reactor (plan §B 7): `lecture_total` locks the shared

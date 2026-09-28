@@ -45,8 +45,10 @@ struct Lecture {
     _tmp: tempfile::TempDir,
 }
 
-/// `lecture --tui` on a fresh folder, in a `cols` × `rows` terminal, as the fixture `scenario`.
-fn tui(scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
+/// `lecture` with `frontend` before the folder arguments, in a `cols` × `rows` terminal, as the
+/// fixture `scenario`. `tui` passes `--tui`, so the terminal frontend is asked for explicitly;
+/// `auto` passes nothing, and the command decides for itself which frontend the terminal allows.
+fn lecture(frontend: &[&str], scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir(&home).unwrap();
@@ -54,7 +56,9 @@ fn tui(scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
     let mut pty = Pty::open(cols, rows);
     let before = pty.termios();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_lecturelive"));
-    cmd.args(["lecture", "--tui", "--dir", dir.to_str().unwrap(), "--course", "Fixture Course"])
+    cmd.args(["lecture"])
+        .args(frontend)
+        .args(["--dir", dir.to_str().unwrap(), "--course", "Fixture Course"])
         .args(extra)
         .env_clear()
         .env("HOME", &home)
@@ -64,6 +68,17 @@ fn tui(scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
         .current_dir(&home);
     pty.spawn(cmd);
     Lecture { pty, home, dir, before, _tmp: tmp }
+}
+
+/// `lecture --tui` on a fresh folder: the terminal frontend was asked for by name.
+fn tui(scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
+    lecture(&["--tui"], scenario, extra, cols, rows)
+}
+
+/// `lecture` with no frontend flag on a fresh folder: the same terminal, the same folder, the same
+/// scripted session, and the process left to choose.
+fn auto(scenario: &str, extra: &[&str], cols: u16, rows: u16) -> Lecture {
+    lecture(&[], scenario, extra, cols, rows)
 }
 
 impl Lecture {
@@ -351,6 +366,61 @@ fn a_failure_after_raw_mode_writes_nothing_it_did_not_take() {
     same_modes(&l.before, &l.pty.termios());
     assert!(untouched(&l.home));
     l.at("Error: the terminal could not be taken over (a failure injected by the debug fixture)", 0);
+}
+
+/// Plan §H as built: with **no** frontend flag, a live lecture on a real terminal opens the terminal
+/// UI by itself. The scripted session, the folder and the lifecycle are the ones PTY 1 already
+/// proves; what is new here is only that nothing asked for the TUI and it was opened anyway, and
+/// that the terminal comes back and the lecture ends as any other.
+#[test]
+fn a_live_lecture_opens_the_terminal_ui_with_no_flag() {
+    let mut l = auto("quiet", &["--secs", "2"], 100, 30);
+    let prepared = l.pty.wait_for("listening on the scripted session", 0, START);
+    let listening = l.listening();
+    assert!(prepared < l.at(ENTER_ALTERNATE, 0), "the start-up lines print before the terminal is taken");
+    assert!(find(l.out(), b"  transcribing", 0).is_none(), "the plain adapter's own line is not what a TUI session prints");
+    let status = l.pty.wait(SOON);
+    assert_eq!(code(status, &l), Some(0));
+    let after = l.restored(listening);
+    l.at("saved", after);
+    l.at("spent on this lecture today", after);
+}
+
+/// Plan §H as built, and plan §G's takeover row: a terminal frontend chosen **by itself** that
+/// cannot take the terminal is not a failure. What was taken is given back, one line says so, and
+/// the same lecture — same folder, same `prepare`, same one engine — continues through the plain
+/// adapter to the same clean end. Nothing is prepared twice and no second session is started.
+#[test]
+fn an_automatic_terminal_that_cannot_be_taken_over_continues_in_plain() {
+    const FALLBACK: &str = "The terminal could not be taken over (a failure injected by the debug fixture); continuing in plain mode.";
+    /// Plain's end summary, which only a lecture that actually ended prints.
+    const END_SUMMARY: &str = "spent on this lecture today";
+    let mut l = auto("init-fail", &["--secs", "3"], 100, 30);
+    let status = l.pty.wait(START);
+    // The takeover really was attempted: raw mode, the alternate screen, bracketed paste and mouse
+    // capture were each taken, and the failure came at the drawing surface.
+    let enter = l.at(ENTER_ALTERNATE, 0);
+    let paste = l.at(PASTE_ON, enter);
+    let mouse = l.at(MOUSE_ON, paste);
+    // All of it is given back, in order, before anything is printed.
+    let leave = l.at(LEAVE_ALTERNATE, l.at(PASTE_OFF, l.at(MOUSE_OFF, mouse)));
+    same_modes(&l.before, &l.pty.termios());
+    assert!(find(l.out(), b"\x1b[?25", 0).is_none(), "no drawing surface, so no cursor was hidden and none is shown");
+    // The one line, then the very same lecture through the plain adapter.
+    let said = l.at(FALLBACK, leave);
+    assert_eq!(l.out()[said..].windows(FALLBACK.len()).filter(|w| *w == FALLBACK.as_bytes()).count(), 1, "the fallback is said once");
+    assert!(find(l.out(), b"Listening", 0).is_none(), "nothing was ever drawn");
+    l.pty.wait_for("transcribing", said, SOON);
+    // `prepare` printed its line once, and the one lecture ends once: neither ran twice.
+    assert_eq!(l.out().windows("listening on the scripted session".len()).filter(|w| *w == b"listening on the scripted session").count(), 1, "prepared twice");
+    assert_eq!(code(status, &l), Some(0), "a plain lecture's own exit code");
+    // Restoration is already behind the fallback line above, so the plain end summary is what
+    // follows on the ordinary screen, exactly as it does for any plain lecture.
+    l.at("saved", said);
+    l.at("spent on this lecture today", said);
+    // The end summary is printed once, by one plain lecture.
+    assert_eq!(l.out().windows(END_SUMMARY.len()).filter(|w| *w == END_SUMMARY.as_bytes()).count(), 1, "the session ended once");
+    assert!(untouched(&l.home));
 }
 
 /// A draw that fails gives the terminal back before the error is printed, and exits 1.

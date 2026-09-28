@@ -11,7 +11,7 @@ fn help(args: &[&str]) -> String {
 #[test]
 fn lecture_help_is_pinned() {
     assert_eq!(help(&["lecture", "--help"]), concat!(
-        "A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter adds a focus hint, polish then Enter polishes and typesets the page. --tui shows the same lecture full-screen in the terminal instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery\n",
+        "A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter adds a focus hint, polish then Enter polishes and typesets the page. On a terminal it opens full-screen with its transcript, notes and slides; --plain keeps the line-by-line output instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery\n",
         "\n",
         "Usage: lecturelive lecture [OPTIONS] [COMMAND]\n",
         "\n",
@@ -31,8 +31,8 @@ fn lecture_help_is_pinned() {
         "      --secs <SECS>              Stop after this many seconds\n",
         "      --keep-days <KEEP_DAYS>    Delete closed recordings older than this many days that have no unresolved gap\n",
         "      --rebuild                  Rebuild a corrupt sidecar from the notes, transcript and slides\n",
-        "      --tui                      Show the live lecture full-screen in the terminal, with its transcript, notes and slides (needs a terminal on stdin and stdout)\n",
-        "      --plain                    Keep the line-by-line live lecture output, as in a pipe [alias: --no-tui]\n",
+        "      --tui                      Ask for the terminal UI by name; it is the default on a terminal already. Without a terminal on stdin and stdout, or a TERM that cannot draw, this is an error rather than a fallback\n",
+        "      --plain                    Keep the line-by-line live lecture output even on a terminal, as in a pipe [alias: --no-tui]\n",
         "  -h, --help                     Print help\n",
     ));
 }

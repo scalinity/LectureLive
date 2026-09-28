@@ -45,8 +45,9 @@ pub(crate) enum Cmd {
         keyterms: Vec<String>,
     },
     /// A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter
-    /// adds a focus hint, polish then Enter polishes and typesets the page. --tui shows the same lecture
-    /// full-screen in the terminal instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery
+    /// adds a focus hint, polish then Enter polishes and typesets the page. On a terminal it opens
+    /// full-screen with its transcript, notes and slides; --plain keeps the line-by-line output
+    /// instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery
     Lecture(LectureArgs),
     #[command(subcommand)]
     Canary(Canary),
@@ -94,11 +95,11 @@ pub(crate) struct LectureArgs {
     /// Rebuild a corrupt sidecar from the notes, transcript and slides
     #[arg(long)]
     pub(crate) rebuild: bool,
-    /// Show the live lecture full-screen in the terminal, with its transcript, notes and slides
-    /// (needs a terminal on stdin and stdout)
+    /// Ask for the terminal UI by name; it is the default on a terminal already. Without a terminal
+    /// on stdin and stdout, or a TERM that cannot draw, this is an error rather than a fallback
     #[arg(long, conflicts_with_all = ["plain", "command"])]
     pub(crate) tui: bool,
-    /// Keep the line-by-line live lecture output, as in a pipe
+    /// Keep the line-by-line live lecture output even on a terminal, as in a pipe
     #[arg(long, visible_alias = "no-tui", conflicts_with = "command")]
     pub(crate) plain: bool,
 }
