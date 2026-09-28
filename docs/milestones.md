@@ -22,8 +22,8 @@ kickoff prompt carries this rule.
 | M4 | Desktop app: transcript + notes panes | done | M3 | No | [m4-desktop-panes](superpowers/plans/2026-09-25-m4-desktop-panes.md) |
 | M5 | Slide automation | done | M4 | No | [m5-slide-automation](superpowers/plans/2026-09-25-m5-slide-automation.md) |
 | M6 | Full-lecture acceptance; mixed mode; Python retired | implementation accepted as M7's baseline; the two-hour real lecture (gate lines 1–2) is deferred to a class | M5 | Removes `live_notes.py` | [m6-full-lecture](superpowers/plans/2026-09-26-m6-full-lecture.md) |
-| M7 | Ratatui CLI | planned | M6 (implementation baseline) | No | [m7-ratatui-cli](superpowers/plans/2026-09-26-m7-ratatui-cli.md) |
-| M8 | Automatic Zoom capture | not yet planned | M7 | No | — |
+| M7 | Ratatui CLI | done | M6 (implementation baseline) | No | [m7-ratatui-cli](superpowers/plans/2026-09-26-m7-ratatui-cli.md) |
+| M8 | Automatic Zoom capture | not yet planned; depends on M7's TUI and capture architecture | M7 | No | — |
 
 The Python CLI (`live_notes.py`) stays the in-class tool until M6 passes.
 
@@ -978,17 +978,58 @@ Tasks (detailed in the M7 plan):
 15. Fresh final review and fixes
 16. Switch the TTY default (last behaviour change), findings, close-out
 
+**Status: done** (2026-09-28). 25 commits over `fcf1d4e`. The last behaviour change is `fee4a34`, "Open the terminal UI by default for live lectures on a terminal"; the findings commit follows it and changes no behaviour.
+
 **Gate** (checked in `cargo test` against fakes, in a PTY, and live on a synthetic lecture; the plan's §L has each line's evidence):
 
-- [ ] No regression of M0–M6: the core, desktop, vitest and svelte-check suites as at M6; no change to `crates/core/src` or `apps/desktop`
-- [ ] The M6 real-class procedure stays available and untouched, and M6 gate lines 1–2 stay unticked
-- [ ] Plain CLI retained: its output, grammar and exit codes unchanged except the planned stop-message fix; non-terminal output carries no terminal control sequences
-- [ ] Terminal restored on normal exit, handled error, SIGTERM, SIGHUP, the emergency stop and a panic-abort child
-- [ ] Staged stop semantics kept (a held Ctrl-C only stops); every accepted key press sends at most one command
-- [ ] An unread or slow frontend holds up neither the lecture nor core; durable state is reconciled by segment id and notes revision; latest-value telemetry may be coalesced
-- [ ] The transcript follows and scrolls; the notes preview is visibly provisional and the committed block wins; the layout works wide, at laptop width, at half screen, narrow and at the minimum
-- [ ] Capture state is truthful and never silently rebinds; warnings and recovery stay inspectable; untrusted text cannot emit terminal controls
-- [ ] The fixture session exists only in debug builds
-- [ ] One Crossterm 0.29.x and one Ratatui 0.30.2 in the CLI's graph, no other terminal backend, and every new duplicate crate classified
-- [ ] TestBackend, PTY and performance suites pass; a synthetic live lecture through the TUI audits whole
-- [ ] A fresh final review leaves no Critical or Important finding open, and the terminal-default switch is the last behaviour change
+- [x] No regression of M0–M6: the core, desktop, vitest and svelte-check suites as at M6; no change to `crates/core/src` or `apps/desktop` — `cargo test -p lecturelive-core --no-fail-fast` green (no known M6 load flake recurred, so no 8× rerun was needed); `cargo test -p desktop` 23 passed / 0 failed / 1 ignored; `npm test` 33/33; `npm run check` 0 errors 0 warnings; `git diff fcf1d4e..HEAD -- crates/core/src apps/desktop` empty, the only core change being `crates/core/tests/lecture_gate.rs` (+144)
+- [x] The M6 real-class procedure stays available and untouched, and M6 gate lines 1–2 stay unticked — `git diff --exit-code fcf1d4e -- docs/VERIFICATION.html` exits 0; M6's two-hour-real-lecture line and its every-§10-row line remain unticked and were **not** run
+- [x] Plain CLI retained: its grammar, its one-shot outputs (`spend`, `audit`, `page`, `record`, `loopback`, `canary`, `inputs`, `outputs`) and its exit codes are unchanged, and its live behaviour is unchanged except the changes this milestone planned and made deliberately — the stop-message fix (Task 2) and the `Gap`/`DeviceGone`/`Recovered` wording and terminal cleaning on a TTY (Task 12, plan §C 11); a pipe keeps its untrusted bytes unchanged by design, and LectureLive itself **adds no** terminal control sequence to non-TTY output — Task 1's help and one-shot goldens green; `the_scripted_lecture_runs_plain_through_a_pipe` green **with no frontend flag** (auto mode + piped streams = plain, and zero `0x1b` bytes for that fixture, which carries no hostile source payload); `tui_is_refused_when_stdin_is_a_pipe` still refuses with exit 1 and an untouched folder
+- [x] Terminal restored on normal exit, handled error, SIGTERM, SIGHUP, the emergency stop and a panic-abort child — the PTY lifecycle tests (1, 2, 3, both 4s, 5, 8, the draw failure and the session failure), each asserting the termios before and after and the restoration byte order; the automatic-fallback path restores the same way before it prints its one line
+- [x] Staged stop semantics kept (a held Ctrl-C only stops); every accepted key press sends at most one command — `held_ctrl_c_cannot_escalate` and PTY 3; the `ops` scenario's own command log
+- [x] An unread or slow frontend holds up neither the lecture nor core; durable state is reconciled by segment id and notes revision; latest-value telemetry may be coalesced — `lecture_gate frontend_boundary` 3/3; `slow_terminal_holds_nothing_up`; `a_lost_segment_comes_back_from_the_log`, `segment_hole_requests_rehydration`, `revision_jump_requests_reload`, `missed_level_samples_change_only_the_meter`
+- [x] The transcript follows and scrolls; the notes preview is visibly provisional and the committed block wins; the layout works wide, at laptop width, at half screen, narrow and at the minimum — Tasks 8/9/10's tests and the goldens at 140×40, 110×32, 72×45, 80×24, 60×16 and 40×8; the person's own sizes were not added, because the optional sitting did not run
+- [x] Capture state is truthful and never silently rebinds; warnings and recovery stay inspectable; untrusted text cannot emit terminal controls — the `capture` PTY scenario and its command log; Task 12's `failures` walk with the activity overlay; `display_text_cannot_emit_terminal_controls`
+- [x] The fixture session exists only in debug builds — a build without debug assertions has 0 fixture symbols and no scenario string, refuses `LECTURELIVE_CLI_FIXTURE` with exit 1, creates no folder and leaves the scratch `HOME` untouched (the §J boundary test, re-run on the final tree); every fixture reference is under `cfg(debug_assertions)`
+- [x] One Crossterm 0.29.x and one Ratatui 0.30.2 in the CLI's graph, no other terminal backend, and every new duplicate crate classified — `crossterm 0.29.0` once (the CLI, `ratatui-crossterm`, `tui-input`); `ratatui 0.30.2` once; `ratatui-core` / `ratatui-crossterm` / `ratatui-widgets` once each; `tui-input 0.15.4` with `default-features = false, features = ["crossterm"]`; `pulldown-cmark 0.13.4` `default-features = false`; one `unicode-width 0.2.2`, shared by the CLI, `ratatui-core`, `ratatui-widgets` and `tui-input`; no Termion, Termwiz or Termina anywhere in the graph; `cargo tree -d` matches Task 15's classification with no new entry — `hashbrown 0.16.1/0.17.1` (inside `ratatui-core`), `itertools 0.13/0.14` (ratatui vs a bindgen build-dep), `either` and `bitflags` at one version each on host and target: all build-time or internal, **none material**
+- [x] TestBackend, PTY and performance suites pass; a synthetic live lecture through the TUI audits whole — the CLI suite 274 + help 2 + perf 1 + pipe 3 + PTY 20, 0 failed; **five consecutive** PTY runs all 20/20; the performance suite re-measured once on the final tree, every §L target met with no idle rerun needed (draws 11.20/s mean, quiet 1.00/s, two-hour p95 0.133 ms, burst p95 6.361 ms, key-to-draw p95 47.762 ms, event-to-draw p95 50.814 ms, CPU 0.06 / 0.48 / 8.59 %, max RSS 33.16 MiB); the live synthetic lecture is Task 14's accepted evidence, not repeated
+- [x] A fresh final review leaves no Critical or Important finding open, and the terminal-default switch is the last behaviour change — Task 15: **PASS**, 0 Critical and 0 unresolved Important after `c215f2b`, `8a895ec` and `5c90ed8`; `fee4a34` is M7's last behaviour-changing commit
+
+**Left open, deliberately:**
+
+- [ ] The real owned-window Screen Recording gate (Task 11) is still **pending**. It needs the person's own Terminal against a real Zoom window with Screen Recording granted; no scripted session can stand in for it. No line above depends on it, and M7 does not claim it.
+- The Task 16 personal Terminal sitting was not run, so no goldens exist at the person's own `tput cols`/`tput lines` and no sizes are invented for them. No gate line depends on the sitting.
+
+**M7 findings**
+
+Three Important, all raised by the Task 15 final review and each fixed test-first in its own commit:
+
+| ID | Finding | Fix |
+|---|---|---|
+| I1 | A held Ctrl-S wrote a durable slide per key repeat. Nothing pushes Crossterm's keyboard-enhancement flags, so terminals report every repeat of a held key as `Press` and the `Press`-only guard never fired; core saves a new slide for each `CaptureNow`. | `c215f2b` — a Ctrl-S that would act now takes the stop controller's held-key rule (≥300 ms quiet, ≥2 s since the last accepted one); another is refused, with a reason |
+| I2 | An unreadable `capture.json` stopped the live lecture from starting, in both frontends. | `8a895ec` — an unreadable selections file at lecture start is no selection, said in one warning line (plain, and the TUI's activity); the file is left as it is, and `keep_selection` still refuses to overwrite it |
+| I3 | The PTY harness failed about 10 % of parallel runs on a kernel-private race in `openpt` (XNU `EREDRIVEOPEN`, −6), before any child existed. | `5c90ed8` — the harness retries `openpt` only on raw errno −6, 5 attempts 50 ms apart; every other error, and everything after allocation, fails as before |
+
+The 30 Minors are the Task 15 review's, with their owners. **Seven were Task 16's and are now closed**, all as documentation or gate corrections with no behaviour change:
+
+| ID | Finding | Closed by |
+|---|---|---|
+| O1 | The gate line claiming the plain CLI's output was unchanged "except the planned stop-message fix" was not literally true: Task 12 deliberately changed the `Gap`/`DeviceGone`/`Recovered` wording and added terminal cleaning | The M7 gate line rewritten to the truth **before** being ticked |
+| O3 | The gate line said non-terminal output "carries no terminal control sequences", which is not the rule — a pipe carries untrusted source bytes unchanged by design | The same gate line, now "**adds no**"; spec §9.5.10 already stated the rule correctly |
+| D1 | Spec §9.5.2 said a rule sits above the notice in every shape; only Wide and Normal draw one | §9.5.2 now names those two shapes, and Stacked's heading-as-rule |
+| D2 | Spec §9.5.7 said the keys row is generated from the key table; `footer()` and `help_lines()` are separately maintained lists | §9.5.7 now says so |
+| D3 | Spec §9.5.9 said a red meter for silence and a red `▲` on the slides tab; silence is red words in the meter's place, and the tab's `▲` takes the tab's own style | §9.5.9 now describes both as built (`view.rs:796-801`, `view.rs:861`) |
+| D4 | Spec §3.6 said a duplicate slide index is ignored; the live `Slide` upserts by index | §3.6 now separates slides from segment ids and notes revisions (`state.rs:681-691`) |
+| D5 | Spec §9.5.8 read as though the 300 ms/2 s debounce governed every stop; it is the key origin's alone | §9.5.8 now names the signal, `--secs` and audio-end origins as not debounced (`stop.rs:76-96`) |
+| X3 | `origin/m7-ratatui-cli` exists although `CLAUDE.md` says milestone branches never go to the remote | **Left as it is — the person's decision.** Task 16 pushed `main` only, did not push the milestone branch, and did not delete the remote one; it is reported in the handover |
+
+The other 23 Minors stay where Task 15 put them and are **not** fixed by this milestone: R1–R5 and F1, F2, F3, F5, D6, D7, P2 (future cleanup); R6 (M8 / core session); R7, F4, F6, P1, X1, X2 (leave-for-good). Two are worth naming. F2: the TUI's control-free render assertion is guaranteed by Ratatui's own filter, so it cannot detect a removed `clean`. X2: `tui/mod.rs`'s `mod task13` reaches `crate::fixture` under `cfg(test)` only, so the tests do not compile without debug assertions.
+
+**Evidence carried from earlier tasks**
+
+- Default mode switch: `fee4a34`.
+- Performance (Task 13, accepted): draws ≤12/s, mean 11.20; preview presentation ≤10 Hz; quiet 1.00 draw/s; two-hour frame p95 0.161 ms; burst frame p95 6.484 ms; key-to-draw p95 17.393 ms; event-to-draw p95 51.017 ms; CPU 0.05 / 0.48 / 10.62 %; max RSS 33.27 MiB. The final tree re-measured within the same targets.
+- Live synthetic lecture (Task 14, `ad22037`): real BlackHole, real STT, real TUI, 411 s from 23:36:20 to 23:43:27. A real dropped slide was captured, and an ordinary snapshot, a hinted snapshot, the polish path and both staged stops were exercised. Audit 0 unexplained / 0 waiting; `segment_cursor` 11 against 11 contiguous ids; no journal left behind; the slide embedded exactly once; the default output byte-identical before and after; **$0.086238** spent, within the $0.50 ceiling; exit 0 with the terminal restored. Not repeated, and no paid request was made again.
+- PTY allocation adjudication: the −6 failure is a kernel-private XNU tty-allocation race, not a test defect; the bounded retry is harness-only and fired 0 times across the final five runs.
+
+**Next:** M8 — Automatic Zoom capture, which depends on the M7 TUI/capture architecture.

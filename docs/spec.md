@@ -190,9 +190,10 @@ consume `session::lecture::Event`: the plain adapter renders that stream line by
 frontend reduces the same events into a projection of its own, owned by one reactor on the main
 thread. Core stays the authority in both cases, and no correctness-bearing state lives only in the
 frontend. The projection reconciles by the same durable identifiers the desktop does — segment-log
-ids, notes revisions, slide indices — so a duplicate is ignored, the next id appends, and a hole
-(the event went unread), a revision jump or a `Polished` asks for the canonical files to be re-read
-instead of guessing. Latest-value telemetry (level, open utterance, connection status) may be
+ids, notes revisions, slide indices — so a duplicate segment id or notes revision is ignored and the
+next id appends, while a slide registration **upserts by index**: a duplicate index refreshes what is
+shown rather than being ignored. A hole (the event went unread), a revision jump or a `Polished` asks
+for the canonical files to be re-read instead of guessing. Latest-value telemetry (level, open utterance, connection status) may be
 coalesced or lost in a terminal frontend without affecting anything that is shown as a count or kept
 on disk. The terminal frontend never sends `Command::State`: it hydrates from the sidecar, the
 segment log and the notes checked against the sidecar's fingerprint, and its commands are core's own
@@ -810,8 +811,10 @@ One pure layout, recomputed from the frame's area on every draw, in five shapes:
 | Too small | <60 columns or <16 rows | the safety view |
 
 A one-cell gutter runs down each side. From the top: two header rows, a full-width rule where there
-is room for one (Wide, Normal), the heading or tab row, the body, a rule, then the notice, prompt
-and keys rows. The last three are the last three rows in every shape. Below the minimum the safety
+is room for one (Wide, Normal only), the heading or tab row, the body, another rule in those same two
+shapes, then the notice, prompt and keys rows. The last three are the last three rows in every shape.
+Stacked divides its body with its notes heading drawn as a rule rather than with the full-width ones;
+Narrow and Too small have none. Below the minimum the safety
 view keeps the phase, the clock, the size it needs and only the keys that work there; typing is
 ignored there. Tab cycles the panes and in a tabbed column switches the visible tab; the panes
 that are hidden keep their place.
@@ -902,8 +905,9 @@ terminal is removed, and it is never a submission — a pasted `polish` or a pas
 nothing until a real Enter follows. A paste that would take the hint past 8 KiB inserts none of it and
 says so; typing stops at the same limit. An Enter is taken at most once per 300 ms, so a held key
 cannot send a stream of snapshots. One accepted key press sends at most one command and never retries
-it. The keys row is generated from that same table, so it names only what a press does now, and help
-is named there as `^H help` (with `F1` equally).
+it. That table is this document's account of what a key does; the keys row and the help overlay are
+separately maintained lists in the view, so each names only what a press does now, and help is named
+there as `^H help` (with `F1` equally).
 
 #### 9.5.8 Stop
 
@@ -918,18 +922,22 @@ Three stages, in the CLI's own words, the same counting in both frontends:
 3. **Quit at once** — the next one: the terminal is given back, one line is printed, and the process
    exits 130. The next session in the folder picks up what was left.
 
-A Ctrl-C is escalated only after 300 ms of quiet since the last one and 2 s since the stage before, so
-a held key reaches stage 1 and no further. The header says which stage the lecture is in, and the keys
-row says what the next Ctrl-C would do.
+That 300 ms/2 s rule is the **key** origin's alone — a Ctrl-C read as a key in raw mode. A held key
+reaches stage 1 and no further. A stop from a signal (plain's Ctrl-C, `kill -INT`) is not debounced
+and counts each time, as `--secs` and the audio's own end count when they begin a stop and are
+ignored once it has. The header says which stage the lecture is in, and the keys row says what the
+next Ctrl-C would do.
 
 #### 9.5.9 Failures and activity
 
 The notice line holds one thing, chosen as the frame is drawn, in this order: a single input that has
 gone; capture asking or refused; this frontend's own last command error (a refused stop, a refused
 paste, a command the lecture can no longer take); the latest ordinary notice. Nothing below is lost
-while something above holds. Persistent conditions also colour their own place — a red meter for
-silence, a red gap count, a red `▲` on the slides tab — and the mark and the words carry the meaning
-without colour.
+while something above holds — though only Wide and Normal have room to draw this line at all, and the
+other shapes give the body the room instead. Persistent conditions also colour their own place: a red
+gap count, and red words in the meter's place for silence (`no signal` where the meter would be, or
+`▲ input gone`), while the slides tab's attention `▲` takes that tab's own style rather than red. The
+mark and the words carry the meaning without colour.
 
 Activity is a ring of at most 500 records, newest last, in the plain adapter's own words and marks,
 seeded from the start-up report. It is in memory only, and once records have fallen off the overlay
