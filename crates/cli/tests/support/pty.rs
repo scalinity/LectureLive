@@ -29,7 +29,7 @@ pub struct Pty {
 impl Pty {
     /// A new terminal of `cols` × `rows`, with nothing attached yet.
     pub fn open(cols: u16, rows: u16) -> Pty {
-        let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+        let master = allocate(|| rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)).expect("openpt");
         rustix::pty::grantpt(&master).expect("grantpt");
         rustix::pty::unlockpt(&master).expect("unlockpt");
         let name = rustix::pty::ptsname(&master, Vec::new()).expect("ptsname");
@@ -161,6 +161,28 @@ impl Drop for Pty {
             let _ = child.wait();
         }
     }
+}
+
+/// XNU's kernel-private `EREDRIVEOPEN` ("redrive open", `bsd/sys/errno.h`): `vn_open_auth` retries it
+/// for the tty allocation race and hands it to `open(2)` only once its own retries run out, which
+/// parallel PTY tests make happen. It comes before any child exists.
+const REDRIVE_OPEN: i32 = -6;
+const ALLOCATIONS: u32 = 5;
+const REALLOCATE_AFTER: Duration = Duration::from_millis(50);
+
+/// Allocates a pseudo-terminal's master with `open`, trying again — a bounded number of times —
+/// only when the kernel lost its own allocation race. Any other error fails at once.
+pub fn allocate<T>(mut open: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
+    for _ in 1..ALLOCATIONS {
+        match open() {
+            Err(e) if e.raw_os_error() == REDRIVE_OPEN => {
+                eprintln!("openpt lost the kernel's tty allocation race (EREDRIVEOPEN); allocating again");
+                std::thread::sleep(REALLOCATE_AFTER);
+            }
+            done => return done,
+        }
+    }
+    open()
 }
 
 pub fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {

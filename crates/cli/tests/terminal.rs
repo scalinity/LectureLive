@@ -125,6 +125,24 @@ fn code(status: ExitStatus, l: &Lecture) -> Option<i32> {
 
 /// The harness itself (plan Task 5 "tests first"): `stty -a` in the child sees the size the test set and a
 /// terminal in its usual modes, and a mode the child changes is read back after it has ended.
+/// macOS can refuse a `/dev/ptmx` open with XNU's kernel-private `EREDRIVEOPEN` (−6) when its own
+/// retries of the tty allocation race run out, as parallel PTY tests make happen. Only that error,
+/// and only the allocation, is tried again, a bounded number of times; any other error fails at once.
+#[test]
+fn only_the_kernels_pty_allocation_race_is_tried_again() {
+    use rustix::io::Errno;
+    let raced = || Errno::from_raw_os_error(-6);
+    let mut calls = 0;
+    assert_eq!(support::pty::allocate(|| { calls += 1; if calls < 3 { Err(raced()) } else { Ok(7) } }), Ok(7), "a cleared race allocates");
+    assert_eq!(calls, 3);
+    calls = 0;
+    assert_eq!(support::pty::allocate(|| { calls += 1; Err::<(), _>(Errno::NOENT) }), Err(Errno::NOENT));
+    assert_eq!(calls, 1, "any other error is not tried again");
+    calls = 0;
+    assert_eq!(support::pty::allocate(|| { calls += 1; Err::<(), _>(raced()) }), Err(raced()), "a race that never clears still fails");
+    assert!((2..=10).contains(&calls), "bounded: {calls} attempts");
+}
+
 #[test]
 fn the_harness_gives_the_child_a_terminal() {
     let mut pty = Pty::open(93, 31);
