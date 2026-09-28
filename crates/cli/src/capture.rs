@@ -40,11 +40,22 @@ pub(crate) struct Context {
 }
 
 /// The course's saved selection, loaded off the reactor before the engine starts: a missing file
-/// is no selection, and a file that cannot be read is an error rather than a silent empty state,
-/// because a course whose window was chosen must not quietly unchoose it.
-pub(crate) async fn load(path: &Path, course: &str) -> Result<Option<Selection>> {
+/// is no selection. A file that cannot be read is no selection too, as the desktop takes it — a
+/// preference never stops a lecture from recording — and the reason comes back beside it to be
+/// said, never a silent empty state. Nothing is written: [`keep_selection`] still refuses to save
+/// over a file it cannot read.
+pub(crate) async fn load(path: &Path, course: &str) -> (Option<Selection>, Option<String>) {
     let (path, course) = (path.to_path_buf(), course.to_string());
-    tokio::task::spawn_blocking(move || Ok(Selections::load(&path)?.get(&course).cloned())).await?
+    match tokio::task::spawn_blocking(move || Selections::load(&path).map(|all| all.get(&course).cloned())).await {
+        Ok(Ok(saved)) => (saved, None),
+        Ok(Err(e)) => (None, Some(format!("{e:#}"))),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
+
+/// What both frontends say when the selections file could not be read at the lecture's start.
+pub(crate) fn unreadable_words(error: &str) -> (&'static str, &'static str, String) {
+    ("warn", "capture", format!("{error}; this lecture starts with no saved window, and the file is left as it is. Screenshots (⌘⇧4) still become slides."))
 }
 
 /// Keeps a selection for the course exactly as core produced it — its descriptor, region, parts
@@ -289,6 +300,24 @@ mod tests {
         assert_eq!(Selections::load(&path).unwrap().get("Machine Learning"), None);
         std::fs::write(&path, "{ not json").unwrap();
         assert!(Selections::load(&path).is_err(), "a broken file is not silently empty");
+    }
+
+    /// Plan §B 8 builds capture as the desktop does (`app.rs:392`, `Selections::load(..).ok()`):
+    /// a selections file that cannot be read never stops a lecture from recording. It starts
+    /// with no selection, and the file is left exactly as it was.
+    #[tokio::test]
+    async fn an_unreadable_selections_file_does_not_stop_the_lecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "{ not json").unwrap();
+        let (selection, why) = load(&path, "Machine Learning").await;
+        assert_eq!(selection, None, "the lecture starts with no selection");
+        assert!(why.as_deref().is_some_and(|w| w.contains(FILE)), "and says why: {why:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json", "the file is left as it was");
+        assert!(keep_selection(&path, "Machine Learning", &saved()).is_err(), "nothing is saved over it");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(load(&path, "Machine Learning").await, (None, None), "a missing file is no selection, silently");
     }
 
     /// Plan §J `capture_moved_is_saved_before_notice`: two courses are saved; a relocation for one

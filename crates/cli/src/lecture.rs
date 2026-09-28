@@ -260,7 +260,9 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     // Capture on by default (plan Task 11): the course's saved window is loaded before the engine
     // starts, off the reactor, and the same saved state seeds the worker and the TUI's Ctrl-S. A
     // scripted session never reaches the window server or the person's data folder: its selections
-    // live in the lecture folder, and only the `capture` scenario has any.
+    // live in the lecture folder, and only the `capture` scenario has any. A selections file that
+    // cannot be read is no selection, said once in both frontends: it never stops the recording.
+    let mut unreadable = None;
     let capture = if fixture.is_some() {
         #[cfg(debug_assertions)]
         {
@@ -275,8 +277,13 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
         { None }
     } else {
         let path = data_dir()?.join(capture::FILE);
-        Some(capture::Context { path: path.clone(), course: course.clone(), saved: capture::load(&path, &course).await?, current: None })
+        let (saved, why) = capture::load(&path, &course).await;
+        unreadable = why.map(|e| capture::unreadable_words(&e));
+        Some(capture::Context { path: path.clone(), course: course.clone(), saved, current: None })
     };
+    if let Some((kind, label, detail)) = &unreadable {
+        plain::say(&mut std::io::stdout().lock(), out, kind, label, detail);
+    }
     // The session, run by the frontend: `lecture::run`, or in debug builds the scripted stand-in.
     // Nothing runs until it is awaited or spawned. Both run behind the capture adapter, so Plain
     // and the TUI see the same already-adapted events — each with whether any relocation it
@@ -349,7 +356,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
             },
             files: files.clone(),
             spend: spend.clone(),
-            seed: plain::startup_records(&ready, &files),
+            seed: plain::startup_records(&ready, &files).into_iter().chain(unreadable.map(|(kind, label, detail)| plain::Notice { kind, label: label.into(), detail })).collect(),
             capture: capture.clone(),
         };
         // The terminal is given back before this returns, so the summary prints on the ordinary screen.
