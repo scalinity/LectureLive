@@ -74,7 +74,9 @@ LectureLive/
       src/capture/           window enumeration, capture worker, change detector
       src/session/           coordinator, lecture folder, sidecar, commit journal, spend ledger, lock
       src/events.rs          notifications to adapters
-    cli/                     headless binary on core, the `lecture` command (replaces live_notes.py at M6)
+    cli/                     Rust binary on the same core, the `lecture` command (replaces live_notes.py at M6):
+                            a conventional plain adapter that prints the event stream line by line, and,
+                            for a live `lecture`, a Ratatui terminal frontend (§9.5) beside it
   apps/desktop/
     src-tauri/               commands → coordinator handle; notifications → events/channels
     src/                     Svelte 5
@@ -182,6 +184,20 @@ makes it read the state again), whose `seq` is at or below the watermark, or at 
 its stream. It appends a committed block only at the next revision and ignores one it already holds;
 a revision jump, `polished`, or a hole in segment ids (the coordinator's notification channel can drop
 under load) makes it read the state again.
+
+**The CLI's terminal frontend is a second adapter on the same events.** The desktop and the CLI both
+consume `session::lecture::Event`: the plain adapter renders that stream line by line, and the Ratatui
+frontend reduces the same events into a projection of its own, owned by one reactor on the main
+thread. Core stays the authority in both cases, and no correctness-bearing state lives only in the
+frontend. The projection reconciles by the same durable identifiers the desktop does — segment-log
+ids, notes revisions, slide indices — so a duplicate is ignored, the next id appends, and a hole
+(the event went unread), a revision jump or a `Polished` asks for the canonical files to be re-read
+instead of guessing. Latest-value telemetry (level, open utterance, connection status) may be
+coalesced or lost in a terminal frontend without affecting anything that is shown as a count or kept
+on disk. The terminal frontend never sends `Command::State`: it hydrates from the sidecar, the
+segment log and the notes checked against the sidecar's fingerprint, and its commands are core's own
+`Command` variants (`Op`, `Cancel`, `Stop`, `CaptureNow`, `Bind`). The one place core answers a
+state read is the desktop's own status.
 
 Commands: `attach(transcript, notes)` on every page load, replacing the previous page's channels;
 `get_session_state`; `select_folder`; `inputs`; `loopback_status`; `start_lecture(source)`; `stop`,
@@ -758,6 +774,181 @@ Next when installed, else the system face, on an 18 px base with a 1.2 ratio; th
 scales it by 125%. Times and money use tabular figures in the same face. Panes are flat columns divided
 by rules, with no cards or shadows. A hanging gutter holds when things happened, and a teal rule marks
 what is live. The command line is the one bold element.
+
+### 9.5 Terminal UI
+
+The CLI's Ratatui frontend for a live `lecture` (`crates/cli/src/tui/`), beside the plain adapter.
+It is a viewer and a keyboard: it reads the lecture's events, keeps its own projection of them, and
+sends core commands. Every number it shows is either the projection or the canonical files read back.
+
+#### 9.5.1 Mode
+
+- `--tui` selects the terminal frontend. It needs a terminal on stdin and stdout and a `TERM` that
+  can draw; anything else is an ordinary error before the lecture starts.
+- `--plain`, whose alias is `--no-tui`, keeps the line-by-line output.
+- With neither flag a live `lecture` is **plain**. Choosing the terminal frontend automatically when
+  stdin, stdout and stderr are terminals is not in place yet; that switch is the last behaviour
+  change of this milestone, after `--tui` has passed its gates.
+- `lecture page`, `lecture spend` and `lecture audit` are always conventional. `record`, `inputs`,
+  `outputs`, `loopback` and `canary` are unaffected.
+
+#### 9.5.2 Layout
+
+One pure layout, recomputed from the frame's area on every draw, in five shapes:
+
+| Shape | When | Body |
+|---|---|---|
+| Wide | ≥132 columns and ≥28 rows | Transcript (40% of the rest) │ Notes (60%) │ Slides (28 columns) |
+| Normal | ≥100 columns and ≥20 rows | left column tabbed Transcript / Slides (40%) │ Notes (60%) |
+| Stacked | 60–99 columns and ≥36 rows | tabbed Transcript / Slides on top (40% of the body), the notes heading as a rule, Notes below — a half-screen window |
+| Narrow | 60–99 columns and 16–35 rows; ≥100 columns and 16–19 rows | one column, tabbed Transcript / Notes / Slides, Transcript first |
+| Too small | <60 columns or <16 rows | the safety view |
+
+A one-cell gutter runs down each side. From the top: two header rows, a full-width rule where there
+is room for one (Wide, Normal), the heading or tab row, the body, a rule, then the notice, prompt
+and keys rows. The last three are the last three rows in every shape. Below the minimum the safety
+view keeps the phase, the clock, the size it needs and only the keys that work there; typing is
+ignored there. Tab cycles the panes and in a tabbed column switches the visible tab; the panes
+that are hidden keep their place.
+
+#### 9.5.3 Header
+
+Row one: the recording dot (red while recording, dim once stopping), the phase in one word
+(Listening, Stopping, Stop waiting), then the course and lecture while listening or, while stopping,
+what the stage is doing; the elapsed clock is right-aligned. Row two: the input's name, its health
+(eight-cell level meter, `no signal`, or `▲ input gone`), the transcription connection, the count of
+transcript gaps waiting, and this lecture's spend today at the right. As the row narrows the spend
+goes first, then the input's name, then the connection's words shorten to `STT ok` or `STT ▲`. The
+phase, the clock, the health and the gap count never go.
+
+#### 9.5.4 Transcript
+
+A closed utterance is its `HH:MM:SS` in a dim gutter, then the text wrapped with a hanging indent; a
+recovered one is marked `recovered` under its time. The utterance being said has no time: the teal
+live edge stands at the gutter's right edge on each of its rows, its settled words in ink and its
+tentative ones dim. Only the rows on screen are wrapped — following from the last utterance upward,
+scrolled from the anchor downward — so a frame's work follows the visible rows and not the lecture's
+length. The reader's place is semantic (a segment id and a byte in its text), so a rewrap at any width
+puts the same words at the top and a resize holds it. `↑`/`↓` move a row, `PgUp`/`PgDn` a page less
+two rows of context, and reaching the end follows again; while scrolled the heading says how much is
+new below and how to come back. `Esc` returns the pane to live.
+
+#### 9.5.5 Notes
+
+The committed document, split at its own `<!-- HH:MM:SS -->` markers, each chunk under its time and
+parsed once into a small vocabulary of blocks (headings, prose, list items, code, table rows, slide
+embeds, rules), wrapped when drawn. Emphasis is bold or italic, inline code and code blocks are dim,
+a blockquote is a dim `│`, a bullet hangs after its mark, a link is its text alone, and TeX stays
+literal. An image embed of a registered slide is drawn as `▣ Slide N` with that slide's time.
+
+The snapshot being written is provisional and looks it: `writing` in the gutter, the teal live edge
+on every row, the text dim, parsed at most ten times a second, shown up to its last whitespace, and
+capped at 1 MiB with a notice when it passes. The committed block replaces it in the same state
+update that ends the work, so no frame shows both. The heading carries the work lane — the head's
+state (`snapshot: writing`, `polish: snapshot first`, `polishing`, `last snapshot: writing`), how many
+of this frontend's requests wait behind it, and `study page: typesetting` — from typed events and its
+own submissions alone, never from the busy text. The notes scroll and return to live like the
+transcript, anchored on a chunk, a block and a byte.
+
+#### 9.5.6 Slides and capture
+
+The slides pane heads with the capture state in words: watching a window (teal edge) with
+`^S capture now`; unbound for this course, with the pointer to the app and to screenshots; paused,
+with its reason; asking, with `^S watch it` where that is possible; Screen Recording off, naming the
+host and the settings path; capture failing, with its reason. It then lists the registered slides,
+newest last and followed, each with its time, its `Slide N`, and how it came to be (`auto`,
+`auto / unsettled`, `manual`). The pane is a column where there is room and a tab otherwise, carrying
+the slide count and a `▲` while capture needs the person.
+
+`^S` captures the watched window now; while there is exactly one window offered, it is the saved
+window, and its region is saved for the course at that size, `^S` watches it. Every other state says
+why and sends nothing: a window is never bound silently. No slide thumbnails — the state is textual.
+
+Slide capture is on by default in the live command: it runs from the course's saved selection, so
+there is nothing to switch on. What the terminal does not do is choose a window for the first time —
+there is no region picker here, and no automatic first-time discovery of a meeting window; an unbound
+state says so and points at the app.
+
+#### 9.5.7 Input
+
+The hint line is always live. No key without Ctrl or a named key is a command, and a paste is never
+a submission.
+
+| Key | |
+|---|---|
+| printable, Backspace, Delete, ←/→, Home/End, Ctrl-A/E/K/U/W | edit the hint |
+| `⏎` | the CLI's grammar: empty → a snapshot; a hint → a snapshot that focuses on it; `polish` → a polish, which takes its own snapshot first. While stopping nothing is sent and the text is kept |
+| `^H`, `F1` | help, in an overlay that scrolls itself and `Esc` closes |
+| `^O` | activity, this session's notices |
+| `^S` | capture now, or watch the one window offered (§9.5.6) |
+| `^X` | cancel this frontend's own notes requests, running and queued; the study page is not cancellable |
+| `^T` | the focused pane fills the body; again to go back |
+| `Tab`, `⇧Tab` | the next or previous pane, and the visible tab in a tabbed column |
+| `↑`/`↓`, `PgUp`/`PgDn`, wheel | scroll the focused pane, or the open overlay; `Esc` closes an overlay, else returns to live |
+| `^C` | the next stop stage (§9.5.8) |
+| `^L` | a full redraw |
+| `^Z` | a notice only: suspending would stop the recording |
+| `^G` | nothing (a system-wide shortcut on the person's Mac) |
+
+A bracketed paste is text: line breaks and tabs become spaces, anything that could act on the
+terminal is removed, and it is never a submission — a pasted `polish` or a pasted Ctrl-C does
+nothing until a real Enter follows. A paste that would take the hint past 8 KiB inserts none of it and
+says so; typing stops at the same limit. An Enter is taken at most once per 300 ms, so a held key
+cannot send a stream of snapshots. One accepted key press sends at most one command and never retries
+it. The keys row is generated from that same table, so it names only what a press does now, and help
+is named there as `^H help` (with `F1` equally).
+
+#### 9.5.8 Stop
+
+Three stages, in the CLI's own words, the same counting in both frontends:
+
+1. **Stopping** — the first Ctrl-C (or `--secs`, or the audio ending by itself): one `Stop`, so
+   finishing the transcript and recovery, then a last snapshot. When the audio ended by itself core is
+   already draining and no `Stop` is sent.
+2. **Stop waiting** — the next one: enough further `Stop`s that core has counted two, so it no longer
+   waits for recovery or for queued requests. The in-flight request is not aborted, and the last
+   snapshot still runs.
+3. **Quit at once** — the next one: the terminal is given back, one line is printed, and the process
+   exits 130. The next session in the folder picks up what was left.
+
+A Ctrl-C is escalated only after 300 ms of quiet since the last one and 2 s since the stage before, so
+a held key reaches stage 1 and no further. The header says which stage the lecture is in, and the keys
+row says what the next Ctrl-C would do.
+
+#### 9.5.9 Failures and activity
+
+The notice line holds one thing, chosen as the frame is drawn, in this order: a single input that has
+gone; capture asking or refused; this frontend's own last command error (a refused stop, a refused
+paste, a command the lecture can no longer take); the latest ordinary notice. Nothing below is lost
+while something above holds. Persistent conditions also colour their own place — a red meter for
+silence, a red gap count, a red `▲` on the slides tab — and the mark and the words carry the meaning
+without colour.
+
+Activity is a ring of at most 500 records, newest last, in the plain adapter's own words and marks,
+seeded from the start-up report. It is in memory only, and once records have fallen off the overlay
+says so.
+
+#### 9.5.10 Terminal safety
+
+- Untrusted text — transcript, notes, previews, file names, error strings, window titles and reasons —
+  is cleaned of terminal controls at the projection boundary, before it can be drawn. The plain
+  adapter's own cleaning on a terminal is a separate step with the same rule; a pipe keeps its bytes.
+- The terminal is given back exactly once, from every way the process can leave: the lecture's end, a
+  returned error, stage 3, SIGTERM, SIGHUP, a lost terminal, a failed draw, and a panic. Each step is
+  attempted whatever the others did, and nothing relies on a destructor.
+- `NO_COLOR` removes colour, never the words: marks, glyphs, bold, dim and reverse still carry every
+  meaning. A non-UTF-8 locale falls back to ASCII chrome glyphs; lecture text is never changed.
+- Mouse reporting is captured, so a wheel notch reads the panes instead of scrolling the terminal's own
+  viewport. Press, release, drag and motion mean nothing.
+
+#### 9.5.11 Performance
+
+The frame is capped at 20 draws a second and drawn only when something changed; the provisional
+preview is presented at most ten times a second however fast its deltas arrive; only the visible rows
+are wrapped; the spend is sampled off the drawing thread about once a second. A two-hour lecture and a
+burst of 500 events a second are within the targets these constraints set, as M7's performance
+acceptance measured. Events are applied in batches, and a slow terminal holds nothing up: the
+event channel is unbounded and core is never made to wait for a frontend.
 
 ## 10. Errors and robustness
 

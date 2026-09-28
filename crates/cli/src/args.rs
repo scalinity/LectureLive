@@ -45,8 +45,8 @@ pub(crate) enum Cmd {
         keyterms: Vec<String>,
     },
     /// A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter
-    /// adds a focus hint, polish then Enter polishes and typesets the page, Ctrl-C stops (twice: stop
-    /// waiting for recovery)
+    /// adds a focus hint, polish then Enter polishes and typesets the page. --tui shows the same lecture
+    /// full-screen in the terminal instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery
     Lecture(LectureArgs),
     #[command(subcommand)]
     Canary(Canary),
@@ -94,10 +94,11 @@ pub(crate) struct LectureArgs {
     /// Rebuild a corrupt sidecar from the notes, transcript and slides
     #[arg(long)]
     pub(crate) rebuild: bool,
-    /// Show the lecture full-screen in the terminal (needs a terminal on stdin and stdout)
+    /// Show the live lecture full-screen in the terminal, with its transcript, notes and slides
+    /// (needs a terminal on stdin and stdout)
     #[arg(long, conflicts_with_all = ["plain", "command"])]
     pub(crate) tui: bool,
-    /// Print the lecture line by line, as in a pipe
+    /// Keep the line-by-line live lecture output, as in a pipe
     #[arg(long, visible_alias = "no-tui", conflicts_with = "command")]
     pub(crate) plain: bool,
 }
