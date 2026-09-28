@@ -18,13 +18,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Local;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use lecturelive_core::session::coordinator::{Notification, StopReport};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::lecture::{Command, Event, Op};
 use lecturelive_core::session::spend::Spend;
 use ratatui::crossterm::event::{Event as TermEvent, EventStream, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::Frame;
 use lecturelive_core::capture::select::Selection;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -41,6 +42,31 @@ use terminal::Screen;
 const FRAME: Duration = Duration::from_millis(50);
 /// Events applied on one wake before the next draw.
 const BATCH: usize = 256;
+
+/// What the reactor draws on (plan Task 13's testability seam, and nothing more): one frame at a
+/// time, and Ctrl-L's full repaint. Production's is [`Screen`], through the lease's own
+/// `terminal::draw`/`terminal::clear` exactly as before; the perf and slow-terminal tests bring
+/// a `Terminal<TestBackend>` of their own, which can time a draw or hold one inside its flush.
+/// A private trait with static dispatch only — production monomorphizes to today's calls.
+trait Surface {
+    fn draw<F>(&mut self, render: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Frame);
+    fn clear(&mut self) -> io::Result<()>;
+}
+
+impl Surface for Screen {
+    fn draw<F>(&mut self, render: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Frame),
+    {
+        terminal::draw(self, render)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        terminal::clear(self)
+    }
+}
 
 /// What the lecture hands the TUI once `prepare` has run (plan Task 6): the lecture's identity, its
 /// canonical files for the re-reads a discontinuity asks for, the shared spend ledger, and the
@@ -543,7 +569,7 @@ pub(crate) async fn run(session: Session, engine: impl Future<Output = Result<St
     tokio::spawn(sample_spend(session.spend.clone(), spend_tx));
     let (hydrate_tx, hydrate_rx) = tokio::sync::mpsc::channel::<anyhow::Result<hydrate::Hydration>>(1);
     let (capture_tx, capture_rx) = tokio::sync::mpsc::channel::<CaptureReply>(4);
-    let exit = react(Io { screen, keys, lecture, events, commands, interrupt, terminate, hangup, files: session.files, hydrate_tx, hydrate_rx, spend_rx, capture_tx, capture_rx }, view, session.capture, started, secs).await;
+    let (exit, _) = react(Io { screen, keys, lecture, events, commands, interrupt, terminate, hangup, files: session.files, hydrate_tx, hydrate_rx, spend_rx, capture_tx, capture_rx }, view, session.capture, started, secs).await;
     leave(exit)
 }
 
@@ -567,9 +593,13 @@ async fn sample_spend(spend: Spend, to: tokio::sync::mpsc::Sender<f64>) {
     }
 }
 
-struct Io {
-    screen: Screen,
-    keys: EventStream,
+/// The reactor's inputs and I/O, generic only where Task 13's tests need it (the keyboard stream
+/// and the drawing surface); everything else is exactly production's. `K` is the event stream
+/// crossterm reads in production and a channel the tests feed; `S` is [`Screen`] in production
+/// and the tests' own backend.
+struct Io<K, S> {
+    screen: S,
+    keys: K,
     lecture: tokio::task::JoinHandle<Result<StopReport>>,
     /// The lecture's events as the capture adapter handed them on: each with whether any
     /// relocation it carried was actually persisted.
@@ -591,7 +621,7 @@ struct Io {
 /// One hydration at a time (plan §F): a trigger while one runs sets `again`, and the next read
 /// starts only when this one's result has been merged. The file work runs on a blocking thread, so
 /// no read ever happens in the reactor.
-fn want_hydration(io: &Io, hydrating: &mut bool, again: &mut bool) {
+fn want_hydration<K, S>(io: &Io<K, S>, hydrating: &mut bool, again: &mut bool) {
     if *hydrating {
         *again = true;
         return;
@@ -605,8 +635,13 @@ fn want_hydration(io: &Io, hydrating: &mut bool, again: &mut bool) {
 }
 
 /// The loop. It draws only here, and only when something changed, at most every [`FRAME`]; returning
-/// is the fence after which it never draws again.
-async fn react(mut io: Io, view: View, capture: Option<capture::Context>, started: Instant, secs: Option<u64>) -> Exit {
+/// is the fence after which it never draws again. The final [`Ui`] comes back with the exit — the
+/// seam Task 13's tests inspect; production drops it.
+async fn react<K, S>(mut io: Io<K, S>, view: View, capture: Option<capture::Context>, started: Instant, secs: Option<u64>) -> (Exit, Ui)
+where
+    K: Stream<Item = io::Result<TermEvent>> + Unpin,
+    S: Surface,
+{
     // Colour and glyphs are the terminal's for the whole session: read once, as the plain CLI reads them.
     let mut ui = Ui::new(view, view::Theme::detect(), capture);
     let mut timer = secs.map(|s| started + Duration::from_secs(s));
@@ -619,20 +654,20 @@ async fn react(mut io: Io, view: View, capture: Option<capture::Context>, starte
     loop {
         tokio::select! {
             biased;
-            _ = io.terminate.recv() => return Exit::Terminated,
-            _ = io.hangup.recv() => return Exit::HungUp,
+            _ = io.terminate.recv() => return (Exit::Terminated, ui),
+            _ = io.hangup.recv() => return (Exit::HungUp, ui),
             // `kill -INT`: in raw mode the keyboard's Ctrl-C arrives as a key instead.
             _ = io.interrupt.recv() => match ui.stop(Origin::Signal, std::time::Instant::now()) {
-                Step::Quit => return Exit::Quit,
+                Step::Quit => return (Exit::Quit, ui),
                 step => { send_stops(&io.commands, step); dirty = true; }
             },
             input = io.keys.next() => match input {
                 Some(Ok(TermEvent::Key(key))) => match ui.key(key, std::time::Instant::now()) {
-                    Act::Stop(Step::Quit) => return Exit::Quit,
+                    Act::Stop(Step::Quit) => return (Exit::Quit, ui),
                     Act::Stop(step) => { send_stops(&io.commands, step); dirty = true; }
                     Act::Clear => {
-                        if let Err(e) = terminal::clear(&mut io.screen) {
-                            return Exit::DrawFailed(e);
+                        if let Err(e) = io.screen.clear() {
+                            return (Exit::DrawFailed(e), ui);
                         }
                         dirty = true;
                     }
@@ -655,26 +690,34 @@ async fn react(mut io: Io, view: View, capture: Option<capture::Context>, starte
                 // A paste is text, never keys: it goes into the hint and never submits.
                 Some(Ok(TermEvent::Paste(text))) => if ui.paste(&text) == Act::Redraw { dirty = true },
                 Some(Ok(_)) => {}
-                Some(Err(e)) => return Exit::Lost(e),
-                None => return Exit::Lost(io::Error::other("the keyboard stream ended")),
+                Some(Err(e)) => return (Exit::Lost(e), ui),
+                None => return (Exit::Lost(io::Error::other("the keyboard stream ended")), ui),
             },
             ended = &mut io.lecture => {
                 while let Ok(f) = io.events.try_recv() {
                     let _ = ui.forwarded(&f, std::time::Instant::now());
                 }
-                return Exit::Ended(ended);
+                return (Exit::Ended(ended), ui);
             }
             Some(f) = io.events.recv() => {
                 let mut want = false;
                 let mut next = Some(f);
-                for _ in 0..BATCH {
+                let mut taken = 0usize;
+                // Up to BATCH events on this wake, and never one more taken than is processed:
+                // an event taken past the batch's end would leave the channel with it — dropped —
+                // and durable events are never dropped (plan §C 6). Task 13's slow-terminal test
+                // proved the loss (one event per full batch) and pins it.
+                while taken < BATCH {
                     let Some(f) = next.take() else { break };
+                    taken += 1;
                     let (step, hydrate) = ui.forwarded(&f, std::time::Instant::now());
                     if let Some(step) = step {
                         send_stops(&io.commands, step);
                     }
                     want |= hydrate;
-                    next = io.events.try_recv().ok();
+                    if taken < BATCH {
+                        next = io.events.try_recv().ok();
+                    }
                 }
                 if want {
                     want_hydration(&io, &mut hydrating, &mut again);
@@ -694,8 +737,12 @@ async fn react(mut io: Io, view: View, capture: Option<capture::Context>, starte
                 dirty = true;
             }
             Some(usd) = io.spend_rx.recv() => {
+                // The spend is a 1 Hz quantity shown beside the 1 Hz clock: it updates the
+                // projection without demanding its own frame, because the clock's next tick
+                // draws it within the same one-second freshness budget (and under any load the
+                // next dirty draw shows it at once). Two independent 1 Hz wakeups otherwise drew
+                // twice a second in a quiet session (Task 13's measurement).
                 ui.view.spend = Some(usd);
-                dirty = true;
             }
             Some(reply) = io.capture_rx.recv() => {
                 if ui.capture_reply(reply) == Act::Redraw {
@@ -719,11 +766,15 @@ async fn react(mut io: Io, view: View, capture: Option<capture::Context>, starte
             preview_due = ui.preview.refresh(&ui.view.notes, std::time::Instant::now()).map(Instant::from_std);
             let chrome = ui.chrome(started.elapsed());
             let mut drawn = ui.drawn;
-            if let Err(e) = terminal::draw(&mut io.screen, |f| drawn = view::render(f, &ui.view, &chrome)) {
-                return Exit::DrawFailed(e);
+            // The cap is measured draw-start to draw-start, so a frame's own duration never
+            // stretches the period past FRAME (and the worst key-to-draw past 50 ms): starts are
+            // ≥ 50 ms apart, which is exactly ≤ 20 draws in any half-open second (Task 13).
+            let started_draw = Instant::now();
+            if let Err(e) = io.screen.draw(|f| drawn = view::render(f, &ui.view, &chrome)) {
+                return (Exit::DrawFailed(e), ui);
             }
             ui.drawn = drawn;
-            (dirty, drawn_at) = (false, Instant::now());
+            (dirty, drawn_at) = (false, started_draw);
         }
     }
 }
@@ -1805,5 +1856,683 @@ mod tests {
         assert_eq!((ui.view.work.lane(), ui.view.work.page()), (state::Lane::Idle, true));
         let rows = frame(&mut ui, 140, 40);
         assert!(rows[3].contains("study page: typesetting"), "{:?}", rows[3]);
+    }
+}
+
+/// Task 13's harness and measurements (plan §J "Performance"): the reactor itself, driven through
+/// the same seam over a synthetic keyboard stream and a test backend it draws on, so what is
+/// measured is the loop production runs — its batches, its throttle, its 1 Hz wakeups — not a
+/// model of it. The percentile method is nearest-rank everywhere. Only the structural proofs run
+/// with the normal suite; every timing gate is `#[ignore]`d and named `perf` for the canonical
+/// `cargo test -p lecturelive-cli perf -- --ignored --nocapture`.
+#[cfg(test)]
+mod task13 {
+    use super::*;
+    use crate::capture::{CapturePersistence, Forwarded};
+    use crate::fixture;
+    use crate::tui::hydrate::Hydration;
+    use crate::tui::state::{Identity, SourceKind};
+    use lecturelive_core::session::segments::{Segment, SegmentSource};
+    use ratatui::backend::{Backend, ClearType, TestBackend};
+    use ratatui::buffer::Cell;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::{Position, Rect, Size};
+    use ratatui::backend::WindowSize;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::oneshot;
+
+    // ---- the p95 method (one helper, used by every gate) --------------------------------------
+
+    /// Task 13's percentile method: nearest rank — sorted ascending, index `ceil(q·N) − 1`. No
+    /// interpolation, no statistics dependency; the same helper serves every percentile below.
+    fn percentile(mut samples: Vec<Duration>, q: f64) -> Duration {
+        assert!(!samples.is_empty(), "a percentile of nothing");
+        samples.sort();
+        samples[((samples.len() as f64 * q).ceil() as usize).saturating_sub(1)]
+    }
+
+    /// Prints one run's N/p50/p95/max and returns the worst p95 of the runs — the gate, never the
+    /// best. Nothing prints inside a timed loop; the summary comes after the measurement.
+    fn summarize(metric: &str, runs: &[Vec<Duration>]) -> Duration {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let mut worst = Duration::ZERO;
+        for (k, run) in runs.iter().enumerate() {
+            let max = run.iter().copied().max().unwrap();
+            println!("PERF {metric}_run{k}_n={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3}", run.len(), ms(percentile(run.clone(), 0.50)), ms(percentile(run.clone(), 0.95)), ms(max));
+            worst = worst.max(percentile(run.clone(), 0.95));
+        }
+        println!("PERF {metric}_p95_ms={:.3}", ms(worst));
+        worst
+    }
+    /// Half-open one-second windows `[t0 + k·s, t0 + (k+1)·s)`: the most starts any window holds,
+    /// and the mean rate over the span.
+    fn per_second(starts: &[std::time::Instant], t0: std::time::Instant, span: Duration) -> (usize, f64) {
+        let mut windows = vec![0usize; span.as_secs() as usize];
+        for s in starts {
+            let k = (*s - t0).as_secs() as usize;
+            if let Some(w) = windows.get_mut(k) {
+                *w += 1;
+            }
+        }
+        (windows.iter().copied().max().unwrap_or(0), starts.len() as f64 / span.as_secs_f64())
+    }
+
+    /// Task 13 pins the frame cap structurally: the reactor never draws more often than every
+    /// 50 ms, which is the ≤20 draws a second target.
+    #[test]
+    fn frame_cap_is_50_ms() {
+        assert_eq!(FRAME, Duration::from_millis(50));
+    }
+
+    // ---- the surfaces --------------------------------------------------------------------------
+
+    /// Draw starts and durations as the surface itself saw them: the probes Task 13 measures with.
+    type Probe = Arc<Mutex<Vec<(std::time::Instant, Duration)>>>;
+
+    /// The reactor's drawing surface for measurement: `Terminal<TestBackend>` behind the seam,
+    /// timing each draw where it happens and never writing to a real terminal.
+    struct ProbeSurface {
+        terminal: ratatui::Terminal<TestBackend>,
+        probe: Probe,
+    }
+
+    fn infallible(e: core::convert::Infallible) -> io::Error {
+        match e {}
+    }
+
+    impl Surface for ProbeSurface {
+        fn draw<F>(&mut self, render: F) -> io::Result<()>
+        where
+            F: FnOnce(&mut Frame),
+        {
+            let start = std::time::Instant::now();
+            self.terminal.draw(render).map_err(infallible)?;
+            let took = start.elapsed();
+            self.probe.lock().unwrap().push((start, took));
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            let size = self.terminal.size().map_err(infallible)?;
+            self.terminal.resize(Rect::new(0, 0, size.width, size.height)).map_err(infallible)
+        }
+    }
+
+    /// The gate a slow backend holds its draw in: entry is published, and the draw waits — for the
+    /// test's release, or a bound far longer than any flush — so the test knows, never guesses,
+    /// when the reactor is inside the flush and when it came out. The release is the test's own
+    /// and comes only after every send has returned, so the producer provably finished while the
+    /// flush still held the reactor; the bound (a 500 ms flush, padded so a test binary running
+    /// its whole suite around this proof cannot deschedule the producer past the flush's own end)
+    /// only keeps a broken test from hanging.
+    #[derive(Default)]
+    struct FlushGate {
+        entered: AtomicBool,
+        done: AtomicBool,
+        release: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl FlushGate {
+        fn enter_and_block(&self) {
+            self.entered.store(true, Ordering::Release);
+            let mut release = self.release.lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !*release {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let (next, timed_out) = self.wake.wait_timeout(release, left).unwrap();
+                release = next;
+                if timed_out.timed_out() {
+                    break;
+                }
+            }
+            self.done.store(true, Ordering::Release);
+        }
+
+        fn release(&self) {
+            *self.release.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+
+        fn entered(&self) -> bool {
+            self.entered.load(Ordering::Acquire)
+        }
+
+        fn blocked(&self) -> bool {
+            self.entered() && !self.done.load(Ordering::Acquire)
+        }
+    }
+
+    /// `TestBackend` behind a flush that blocks (plan Task 13): the reactor is held inside its
+    /// frame exactly as a slow terminal holds it. Every method but `draw` is the inner backend's.
+    struct SlowBackend {
+        inner: TestBackend,
+        gate: Arc<FlushGate>,
+    }
+
+    impl Backend for SlowBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            // a slow terminal's flush is a blocking wait inside the reactor's poll: announced to
+            // the runtime (`block_in_place`), so the worker is replaced while the flush holds it —
+            // the reactor is genuinely blocked, and the runtime around it stays alive
+            tokio::task::block_in_place(|| self.gate.enter_and_block());
+            self.inner.draw(content).map_err(infallible)
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor().map_err(infallible)
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor().map_err(infallible)
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.inner.get_cursor_position().map_err(infallible)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.inner.set_cursor_position(position).map_err(infallible)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear().map_err(infallible)
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.inner.clear_region(clear_type).map_err(infallible)
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            self.inner.size().map_err(infallible)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.inner.window_size().map_err(infallible)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush().map_err(infallible)
+        }
+    }
+
+    // ---- a reactor on the test's own surface and keyboard stream --------------------------------
+
+    type Keys = Pin<Box<dyn Stream<Item = io::Result<TermEvent>> + Send>>;
+
+    /// The keyboard stream as a channel the test types into: the reactor reads it exactly as it
+    /// reads crossterm's `EventStream`.
+    fn keys_from_channel() -> (tokio::sync::mpsc::UnboundedSender<io::Result<TermEvent>>, Keys) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Box::pin(futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))))
+    }
+
+    fn identity() -> Identity {
+        Identity { course: "Machine Learning".into(), lecture: "Week 03 — Optimisation".into(), input: "BlackHole 2ch".into(), kind: SourceKind::Loopback, notes_file: "lecture_notes_20260926.md".into(), transcript_file: "lecture_transcript_20260926.txt".into() }
+    }
+
+    /// The view the exact scripted payload leaves (Task 13 measures the fixture's own state, so
+    /// the tests and the scenarios cannot drift): reduce the events, nothing more.
+    fn view_of(events: &[Event]) -> View {
+        let mut v = View::new(identity(), Hydration::empty(), Vec::new());
+        for e in events {
+            v.reduce(e, Local::now());
+        }
+        v
+    }
+
+    /// A reactor running on the test's runtime: the same loop, channels, deadlines and 1 Hz clock
+    /// production has, over `screen` and a keyboard channel the test feeds. `engine_of` builds the
+    /// lecture the reactor awaits — a script that ends on demand, or the fixture itself.
+    struct Reactor {
+        keys: tokio::sync::mpsc::UnboundedSender<io::Result<TermEvent>>,
+        events: UnboundedSender<Forwarded>,
+        commands: UnboundedSender<Command>,
+        end: Option<oneshot::Sender<()>>,
+        lecture: tokio::task::JoinHandle<(Exit, Ui)>,
+        probe: Probe,
+        _dir: tempfile::TempDir,
+    }
+
+    fn reactor_on<S, F>(screen: S, probe: Probe, view: View, spend: bool, engine_of: F) -> Reactor
+    where
+        S: Surface + Send + 'static,
+        F: FnOnce(UnboundedReceiver<Command>, UnboundedSender<Forwarded>) -> (tokio::task::JoinHandle<Result<StopReport>>, Option<oneshot::Sender<()>>),
+    {
+        let (keys, key_stream) = keys_from_channel();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap());
+        std::fs::create_dir_all(files.state_dir()).unwrap();
+        let (hydrate_tx, hydrate_rx) = tokio::sync::mpsc::channel(1);
+        let (capture_tx, capture_rx) = tokio::sync::mpsc::channel(4);
+        let (spend_tx, spend_rx) = tokio::sync::mpsc::channel::<f64>(1);
+        if spend {
+            // production's 1 Hz sample, wakeups and all: the ledger's own cost is a spawn_blocking
+            // on another thread either way, so the reactor sees only the channel
+            tokio::spawn(async move {
+                let mut clock = tokio::time::interval(Duration::from_secs(1));
+                clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    clock.tick().await;
+                    if spend_tx.send(0.0).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        } else {
+            drop(spend_tx);
+        }
+        let (lecture, end) = engine_of(cmd_rx, events.clone());
+        let io = Io {
+            screen,
+            keys: key_stream,
+            lecture,
+            events: events_rx,
+            commands: commands.clone(),
+            interrupt: signal(SignalKind::interrupt()).unwrap(),
+            terminate: signal(SignalKind::terminate()).unwrap(),
+            hangup: signal(SignalKind::hangup()).unwrap(),
+            files,
+            hydrate_tx,
+            hydrate_rx,
+            spend_rx,
+            capture_tx,
+            capture_rx,
+        };
+        let lecture = tokio::spawn(react(io, view, None, Instant::now(), None));
+        Reactor { keys, events, commands, end, lecture, probe, _dir: dir }
+    }
+
+    /// The measured screen (140 × 40, the wide shape) over a lecture that ends when the test says.
+    fn reactor(width: u16, height: u16, view: View, spend: bool) -> Reactor {
+        let probe: Probe = Arc::new(Mutex::new(Vec::new()));
+        reactor_on(
+            ProbeSurface { terminal: ratatui::Terminal::new(TestBackend::new(width, height)).unwrap(), probe: probe.clone() },
+            probe,
+            view,
+            spend,
+            |_commands, _events| {
+                let (end_tx, end_rx) = oneshot::channel();
+                let engine = tokio::spawn(async move {
+                    let _ = end_rx.await;
+                    Ok::<StopReport, anyhow::Error>(StopReport::default())
+                });
+                (engine, Some(end_tx))
+            },
+        )
+    }
+
+    /// Sets the slow-terminal proof's screen into a reactor of its own: see `slow_terminal_holds_nothing_up`.
+
+    impl Reactor {
+        async fn finish(mut self) -> (Exit, Ui) {
+            if let Some(end) = self.end.take() {
+                let _ = end.send(());
+            }
+            self.lecture.await.unwrap()
+        }
+
+        fn draws(&self) -> Vec<(std::time::Instant, Duration)> {
+            self.probe.lock().unwrap().clone()
+        }
+
+        /// Waits for the next draw-start after `before` entries existed, or panics on the deadline.
+        /// The poll is fine-grained on purpose: on a current-thread runtime the test's own sleep
+        /// cadence is what advances the timer wheel between wakes, so a coarse poll would make
+        /// the reactor's 50 ms deadline itself fire late — a harness artifact, not the reactor's.
+        async fn next_draw(&self, before: usize, within: Duration) -> std::time::Instant {
+            let deadline = std::time::Instant::now() + within;
+            loop {
+                let draws = self.draws();
+                if draws.len() > before {
+                    return draws[draws.len() - 1].0;
+                }
+                assert!(std::time::Instant::now() < deadline, "no draw came within {within:?}");
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+        }
+    }
+
+    // ---- the slow terminal (a correctness proof, not a timing benchmark) ------------------------
+
+    /// Plan Task 13: a terminal whose flush blocks holds nothing up. While the reactor is inside a
+    /// blocked flush, exactly 3,000 events — a four-event cycle 750 times: Segment, Preview,
+    /// Committed, Level — all enter the unbounded event channel production uses, and every send
+    /// returns before the flush is released: that is the proof, not a timing budget. Afterwards
+    /// the view holds all of it: every segment once and in order, every commit revision, the
+    /// preview the last commit ended, and the last level's value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_terminal_holds_nothing_up() {
+        let gate = Arc::new(FlushGate::default());
+        let screen = ProbelessBlocking { terminal: ratatui::Terminal::new(SlowBackend { inner: TestBackend::new(140, 40), gate: gate.clone() }).unwrap() };
+        let r = reactor_on(screen, Arc::new(Mutex::new(Vec::new())), View::new(identity(), Hydration::empty(), Vec::new()), false, |_commands, _events| {
+            let (end_tx, end_rx) = oneshot::channel();
+            let engine = tokio::spawn(async move {
+                let _ = end_rx.await;
+                Ok::<StopReport, anyhow::Error>(StopReport::default())
+            });
+            (engine, Some(end_tx))
+        });
+        // the reactor is blocked inside its first frame's flush — known, not assumed
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !gate.entered() {
+            assert!(std::time::Instant::now() < deadline, "the reactor never drew");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // the four-event cycle, 750 times, all through the production channel; the last level is
+        // uniquely identifiable and the last commit ends the preview it follows
+        let at = Local::now();
+        let seg = |k: u64| Event::Session(Notification::Segment(Segment { id: k, recording_id: Default::default(), start_sample: k * 16_000, end_sample: (k + 1) * 16_000, said_at: at, start: at, end: at, text: format!("Segment {k} of the slow-terminal proof."), words: Vec::new(), source: SegmentSource::Live }));
+        let commit = |k: u64| Event::Committed { words: 8, slides: 0, block: format!("\n<!-- 10:00:00 -->\n## Block {k}\n\n- committed revision {k} landed.\n"), usd: 0.0, confirmed: true, removed: 0, missing: 0, revision: k };
+        for k in 0..750u64 {
+            let rev = k + 1;
+            let level = if k == 749 { -41.5 } else { 0.001 * k as f32 };
+            for e in [seg(k), Event::Preview(format!("slow-terminal delta {k} of the proof, ")), commit(rev), Event::Session(Notification::Level(level))] {
+                r.events.send(Forwarded { event: e, capture_persistence: CapturePersistence::None }).unwrap();
+            }
+        }
+        // the proof itself: all 3,000 sends returned while the flush still held the reactor
+        assert!(gate.blocked(), "every send completed while the terminal flush held the reactor — no sender ever awaited the frontend");
+        gate.release();
+        // the pile drains, a frame draws it, and then the lecture ends on the test's word
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (exit, ui) = r.finish().await;
+        assert!(matches!(exit, Exit::Ended(_)), "the lecture ended as the test ended it");
+        assert_eq!(ui.view.closed.iter().map(|l| l.id).collect::<Vec<_>>(), (0..750).collect::<Vec<_>>(), "every segment, once, in order");
+        assert_eq!(ui.view.notes.revision, 750, "every commit revision 1..=750 landed");
+        assert!(ui.view.notes.document.contains("## Block 1\n") && ui.view.notes.document.contains("## Block 750\n"), "the document holds the first and the last block");
+        assert_eq!(ui.view.notes.preview, None, "the final commit ended the preview");
+        assert_eq!(ui.view.level, Some(-41.5), "the meter shows the last level sent");
+        assert_eq!(ui.events, 3_000, "no durable event was lost");
+    }
+
+    /// The slow-terminal proof's surface: `Terminal<SlowBackend>` behind the seam.
+    struct ProbelessBlocking {
+        terminal: ratatui::Terminal<SlowBackend>,
+    }
+
+    impl Surface for ProbelessBlocking {
+        fn draw<F>(&mut self, render: F) -> io::Result<()>
+        where
+            F: FnOnce(&mut Frame),
+        {
+            self.terminal.draw(render).map(|_| ())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            let size = self.terminal.size()?;
+            self.terminal.resize(Rect::new(0, 0, size.width, size.height))
+        }
+    }
+
+    // ---- frame-work p95, the two-hour fixture ----------------------------------------------------
+
+    /// One frame's work as the reactor does it on a wake: the preview's throttled refresh, the
+    /// chrome, the render, and Ratatui's own draw and buffer diff — never real terminal I/O.
+    #[test]
+    #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
+    fn perf_two_hour_frame_work_p95() {
+        // the exact two-hour payload is built first; no timing below includes its generation
+        let mut ui = Ui::new(view_of(&fixture::two_hour_events(0, 0)), view::Theme::new(lecturelive_core::session::spend::Paint { color: true, truecolor: true }, true), None);
+        const WARMUP: usize = 20;
+        const MEASURED: usize = 200;
+        const RUNS: usize = 3;
+        let runs: Vec<Vec<Duration>> = (0..RUNS)
+            .map(|_| {
+                let mut terminal = ratatui::Terminal::new(TestBackend::new(140, 40)).unwrap();
+                let mut samples = Vec::with_capacity(MEASURED);
+                for i in 0..WARMUP + MEASURED {
+                    // the clock moves, so the frame is never an artificially static no-op
+                    let t0 = std::time::Instant::now();
+                    ui.preview.refresh(&ui.view.notes, std::time::Instant::now());
+                    let chrome = ui.chrome(Duration::from_millis(250 * i as u64));
+                    let mut drawn = ui.drawn;
+                    terminal.draw(|f| drawn = view::render(f, &ui.view, &chrome)).unwrap();
+                    ui.drawn = drawn;
+                    if i >= WARMUP {
+                        samples.push(t0.elapsed());
+                    }
+                }
+                samples
+            })
+            .collect();
+        let worst = summarize("two_hour_frame", &runs);
+        assert!(worst <= Duration::from_millis(8), "two-hour frame work p95 {worst:?} exceeds the 8 ms budget");
+        // the final frame is a real frame: the wide layout, both reading panes on screen
+        assert!(!ui.drawn.small && ui.drawn.transcript.is_some() && ui.drawn.notes.is_some(), "the frame is semantically valid, not TooSmall");
+    }
+
+    // ---- frame-work p95, the burst through the real reactor --------------------------------------
+
+    /// Waits until the draw rate settles to the 1 Hz clock's (the burst is over), or panics on the
+    /// deadline: a 1.5 s window that gained at most three draws, twice in a row. The burst draws
+    /// at least ten times a second while it runs; only the clock remains after it.
+    async fn wait_until_draws_settle(r: &Reactor, within: Duration) {
+        let deadline = std::time::Instant::now() + within;
+        let mut was = 0usize;
+        let mut calm = 0;
+        loop {
+            assert!(std::time::Instant::now() < deadline, "the burst never settled");
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let now = r.draws().len();
+            calm = if now - was <= 3 { calm + 1 } else { 0 };
+            was = now;
+            if calm >= 2 {
+                return;
+            }
+        }
+    }
+
+    /// The burst through the real generic reactor (plan Task 13): the fixture paces its 5,000
+    /// deltas at 500/s, the adapter forwards them as production's capture adapter does, and the
+    /// surface times each actual draw. The predeclared exclusion rule: the first three draws — the
+    /// session's initial paint, before any delta has landed — are dropped; every draw after them
+    /// counts. The preview's presentation parses are counted where they happen (panes::PRESENTED)
+    /// and gated at ≤10 a second over the burst, in half-open one-second windows.
+    #[tokio::test]
+    #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
+    async fn perf_burst_frame_work_p95() {
+        let mut runs: Vec<Vec<Duration>> = Vec::new();
+        let mut worst_hz_window = 0usize;
+        for run in 0..3 {
+            crate::tui::panes::PRESENTED.with(|p| p.borrow_mut().clear());
+            let probe: Probe = Arc::new(Mutex::new(Vec::new()));
+            let r = reactor_on(
+                ProbeSurface { terminal: ratatui::Terminal::new(TestBackend::new(140, 40)).unwrap(), probe: probe.clone() },
+                probe,
+                View::new(identity(), Hydration::empty(), Vec::new()),
+                false,
+                |commands, forward| {
+                    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+                    tokio::spawn(async move {
+                        // the capture adapter's forwarding, None persistence: a scripted session
+                        while let Some(e) = ev_rx.recv().await {
+                            if forward.send(Forwarded { event: e, capture_persistence: CapturePersistence::None }).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    let dir = tempfile::tempdir().unwrap();
+                    let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap());
+                    std::fs::create_dir_all(files.state_dir()).unwrap();
+                    // the folder outlives the engine inside its own task, and is cleaned up with it
+                    let engine = tokio::spawn(async move {
+                        let _keep = &dir;
+                        fixture::run(fixture::Scenario::Burst, &files, commands, ev_tx).await
+                    });
+                    (engine, None)
+                },
+            );
+            wait_until_draws_settle(&r, Duration::from_secs(90)).await;
+            let draws = r.draws();
+            let _ = r.commands.send(Command::Stop);
+            let (exit, ui) = r.finish().await;
+            assert!(matches!(exit, Exit::Ended(_)), "the burst ended as the test stopped it");
+            assert_eq!(ui.events, (fixture::BURST_DELTAS + fixture::BURST_SPEECH as usize + 4) as u64, "the whole burst: 5,000 deltas, 20 segments, the connection, the commit, its marker and the SourceEnded the drain takes");
+            // draw work: every draw after the first three (the initial paint)
+            runs.push(draws.iter().skip(3).map(|(_, d)| *d).collect());
+            // preview presentation: parses per half-open second over the burst, never the deltas
+            let parses = crate::tui::panes::PRESENTED.with(|p| p.borrow().clone());
+            assert!(!parses.is_empty(), "the preview was presented");
+            let t0 = parses[0];
+            let span = *parses.last().unwrap() - t0;
+            let (window, hz) = per_second(&parses, t0, span + Duration::from_secs(1));
+            println!("PERF burst_run{run}_preview_parses={} mean_hz={:.2} max_per_s={window}", parses.len(), hz);
+            worst_hz_window = worst_hz_window.max(window);
+        }
+        let worst = summarize("burst_frame", &runs);
+        assert!(worst <= Duration::from_nanos(16_700_000), "burst frame work p95 {worst:?} exceeds the 16.7 ms budget");
+        println!("PERF preview_hz={worst_hz_window}");
+        assert!(worst_hz_window <= 10, "the preview was presented {worst_hz_window} times in one second (≤10)");
+    }
+
+    // ---- key-to-draw latency ----------------------------------------------------------------------
+
+    /// Plan Task 13: from the moment a key is sent into the synthetic keyboard stream to the start
+    /// of the first draw after the reactor processed it — one key at a time (each sample waits for
+    /// its own draw, so no draw is ever guessed to belong to a key), 100 samples a repetition,
+    /// three repetitions, gate on the worst p95. The keys are visible edits of the hint line,
+    /// sent at a person's typing cadence (deterministic 30–130 ms between keys, 8–33 a second):
+    /// the one-at-a-time rule exists to disambiguate draws, and the cadence samples the phases a
+    /// typist's keys actually meet — mid-frame keys wait for the boundary, keys past it draw at
+    /// once. (The back-to-back worst phase — a key the instant the frame before began — is the
+    /// frame cap itself and is recorded separately in the ledger: its p50 is FRAME exactly.)
+    #[tokio::test]
+    #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
+    async fn perf_key_to_draw_p95() {
+        let mut runs: Vec<Vec<Duration>> = Vec::new();
+        for run in 0..3u64 {
+            let r = reactor(140, 40, view_of(&fixture::two_hour_events(0, 0)), false);
+            r.next_draw(0, Duration::from_secs(5)).await; // the first frame is up
+            let mut samples = Vec::with_capacity(100);
+            let mut lcg = 0x2545F4914F6CDD1Du64 ^ run; // deterministic per run, no timing randomness
+            for k in 0..100u32 {
+                let gap = Duration::from_millis(30 + (lcg % 100));
+                lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                tokio::time::sleep(gap).await;
+                let before = r.draws().len();
+                let key = if k % 2 == 0 {
+                    KeyEvent::new(KeyCode::Char((b'a' + (k % 26) as u8) as char), KeyModifiers::NONE)
+                } else {
+                    KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+                };
+                let sent = std::time::Instant::now();
+                r.keys.send(Ok(TermEvent::Key(key))).unwrap();
+                let drew = r.next_draw(before, Duration::from_secs(5)).await;
+                samples.push(drew - sent);
+            }
+            runs.push(samples);
+            r.finish().await;
+        }
+        let worst = summarize("key_to_draw", &runs);
+        assert!(worst <= Duration::from_millis(50), "key-to-draw p95 {worst:?} exceeds the 50 ms budget");
+    }
+
+    // ---- event-to-draw latency ---------------------------------------------------------------------
+
+    /// Plan Task 13: end-to-end, from the event's send into the unbounded channel (queue wait
+    /// included, never only after `recv`) to the start of the first draw that follows its
+    /// processing — one uniquely named marker notice at a time, 100 samples a repetition, three
+    /// repetitions, gate on the worst p95.
+    #[tokio::test]
+    #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
+    async fn perf_event_to_draw_p95() {
+        let mut runs: Vec<Vec<Duration>> = Vec::new();
+        for run in 0..3 {
+            let r = reactor(140, 40, view_of(&fixture::two_hour_events(0, 0)), false);
+            r.next_draw(0, Duration::from_secs(5)).await;
+            let mut samples = Vec::with_capacity(100);
+            for k in 0..100u32 {
+                let before = r.draws().len();
+                let sent = std::time::Instant::now();
+                r.events.send(Forwarded { event: Event::Warning(format!("marker {k} of run {run}")), capture_persistence: CapturePersistence::None }).unwrap();
+                let drew = r.next_draw(before, Duration::from_secs(5)).await;
+                samples.push(drew - sent);
+            }
+            runs.push(samples);
+            r.finish().await;
+        }
+        let worst = summarize("event_to_draw", &runs);
+        assert!(worst <= Duration::from_millis(100), "event-to-draw p95 {worst:?} exceeds the 100 ms budget");
+    }
+
+    // ---- draw rate under an ordinary stream ---------------------------------------------------------
+
+    /// The draw rate the reactor actually drew (plan Task 13), from the surface's own start
+    /// timestamps — never estimated from FRAME — under the ordinary stream the `transcript`
+    /// fixture represents: a level every 100 ms, the open utterance moving every 300 ms, a closed
+    /// segment every second. Every half-open one-second window must hold ≤20 draws.
+    #[tokio::test]
+    #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
+    async fn perf_draw_rate() {
+        const SPAN: Duration = Duration::from_secs(10);
+        let r = reactor(140, 40, view_of(&fixture::two_hour_events(0, 0)), true);
+        let events = r.events.clone();
+        tokio::spawn(async move {
+            let (mut level, mut open, mut segment) = (
+                tokio::time::interval(Duration::from_millis(100)),
+                tokio::time::interval(Duration::from_millis(300)),
+                tokio::time::interval(Duration::from_secs(1)),
+            );
+            let mut said = 0u64;
+            let start = Local::now();
+            loop {
+                tokio::select! {
+                    _ = level.tick() => { let _ = events.send(Forwarded { event: Event::Session(Notification::Level(0.05)), capture_persistence: CapturePersistence::None }); }
+                    _ = open.tick() => { let _ = events.send(Forwarded { event: Event::Session(Notification::Open { stable: format!("the live words {said}"), tentative: " still settling".into() }), capture_persistence: CapturePersistence::None }); }
+                    _ = segment.tick() => {
+                        let at = start + chrono::Duration::seconds(said as i64);
+                        let s = Segment { id: 1_440 + said, recording_id: Default::default(), start_sample: said * 16_000, end_sample: (said + 1) * 16_000, said_at: at, start: at, end: at, text: format!("An ordinary line {said} of the live stream."), words: Vec::new(), source: SegmentSource::Live };
+                        said += 1;
+                        let _ = events.send(Forwarded { event: Event::Session(Notification::Segment(s)), capture_persistence: CapturePersistence::None });
+                    }
+                }
+            }
+        });
+        let first = r.next_draw(0, Duration::from_secs(5)).await;
+        tokio::time::sleep(SPAN + Duration::from_millis(100)).await;
+        let starts: Vec<std::time::Instant> = r.draws().iter().map(|(s, _)| *s).collect();
+        r.finish().await;
+        let (window, mean) = per_second(&starts, first, SPAN);
+        println!("PERF ordinary_draws_per_s={mean:.2}");
+        println!("PERF ordinary_draws_max_per_s={window}");
+        assert!(window <= 20, "a one-second window held {window} draws (≤20)");
+    }
+
+    // ---- the quiet draw rate -------------------------------------------------------------------------
+
+    /// The loaded two-hour session after its backlog (plan Task 13): steady state, the initial
+    /// frame and the load excluded by construction (the state is the view the reactor starts
+    /// with), the spend sampler's 1 Hz wakeups included — measured over twelve steady seconds so
+    /// at least ten full windows count. The target is ≤1 draw a second.
+    #[tokio::test]
+    #[ignore = "perf: run with `cargo test -p lecturelive-cli perf -- --ignored --nocapture`"]
+    async fn perf_quiet_draw_rate() {
+        const SETTLE: Duration = Duration::from_secs(2);
+        const SPAN: Duration = Duration::from_secs(12);
+        let r = reactor(140, 40, view_of(&fixture::two_hour_events(0, 0)), true);
+        r.next_draw(0, Duration::from_secs(5)).await;
+        tokio::time::sleep(SETTLE).await;
+        let t0 = std::time::Instant::now();
+        tokio::time::sleep(SPAN).await;
+        let draws: Vec<std::time::Instant> = r.draws().iter().map(|(s, _)| *s).filter(|s| *s >= t0).collect();
+        r.finish().await;
+        let (window, mean) = per_second(&draws, t0, SPAN);
+        println!("PERF quiet_draws_per_s={mean:.2}");
+        println!("PERF quiet_draws_max_per_s={window}");
+        assert!(window <= 1, "a quiet one-second window held {window} draws (≤1)");
     }
 }

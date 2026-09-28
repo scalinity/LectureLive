@@ -464,6 +464,14 @@ pub(crate) struct Ink<'a> {
 /// The preview is parsed at most this often (plan §F: ≤10 Hz), however fast its deltas come.
 pub(crate) const PREVIEW_EVERY: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+thread_local! {
+    /// When each presentation parse of the preview happened (plan Task 13's rate probe): the
+    /// reactor's tests read it after a run. Production has nothing of the kind — the probe lives
+    /// here, at the one place [`Preview::refresh`] does the work it throttles.
+    pub(crate) static PRESENTED: std::cell::RefCell<Vec<std::time::Instant>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The preview as last parsed, for drawing (UI-local, the reactor's): which preview it is, how much
 /// of it was seen, when it was parsed, and the blocks.
 #[derive(Debug, Default)]
@@ -498,6 +506,8 @@ impl Preview {
         let shown = shown(text);
         if self.at.is_none() || shown.len() != self.shown {
             self.blocks = markdown::parse(shown);
+            #[cfg(test)]
+            PRESENTED.with(|p| p.borrow_mut().push(std::time::Instant::now()));
             self.shown = shown.len();
         }
         self.at = Some(now);
@@ -1769,6 +1779,13 @@ mod tests {
         assert!(s.len() <= PREVIEW_CAP && s.len() > PREVIEW_CAP - 4 && s.ends_with(' '));
     }
 
+    /// Task 13 pins the throttle structurally: the preview's presentation interval is exactly
+    /// 100 ms, so the rate can never exceed 10 Hz however the deltas arrive.
+    #[test]
+    fn preview_throttle_is_100_ms() {
+        assert_eq!(PREVIEW_EVERY, Duration::from_millis(100));
+    }
+
     /// Plan §F: the preview is parsed at most every 100 ms however fast its deltas come; a new
     /// preview is parsed at once and never shows an earlier one's blocks; an ended one drops at once.
     #[test]
@@ -2097,5 +2114,27 @@ mod tests {
         let v = slides_view(0, CaptureState::Denied);
         slides(&mut b, area, &v, &SlidesScroll::default(), &crate::capture::Action::Refused(crate::capture::Refusal::None), &words(), &ink, SIGNAL);
         assert!(row_text(&b, 0).starts_with("! Screen Recording is off"), "{:?}", row_text(&b, 0));
+    }
+}
+
+#[cfg(test)]
+mod task13_probe {
+    use super::*;
+
+    #[test]
+    fn probe_preview_costs() {
+        // the burst's final preview text, exactly as the fixture writes it
+        let text: String = (0..5_000).map(|d| format!("burst {d}: more of the notes as they are written, ")).collect();
+        let shown = shown(&text);
+        eprintln!("probe: preview {} bytes, shown {}", text.len(), shown.len());
+        let t = std::time::Instant::now();
+        let blocks = markdown::parse(shown);
+        eprintln!("probe: parse {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let rows = wrap(&blocks[0].text, 78);
+        eprintln!("probe: wrap of {} text -> {} rows {:?}", blocks[0].text.len(), rows.len(), t.elapsed());
+        let t = std::time::Instant::now();
+        for _ in 0..3 { let _ = markdown::parse(shown); }
+        eprintln!("probe: parse again (3x) {:?}", t.elapsed());
     }
 }

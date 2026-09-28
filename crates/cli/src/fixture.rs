@@ -65,6 +65,19 @@ pub(crate) enum Scenario {
     /// words, so the terminal is restored before the ordinary `Error: …` (cleaned only when
     /// stderr is a terminal) and exit 1.
     SessionFail,
+    /// Two hours of history in one moment (plan Task 13): 1,440 closed segments five seconds
+    /// apart and the canonical notes document of exactly 6,671 content words, emitted as fast as
+    /// the channel takes them, then a marker notice — and after it, quiet until Stop. Nothing is
+    /// paced and nothing repeats: the session exists to load long state and then be still.
+    TwoHour,
+    /// Pathological retained state (plan Task 13): 10,000 closed segments, a notes document of
+    /// exactly 100,000 content words and 200 registered slides, then the same quiet until Stop.
+    Stress,
+    /// A writing burst (plan Task 13): 5,000 preview deltas at 500 a second — one every 2 ms for
+    /// ten seconds — with one closed speech segment every 500 ms (20 in all), then one commit so
+    /// the preview ends and canonical notes win, then quiet until Stop. Deadline-driven: a late
+    /// tick catches up; a delta is never skipped and never added.
+    Burst,
 }
 
 impl Scenario {
@@ -82,7 +95,10 @@ impl Scenario {
             "capture" => Ok(Scenario::Capture),
             "failures" => Ok(Scenario::Failures),
             "session-fail" => Ok(Scenario::SessionFail),
-            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\", \"ops\", \"capture\", \"failures\" and \"session-fail\""),
+            "two-hour" => Ok(Scenario::TwoHour),
+            "stress" => Ok(Scenario::Stress),
+            "burst" => Ok(Scenario::Burst),
+            _ => anyhow::bail!("LECTURELIVE_CLI_FIXTURE names no scenario {name:?}; there are \"quiet\", \"transcript\", \"slow-stop\", \"panic\", \"init-fail-raw\", \"init-fail-mouse\", \"init-fail\", \"draw-fail\", \"ops\", \"capture\", \"failures\", \"session-fail\", \"two-hour\", \"stress\" and \"burst\""),
         }
     }
 }
@@ -108,6 +124,149 @@ pub(crate) const COMMAND_LOG: &str = "fixture-commands.log";
 /// Where the `capture` scenario's selections are kept (plan Task 11): in the lecture folder the
 /// test made, never the person's data folder.
 pub(crate) const CAPTURE_JSON: &str = "fixture-capture.json";
+
+// ---------------------------------------------------------------------------------------------
+// The Task-13 payloads: exact shapes, generated once, shared by the scenarios and their tests.
+
+/// The `two-hour` scenario's exact segment count: 1,440 closed segments, five seconds apart —
+/// 1,440 × 5 s = 7,200 s = two hours of history.
+pub(crate) const TWO_HOUR_SEGMENTS: u64 = 1_440;
+/// The `two-hour` notes document's exact content-word count.
+pub(crate) const TWO_HOUR_WORDS: usize = 6_671;
+/// The `stress` scenario's exact retained state.
+pub(crate) const STRESS_SEGMENTS: u64 = 10_000;
+pub(crate) const STRESS_WORDS: usize = 100_000;
+pub(crate) const STRESS_SLIDES: u32 = 200;
+/// The `burst` scenario's exact shape: 5,000 preview deltas at 500 a second (one every 2 ms, for
+/// ten seconds) with one closed speech segment every 500 ms.
+pub(crate) const BURST_DELTAS: usize = 5_000;
+pub(crate) const BURST_PER_SECOND: u64 = 500;
+pub(crate) const BURST_SPEECH: u64 = 20;
+
+/// The deterministic content-word counter for the scripted notes documents (plan Task 13): the
+/// words a person reads — whitespace-separated tokens holding at least one alphanumeric — once
+/// the timestamp markers are taken out. Markdown punctuation (`##`, `-`, emphasis) carries no
+/// content of its own. One definition, shared by the generator and the tests that pin it.
+pub(crate) fn content_words(document: &str) -> usize {
+    fn in_text(text: &str) -> usize {
+        text.split_whitespace().filter(|t| t.chars().any(char::is_alphanumeric)).count()
+    }
+    let mut words = 0;
+    let mut rest = document;
+    while let Some(a) = rest.find("<!--") {
+        words += in_text(&rest[..a]);
+        let marker = &rest[a..];
+        match marker.find("-->") {
+            Some(b) => rest = &marker[b + 3..],
+            None => return words, // an unterminated marker marks nothing readable after it
+        }
+    }
+    words + in_text(rest)
+}
+
+/// The word pool the scripted documents draw from: plain, alphanumeric words only, so a tail
+/// paragraph built from it counts exactly as many content words as it has words.
+const POOL: [&str; 32] = ["the", "standard", "error", "shrinks", "with", "square", "root", "of", "sample", "size", "larger", "samples", "reduce", "quadrupling", "only", "halves", "it", "distinct", "from", "spread", "observations", "sampling", "distributions", "each", "gives", "different", "mean", "means", "their", "own", "trade", "off"];
+
+/// The scripted notes document with exactly `exact` content words (plan Task 13): a title, then
+/// timestamp-marked sections — heading, paragraph, nested bullets — whose final piece is a
+/// paragraph trimmed to land on the exact count. Deterministic, realistic in shape (never one
+/// long line) and valid for the existing Markdown parser.
+pub(crate) fn notes_document(exact: usize) -> String {
+    let mut doc = String::from("# LectureLive notes\n\n");
+    let mut have = content_words(&doc);
+    let (mut section, mut cursor) = (0usize, 0usize);
+    while have < exact {
+        let remaining = exact - have;
+        let seconds = (section as u64 * 61) % 86_400;
+        let marker = format!("<!-- {:02}:{:02}:{:02} -->", seconds / 3_600, seconds / 60 % 60, seconds % 60);
+        let piece = if remaining >= 35 {
+            // a whole section: 5 (heading) + 12 (paragraph) + 6 + 6 + 6 (bullets) content words
+            format!("{marker}\n## Section {section}: sampling and spread\n\nThe standard error shrinks with the square root of the sample size.\n\n- Larger samples reduce the standard error.\n  - Quadrupling the sample only halves it.\n- Distinct from the spread of observations.\n\n")
+        } else {
+            // the tail: a paragraph of exactly the words that remain, nothing else
+            let words: Vec<&str> = (0..remaining).map(|i| POOL[(cursor + i) % POOL.len()]).collect();
+            format!("{marker}\n\n{}\n\n", words.join(" "))
+        };
+        have += content_words(&piece);
+        doc.push_str(&piece);
+        cursor += 16;
+        section += 1;
+    }
+    doc
+}
+
+/// One scripted backlog line: a sentence or two of lecture-speak, varying in length so the rows
+/// it wraps into vary too. The last line says the backlog ends, so it reads as a mark on screen.
+fn long_line(k: u64, total: u64) -> String {
+    const PHRASES: [&str; 8] = [
+        "We distinguish the sample statistic from the population parameter",
+        "Increasing the sample size reduces that variability",
+        "but only with the square root of n",
+        "so to halve the error you need four times the data",
+        "keep that trade-off in mind for the confidence intervals",
+        "a question from the chat: does this assume a normal population",
+        "not for the mean with a reasonable sample, which is the central limit theorem",
+        "let us check it with the simulation from the lab",
+    ];
+    if k + 1 == total {
+        return format!("Line {k}: the scripted backlog ends here; the session is now quiet.");
+    }
+    let mut text = format!("Line {k}: {}.", PHRASES[(k as usize) % PHRASES.len()]);
+    if k % 3 == 1 {
+        text.push_str(&format!(" {}", PHRASES[((k + 3) as usize) % PHRASES.len()]));
+    }
+    text
+}
+
+/// The long sessions' backlog as one event list (plan Task 13), shared by the scenarios and the
+/// in-process tests so both measure the very same payload: the connection, `segments` closed
+/// lines five seconds apart (mostly live, every ninety-seventh recovered — history, never
+/// breaking the id order), the notes document of exactly `words` content words as one commit,
+/// then the registered slides — `index % 3`: auto settled, auto unsettled, manual.
+fn backlog_events(segments: u64, words: usize, slides: u32, first: u64, revision: u64) -> Vec<Event> {
+    let start = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 26, 9, 0, 0).unwrap();
+    let mut out = Vec::with_capacity(segments as usize + slides as usize + 2);
+    out.push(Event::Session(Notification::Stt(SttStatus::Connected)));
+    for k in 0..segments {
+        let (id, said_at) = (first + k, start + chrono::Duration::seconds(k as i64 * 5));
+        let source = if k % 97 == 13 { SegmentSource::Recovered } else { SegmentSource::Live };
+        out.push(Event::Session(Notification::Segment(Segment {
+            id,
+            recording_id: Default::default(),
+            start_sample: id * 80_000,
+            end_sample: (id + 1) * 80_000,
+            said_at,
+            start: said_at,
+            end: said_at,
+            text: long_line(k, segments),
+            words: Vec::new(),
+            source,
+        })));
+    }
+    out.push(Event::Committed { words, slides: slides as usize, block: format!("\n{}", notes_document(words)), usd: 0.0, confirmed: true, removed: 0, missing: 0, revision: revision + 1 });
+    for index in 1..=slides {
+        let shown_at = start + chrono::Duration::seconds(index as i64);
+        let (auto, uncertain) = match index % 3 {
+            0 => (true, false),
+            1 => (true, true),
+            _ => (false, false),
+        };
+        let name = shown_at.format("%H%M%S");
+        out.push(Event::Slide { index, file: format!("slides/slide_{index:03}_{name}.png"), auto, uncertain, shown_at });
+    }
+    out
+}
+
+/// The `two-hour` scenario's exact backlog (plan Task 13).
+pub(crate) fn two_hour_events(first: u64, revision: u64) -> Vec<Event> {
+    backlog_events(TWO_HOUR_SEGMENTS, TWO_HOUR_WORDS, 0, first, revision)
+}
+
+/// The `stress` scenario's exact retained state (plan Task 13).
+pub(crate) fn stress_events(first: u64, revision: u64) -> Vec<Event> {
+    backlog_events(STRESS_SEGMENTS, STRESS_WORDS, STRESS_SLIDES, first, revision)
+}
 
 /// A command received, as the `ops` and `capture` logs record it: `snapshot<TAB>hint`, `polish`,
 /// `cancel`, `stop`, `capture-now`, or a `bind` with the window and enough of the selection to
@@ -202,9 +361,89 @@ extern "C" fn panic_without_unwinding() {
     panic!("the scripted panic (LECTURELIVE_CLI_FIXTURE=panic)");
 }
 
+/// The long scripted sessions, `two-hour` and `stress` (plan Task 13): the exact retained state
+/// above, emitted as fast as the channel takes it — no pacing, so loading is over in a moment —
+/// then one marker notice. After the marker the session is genuinely quiet: nothing at all until
+/// Stop, so a loaded session's steady-state draw rate and CPU are the reactor's own.
+async fn long_session(scenario: Scenario, files: &LectureFiles, mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) -> Result<StopReport> {
+    let first = segments::read(&files.segments())?.len() as u64;
+    let revision = Sidecar::load(&files.sidecar())?.map_or(0, |sc| sc.notes.revision);
+    let (backlog, name) = if scenario == Scenario::TwoHour { (two_hour_events(first, revision), "two-hour") } else { (stress_events(first, revision), "stress") };
+    let segments = backlog.iter().filter(|e| matches!(e, Event::Session(Notification::Segment(_)))).count() as u64;
+    for e in backlog {
+        let _ = events.send(e);
+    }
+    let _ = events.send(Event::Warning(format!("the scripted {name} session is loaded and now quiet")));
+    while let Some(c) = commands.recv().await {
+        if matches!(c, Command::Stop) {
+            break;
+        }
+    }
+    let _ = events.send(Event::Session(Notification::SourceEnded));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(StopReport { segments, ..Default::default() })
+}
+
+/// The `burst` scenario (plan Task 13): 5,000 preview deltas at 500 a second, deadline-driven —
+/// each delta waits for its own 2 ms deadline, and a late tick catches up without sleeping rather
+/// than skipping or adding anything — with one closed speech segment every 500 ms (20 in all).
+/// The burst ends with one commit, so the preview it wrote ends and canonical notes win; then the
+/// same quiet as the long sessions. A `Stop` mid-burst ends it at once, its deltas delivered.
+async fn burst_session(files: &LectureFiles, mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) -> Result<StopReport> {
+    let first = segments::read(&files.segments())?.len() as u64;
+    let mut revision = Sidecar::load(&files.sidecar())?.map_or(0, |sc| sc.notes.revision);
+    let base = Local::now();
+    let _ = events.send(Event::Session(Notification::Stt(SttStatus::Connected)));
+    let t0 = Instant::now();
+    let (mut sent, mut stopped) = (0u64, false);
+    for delta in 0..BURST_DELTAS {
+        let due = t0 + Duration::from_millis(delta as u64 * 1_000 / BURST_PER_SECOND);
+        if Instant::now() < due {
+            tokio::select! {
+                _ = tokio::time::sleep_until(due) => {}
+                c = commands.recv() => match c {
+                    Some(Command::Stop) | None => { stopped = true; }
+                    Some(_) => {}
+                }
+            }
+        }
+        if stopped {
+            break;
+        }
+        let _ = events.send(Event::Preview(format!("burst {delta}: more of the notes as they are written, ")));
+        sent += 1;
+        if sent % (BURST_PER_SECOND / 2) == 0 {
+            // every 500 ms of burst: one closed speech segment, ids in order
+            let k = sent / (BURST_PER_SECOND / 2);
+            let said_at = base + chrono::Duration::milliseconds(500 * (k - 1) as i64);
+            let s = Segment { id: first + k - 1, recording_id: Default::default(), start_sample: (first + k - 1) * 16_000, end_sample: (first + k) * 16_000, said_at, start: said_at, end: said_at, text: format!("Burst speech {k} of {BURST_SPEECH}: the notes keep up a clause at a time."), words: Vec::new(), source: SegmentSource::Live };
+            let _ = events.send(Event::Session(Notification::Segment(s)));
+        }
+    }
+    revision += 1;
+    let _ = events.send(Event::Committed { words: BURST_SPEECH as usize * 10, slides: 0, block: format!("\n<!-- {} -->\n## The burst's notes\n\n- 5,000 deltas folded into one canonical commit.\n", base.format("%H:%M:%S")), usd: 0.01, confirmed: true, removed: 0, missing: 0, revision });
+    let _ = events.send(Event::Warning("the scripted burst is complete and now quiet".into()));
+    if !stopped {
+        while let Some(c) = commands.recv().await {
+            if matches!(c, Command::Stop) {
+                break;
+            }
+        }
+    }
+    let _ = events.send(Event::Session(Notification::SourceEnded));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let speech = sent / (BURST_PER_SECOND / 2); // one closed segment per 500 ms of burst delivered
+    Ok(StopReport { segments: speech, ..Default::default() })
+}
+
 /// Runs `scenario` until the first `Stop`: then `SourceEnded`, and the end 200 ms later. Segment ids
 /// continue the folder's log and revisions its notes, though nothing is written.
 pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) -> Result<StopReport> {
+    match scenario {
+        Scenario::TwoHour | Scenario::Stress => return long_session(scenario, files, commands, events).await,
+        Scenario::Burst => return burst_session(files, commands, events).await,
+        _ => {}
+    }
     let first = segments::read(&files.segments())?.len() as u64;
     let mut revision = Sidecar::load(&files.sidecar())?.map_or(0, |sc| sc.notes.revision);
     let (mut next, mut words, mut open) = (first, 0, true);
@@ -505,4 +744,164 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(StopReport { segments: next - first, ..Default::default() })
+}
+
+/// The Task-13 payloads' exact shapes, measured on the scenarios themselves (plan Task 13): the
+/// counts are the contract, and the tests pin them against the same generators the scenarios run.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tokio::sync::mpsc::unbounded_channel;
+    use crate::fixture;
+
+    fn folder() -> (tempfile::TempDir, LectureFiles) {
+        let dir = tempfile::tempdir().unwrap();
+        let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap());
+        std::fs::create_dir_all(files.state_dir()).unwrap();
+        (dir, files)
+    }
+
+    /// Runs `scenario` until its marker notice names it loaded, then stops it: every event it
+    /// sent, each with when it arrived, and the report it returned.
+    async fn script(scenario: Scenario) -> (Vec<(Event, std::time::Instant)>, Result<StopReport>) {
+        let (dir, files) = folder();
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let run = tokio::spawn({
+            let files = files.clone();
+            async move { fixture::run(scenario, &files, cmd_rx, ev_tx).await }
+        });
+        let mut out = Vec::new();
+        let deadline = tokio::time::sleep(Duration::from_secs(60)); // the burst alone needs >10 s
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                e = ev_rx.recv() => match e {
+                    Some(e) => {
+                        let done = matches!(&e, Event::Warning(w) if w.contains("now quiet"));
+                        out.push((e, std::time::Instant::now()));
+                        if done {
+                            cmd_tx.send(Command::Stop).unwrap();
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = &mut deadline => panic!("{scenario:?} never finished after {} events", out.len()),
+            }
+        }
+        let report = run.await.unwrap();
+        while let Ok(e) = ev_rx.try_recv() {
+            out.push((e, std::time::Instant::now()));
+        }
+        drop(dir);
+        (out, report)
+    }
+
+    fn segments_of(events: &[(Event, std::time::Instant)]) -> Vec<&Segment> {
+        events.iter().map(|(e, _)| e).filter_map(|e| match e {
+            Event::Session(Notification::Segment(s)) => Some(s),
+            _ => None,
+        }).collect()
+    }
+
+    /// The counter's own definition, first: markers and Markdown punctuation are not content, and
+    /// the generator lands on its exact counts — the two Task-13 documents included.
+    #[test]
+    fn the_content_word_counter_counts_words_not_marks() {
+        assert_eq!(content_words("<!-- 09:00:00 -->\n## A\n\n- one two.\n"), 3);
+        assert_eq!(content_words("# Title\n\nSome *emphasised* text.\n"), 4);
+        assert_eq!(content_words(""), 0);
+        assert_eq!(content_words(&notes_document(TWO_HOUR_WORDS)), TWO_HOUR_WORDS, "the two-hour document is exactly 6,671 content words");
+        assert_eq!(content_words(&notes_document(STRESS_WORDS)), STRESS_WORDS, "the stress document is exactly 100,000");
+    }
+
+    #[tokio::test]
+    async fn two_hour_fixture_has_exact_shape() {
+        let (events, report) = script(Scenario::TwoHour).await;
+        let segments = segments_of(&events);
+        assert_eq!(segments.len(), TWO_HOUR_SEGMENTS as usize, "1,440 closed segments");
+        assert_eq!(segments.iter().map(|s| s.id).collect::<Vec<_>>(), (0..TWO_HOUR_SEGMENTS).collect::<Vec<_>>(), "ids 0..=1439, contiguous and in order");
+        assert!(segments.iter().any(|s| s.source == SegmentSource::Recovered), "an occasional recovered line");
+        assert_eq!(segments.iter().map(|s| (s.end_sample - s.start_sample) / 16_000).collect::<HashSet<_>>(), [5].into_iter().collect::<HashSet<_>>(), "five-second spacing: 1,440 × 5 s = two hours");
+        let committed: Vec<&Event> = events.iter().map(|(e, _)| e).filter(|e| matches!(e, Event::Committed { .. })).collect();
+        assert_eq!(committed.len(), 1);
+        match committed[0] {
+            Event::Committed { words, block, revision, .. } => {
+                assert_eq!((*words, *revision), (TWO_HOUR_WORDS, 1), "the commit says its own word count, at the next revision");
+                assert_eq!(content_words(block), TWO_HOUR_WORDS, "the document is exactly 6,671 content words");
+            }
+            _ => unreachable!(),
+        }
+        assert!(!events.iter().any(|(e, _)| matches!(e, Event::Slide { .. })), "no slides in the two-hour session");
+        assert!(matches!(events.last().map(|(e, _)| e), Some(Event::Session(Notification::SourceEnded))), "it stays alive until Stop");
+        assert_eq!(report.unwrap().segments, TWO_HOUR_SEGMENTS);
+    }
+
+    #[tokio::test]
+    async fn stress_fixture_has_exact_shape() {
+        let (events, report) = script(Scenario::Stress).await;
+        let segments = segments_of(&events);
+        assert_eq!(segments.len(), STRESS_SEGMENTS as usize, "10,000 closed segments");
+        assert_eq!(segments.iter().map(|s| s.id).collect::<Vec<_>>(), (0..STRESS_SEGMENTS).collect::<Vec<_>>(), "ids 0..=9,999, contiguous and in order");
+        let committed: Vec<&Event> = events.iter().map(|(e, _)| e).filter(|e| matches!(e, Event::Committed { .. })).collect();
+        assert_eq!(committed.len(), 1);
+        match committed[0] {
+            Event::Committed { words, block, revision, .. } => {
+                assert_eq!((*words, *revision), (STRESS_WORDS, 1));
+                assert_eq!(content_words(block), STRESS_WORDS, "exactly 100,000 content words");
+            }
+            _ => unreachable!(),
+        }
+        let slides: Vec<&Event> = events.iter().map(|(e, _)| e).filter(|e| matches!(e, Event::Slide { .. })).collect();
+        assert_eq!(slides.len(), STRESS_SLIDES as usize, "200 registered slides");
+        assert_eq!(
+            slides.iter().map(|e| match e { Event::Slide { index, .. } => *index, _ => 0 }).collect::<Vec<_>>(),
+            (1..=STRESS_SLIDES).collect::<Vec<_>>(),
+            "indices 1..=200"
+        );
+        for e in &slides {
+            match e {
+                // the representative mix, on the index % 3 cycle: auto settled / auto unsettled / manual
+                Event::Slide { index, auto, uncertain, .. } => assert_eq!((*auto, *uncertain), (index % 3 != 2, index % 3 == 1), "slide {index}"),
+                _ => unreachable!(),
+            }
+        }
+        assert!(matches!(events.last().map(|(e, _)| e), Some(Event::Session(Notification::SourceEnded))));
+        assert_eq!(report.unwrap().segments, STRESS_SEGMENTS);
+    }
+
+    /// The burst's exact shape and its real 500/s pacing (plan Task 13): 5,000 deltas, never
+    /// skipped and never duplicated however the scheduler behaved; 20 speech segments; one
+    /// terminal commit after the last delta; and the ten seconds the schedule demands.
+    #[tokio::test]
+    async fn burst_fixture_has_exact_shape() {
+        let (events, report) = script(Scenario::Burst).await;
+        let deltas: Vec<&String> = events.iter().filter_map(|(e, _)| match e { Event::Preview(d) => Some(d), _ => None }).collect();
+        assert_eq!(deltas.len(), BURST_DELTAS, "exactly 5,000 deltas");
+        assert_eq!(
+            deltas.iter().map(|d| d.trim_start_matches("burst ").split(':').next().unwrap().parse::<u64>().unwrap()).collect::<Vec<_>>(),
+            (0..BURST_DELTAS as u64).collect::<Vec<_>>(),
+            "in order, one of each: none skipped, none added"
+        );
+        let segments = segments_of(&events);
+        assert_eq!(segments.len(), BURST_SPEECH as usize, "20 closed speech segments");
+        assert_eq!(segments.iter().map(|s| s.id).collect::<Vec<_>>(), (0..BURST_SPEECH).collect::<Vec<_>>(), "deterministic sequential ids");
+        // the terminal event: the last preview is followed by the commit that ends it
+        let last_preview = events.iter().rposition(|(e, _)| matches!(e, Event::Preview(_))).unwrap();
+        let commit = events.iter().rposition(|(e, _)| matches!(e, Event::Committed { .. })).unwrap();
+        assert!(commit > last_preview, "the commit ends the preview");
+        match &events[commit].0 {
+            Event::Committed { revision, .. } => assert_eq!(*revision, 1, "canonical notes win at revision 1"),
+            _ => unreachable!(),
+        }
+        // the real rate: the deltas' schedule is 2 ms apart, so 5,000 of them span ten seconds —
+        // generous bounds, for a machine that briefly fell behind and caught up
+        let first = events.iter().find(|(e, _)| matches!(e, Event::Preview(_))).unwrap().1;
+        let last = events.iter().rposition(|(e, _)| matches!(e, Event::Preview(_))).unwrap();
+        let span = events[last].1 - first;
+        assert!(span >= std::time::Duration::from_secs(8) && span <= std::time::Duration::from_secs(15), "the burst spanned {span:?} (500/s for 10 s)");
+        assert_eq!(report.unwrap().segments, BURST_SPEECH);
+    }
 }

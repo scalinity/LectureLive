@@ -33,6 +33,23 @@ opt-level = 3
 [profile.dev.package.lecturelive-core]
 opt-level = 3
 
+# The terminal frontend's hot paths in dev builds (M7 Task 13, measured before/after in the M7
+# ledger): the notes pane wraps and renders, the reactor reduces, and Ratatui diffs the buffer —
+# unoptimised, the 500-delta/s burst cost 37.4% of a core and its frame work p95 31.1 ms; the
+# same tree with these four at opt-level 3 met §L's <20% and ≤16.7 ms with the design unchanged
+# (draws still capped at 20/s, preview parses at ≤10/s, batches bounded).
+[profile.dev.package.ratatui]
+opt-level = 3
+
+[profile.dev.package.ratatui-core]
+opt-level = 3
+
+[profile.dev.package.ratatui-widgets]
+opt-level = 3
+
+[profile.dev.package.lecturelive-cli]
+opt-level = 3
+
 [profile.dev.package.rubato]
 opt-level = 3
 
