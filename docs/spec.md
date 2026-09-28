@@ -862,7 +862,9 @@ the slide count and a `▲` while capture needs the person.
 
 `^S` captures the watched window now; while there is exactly one window offered, it is the saved
 window, and its region is saved for the course at that size, `^S` watches it. Every other state says
-why and sends nothing: a window is never bound silently. No slide thumbnails — the state is textual.
+why and sends nothing: a window is never bound silently. Each capture is a slide, so a held `^S` is
+one press: another is taken only after 300 ms without it and 2 s after the last one taken, as a held
+Ctrl-C is counted. No slide thumbnails — the state is textual.
 
 Slide capture is on by default in the live command: it runs from the course's saved selection, so
 there is nothing to switch on. What the terminal does not do is choose a window for the first time —

@@ -107,6 +107,8 @@ struct Ui {
     help: usize,
     /// The capture context: the course's selections file and the selection as loaded, for Ctrl-S.
     capture: Option<capture::Context>,
+    /// Ctrl-S presses that act: a held key's repeats are one capture, never a slide each.
+    capture_press: input::Held,
     /// Where the last frame put things: reading moves count rows as the person sees them.
     drawn: view::Drawn,
     /// The preview as last parsed for drawing: at most every [`panes::PREVIEW_EVERY`], never per delta.
@@ -178,6 +180,7 @@ impl Ui {
             activity: panes::ActivityScroll::default(),
             help: 0,
             capture,
+            capture_press: input::Held::default(),
             drawn: view::Drawn::default(),
             preview: panes::Preview::default(),
             theme,
@@ -333,7 +336,7 @@ impl Ui {
                 self.focus = PANES[if forward { (at + 1) % 3 } else { (at + 2) % 3 }];
                 Act::Redraw
             }
-            Key::Capture => self.capture_key(),
+            Key::Capture => self.capture_key(now),
             Key::Read(m) => self.read(m),
             Key::Enter => self.enter(now),
             Key::Edit => match self.hint.edit(key) {
@@ -370,12 +373,14 @@ impl Ui {
 
     /// Ctrl-S, by what capture is doing (plan §H): a watched window captures now; the one window
     /// offered through its saved region is watched — saved first, by the send, then bound. Every
-    /// other state says why it refuses, and sends nothing.
-    fn capture_key(&mut self) -> Act {
+    /// other state says why it refuses, and sends nothing. A press that would act is taken as a
+    /// held key allows ([`input::Held`]): each capture-now is a slide core saves.
+    fn capture_key(&mut self, now: std::time::Instant) -> Act {
         match self.capture_action() {
+            capture::Action::Refused(why) => self.say(self.capture_refusal(why)),
+            _ if !self.capture_press.take(now) => Act::Nothing,
             capture::Action::Now => Act::CaptureNow,
             capture::Action::Watch { window, selection } => Act::CaptureWatch { window, selection },
-            capture::Action::Refused(why) => self.say(self.capture_refusal(why)),
         }
     }
 
@@ -1461,8 +1466,9 @@ mod tests {
         ui.event(&Event::Slide { index: 4, file: "slides/slide_04.png".into(), auto: false, uncertain: false, shown_at: Local::now() }, Instant::now());
         assert_eq!(ui.view.slides.len(), 1);
         assert_eq!(ui.view.slides[0].index, 4, "the canonical slide, not a fabricated one");
-        // a failed capture-now is a notice; a second press is a second command, never a retry
-        assert_eq!(ui.key(ctrl('s'), Instant::now()), Act::CaptureNow);
+        // a failed capture-now is a notice; a second press, not a held key's repeat, is a second
+        // command, never a retry
+        assert_eq!(ui.key(ctrl('s'), Instant::now() + Duration::from_secs(3)), Act::CaptureNow);
         ui.send(Act::CaptureNow, &tx, &replies);
         let Command::CaptureNow(answer) = rx.recv().await.unwrap() else { panic!() };
         assert!(rx.try_recv().is_err(), "one more key, one more command");
@@ -1733,7 +1739,7 @@ mod tests {
         assert_eq!(ui.key(repeat, Instant::now()), Act::Nothing);
         assert_eq!(ui.key(repeat, Instant::now()), Act::Nothing);
         let (replies, mut reply_rx) = tokio::sync::mpsc::channel(4);
-        let act = ui.key(press, Instant::now()); // a second, real press: a second deliberate action
+        let act = ui.key(press, Instant::now() + Duration::from_secs(3)); // a second, real press after the hold: a second deliberate action
         assert!(matches!(act, Act::CaptureWatch { .. }));
         ui.send(act, &tx, &replies);
         let sent = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1749,6 +1755,41 @@ mod tests {
         assert!(matches!(sent, Command::Bind { .. }));
         assert!(rx.try_recv().is_err(), "one press sequence, one Bind");
         let _ = reply_rx.recv().await; // the reply is drained elsewhere; nothing retries on its own
+    }
+
+    /// A held Ctrl-S as a real terminal delivers it: no terminal is asked to report key kinds, so
+    /// crossterm reports every repeat as a `Press`; macOS repeats after 225–1800 ms, then about
+    /// every 33 ms. Each capture-now is a slide core saves, so one hold is one capture — and one
+    /// watch-it — while a deliberate press after it is another.
+    #[test]
+    fn a_held_ctrl_s_as_terminals_send_it_is_one_capture() {
+        for delay in [225, 500, 1800] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ui = capture_ui(&dir);
+            frame(&mut ui, 110, 32);
+            let t0 = Instant::now();
+            ui.event(&Event::Capture(CaptureState::Watching { window: "Zoom Meeting".into() }), t0);
+            let mut acts = vec![ui.key(ctrl('s'), t0)];
+            let mut at = t0 + ms(delay);
+            while at < t0 + Duration::from_secs(5) {
+                acts.push(ui.key(ctrl('s'), at));
+                at += ms(33);
+            }
+            let captures = acts.iter().filter(|a| **a == Act::CaptureNow).count();
+            assert_eq!(captures, 1, "one hold, one capture (repeat delay {delay} ms)");
+            assert_eq!(ui.key(ctrl('s'), at + ms(400)), Act::CaptureNow, "a deliberate press after the hold is another capture");
+
+            let mut ui = capture_ui(&dir);
+            frame(&mut ui, 110, 32);
+            ui.event(&asking(vec![candidate(42, 1280, 720)]), t0);
+            let mut watches = usize::from(matches!(ui.key(ctrl('s'), t0), Act::CaptureWatch { .. }));
+            let mut at = t0 + ms(delay);
+            while at < t0 + Duration::from_secs(5) {
+                watches += usize::from(matches!(ui.key(ctrl('s'), at), Act::CaptureWatch { .. }));
+                at += ms(33);
+            }
+            assert_eq!(watches, 1, "one hold, one watch-it (repeat delay {delay} ms)");
+        }
     }
 
     /// Every state that cannot act says why and sends nothing: unbound, paused, denied, failing,

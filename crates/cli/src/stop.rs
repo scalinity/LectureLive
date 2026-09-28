@@ -5,9 +5,9 @@
 use std::time::{Duration, Instant};
 
 /// A held key's repeats keep arriving: a Key must follow this much quiet since the last Ctrl-C key.
-const QUIET: Duration = Duration::from_millis(300);
+pub(crate) const QUIET: Duration = Duration::from_millis(300);
 /// macOS waits up to 1.8 s before a held key repeats: a Key must also come this long after the stage before.
-const DWELL: Duration = Duration::from_secs(2);
+pub(crate) const DWELL: Duration = Duration::from_secs(2);
 
 /// Where a stop request came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

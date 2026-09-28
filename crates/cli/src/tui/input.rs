@@ -13,6 +13,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::panes::Move;
+use crate::stop::{DWELL, QUIET};
 
 /// The most a hint may hold, in UTF-8 bytes.
 pub(crate) const HINT_CAP: usize = 8 * 1024;
@@ -100,6 +101,29 @@ pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
         KeyCode::BackTab => Key::Focus(false),
         KeyCode::Enter => Key::Enter,
         _ => Key::Edit,
+    }
+}
+
+/// A chord whose every press acts on the lecture, held or not: taken as the stop controller takes a
+/// Ctrl-C key. No terminal is asked to report key kinds, so a held key's repeats arrive as presses;
+/// one is taken only after [`QUIET`] without the chord and [`DWELL`] after the last one taken, which
+/// is longer than macOS waits before a held key repeats.
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    last: Option<Instant>,
+    taken: Option<Instant>,
+}
+
+impl Held {
+    /// A press of the chord at `now`: whether it is taken. Every press, taken or not, restarts the quiet.
+    pub(crate) fn take(&mut self, now: Instant) -> bool {
+        let quiet = self.last.is_none_or(|t| now.saturating_duration_since(t) >= QUIET);
+        self.last = Some(now);
+        let rested = self.taken.is_none_or(|t| now.saturating_duration_since(t) >= DWELL);
+        if quiet && rested {
+            self.taken = Some(now);
+        }
+        quiet && rested
     }
 }
 
