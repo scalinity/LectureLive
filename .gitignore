@@ -13,3 +13,4 @@ spend.jsonl
 target/
 node_modules/
 recordings/
+.claude/
