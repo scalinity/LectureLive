@@ -4,7 +4,7 @@ import type { DropEvent, Transport } from "./transport";
 import type { Envelope, NotesMsg, SessionState, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 
 export function idleStatus(): Status {
-  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, input_gone: null, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
+  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, paused: false, input_gone: null, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
 }
 
 export function emptyState(session: string): SessionState {

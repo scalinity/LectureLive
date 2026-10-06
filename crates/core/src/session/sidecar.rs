@@ -34,12 +34,24 @@ pub struct Sidecar {
     /// Registered slides, in registration order (spec §7.3, §8).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slides: Vec<SlideEntry>,
+    /// The stretches the person paused the lecture (spec §9.6): nothing was recorded in them, so the hole between
+    /// the recordings either side is theirs, and the audit counts it as explained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pauses: Vec<PauseSpan>,
 }
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new() }
+        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new(), pauses: Vec::new() }
     }
+}
+
+/// A pause, from when it began to when it ended; `to` is None while it lasts, or when a crash ended the session in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseSpan {
+    pub from: DateTime<Local>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<DateTime<Local>>,
 }
 
 /// The notes document's committed state: its revision and fingerprint, and the cursors of what it holds.

@@ -2,6 +2,7 @@ mod adapter;
 mod app;
 mod canary;
 mod keychain;
+mod quit;
 mod wire;
 
 use tauri::Manager;
@@ -15,6 +16,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, e| if e.state == ShortcutState::Pressed { app::shortcut(app) }).build())
         .setup(move |a| {
             a.manage(app::App::new(a.handle().clone()));
+            #[cfg(unix)]
+            watch_signals(a.handle().clone());
             if !check.is_empty() {
                 let handle = a.handle().clone();
                 std::thread::spawn(move || {
@@ -34,6 +37,8 @@ pub fn run() {
             app::start_lecture,
             app::stop,
             app::snapshot,
+            app::pause,
+            app::resume,
             app::polish,
             app::cancel,
             app::open_page,
@@ -59,6 +64,60 @@ pub fn run() {
             app::open_microphone_settings,
             app::use_input,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|handle, event| match event {
+            // The last window closing, or `exit`: a running lecture is saved first, then the app exits.
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if let Some(until) = handle.try_state::<app::App>().and_then(|a| a.quit_deadline()) {
+                    api.prevent_exit();
+                    let h = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let app = h.state::<app::App>();
+                        app::save_for_quit(&app, until).await;
+                        h.exit(0); // asks again; nothing is running now, or the time is up, so it goes through
+                    });
+                }
+            }
+            // A native quit (Cmd-Q, an Apple Event) arrives only here and cannot be cancelled: the main thread waits for
+            // the lecture to save, until the same deadline. The lecture runs on Tauri's runtime, not on this thread.
+            tauri::RunEvent::Exit => {
+                if let Some(app) = handle.try_state::<app::App>() {
+                    if let Some(until) = app.quit_deadline() {
+                        tauri::async_runtime::block_on(app::save_for_quit(&app, until));
+                    }
+                }
+            }
+            _ => {}
+        });
+}
+
+/// SIGTERM, SIGHUP and SIGINT: nothing in Tauri handles them, so the process would end with the recording unsaved.
+/// The first saves a running lecture and exits; a second, while that is going on, exits at once.
+#[cfg(unix)]
+fn watch_signals(handle: tauri::AppHandle) {
+    use tokio::signal::unix::{signal, SignalKind};
+    tauri::async_runtime::spawn(async move {
+        let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup()), signal(SignalKind::interrupt())) else { return };
+        let mut seen = 0;
+        loop {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+                _ = int.recv() => {}
+            }
+            seen += 1;
+            if seen > 1 {
+                std::process::exit(1);
+            }
+            let h = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let app = h.state::<app::App>();
+                if let Some(until) = app.quit_deadline() {
+                    app::save_for_quit(&app, until).await;
+                }
+                h.exit(0);
+            });
+        }
+    });
 }

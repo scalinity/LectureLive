@@ -1,15 +1,16 @@
 //! The app's one lecture (spec §3.2, §3.6): a folder opened, at most one `lecture::run` on Tauri's
 //! runtime, and the commands the frontend calls. Every event goes through the `Pump`.
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use lecturelive_core::audio::permission::{self, MicPermission};
 use lecturelive_core::audio::mixed::{MixedSource, MIXED_MODE};
 use lecturelive_core::audio::source::{DeviceSource, Fallback, Source};
 use lecturelive_core::audio::{input, loopback};
-use lecturelive_core::capture::detect::{Region, Thresholds};
+use lecturelive_core::capture::detect::{Region, Thresholds, SAMPLE_INTERVAL};
 use lecturelive_core::capture::select::{Descriptor, Selection, Selections};
 use lecturelive_core::capture::window::{self, SystemWindows, WindowInfo, WindowSource};
 use lecturelive_core::notes::chat::{ChatClient, ChatConfig};
@@ -35,6 +36,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::adapter::{read_document, Phase, Pump, Sink, SourceKind, Stream};
 use crate::keychain;
+use crate::quit;
 use crate::wire::{CaptureView, CaptureWord, FolderView, NoticeKind, PreviewShot, SavedRegion, SessionState, WindowView};
 
 /// The Python CLI's ledger, taken over by the app's at each start (spec §8).
@@ -100,12 +102,34 @@ pub struct App {
     sink: Arc<TauriSink>,
     folder: StdMutex<Option<OpenFolder>>,
     running: StdMutex<Option<Running>>,
+    /// The running lecture's `run` has returned, so everything is saved. Set before anything that needs the main
+    /// thread (the shortcut's removal does), because a quit may be holding that thread to wait for exactly this.
+    run_over: AtomicBool,
+    /// When a quit must have saved the running lecture by, whichever way the quit arrived (spec §9.6).
+    quit: quit::Quit,
 }
 
 impl App {
     pub fn new(app: AppHandle) -> Self {
         let sink = Arc::new(TauriSink { app, channels: StdMutex::new(None) });
-        Self { pump: Arc::new(Mutex::new(Pump::new(String::new(), sink.clone(), None, SourceKind::Input))), sink, folder: StdMutex::new(None), running: StdMutex::new(None) }
+        Self {
+            pump: Arc::new(Mutex::new(Pump::new(String::new(), sink.clone(), None, SourceKind::Input))),
+            sink,
+            folder: StdMutex::new(None),
+            running: StdMutex::new(None),
+            run_over: AtomicBool::new(false),
+            quit: quit::Quit::default(),
+        }
+    }
+
+    /// A lecture is being recorded and its recording is not yet saved.
+    fn lecture_running(&self) -> bool {
+        self.running.lock().expect("the running lock").is_some() && !self.run_over.load(Ordering::SeqCst)
+    }
+
+    /// The moment a quit must wait until for the running lecture to save; None when none runs, or the time is up.
+    pub fn quit_deadline(&self) -> Option<Instant> {
+        self.quit.deadline(self.lecture_running(), quit::QUIT_WAIT)
     }
 
     fn folder(&self) -> Option<OpenFolder> {
@@ -118,10 +142,22 @@ impl App {
 
     fn send(&self, c: Command) -> Res<()> {
         // Core takes no new operation once the lecture is stopping; say so rather than drop it.
-        if matches!(c, Command::Op(_)) && self.running.lock().expect("the running lock").as_ref().is_some_and(|r| r.stops > 0) {
-            return Err("The lecture is stopping; the last snapshot takes what is left.".into());
+        if let Some(why) = stopping_refusal(&c) {
+            if self.running.lock().expect("the running lock").as_ref().is_some_and(|r| r.stops > 0) {
+                return Err(why.into());
+            }
         }
         self.commands().ok_or("No lecture is running.")?.send(c).map_err(|_| "The lecture has ended.".to_string())
+    }
+}
+
+/// What to say when this command arrives after the lecture began stopping, which takes no new operation and no
+/// pause or resume; None for the commands a stopping lecture still takes (state, capture, stop itself).
+fn stopping_refusal(c: &Command) -> Option<&'static str> {
+    match c {
+        Command::Op(_) => Some("The lecture is stopping; the last snapshot takes what is left."),
+        Command::Pause | Command::Resume => Some("The lecture is stopping; it can no longer be paused or resumed."),
+        _ => None,
     }
 }
 
@@ -390,7 +426,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let watch = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
     // Spec §7: the course's saved window, revalidated by the worker as the lecture starts.
     let selection = Selections::load(&selections_path()?).ok().and_then(|s| s.get(&folder.course).cloned());
-    let capture = CaptureSetup { source: Box::new(SystemWindows), selection, interval: Duration::from_secs(1), thresholds: Thresholds::default(), record: std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from) };
+    let capture = CaptureSetup { source: Box::new(SystemWindows), selection, interval: SAMPLE_INTERVAL, thresholds: Thresholds::live(), record: std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from) };
     let (source, fallback): (Box<dyn Source>, Option<Fallback>) = match kind {
         SourceKind::Mixed => (Box::new(MixedSource::new(loopback::BLACKHOLE_UID, &uid)), None),
         _ => {
@@ -399,6 +435,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
         }
     };
     let run = lecture::run(lec.clone(), cfg, source, watch, Some(capture), cmd_rx, ev_tx);
+    app.run_over.store(false, Ordering::SeqCst);
     *app.running.lock().expect("the running lock") = Some(Running { commands: cmd_tx, lecture: lec, stops: 0, fallback, _lock: lock });
     app.pump.lock().await.set_status(|s| s.phase = Phase::Running);
     // ⌘⇧2 captures the slide from anywhere, only while a lecture runs: it takes the keys from every other app.
@@ -408,6 +445,9 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let h = handle.clone();
     tauri::async_runtime::spawn(async move {
         let result = run.await;
+        // Everything is saved: a quit waiting on this may go on. Before the shortcut, whose removal waits for the main
+        // thread, which that quit may be holding.
+        h.state::<App>().run_over.store(true, Ordering::SeqCst);
         let _ = forward.await;
         let app = h.state::<App>();
         let _ = h.global_shortcut().unregister(SHORTCUT);
@@ -454,6 +494,17 @@ pub async fn stop(app: State<'_, App>) -> Res<u32> {
 #[tauri::command]
 pub fn snapshot(hint: String, app: State<'_, App>) -> Res<()> {
     app.send(Command::Op(Op::Snapshot(hint)))
+}
+
+/// Pause the lecture (spec §9.6): nothing is recorded or transcribed, and automatic slide capture waits, until resume.
+#[tauri::command]
+pub fn pause(app: State<'_, App>) -> Res<()> {
+    app.send(Command::Pause)
+}
+
+#[tauri::command]
+pub fn resume(app: State<'_, App>) -> Res<()> {
+    app.send(Command::Resume)
 }
 
 /// A polish inside the lecture; once it has ended (decision D1), on the chosen folder, with the page after it.
@@ -707,8 +758,9 @@ pub async fn open_page(app: State<'_, App>) -> Res<String> {
     drop(tx);
     let _ = forward.await;
     let outcome = outcome?;
-    // A check typesets without opening the default browser: the page itself loads math and fonts from the web.
-    if std::env::var_os("LECTURELIVE_CHECK").is_none() {
+    // A check typesets without opening the default browser (the page itself loads math and fonts from the web), unless it is
+    // asked to (`LECTURELIVE_CHECK_OPEN`): the check that the page opens is the person's V07.
+    if std::env::var_os("LECTURELIVE_CHECK").is_none() || std::env::var_os("LECTURELIVE_CHECK_OPEN").is_some() {
         std::process::Command::new("open").arg(&outcome.path).status().map_err(text)?;
     }
     Ok(outcome.path.to_string_lossy().into_owned())
@@ -759,6 +811,9 @@ pub struct CheckConfig {
     dir: Option<String>,
     /// How long a timed check runs (`LECTURELIVE_CHECK_MINUTES`).
     minutes: Option<u64>,
+    /// End by quitting the app with the lecture running, as a quit from outside would (`LECTURELIVE_CHECK_QUIT`), not by
+    /// stopping it: no last snapshot is taken, so no slide is sent anywhere.
+    quit: bool,
 }
 
 /// A measurement or check the page runs by itself, from `LECTURELIVE_CHECK` (and `LECTURELIVE_CHECK_DIR`,
@@ -766,7 +821,8 @@ pub struct CheckConfig {
 #[tauri::command]
 pub fn check_config() -> Option<CheckConfig> {
     let mode = std::env::var("LECTURELIVE_CHECK").ok().filter(|m| !m.is_empty())?;
-    Some(CheckConfig { mode, dir: std::env::var("LECTURELIVE_CHECK_DIR").ok(), minutes: std::env::var("LECTURELIVE_CHECK_MINUTES").ok().and_then(|m| m.parse().ok()) })
+    let quit = std::env::var_os("LECTURELIVE_CHECK_QUIT").is_some_and(|v| !v.is_empty());
+    Some(CheckConfig { mode, dir: std::env::var("LECTURELIVE_CHECK_DIR").ok(), minutes: std::env::var("LECTURELIVE_CHECK_MINUTES").ok().and_then(|m| m.parse().ok()), quit })
 }
 
 /// Writes a check's report to `~/Library/Application Support/LectureLive/m5-checks/<name>.json`.
@@ -803,7 +859,7 @@ pub async fn check_record(minutes: u64, app: State<'_, App>) -> Res<Value> {
     let scratch = data_dir()?.join("m5-record-scratch");
     std::fs::create_dir_all(&scratch).map_err(text)?;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let cfg = WorkerConfig { slides: scratch, interval: Duration::from_secs(1), thresholds: Thresholds::default(), record: Some(record) };
+    let cfg = WorkerConfig { slides: scratch, interval: SAMPLE_INTERVAL, thresholds: Thresholds::live(), record: Some(record) };
     let handle = worker::spawn(Box::new(SystemWindows), Some(selection), cfg, tx);
     let end = tokio::time::Instant::now() + Duration::from_secs(minutes * 60);
     let (mut states, mut kept) = (Vec::new(), Vec::new());
@@ -883,6 +939,7 @@ pub async fn check_deck(action: String, handle: AppHandle) -> Res<Value> {
             open_deck(&handle)?;
             Ok(deck_id(Some(old)).await?.into())
         }
+        "bar:on" | "bar:off" => deck()?.eval(format!("window.__deck.bar({})", action == "bar:on")).map(|_| Value::Null).map_err(text),
         show => {
             let i: u32 = show.strip_prefix("show:").and_then(|n| n.parse().ok()).ok_or_else(|| format!("unknown deck action {show:?}"))?;
             deck()?.eval(format!("window.__deck.show({i})")).map(|_| Value::Null).map_err(text)
@@ -895,9 +952,32 @@ pub fn exit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// Saves a running lecture for an app that is being quit: a `Quit` takes no last snapshot and waits for no recovery,
+/// so the recording is finalized and the sidecar written in moments. Waits until `until`; whether it ended in time.
+/// Asking twice is harmless: a quit that arrives while the lecture is already being saved just waits with the first.
+pub async fn save_for_quit(app: &App, until: Instant) -> bool {
+    let Some(commands) = app.commands() else { return true };
+    let _ = commands.send(Command::Quit);
+    quit::wait_until(|| !app.lecture_running(), until.saturating_duration_since(Instant::now()), quit::POLL).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec §9.6: a stopping lecture takes no new operation and no pause or resume, and says so; a stop, a cancel, a
+    /// quit and a state read still go through.
+    #[test]
+    fn a_stopping_lecture_refuses_operations_and_pauses_but_not_a_stop_a_cancel_or_a_state_read() {
+        let (tx, _rx) = oneshot::channel();
+        assert!(stopping_refusal(&Command::Op(Op::Polish)).is_some());
+        assert!(stopping_refusal(&Command::Op(Op::Snapshot(String::new()))).is_some());
+        assert!(stopping_refusal(&Command::Pause).is_some_and(|m| m.contains("paused")));
+        assert!(stopping_refusal(&Command::Resume).is_some());
+        for c in [Command::Stop, Command::Quit, Command::Cancel, Command::State(tx)] {
+            assert_eq!(stopping_refusal(&c), None, "{c:?}");
+        }
+    }
 
     /// Final review, I1: once the lecture is stopping it no longer reads its commands (the last snapshot
     /// runs), so the state comes from the file at once; a lecture that does not answer falls back to it too.

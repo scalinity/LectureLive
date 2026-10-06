@@ -3,7 +3,7 @@
   import "$lib/theme.css";
   import { isTauri } from "@tauri-apps/api/core";
   import { measure } from "$lib/bench";
-  import { captureCheck, cspCheck, deckRecordCheck, faultsCheck, fullscreenCheck, liveCheck, pageCheck, recordCheck, zoomCheck } from "$lib/checks";
+  import { captureCheck, cspCheck, deckRecordCheck, faultsCheck, fullscreenCheck, idleCheck, liveCheck, looksCheck, pageCheck, recordCheck, zoomCheck } from "$lib/checks";
   import { burstFixture, demoLook, demoWithNotes, FixtureTransport, twoHourFixture } from "$lib/fixture";
   import { session } from "$lib/session.svelte";
   import { tauriTransport, type Transport } from "$lib/transport";
@@ -16,7 +16,7 @@
   import StatusStrip from "$lib/StatusStrip.svelte";
   import Transcript from "$lib/Transcript.svelte";
 
-  type CheckConfig = { mode: string; dir: string | null; minutes: number | null };
+  type CheckConfig = { mode: string; dir: string | null; minutes: number | null; quit?: boolean };
 
   // The app talks to Tauri; outside it, the browser preview plays a scripted lecture.
   const real = isTauri() ? tauriTransport() : null;
@@ -68,7 +68,10 @@
     if (real && cfg?.mode === "csp" && cfg.dir) return cspCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "live" && cfg.dir) return liveCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "page" && cfg.dir) return pageCheck(session, real, cfg.dir);
-    if (real && cfg?.mode === "capture" && cfg.dir) return captureCheck(session, real, cfg.dir);
+    if (real && cfg?.mode === "capture" && cfg.dir) return captureCheck(session, real, cfg.dir, cfg.quit);
+    if (real && cfg?.mode === "idle" && cfg.dir) return idleCheck(session, real, cfg.dir, false);
+    if (real && cfg?.mode === "idle-paused" && cfg.dir) return idleCheck(session, real, cfg.dir, true);
+    if (real && cfg?.mode === "looks" && cfg.dir) return looksCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "zoom" && cfg.dir) return zoomCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "record" && cfg.dir) return recordCheck(session, real, cfg.dir);
     if (real && cfg?.mode === "deck-record" && cfg.dir) return deckRecordCheck(session, real, cfg.dir);

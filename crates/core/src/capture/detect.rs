@@ -4,11 +4,21 @@
 //! candidate that never settles is kept after 10 samples, flagged uncertain.
 use image::{imageops::FilterType, DynamicImage, GrayImage, RgbaImage};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 pub const W: u32 = 256;
 pub const H: u32 = 144;
 pub const TILE: u32 = 16;
 pub const TILES: usize = ((W / TILE) * (H / TILE)) as usize;
+/// A settled frame equal to one of this many kept frames before the current one is the same slide again.
+pub const RECENT_KEPT: usize = 3;
+/// ...when that frame was on screen within this many samples (about a second each) of now.
+pub const RECENT_SAMPLES: u64 = 60;
+/// Samples a lecture takes each second. A slide held for 1–2 s was seen twice only half the time at one a
+/// second, which is how a lecturer paging through a deck lost slides (M7.1 class); at three it is seen twice
+/// from about 0.7 s.
+pub const SAMPLE_HZ: u32 = 3;
+pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000 / SAMPLE_HZ as u64);
 
 /// The slide's rectangle as fractions of the window, so it holds at any capture scale (spec §7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -92,11 +102,32 @@ pub struct Thresholds {
     pub animated: u32,
     /// A candidate unsettled for this many samples is kept anyway, flagged uncertain.
     pub expire: u32,
+    /// A candidate is kept once this many samples in a row have shown it still: the picture has finished
+    /// sharpening (Zoom sends a share coarse first), so what is saved is the finished slide.
+    pub hold: u32,
+    /// A settled frame equal to a recently kept one is the same slide again within this many samples.
+    pub recent: u64,
 }
 
 impl Default for Thresholds {
+    /// The values calibrated at one sample a second (M5).
     fn default() -> Self {
-        Self { change: 0.05, settle: 0.03, animated: 3, expire: 10 }
+        Self { change: 0.05, settle: 0.03, animated: 3, expire: 10, hold: 1, recent: RECENT_SAMPLES }
+    }
+}
+
+impl Thresholds {
+    /// The calibrated values for `hz` samples a second: what counts in seconds stays the same, so each count of
+    /// samples grows with the rate, and a slide is kept after about two thirds of a second on screen.
+    pub fn at(hz: u32) -> Self {
+        let hz = hz.max(1);
+        let one = Self::default();
+        Self { animated: one.animated * hz, expire: one.expire * hz, hold: (2 * hz / 3).max(1), recent: one.recent * hz as u64, ..one }
+    }
+
+    /// What a lecture runs with.
+    pub fn live() -> Self {
+        Self::at(SAMPLE_HZ)
     }
 }
 
@@ -111,6 +142,8 @@ struct Candidate<T> {
     frame: GrayImage,
     since: T,
     age: u32,
+    /// Samples in a row that showed it still.
+    still: u32,
 }
 
 /// Mean absolute difference of each 16×16 tile, 0–1.
@@ -136,11 +169,23 @@ pub struct Detector<T> {
     candidate: Option<Candidate<T>>,
     moving: [u32; TILES],
     masked: [bool; TILES],
+    /// Samples seen, and the kept frames before the current one with the sample each was replaced at.
+    samples: u64,
+    recent: VecDeque<(GrayImage, u64)>,
 }
 
 impl<T: Clone> Detector<T> {
     pub fn new(t: Thresholds) -> Self {
-        Self { t, reference: None, prev: None, candidate: None, moving: [0; TILES], masked: [false; TILES] }
+        Self { t, reference: None, prev: None, candidate: None, moving: [0; TILES], masked: [false; TILES], samples: 0, recent: VecDeque::new() }
+    }
+
+    /// Whether `frame` is one of the last few kept frames again, shown within the last minute or so: a
+    /// window's control bar fading in and out of the region, or the lecturer stepping back a slide and forward.
+    fn seen_recently(&self, frame: &GrayImage) -> bool {
+        self.recent.iter().any(|(old, at)| self.samples - at <= self.t.recent && {
+            let d = tile_diffs(frame, old);
+            (0..TILES).all(|i| self.masked[i] || d[i] <= self.t.change)
+        })
     }
 
     /// The last kept frame: what the slide on screen should look like.
@@ -166,7 +211,12 @@ impl<T: Clone> Detector<T> {
 
     /// Makes `frame` the kept frame: a slide taken by hand, or one this detector decided on.
     pub fn keep(&mut self, frame: GrayImage) {
-        self.reference = Some(frame.clone());
+        if let Some(old) = self.reference.replace(frame.clone()) {
+            self.recent.push_back((old, self.samples));
+            if self.recent.len() > RECENT_KEPT {
+                self.recent.pop_front();
+            }
+        }
         self.prev = Some(frame);
         self.candidate = None;
         self.moving = [0; TILES];
@@ -174,6 +224,7 @@ impl<T: Clone> Detector<T> {
     }
 
     pub fn observe(&mut self, at: T, frame: GrayImage) -> Option<Decision<T>> {
+        self.samples += 1;
         let (Some(reference), Some(prev)) = (&self.reference, &self.prev) else {
             self.keep(frame);
             return Some(Decision { shown_at: at, uncertain: false }); // the first valid frame of a session
@@ -194,7 +245,7 @@ impl<T: Clone> Detector<T> {
         self.prev = Some(frame.clone());
         let Some(c) = self.candidate.as_mut() else {
             if !changed.is_empty() {
-                self.candidate = Some(Candidate { frame, since: at, age: 0 });
+                self.candidate = Some(Candidate { frame, since: at, age: 0, still: 0 });
             }
             return None;
         };
@@ -206,11 +257,17 @@ impl<T: Clone> Detector<T> {
         // kept frame would let an animation's quieter tiles pass for a still frame.
         let d_cand = tile_diffs(&frame, &c.frame);
         if (0..TILES).all(|i| self.masked[i] || d_cand[i] < self.t.settle) {
+            c.still += 1;
+            if c.still < self.t.hold {
+                return None;
+            }
             let since = c.since.clone();
+            let again = self.seen_recently(&frame);
             self.keep(frame);
-            return Some(Decision { shown_at: since, uncertain: false });
+            return (!again).then_some(Decision { shown_at: since, uncertain: false });
         }
         c.age += 1;
+        c.still = 0;
         c.frame = frame.clone();
         if c.age >= self.t.expire {
             let since = c.since.clone();
@@ -274,6 +331,44 @@ mod tests {
         let flash = with_bar(a.clone(), 0, 0, W, H, 20);
         let got = run(&mut Detector::new(Thresholds::default()), &[a.clone(), flash, a.clone(), a.clone()]);
         assert_eq!(got.len(), 1, "only the first frame: {got:?}");
+    }
+
+    /// Live evidence (M6, a Zoom lecture): the window's control bar fades in and out inside the region, and each
+    /// stable state of the same slide was kept as a new slide, 24 in five minutes. A frame that matches one of the
+    /// last few kept frames is the same slide again: it becomes the reference and is not registered.
+    #[test]
+    fn a_control_bar_that_comes_and_goes_registers_the_slide_once_per_look_not_every_time() {
+        let a = page();
+        let bar = with_bar(a.clone(), 0, 128, W, 16, 15); // the toolbar: a dark strip along the bottom
+        let (a, bar) = (|| a.clone(), || bar.clone());
+        let mut frames = vec![a(), a()];
+        for _ in 0..4 {
+            frames.extend([bar(), bar(), bar(), a(), a(), a()]);
+        }
+        let got = run(&mut Detector::new(Thresholds::default()), &frames);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 3], "the first frame and the bar's first look: {got:?}");
+    }
+
+    #[test]
+    fn a_frame_matching_an_old_kept_frame_registers_again_once_it_is_no_longer_recent() {
+        let a = page();
+        let b = with_bar(a.clone(), 16, 32, 120, 6, 40);
+        let c = with_bar(a.clone(), 16, 64, 120, 6, 40);
+        let (d, e) = (with_bar(a.clone(), 16, 96, 120, 6, 40), with_bar(a.clone(), 16, 112, 120, 6, 40));
+        let mut frames = vec![a.clone()];
+        for f in [&b, &c, &d, &e] {
+            frames.extend([f.clone(), f.clone()]);
+        }
+        // Three slides ago is still recent: going back to b within the window is the same slide.
+        let mut at = Detector::new(Thresholds::default());
+        let near = run(&mut at, &[frames.clone(), vec![b.clone(), b.clone()]].concat());
+        assert_eq!(near.len(), 5, "a, b, c, d, e, and no sixth for b again: {near:?}");
+        // Past the window it is a new look.
+        let mut far = Detector::new(Thresholds::default());
+        let mut late = frames.clone();
+        late.extend(std::iter::repeat(e.clone()).take(RECENT_SAMPLES as usize));
+        late.extend([b.clone(), b]);
+        assert_eq!(run(&mut far, &late).len(), 6, "b again after the window is registered");
     }
 
     #[test]
@@ -367,5 +462,38 @@ mod tests {
         assert!(thumb(&img, &Region { x: 0.5, y: 0.5, w: 0.0, h: 0.5 }).is_none(), "zero size");
         assert_eq!(Region { x: 0.25, y: 0.5, w: 0.5, h: 0.5 }.pixels(1000, 600), Some((250, 300, 500, 300)));
         assert_eq!(Region { x: 0.9, y: 0.9, w: 0.5, h: 0.5 }.pixels(1000, 600), Some((900, 540, 100, 60)), "clamped inside");
+    }
+
+    /// Live evidence (M7.1 class): a lecturer paging through a deck lost slides at one sample a second, since a page
+    /// held for a second or two is seen twice only half the time. The live rate is the calibrated one scaled to
+    /// three samples a second, and keeps each page held for about a second.
+    #[test]
+    fn the_live_rate_is_the_calibrated_one_scaled_and_keeps_every_page_held_for_about_a_second() {
+        assert_eq!(Thresholds::at(1), Thresholds::default());
+        let t = Thresholds::at(SAMPLE_HZ);
+        assert_eq!((t.animated, t.expire, t.hold, t.recent), (9, 30, 2, 180));
+        assert_eq!(SAMPLE_INTERVAL.as_millis(), 333);
+        let pages: Vec<GrayImage> = (0..5).map(|k| with_bar(page(), 16, 20 + k * 24, 120, 6, 40)).collect();
+        // Each page on screen for three samples: one second.
+        let frames: Vec<GrayImage> = pages.iter().flat_map(|p| [p.clone(), p.clone(), p.clone()]).collect();
+        let got = run(&mut Detector::new(t), &frames);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 5, 8, 11, 14], "the first frame, then each page when it has held: {got:?}");
+        // The same five pages, one second each, sampled once a second: only the first is kept.
+        assert_eq!(run(&mut Detector::new(Thresholds::default()), &pages).len(), 1);
+    }
+
+    /// A slide still sharpening (Zoom sends a share coarse first) is not kept until it has held for `hold` samples,
+    /// so what is saved is the finished picture, whatever the rate.
+    #[test]
+    fn a_change_is_kept_only_after_hold_samples_in_a_row_that_show_it_still() {
+        let a = page();
+        let b = with_bar(a.clone(), 16, 32, 120, 6, 40);
+        let t = Thresholds { hold: 3, ..Thresholds::default() };
+        let got = run(&mut Detector::new(t), &[a.clone(), b.clone(), b.clone(), b.clone(), b.clone()]);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 4], "b is first seen at 1 and kept at its third look after: {got:?}");
+        // A sample that differs puts the count back to nothing.
+        let c = with_bar(a.clone(), 16, 80, 120, 6, 40);
+        let got = run(&mut Detector::new(t), &[a.clone(), b.clone(), b.clone(), c.clone(), c.clone(), c.clone(), c.clone()]);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 6], "{got:?}");
     }
 }

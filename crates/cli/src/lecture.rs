@@ -398,15 +398,19 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     plain::read_commands(cmd_tx.clone());
     let stop = Arc::new(Mutex::new(StopController::default()));
     plain::stop_on_ctrl_c(cmd_tx.clone(), out, stop.clone());
+    let quitting = plain::Quitting::default();
+    plain::quit_on_signals(cmd_tx.clone(), out, quitting.clone(), plain::QUIT_GRACE)?;
     if let Some(limit) = a.secs {
         plain::stop_after_secs(limit, cmd_tx.clone(), out, stop);
     }
     drop(cmd_tx);
     let mixed = uid.starts_with("mixed:");
     let mut watch = (uid == loopback::BLACKHOLE_UID || mixed).then(|| SilenceWatch::new(-60.0, 10));
+    let watched = watch.is_some();
     let words = capture::Words::new(&course);
     let printer = tokio::spawn(async move {
         while let Some(f) = events.recv().await {
+            watch = plain::watch_after(&f.event, watched, watch.take()); // nothing is silent while the lecture is paused
             match &f.capture_persistence {
                 // a relocation the session found but could not keep: one line, both truths, the
                 // failure last — never a bare "found again" that implies it was saved
@@ -422,9 +426,18 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     printer.await?;
     // The same final boundary as the TUI's: a fatal error's words are cleaned only as they leave
     // for a terminal stderr, after the events are drained and printed.
-    let report = result.map_err(plain::fatal)?;
+    let mut report = result.map_err(plain::fatal)?;
+    let quit = quitting.load(std::sync::atomic::Ordering::SeqCst);
+    // A quit takes no last snapshot on purpose: the summary says so, not that one failed.
+    if quit != 0 && report.last_snapshot.take().is_some() {
+        plain::say(&mut std::io::stdout().lock(), out, "notes", "notes", "the last snapshot was not taken; the next session in this folder adds what it missed");
+    }
     plain::print_end(&mut std::io::stdout().lock(), out, &files, &report, &spend);
-    Ok(())
+    // A SIGTERM or SIGHUP asked the lecture to quit: it has, and the status says why the process ended.
+    match quit {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
 }
 
 #[cfg(test)]

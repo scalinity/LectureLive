@@ -37,4 +37,4 @@
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " ▲ screen recording  Screen Recording is off for Terminal: System Settings → Privacy & Security → Screen & System Audio Recording, then qu… "
 " ◆  a hint, or ⏎ for a snapshot                                                                                                             "
-" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop                                                                          "
+" ⏎ snapshot   polish⏎   ^P pause   Tab pane   ^O activity   ^H help   ^C stop                                                               "

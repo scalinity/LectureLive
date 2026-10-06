@@ -11,7 +11,7 @@ fn help(args: &[&str]) -> String {
 #[test]
 fn lecture_help_is_pinned() {
     assert_eq!(help(&["lecture", "--help"]), concat!(
-        "A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter adds a focus hint, polish then Enter polishes and typesets the page. On a terminal it opens full-screen with its transcript, notes and slides; --plain keeps the line-by-line output instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery\n",
+        "A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter adds a focus hint, polish then Enter polishes and typesets the page, pause then Enter stops recording and transcribing until resume then Enter. On a terminal it opens full-screen with its transcript, notes and slides; --plain keeps the line-by-line output instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery\n",
         "\n",
         "Usage: lecturelive lecture [OPTIONS] [COMMAND]\n",
         "\n",

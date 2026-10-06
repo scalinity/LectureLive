@@ -21,4 +21,4 @@
 "           • 標本平均 is the sample mean 🎓                                     " Hidden by multi-width symbols: [(14, " "), (16, " "), (18, " "), (20, " "), (42, " ")]
 "                                                                                "
 " ◆  a hint, or ⏎ for a snapshot                                                 "
-" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop              "
+" ⏎ snapshot   polish⏎   ^P pause   Tab pane   ^O activity   ^H help   ^C stop   "

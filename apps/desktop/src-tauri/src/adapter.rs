@@ -117,6 +117,7 @@ impl Pump {
         s.busy = None;
         s.level_dbfs = None;
         s.input_gone = None;
+        s.paused = false;
         if s.capture.window.is_some() {
             s.capture = CaptureView { state: CaptureWord::Ready, window: s.capture.window.take(), ..CaptureView::default() };
         } else {
@@ -240,9 +241,25 @@ impl Pump {
             }
             Event::Capture(s) => self.capture_state(s),
             Event::CaptureMoved { note, .. } => self.notice(NoticeKind::Slide, "Found again", &note),
+            Event::Paused(paused) => self.paused(paused),
             Event::Warning(m) => self.notice(NoticeKind::Warn, "Warning", &m),
         }
         self.flush_status();
+    }
+
+    /// The person paused or resumed (spec §9.6). A break is silent on purpose, so the silence warning is off during it
+    /// and its ten seconds are counted again from the resume.
+    fn paused(&mut self, paused: bool) {
+        self.mirror.status.paused = paused;
+        self.mirror.status.silence = false;
+        if self.silence.is_some() {
+            self.silence = Some(SilenceWatch::new(-60.0, 10));
+        }
+        if paused {
+            self.notice(NoticeKind::Notes, "Paused", "nothing is recorded or transcribed until you resume; notes and slides taken by hand carry on");
+        } else {
+            self.notice(NoticeKind::Done, "Resumed", "recording again, in a new file");
+        }
     }
 
     /// The capture worker's state into the status; a changed state is also a notice.
@@ -303,7 +320,7 @@ impl Pump {
             Notification::Segment(s) => self.emit(Stream::Transcript, TranscriptMsg::Segment { segment: SegmentView::from(&s) }),
             Notification::Level(l) => {
                 self.mirror.status.level_dbfs = Some(dbfs(l).round());
-                if let Some(w) = self.silence.as_mut() {
+                if let Some(w) = self.silence.as_mut().filter(|_| !self.mirror.status.paused) {
                     if w.observe(l) {
                         self.mirror.status.silence = true;
                         self.notice(NoticeKind::Warn, "No signal", "10 s of silence on BlackHole: is Zoom's Speaker \"LectureLive Loopback\"?");
@@ -590,6 +607,54 @@ mod tests {
         assert_eq!(p.mirror().status.silence, true);
         p.apply(Event::Session(Notification::Level(0.3)));
         assert_eq!(p.mirror().status.silence, false);
+    }
+
+    /// Pause (spec §9.6): the status says so, a reload rebuilds it from the mirror, and the end of the lecture clears it.
+    #[test]
+    fn a_pause_is_in_the_status_and_the_mirror_and_a_resume_or_the_end_clears_it() {
+        let (mut p, sink) = pump();
+        p.set_status(|s| s.phase = Phase::Running);
+        sink.take();
+        p.apply(Event::Paused(true));
+        assert!(p.mirror().status.paused);
+        assert_eq!(p.mirror().status.phase, Phase::Running, "a pause is not a phase: the lecture runs");
+        let s = p.state(None, &[], String::new(), None);
+        assert!(s.status.paused, "a reloaded page is told");
+        let msgs = sink.on(Stream::Status);
+        let status = msgs.iter().rev().find(|m| m["type"] == "status").unwrap();
+        assert_eq!(status["paused"].as_bool(), Some(true));
+        assert_eq!(p.mirror().notices.back().map(|n| n.label.as_str()), Some("Paused"));
+        p.apply(Event::Paused(false));
+        assert!(!p.mirror().status.paused);
+        assert_eq!(p.mirror().notices.back().map(|n| n.label.as_str()), Some("Resumed"));
+        p.apply(Event::Paused(true));
+        p.lecture_ended();
+        assert!(!p.mirror().status.paused, "an ended lecture is not paused");
+    }
+
+    /// A break is silent on purpose: no warning that Zoom's audio is missing, and ten silent seconds are counted
+    /// again from the resume, not from before the pause.
+    #[test]
+    fn a_pause_raises_no_silence_warning_and_the_count_starts_again_after_it() {
+        let (mut p, sink) = pump_with(SourceKind::Loopback);
+        for _ in 0..6 {
+            p.apply(Event::Session(Notification::Level(0.0)));
+        }
+        p.apply(Event::Paused(true));
+        sink.take();
+        for _ in 0..30 {
+            p.apply(Event::Session(Notification::Level(0.0)));
+        }
+        assert!(!p.mirror().status.silence);
+        assert_eq!(sink.take().iter().filter(|(_, m)| m["type"] == "notice" && m["label"] == "No signal").count(), 0);
+        assert!(p.mirror().status.level_dbfs.is_some(), "the meter still moves while paused");
+        p.apply(Event::Paused(false));
+        for _ in 0..9 {
+            p.apply(Event::Session(Notification::Level(0.0)));
+        }
+        assert!(!p.mirror().status.silence, "the six silent seconds before the pause do not count");
+        p.apply(Event::Session(Notification::Level(0.0)));
+        assert!(p.mirror().status.silence, "ten silent seconds after it do");
     }
 
     #[test]

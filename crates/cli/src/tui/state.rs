@@ -342,6 +342,9 @@ pub(crate) struct View {
     /// Whether the loopback has been silent for ten seconds (loopback and mixed inputs only).
     pub(crate) silence: bool,
     watch: Option<SilenceWatch>,
+    /// The person paused the lecture (spec §9.6): nothing is recorded or transcribed, and the input is not silent,
+    /// only unheard. As core said it: the view never decides it.
+    pub(crate) paused: bool,
     /// The single input that is away, while it is gone (mixed leaves it unset: Zoom goes on).
     pub(crate) input_gone: Option<String>,
     /// The transcription connection, as core typed it; never flattened to a string before the view.
@@ -408,6 +411,7 @@ impl View {
             level: None,
             silence: false,
             watch: matches!(kind, SourceKind::Loopback | SourceKind::Mixed).then(|| SilenceWatch::new(-60.0, 10)),
+            paused: false,
             input_gone: None,
             stt: None,
             capture: None,
@@ -455,6 +459,13 @@ impl View {
             }
             Event::Slide { index, file, auto, uncertain, shown_at } => self.slide(*index, file, *auto, *uncertain, *shown_at),
             Event::Capture(s) => self.capture = Some(capture_cleaned(s)),
+            // Nothing is recorded while paused, so nothing is silent; the watch starts afresh on the resume.
+            Event::Paused(p) => {
+                self.paused = *p;
+                self.silence = false;
+                let watched = matches!(self.identity.kind, SourceKind::Loopback | SourceKind::Mixed);
+                self.watch = plain::watch_after(e, watched, self.watch.take());
+            }
             _ => {}
         }
         // The wording both frontends share goes to the ring; the line is layered, not
@@ -1377,6 +1388,45 @@ mod tests {
         assert_eq!(v.level, Some(quiet));
         v.reduce(&Event::Session(Notification::Level(0.5)), at());
         assert!(!v.silence, "a real level clears it");
+    }
+
+    /// Pause (spec §9.6): the view says so, and the loopback's silence watch is off while nothing is recorded: the
+    /// warning standing at the pause goes, quiet samples during it add nothing, and the resume starts the count afresh.
+    #[test]
+    fn a_pause_clears_the_silence_and_a_resume_starts_its_watch_afresh() {
+        let mut v = view(); // the loopback
+        let quiet = 10f32.powf(-80.0 / 20.0);
+        for _ in 0..10 {
+            v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(v.silence && !v.paused);
+        v.reduce(&Event::Paused(true), at());
+        assert!(v.paused, "the view knows");
+        assert!(!v.silence, "paused is not silent");
+        for _ in 0..30 {
+            v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(!v.silence, "quiet while paused warns nothing");
+        assert_eq!(v.level, Some(quiet), "the input is still metered");
+        assert_eq!(v.activity.records().iter().filter(|a| a.label == "no signal").count(), 1, "only the warning from before the pause");
+        v.reduce(&Event::Paused(false), at());
+        assert!(!v.paused);
+        for _ in 0..9 {
+            v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(!v.silence, "nine quiet seconds after the resume: the count began again");
+        v.reduce(&Event::Session(Notification::Level(quiet)), at());
+        assert!(v.silence, "the tenth warns");
+        assert_eq!(v.activity.records().iter().filter(|a| a.label == "paused").count(), 1);
+        assert_eq!(v.activity.records().iter().filter(|a| a.label == "resumed").count(), 1);
+        // an input that is not watched (a microphone) stays unwatched through both
+        let mut mic = View::new(identity(SourceKind::Input), Hydration::empty(), Vec::new());
+        mic.reduce(&Event::Paused(true), at());
+        mic.reduce(&Event::Paused(false), at());
+        for _ in 0..20 {
+            mic.reduce(&Event::Session(Notification::Level(quiet)), at());
+        }
+        assert!(!mic.silence);
     }
 
     /// The loopback silence warning clears only on a level at or above −60 dBFS (plan §H): a

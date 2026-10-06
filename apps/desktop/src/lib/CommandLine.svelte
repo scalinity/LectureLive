@@ -1,6 +1,7 @@
 <script lang="ts">
   // The command line (spec §9.1): the CLI's grammar in one field. Empty ⏎ is a snapshot, a hint then
-  // ⏎ a hinted snapshot, `polish` ⏎ a polish. Stop goes Stop → Stop waiting; quitting is the third.
+  // ⏎ a hinted snapshot, `polish` ⏎ a polish, `pause` and `resume` ⏎ a break (spec §9.6). Stop goes Stop → Stop waiting;
+  // quitting is the third.
   import FolderPicker from "./FolderPicker.svelte";
   import { session } from "./session.svelte";
   import type { NoticeKind } from "./wire";
@@ -11,7 +12,8 @@
 
   const MARK: Record<NoticeKind, string> = { notes: "◆", slide: "▣", page: "✦", done: "✓", warn: "▲" };
   const live = $derived(session.status.phase !== "idle" && session.status.phase !== "ended");
-  const latest = $derived(session.notices[session.notices.length - 1]);
+  // While paused the line above says it, so the notice that repeats it is left to the history.
+  const latest = $derived(session.notices.filter((n) => !(session.paused && n.label === "Paused")).at(-1));
   // The fallback offer (spec §4.1): the first other input unless the person picked one.
   let pick = $state("");
   const chosen = $derived(session.fallbacks.some((i) => i.uid === pick) ? pick : (session.fallbacks[0]?.uid ?? ""));
@@ -31,6 +33,11 @@
 </script>
 
 <footer class="command">
+  {#if live && session.paused}
+    <p class="paused" role="status">
+      <span class="pause" aria-hidden="true"></span><strong>Paused.</strong> Nothing is recorded or sent for transcription, and slides are not taken by themselves. Notes, snapshots and screenshots still work.
+    </p>
+  {/if}
   {#if live && session.status.input_gone}
     <div class="offer" role="alert">
       <p><span class="mark warn">▲</span> <strong>{session.status.source ?? session.status.input_gone}</strong> is unplugged. LectureLive waits for it and records nothing meanwhile.</p>
@@ -67,10 +74,12 @@
         <span class="diamond" aria-hidden="true">◆</span>
         <input bind:value={hint} placeholder="a hint, or ⏎ for a snapshot" aria-label="Hint for the next snapshot" disabled={!session.canSnapshot} />
       </label>
-      <button class="primary" type="submit" disabled={!session.canSnapshot}>Snapshot</button>
+      <!-- One filled action per state: while paused it is Resume. -->
+      <button class={session.paused ? "outline" : "primary"} type="submit" disabled={!session.canSnapshot}>Snapshot</button>
       {#if session.busyOp}<button class="cancel" type="button" onclick={() => session.cancel()}>Cancel</button>{/if}
       <button class="outline" type="button" onclick={() => session.polish()} disabled={!session.canPolish}>Polish</button>
       <button class="outline" type="button" onclick={page} disabled={pageRunning}>{pageRunning ? "Typesetting" : "Study page"}</button>
+      <button class={session.paused ? "primary" : "outline"} type="button" onclick={() => (session.paused ? session.resume() : session.pause())} disabled={!session.canPause} title={session.paused ? "Record and transcribe again, in a new file" : "Stop recording and transcribing until you resume; for a break"}>{session.paused ? "Resume" : "Pause"}</button>
       {#if session.stopLabel}
         <button class={session.stopLabel === "Stop" ? "stop" : "stop waiting"} type="button" onclick={() => session.stop()}>{session.stopLabel}</button>
       {/if}
@@ -159,6 +168,29 @@
     border: 1px solid var(--rule);
     background: var(--paper);
     color: var(--ink);
+  }
+
+  /* A pause is stated for as long as it lasts, in ink: it is the person's own doing, not a fault. */
+  .paused {
+    margin: 0 0 0.55rem;
+    font-size: var(--step--1);
+    color: var(--ink);
+  }
+
+  .paused strong {
+    font-weight: 700;
+    margin-right: 0.3em;
+  }
+
+  .pause {
+    display: inline-block;
+    box-sizing: border-box;
+    width: 0.62em;
+    height: 0.72em;
+    margin-right: 0.5em;
+    border-left: 0.2em solid currentColor;
+    border-right: 0.2em solid currentColor;
+    vertical-align: -0.05em;
   }
 
   .mark {

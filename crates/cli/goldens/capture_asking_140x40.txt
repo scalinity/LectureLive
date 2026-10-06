@@ -37,4 +37,4 @@
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " ▲ asking  Zoom Meeting is 1280 × 720 now; it was 1600 × 900; choose or update “Zoom Meeting” in the LectureLive app                        "
 " ◆  a hint, or ⏎ for a snapshot                                                                                                             "
-" ⏎ snapshot   polish⏎   ^S watch   Tab pane   ^O activity   ^H help   ^C stop                                                               "
+" ⏎ snapshot   polish⏎   ^P pause   ^S watch   Tab pane   ^O activity   ^H help   ^C stop                                                    "

@@ -33,6 +33,8 @@ export type Status = {
   started_at: string | null;
   spend_usd: number;
   silence: boolean;
+  /** The person paused the lecture: nothing is recorded or transcribed until they resume. */
+  paused: boolean;
   /** The single input that went, while it is away: the fallback offer. */
   input_gone: string | null;
   capture: CaptureView;

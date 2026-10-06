@@ -103,6 +103,8 @@ pub struct Status {
     pub spend_usd: f64,
     /// Ten silent seconds on loopback.
     pub silence: bool,
+    /// The person paused the lecture: nothing is recorded or transcribed until they resume (spec §9.6).
+    pub paused: bool,
     /// The single input that went, while it is away: the fallback offer (spec §4.1).
     pub input_gone: Option<String>,
     /// Slide capture: the watched window and its state (spec §7).

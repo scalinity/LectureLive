@@ -22,4 +22,4 @@
 "                                                                                "
 " ▣ slide 18  slide_18_104152.png, into the next snapshot                        "
 " ◆  a hint, or ⏎ for a snapshot                                                 "
-" ⏎ snapshot   polish⏎   ^S capture   Tab pane   ^O activity   ^H help   ^C stop "
+" ⏎ snapshot   polish⏎   ^P pause   ^S capture   Tab pane   ^H help   ^C stop    "

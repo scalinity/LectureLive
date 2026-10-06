@@ -607,3 +607,107 @@ mod frontend_boundary {
         }
     }
 }
+
+/// Pause (spec §9.6): while it lasts nothing reaches speech-to-text, the recording the pause interrupts ends as any
+/// does, and resuming opens the next one on a connection of its own. The sidecar says when the person paused.
+#[tokio::test]
+async fn a_paused_lecture_streams_nothing_and_its_resume_is_a_second_recording() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    segments::session_marker(&f.transcript, Local::now()).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let sse = fake_sse::start(respond).await;
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), spend: Some(lec.spend.clone()), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+
+    segments_seen(&mut ev, 1).await;
+    cmd.send(Command::Pause).unwrap();
+    until(&mut ev, "the pause", |e| matches!(e, Event::Paused(true))).await;
+    tokio::time::sleep(ms(600)).await; // what was in flight when the pause began has been sent
+    let (frames, connections) = (stt.state.frames.load(SeqCst), stt.state.accepted.load(SeqCst));
+    tokio::time::sleep(ms(600)).await;
+    assert_eq!(stt.state.frames.load(SeqCst), frames, "no audio reaches speech-to-text while paused");
+    assert_eq!(connections, 1, "and the connection of the recording the pause ended is closed");
+    // A second pause changes nothing; a resume starts the next recording on a new connection.
+    cmd.send(Command::Pause).unwrap();
+    cmd.send(Command::Resume).unwrap();
+    until(&mut ev, "the resume", |e| matches!(e, Event::Paused(false))).await;
+    stt.state.wait_accepted(2).await;
+    segments_seen(&mut ev, 1).await;
+    cmd.send(Command::Stop).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+
+    assert_eq!(report.recordings.len(), 2, "one recording before the pause and one after");
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert!(sc.recordings.iter().all(|r| r.state == lecturelive_core::session::sidecar::RecState::Finalized), "{:?}", sc.recordings);
+    assert_eq!(sc.pauses.len(), 1, "{:?}", sc.pauses);
+    assert!(sc.pauses[0].to.is_some_and(|to| to >= sc.pauses[0].from), "the pause is closed: {:?}", sc.pauses);
+    assert_eq!(report.unresolved, 0, "the pause left no transcript gap to recover");
+}
+
+/// A pause the lecture is stopped in ends with it, so an open pause never outlives the session that made it.
+#[tokio::test]
+async fn a_lecture_stopped_while_paused_closes_the_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let sse = fake_sse::start(respond).await;
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), spend: Some(lec.spend.clone()), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+    segments_seen(&mut ev, 1).await;
+    cmd.send(Command::Pause).unwrap();
+    until(&mut ev, "the pause", |e| matches!(e, Event::Paused(true))).await;
+    cmd.send(Command::Stop).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+    assert_eq!(report.recordings.len(), 1);
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert_eq!(sc.pauses.len(), 1);
+    assert!(sc.pauses[0].to.is_some(), "{:?}", sc.pauses);
+}
+
+/// Quit (spec §9.6): the app is being closed, by the person or by something that quits apps. The recording is
+/// finalized, a request in flight is dropped, and there is no last snapshot to hold the app up or to spend money.
+#[tokio::test]
+async fn a_quit_finalizes_the_recording_drops_the_request_in_flight_and_takes_no_last_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stt = fake_stt::start(fake_stt::Config::default()).await;
+    let sse = fake_sse::start(|_| Reply::Stall).await; // every request hangs until the idle timeout
+    let stt_cfg = SttConfig { url: stt.url.clone(), backoff_unit: ms(1), connect_timeout: ms(2_000), send_timeout: ms(2_000), idle_timeout: ms(2_000), finalize_wait: ms(2_000), done_wait: ms(2_000), ..SttConfig::new("test-key".into(), vec![]) };
+    let spend = Spend::open(&ledger, "Machine Learning", NAME, f.date).unwrap();
+    let chat = ChatClient::new(ChatConfig { url: sse.url.clone(), idle_timeout: ms(30_000), ..ChatConfig::new("test-key".into()) }, Some(spend.clone())).unwrap();
+    let lec = Arc::new(Lecture { files: f.clone(), course: "Machine Learning".into(), name: NAME.into(), title: TITLE.into(), chat, spend });
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Talking { pace: ms(2), fake: stt.state.clone() }), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+    segments_seen(&mut ev, 1).await;
+    cmd.send(Command::Op(Op::Snapshot(String::new()))).unwrap();
+    until(&mut ev, "the snapshot in flight", |e| matches!(e, Event::Busy(m) if m.starts_with("snapshot"))).await;
+    cmd.send(Command::Quit).unwrap();
+    // The request would hold a stop for its 30 s timeout; a quit does not wait for it.
+    let report = tokio::time::timeout(Duration::from_secs(10), run).await.expect("a quit is prompt").unwrap().unwrap();
+    assert!(report.last_snapshot.is_some_and(|m| m.contains("quit")), "the report says the last snapshot was not taken");
+    let systems: Vec<String> = sse.state.bodies().iter().map(|b| b["messages"][0]["content"].as_str().unwrap_or_default().chars().take(22).collect()).collect();
+    // The fake records a request when it completes, and the one in flight was cancelled; a last snapshot against this
+    // stalling server would have waited out its 30 s timeout, so the prompt end above is the proof it was not taken.
+    assert!(systems.len() <= 1, "no request but the one that was in flight: {systems:?}");
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert!(sc.recordings.iter().all(|r| r.state == lecturelive_core::session::sidecar::RecState::Finalized), "no repair is left for the next session: {:?}", sc.recordings);
+    assert_eq!(sc.notes.segment_cursor, 0, "what the snapshot would have taken is still pending");
+}

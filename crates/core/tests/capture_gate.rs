@@ -24,7 +24,7 @@ use lecturelive_core::stt::stream::{self, SttConfig};
 use serde_json::Value;
 use support::fake_sse::{self, Reply};
 use support::sources::Talking;
-use support::windows::{slide, zoom_window, FakeWindows};
+use support::windows::{camera, notice, slide, zoom_window, FakeWindows};
 use support::{fake_rest, fake_stt};
 use tokio::sync::mpsc;
 
@@ -118,8 +118,31 @@ async fn occlusion_changes_nothing_minimising_pauses_and_the_same_window_resumes
     assert!(shots.is_empty(), "the same slide is not captured again after the pause");
 }
 
+/// Live evidence (M6, a Zoom lecture): a proctoring browser quit Zoom, and when it was opened again the strip asked
+/// and nothing was captured for the rest of the class, since no one was there to choose. A window that matches the
+/// selection exactly, as one does at a lecture's start, is the same window back: it is followed, and said.
 #[tokio::test]
-async fn a_replaced_window_asks_and_nothing_is_captured_from_it_until_the_person_binds_it() {
+async fn a_restarted_window_is_followed_and_the_slide_that_was_up_is_not_taken_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    fake.close(42);
+    let (states, _) = watch(&mut rx, 150).await;
+    assert!(matches!(states.last(), Some(CaptureState::Paused { reason, .. }) if reason.contains("closed")), "{states:?}");
+    fake.add(77, "Zoom Meeting", 1600, 900, slide(1));
+    let (states, shots, moved) = until_moved(&mut rx, 600).await;
+    assert!(moved, "the app is told, to say it and keep the selection: {states:?}");
+    assert!(shots.is_empty(), "the slide that was up before the restart is not taken again: {shots:?}");
+    fake.show(77, slide(2));
+    let (_, shots) = watch(&mut rx, 300).await;
+    assert_eq!(shots, vec![(true, false)], "and the next build is taken from the new window");
+}
+
+/// What still asks: two windows that match, since there is a choice to make.
+#[tokio::test]
+async fn two_windows_matching_after_a_close_still_ask_and_nothing_is_captured_until_the_person_binds_one() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeWindows::default();
     fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
@@ -127,17 +150,41 @@ async fn a_replaced_window_asks_and_nothing_is_captured_from_it_until_the_person
     let (h, mut rx) = start(&fake, Some(sel.clone()), dir.path());
     watch(&mut rx, 200).await;
     fake.close(42);
-    let (states, _) = watch(&mut rx, 150).await;
-    assert!(matches!(states.last(), Some(CaptureState::Paused { reason, .. }) if reason.contains("closed")), "{states:?}");
     fake.add(77, "Zoom Meeting", 1600, 900, slide(3));
+    fake.add(78, "Zoom Meeting", 1600, 900, slide(3));
     let (states, shots) = watch(&mut rx, 300).await;
     let Some(CaptureState::Asking { candidates, .. }) = states.last() else { panic!("{states:?}") };
-    assert_eq!(candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![77]);
-    assert!(shots.is_empty(), "no silent rebinding");
+    assert_eq!(candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![77, 78]);
+    assert!(shots.is_empty(), "there is a choice, so nothing is watched until it is made");
     h.send(CaptureCmd::Bind { window: 77, selection: sel });
     let (states, shots) = watch(&mut rx, 300).await;
     assert!(states.last().is_some_and(watching));
-    assert_eq!(shots, vec![(true, false)], "the new window's slide, once it is chosen");
+    assert_eq!(shots, vec![(true, false)], "the chosen window's slide, once it is chosen");
+}
+
+/// The lecture's pause (spec §9.6): nothing is sampled, and what changed while it lasted is taken once, after it.
+#[tokio::test]
+async fn a_held_worker_samples_nothing_takes_a_manual_capture_and_takes_the_change_once_it_is_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 200).await;
+    h.send(CaptureCmd::Hold(true));
+    fake.show(42, slide(2));
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(matches!(states.last(), Some(CaptureState::Paused { reason, .. }) if reason.contains("paused")), "{states:?}");
+    assert!(shots.is_empty(), "a break's slide changes are not sampled");
+    let (tx, reply) = tokio::sync::oneshot::channel();
+    h.send(CaptureCmd::Now(tx));
+    assert_eq!(reply.await.unwrap(), Ok(()), "an explicit capture still works while paused");
+    let (_, shots) = watch(&mut rx, 100).await;
+    assert_eq!(shots, vec![(false, false)], "the manual slide");
+    fake.show(42, slide(3));
+    h.send(CaptureCmd::Hold(false));
+    let (states, shots) = watch(&mut rx, 300).await;
+    assert!(states.last().is_some_and(watching), "{states:?}");
+    assert_eq!(shots, vec![(true, false)], "what changed during the pause is taken once, after it");
 }
 
 
@@ -348,8 +395,10 @@ async fn a_window_near_its_saved_size_at_start_takes_its_first_slide() {
 }
 
 /// Live evidence (M5 capture check): a closed window's id can stay listed, off screen, while its app runs.
+/// A closed window's id can stay listed off screen while its app runs; the one window on screen that matches is the
+/// replacement, as when the old one is not listed at all.
 #[tokio::test]
-async fn a_replacement_whose_old_window_lingers_off_screen_still_asks() {
+async fn a_replacement_whose_old_window_lingers_off_screen_is_followed() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeWindows::default();
     fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
@@ -357,10 +406,9 @@ async fn a_replacement_whose_old_window_lingers_off_screen_still_asks() {
     watch(&mut rx, 200).await;
     fake.on_screen(42, false);
     fake.add(77, "Zoom Meeting", 1600, 900, slide(3));
-    let (states, shots) = watch(&mut rx, 300).await;
-    let Some(CaptureState::Asking { candidates, .. }) = states.last() else { panic!("{states:?}") };
-    assert_eq!(candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![77]);
-    assert!(shots.is_empty(), "no silent rebinding");
+    let (states, shots, moved) = until_moved(&mut rx, 1_000).await;
+    assert!(moved, "the replacement is followed and the app is told: {states:?}");
+    assert_eq!(shots, vec![(true, false)], "the new window shows another slide: taken once");
 }
 
 /// Live evidence (M5, a recorded Zoom lecture): all false captures were the speaker's camera drawn over
@@ -394,8 +442,65 @@ async fn a_camera_left_out_takes_no_slides_and_a_build_still_does() {
     assert_eq!(shots, vec![(true, false)], "the build");
 }
 
+/// Live evidence (M7.1 class): before the share Zoom drew the speaker's camera, a name on a dark tile and "has started
+/// screen sharing", and 17 of the first 21 captures were those. Nothing is taken from them, the strip says what is
+/// showing, and the first slide after them is taken.
 #[tokio::test]
-async fn no_window_at_start_asks_and_a_later_window_waits_for_the_person() {
+async fn a_camera_and_a_notice_take_nothing_and_the_first_slide_after_them_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, camera(640, 360));
+    fake.0.lock().unwrap().shimmer = true;
+    let (_h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    let (states, shots) = watch(&mut rx, 500).await;
+    assert!(shots.is_empty(), "a camera is not a slide: {shots:?}");
+    let says = |states: &[CaptureState], what: &str| states.iter().any(|s| matches!(s, CaptureState::Watching { window } if window.contains("waiting for a slide") && window.contains(what)));
+    assert!(says(&states, "camera"), "the strip says what is showing: {states:?}");
+    fake.0.lock().unwrap().shimmer = false;
+    fake.show(42, notice(640, 360));
+    let (states, shots) = watch(&mut rx, 400).await;
+    assert!(shots.is_empty() && says(&states, "notice"), "{states:?} {shots:?}");
+    fake.show(42, slide(1));
+    let (states, shots) = watch(&mut rx, 500).await;
+    assert_eq!(shots, vec![(true, false)], "the first slide, once");
+    assert!(matches!(states.last(), Some(CaptureState::Watching { window }) if window == "Zoom Meeting"), "watching again, with nothing to wait for: {states:?}");
+}
+
+/// Live evidence (M7.1 class): a search at the moment Zoom went full screen chose a corner of the slide, the region
+/// stayed there, and three crops were kept as slides. A region that does not look at the shared content is moved to
+/// it, and nothing is taken through it meanwhile.
+#[tokio::test]
+async fn a_region_looking_at_a_corner_of_the_slide_is_moved_to_the_slide_before_anything_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 800, 450, zoom_window(800, 450, (80, 60, 560, 315), 1));
+    let mut sel = selection(&fake, 42);
+    sel.region = Region { x: 0.7, y: 0.7, w: 0.28, h: 0.28 };
+    let (_h, mut rx) = start(&fake, Some(sel), dir.path());
+    let mut seen: Vec<String> = Vec::new();
+    let end = tokio::time::Instant::now() + Duration::from_secs(5);
+    while seen.len() < 2 {
+        match tokio::time::timeout_at(end, rx.recv()).await {
+            Ok(Some(CaptureEvent::Relocated { selection, .. })) => {
+                let r = selection.region;
+                assert!(r.w > 0.6 && r.h > 0.6, "the slide's own area: {r:?}");
+                seen.push("moved".into());
+            }
+            Ok(Some(CaptureEvent::Captured(c))) => {
+                let (w, _) = image::ImageReader::open(&c.path).unwrap().with_guessed_format().unwrap().into_dimensions().unwrap();
+                seen.push(format!("slide {w}"));
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(seen.first().map(String::as_str), Some("moved"), "moved first, no crop taken before it: {seen:?}");
+    let width: u32 = seen.get(1).and_then(|s| s.strip_prefix("slide ")).and_then(|w| w.parse().ok()).expect("a slide after the move");
+    assert!(width >= 500, "the whole slide (560 px), not the corner (224 px): {width}");
+}
+
+#[tokio::test]
+async fn no_window_at_start_asks_and_the_saved_window_is_followed_when_it_opens() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeWindows::default();
     fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
@@ -405,9 +510,9 @@ async fn no_window_at_start_asks_and_a_later_window_waits_for_the_person() {
     let (states, _) = watch(&mut rx, 150).await;
     assert!(matches!(states.last(), Some(CaptureState::Asking { candidates, .. }) if candidates.is_empty()), "{states:?}");
     fake.add(50, "Zoom Meeting", 1600, 900, slide(1));
-    let (states, shots) = watch(&mut rx, 300).await;
-    assert!(matches!(states.last(), Some(CaptureState::Asking { candidates, .. }) if candidates.len() == 1), "{states:?}");
-    assert!(shots.is_empty());
+    let (states, shots) = watch(&mut rx, 600).await;
+    assert!(states.last().is_some_and(watching), "{states:?}");
+    assert_eq!(shots, vec![(true, false)], "the first slide of the session, from the window that opened");
 }
 
 #[tokio::test]

@@ -22,4 +22,4 @@
 "         ▎ • tentative words the model is still writing about quadrupling       "
 "                                                                                "
 " ◆  a hint, or ⏎ for a snapshot                                                 "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^T back   ^H help   ^C stop      "
+" ⏎ snapshot   polish⏎   ^P pause   ^X cancel   ^T back   ^H help   ^C stop      "

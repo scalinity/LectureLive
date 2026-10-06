@@ -22,4 +22,4 @@
 "         | the sample only halves                                               "
 "                                                                                "
 " *  a hint, or Enter for a snapshot                                             "
-" Enter snapshot   polish Enter   Tab pane   ^O activity   ^H help   ^C stop     "
+" Enter snapshot   polish Enter   ^P pause   Tab pane   ^H help   ^C stop        "

@@ -120,10 +120,14 @@ pub fn audit_day(files: &LectureFiles) -> Result<Audit> {
                 let terminal = sc.gaps.iter().find(|g| g.recording_id == p.id && g.end_sample.is_none());
                 let slack = chrono::Duration::milliseconds((SESSION_SLACK_S * 1000.0) as i64);
                 let session = sessions.iter().any(|&s| s >= prev_end - slack && s <= start + slack);
-                match (terminal, session) {
-                    (Some(g), _) => a.note(prev_end, format!("hole of {hole:.1} s after {}: {} (explained)", p.file, kind(g.kind))),
-                    (None, true) => a.note(prev_end, format!("hole of {hole:.1} s after {}: a stop and a new session (explained)", p.file)),
-                    (None, false) => a.unexplained(prev_end, format!("hole of {hole:.1} s after {}", p.file)),
+                // A pause covers the hole when it began before the next recording did and had not ended before the last
+                // stopped. One a crash left open covers only the hole it began in, not every later one.
+                let paused = sc.pauses.iter().any(|p| p.from <= start + slack && p.to.map_or(p.from >= prev_end - slack, |t| t >= prev_end - slack));
+                match (terminal, paused, session) {
+                    (Some(g), _, _) => a.note(prev_end, format!("hole of {hole:.1} s after {}: {} (explained)", p.file, kind(g.kind))),
+                    (None, true, _) => a.note(prev_end, format!("hole of {hole:.1} s after {}: a pause (explained)", p.file)),
+                    (None, false, true) => a.note(prev_end, format!("hole of {hole:.1} s after {}: a stop and a new session (explained)", p.file)),
+                    (None, false, false) => a.unexplained(prev_end, format!("hole of {hole:.1} s after {}", p.file)),
                 }
             }
         }
@@ -268,6 +272,38 @@ mod tests {
         f.recording((1, 30), 60);
         let audit = f.run();
         assert_eq!(audit.unexplained, 0, "{:#?}", audit.lines);
+    }
+
+    /// A pause is the person's own doing: nothing was recorded in it, and the sidecar says when it began and ended.
+    #[test]
+    fn a_hole_inside_a_recorded_pause_is_explained_and_one_outside_it_is_not() {
+        let mut f = folder();
+        f.recording((0, 0), 60); // ends 10:01:00
+        f.recording((1, 30), 60); // begins 10:01:30
+        let at = |m, s| Local.with_ymd_and_hms(2026, 9, 26, 10, m, s).unwrap();
+        f.sc.pauses.push(crate::session::sidecar::PauseSpan { from: at(1, 1), to: Some(at(1, 30)) });
+        let audit = f.run();
+        assert_eq!(audit.unexplained, 0, "{:#?}", audit.lines);
+        assert!(audit.lines.iter().any(|l| l.contains("a pause (explained)")), "{:#?}", audit.lines);
+
+        let mut elsewhere = folder();
+        elsewhere.recording((0, 0), 60);
+        elsewhere.recording((1, 30), 60);
+        elsewhere.sc.pauses.push(crate::session::sidecar::PauseSpan { from: at(5, 0), to: Some(at(6, 0)) });
+        assert_eq!(elsewhere.run().unexplained, 1, "a pause at another time explains nothing");
+    }
+
+    #[test]
+    fn a_pause_a_crash_left_open_explains_the_hole_it_began_in_and_no_later_one() {
+        let mut f = folder();
+        f.recording((0, 0), 60); // ends 10:01:00
+        f.recording((1, 30), 60); // begins 10:01:30: the pause's hole
+        f.sc.pauses.push(crate::session::sidecar::PauseSpan { from: Local.with_ymd_and_hms(2026, 9, 26, 10, 1, 1).unwrap(), to: None });
+        let audit = f.run();
+        assert_eq!(audit.unexplained, 0, "{:#?}", audit.lines);
+        f.recording((5, 0), 60); // 10:02:30 to 10:05:00 is nobody's pause
+        let audit = f.run();
+        assert_eq!(audit.unexplained, 1, "an open pause is not a licence for every later hole: {:#?}", audit.lines);
     }
 
     #[test]

@@ -49,6 +49,8 @@ pub(crate) enum Key {
     Zoom,
     /// Ctrl-S (Task 11): capture now, or watch the one window offered.
     Capture,
+    /// Ctrl-P: pause the lecture, or resume it (spec §9.6), by what the view says it is now.
+    Pause,
     /// Esc with an overlay open.
     Close,
     /// A reading move: the overlay's, else the focused pane's.
@@ -85,6 +87,7 @@ pub(crate) fn classify(key: &KeyEvent, overlay: Overlay) -> Key {
                 't' => Key::Zoom,
                 's' if key.kind == KeyEventKind::Press => Key::Capture,
                 's' => Key::Nothing, // a repeat of a held Ctrl-S: the press was the action
+                'p' => Key::Pause,   // a held Ctrl-P is the reactor's to debounce, as a held Ctrl-S capture is
                 _ => Key::Edit,
             };
         }
@@ -228,11 +231,11 @@ mod tests {
         h
     }
 
-    /// The app's chords come first: tui-input never sees Ctrl-X, -H, -O, -T, -C, -Z, -L or -S; its
-    /// own Ctrl-A/E/W/U/K still edit; Ctrl-S is the capture action (Task 11).
+    /// The app's chords come first: tui-input never sees Ctrl-X, -H, -O, -T, -C, -Z, -L, -S or -P; its
+    /// own Ctrl-A/E/W/U/K still edit; Ctrl-S is the capture action (Task 11); Ctrl-P pauses and resumes.
     #[test]
     fn app_chords_are_taken_before_the_editor() {
-        for (c, want) in [('c', Key::Stop), ('z', Key::Suspend), ('l', Key::Clear), ('x', Key::Cancel), ('h', Key::Help), ('o', Key::Activity), ('t', Key::Zoom), ('s', Key::Capture)] {
+        for (c, want) in [('c', Key::Stop), ('z', Key::Suspend), ('l', Key::Clear), ('x', Key::Cancel), ('h', Key::Help), ('o', Key::Activity), ('t', Key::Zoom), ('s', Key::Capture), ('p', Key::Pause)] {
             assert_eq!(classify(&ctrl(c), Overlay::None), want, "^{c}");
             assert_eq!(classify(&ctrl(c), Overlay::Help), want, "^{c} with help open");
         }

@@ -33,4 +33,4 @@
 " ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 "                                                                                                                               "
 " ◆  a hint, or ⏎ for a snapshot                                                                                                "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^H help   ^C stop                                                 "
+" ⏎ snapshot   polish⏎   ^P pause   ^X cancel   Tab pane   ^O activity   ^H help   ^C stop                                      "

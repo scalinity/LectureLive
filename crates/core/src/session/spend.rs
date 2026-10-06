@@ -146,7 +146,8 @@ pub fn import_mark(app: &Path) -> PathBuf {
 pub fn take_over(app: &Path, cli: &Path) -> Result<usize> {
     let cli_bytes = match std::fs::read(cli) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        // Not there, or not the app's to read (a packaged app launched by the system, in the person's Documents folder): nothing to take over.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) => return Ok(0),
         Err(e) => return Err(e).with_context(|| format!("read {}", cli.display())),
     };
     let end = cli_bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
@@ -397,6 +398,24 @@ mod tests {
         assert_eq!(spend.lecture_total(), 0.25);
         spend.add_at(at(25, 10, 0, 0), SpendKind::Page, 0.125, true, None).unwrap();
         assert_eq!((spend.lecture_total(), spend.kind_total(SpendKind::Page), spend.kind_total(SpendKind::Notes)), (0.375, 0.125, 0.0));
+    }
+
+    /// Live evidence (M7.1): a packaged app launched by the system may not read the Python CLI's ledger, which lives in the
+    /// person's Documents folder ("Operation not permitted"), and the lecture then refused to start. The ledger is a
+    /// convenience: one that cannot be read is imported as nothing, as one that is not there is.
+    #[test]
+    fn a_cli_ledger_that_cannot_be_read_imports_nothing_instead_of_stopping_the_lecture() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (app, cli) = (dir.path().join("app/spend.jsonl"), dir.path().join("spend.jsonl"));
+        std::fs::write(&cli, line(at(24, 9, 0, 0), "ML", "W", SpendKind::Notes, 0.1, true, None)).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&cli).is_ok() {
+            return; // running as a user who can read anything (root): there is nothing to refuse
+        }
+        assert_eq!(take_over(&app, &cli).unwrap(), 0, "unreadable is not fatal");
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(take_over(&app, &cli).unwrap(), 1, "and it is imported when it can be read again");
     }
 
     #[test]

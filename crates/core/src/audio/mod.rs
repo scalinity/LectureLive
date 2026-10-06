@@ -7,6 +7,7 @@ pub mod level;
 pub mod loopback;
 pub mod mix;
 pub mod mixed;
+pub mod pause;
 pub mod permission;
 pub mod pipeline;
 pub mod recorder;

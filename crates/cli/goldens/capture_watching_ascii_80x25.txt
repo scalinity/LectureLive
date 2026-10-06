@@ -22,4 +22,4 @@
 "                                                                                "
 " [] slide 18  slide_18_104152.png, into the next snapshot                       "
 " *  a hint, or Enter for a snapshot                                             "
-" Enter snapshot   polish Enter   ^S capture   Tab pane   ^H help   ^C stop      "
+" Enter snapshot   polish Enter   ^P pause   ^S capture   ^H help   ^C stop      "

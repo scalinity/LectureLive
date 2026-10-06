@@ -22,4 +22,4 @@
 "                                                                                "
 " ▲ gap  no transcription of 7.5 s onward of recording 00000000-0000-0000-0000-… "
 " ◆  a hint, or ⏎ for a snapshot                                                 "
-" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop              "
+" ⏎ snapshot   polish⏎   ^P pause   Tab pane   ^O activity   ^H help   ^C stop   "

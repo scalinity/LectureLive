@@ -21,4 +21,4 @@
 "         ▎ the sample only halves                                               "
 "                                                                                "
 " ◆  a hint, or ⏎ for a snapshot                                                 "
-" ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop              "
+" ⏎ snapshot   polish⏎   ^P pause   Tab pane   ^O activity   ^H help   ^C stop   "

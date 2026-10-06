@@ -13,6 +13,8 @@ pub struct Screen {
     pub captures: u32,
     /// Windows off screen can still be captured: a full-screen window on another desktop.
     pub off_screen_capture: bool,
+    /// Every capture differs a little from the last, as a camera's compression grain does.
+    pub shimmer: bool,
 }
 
 #[derive(Clone, Default)]
@@ -67,6 +69,7 @@ impl WindowSource for FakeWindows {
         if blank {
             s.blank_next -= 1;
         }
+        let (shimmer, n) = (s.shimmer, s.captures);
         let (i, c) = s.windows.iter().find(|(i, _)| i.id == id).ok_or(CaptureError::Failed("gone".into()))?;
         if !i.on_screen && !s.off_screen_capture {
             return Err(CaptureError::Failed("not on screen".into()));
@@ -75,8 +78,38 @@ impl WindowSource for FakeWindows {
             let (w, h) = c.dimensions();
             return Ok(RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255])));
         }
-        Ok(c.clone())
+        let mut img = c.clone();
+        if shimmer {
+            for (x, y, p) in img.enumerate_pixels_mut() {
+                let grain = ((x * 7 + y * 13 + n * 31) % 17) as i32 - 8;
+                for v in &mut p.0[..3] {
+                    *v = (*v as i32 + grain).clamp(0, 255) as u8;
+                }
+            }
+        }
+        Ok(img)
     }
+}
+
+/// A camera's picture: shaded, textured and grainy all over, with no one level most of it shares.
+pub fn camera(w: u32, h: u32) -> RgbaImage {
+    RgbaImage::from_fn(w, h, |x, y| {
+        let shade = 60 + x * 90 / w + y * 70 / h + ((x / 24 + y / 18) % 3) * 17;
+        let grain = ((x.wrapping_mul(73856093) ^ y.wrapping_mul(19349663)) % 61) as i32 - 30;
+        let v = (shade as i32 + grain).clamp(0, 255) as u8;
+        Rgba([v, v, v, 255])
+    })
+}
+
+/// Zoom's own tile: a dark page with a line of white text, a participant's name or a notice.
+pub fn notice(w: u32, h: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(w, h, Rgba([30, 30, 32, 255]));
+    for y in h * 9 / 20..h * 11 / 20 {
+        for x in w * 3 / 10..w * 7 / 10 {
+            img.put_pixel(x, y, Rgba([240, 240, 240, 255]));
+        }
+    }
+    img
 }
 
 /// A slide as a window shows it: a white page with `lines` dark bullet bars.

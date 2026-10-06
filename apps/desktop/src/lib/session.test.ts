@@ -141,6 +141,50 @@ describe("session store", () => {
     expect(t.calls).toEqual([["capture_select", { id: 42, region, leaveOut: camera }], ["capture_select", { id: 42, region }]]);
   });
 
+  test("pause and resume reach the backend, and `pause` and `resume` on the command line are the same commands", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running" });
+    frame();
+    expect(s.canPause).toBe(true);
+    await s.pause();
+    await s.resume();
+    await s.snapshot("pause");
+    await s.snapshot(" Resume ");
+    expect(t.calls).toEqual([["pause", undefined], ["resume", undefined], ["pause", undefined], ["resume", undefined]]);
+  });
+
+  test("a paused lecture is told apart from a running one, counted from the pause, and clear at the end", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running" });
+    frame();
+    expect([s.paused, s.pausedFor]).toEqual([false, null]);
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running", paused: true });
+    frame();
+    expect(s.paused).toBe(true);
+    expect(s.pausedFor).toBe(0);
+    expect(s.stopLabel).toBe("Stop");
+    expect(s.canSnapshot, "the notes still work while paused").toBe(true);
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running", paused: false });
+    frame();
+    expect([s.paused, s.pausedFor]).toEqual([false, null]);
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running", paused: true });
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "stopping", paused: false });
+    frame();
+    expect(s.pausedFor).toBeNull();
+    expect(s.canPause, "a stopping lecture cannot be paused").toBe(false);
+  });
+
+  test("a page reloaded during a pause is told, and counts from the reload", async () => {
+    const st = emptyState("s1");
+    st.status = { ...st.status, phase: "running", paused: true };
+    const { s, ready } = setup(st);
+    await ready;
+    expect(s.paused).toBe(true);
+    expect(s.pausedFor).toBe(0);
+  });
+
   test("the command line maps to the CLI's operations and the stop button to its levels", async () => {
     const { t, s, ready, frame } = setup();
     await ready;

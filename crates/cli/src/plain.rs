@@ -351,8 +351,21 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
             let (kind, label, detail) = capture::moved_words(note);
             n(kind, label, detail)
         }
+        Event::Paused(true) => n("notes", "paused", "nothing is recorded or transcribed until you resume; slides taken by hand and snapshots still work".into()),
+        Event::Paused(false) => n("done", "resumed", "recording and transcribing again, in a new file".into()),
         Event::Warning(m) => n("warn", "warning", m.clone()),
         Event::Busy(_) | Event::Preview(_) => None,
+    }
+}
+
+/// The loopback's silence watch across a pause (spec §9.6): nothing is recorded while paused, so nothing is silent and
+/// nothing is watched; the watch starts afresh on the resume, so the quiet seconds before the pause do not count.
+/// `wanted` is whether this input is watched at all (the loopback and mixed inputs).
+pub(crate) fn watch_after(e: &Event, wanted: bool, watch: Option<SilenceWatch>) -> Option<SilenceWatch> {
+    match e {
+        Event::Paused(true) => None,
+        Event::Paused(false) => wanted.then(|| SilenceWatch::new(-60.0, 10)),
+        _ => watch,
     }
 }
 
@@ -425,6 +438,19 @@ pub(crate) fn parse_line(line: &str) -> Op {
     if text.eq_ignore_ascii_case("polish") { Op::Polish } else { Op::Snapshot(text) }
 }
 
+/// The whole grammar a line of input is read in: the notes operations above, and `pause` and `resume` (spec §9.6),
+/// each only as the whole line, so a hint that merely begins with the word is still a hint.
+pub(crate) fn parse_command(line: &str) -> LectureCommand {
+    let text = line.trim();
+    if text.eq_ignore_ascii_case("pause") {
+        LectureCommand::Pause
+    } else if text.eq_ignore_ascii_case("resume") {
+        LectureCommand::Resume
+    } else {
+        LectureCommand::Op(parse_line(line))
+    }
+}
+
 /// The start-up report's records (M7 plan Task 6): what launch did to the recordings and what the
 /// folder's initialisation found, in the order [`print_prepared`] prints them. The TUI seeds its
 /// activity with the same records, so both frontends open with the same words.
@@ -486,7 +512,7 @@ pub(crate) fn print_prepared(out: &mut impl Write, d: Display, ready: &start::Pr
         String::new()
     };
     writeln!(out, "{}", d.paint.paint(&format!("  listening on {input_name}{waiting}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
-    writeln!(out, "{}", d.paint.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "{}", d.paint.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
@@ -510,7 +536,7 @@ pub(crate) fn print_end(out: &mut impl Write, d: Display, files: &LectureFiles, 
 pub(crate) fn read_commands(stdin_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>) {
     std::thread::spawn(move || {
         for line in std::io::stdin().lines().map_while(Result::ok) {
-            if stdin_tx.send(LectureCommand::Op(parse_line(&line))).is_err() {
+            if stdin_tx.send(parse_command(&line)).is_err() {
                 return;
             }
         }
@@ -551,6 +577,38 @@ pub(crate) fn stop_on_ctrl_c(stop_tx: tokio::sync::mpsc::UnboundedSender<Lecture
             }
         }
     });
+}
+
+/// The exit status a signal asked for while the lecture ran: 0 until one did, then 143 (SIGTERM) or 129 (SIGHUP).
+pub(crate) type Quitting = Arc<std::sync::atomic::AtomicI32>;
+
+/// How long a lecture told to quit is given to save before the process ends anyway.
+pub(crate) const QUIT_GRACE: Duration = Duration::from_secs(8);
+
+/// SIGTERM (`kill`, an app that quits other apps, a shutdown) and SIGHUP (the terminal closed) in the plain CLI
+/// (spec §9.6): the lecture is told to quit, which finalizes the recording and takes no last snapshot, and the process
+/// ends with the signal's usual status once the lecture has, or after `grace` if it has not. The handlers are
+/// installed before this returns, so a signal that comes at once is not lost. The command goes first and the line
+/// after, best effort: a terminal that is gone must not hold up the quit.
+pub(crate) fn quit_on_signals(cmd_tx: tokio::sync::mpsc::UnboundedSender<LectureCommand>, d: Display, quitting: Quitting, grace: Duration) -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut term, mut hup) = (signal(SignalKind::terminate())?, signal(SignalKind::hangup())?);
+    tokio::spawn(async move {
+        let code = tokio::select! {
+            _ = term.recv() => 143,
+            _ = hup.recv() => 129,
+        };
+        quitting.store(code, std::sync::atomic::Ordering::SeqCst);
+        if cmd_tx.send(LectureCommand::Quit).is_err() {
+            return; // the lecture has ended already: the process is on its way out with the status above
+        }
+        let mut line = Vec::new();
+        say(&mut line, d, "warn", "quit", "saving the recording and the notes' state, with no last snapshot; the next session in this folder takes it");
+        let _ = std::io::stdout().write_all(&line);
+        tokio::time::sleep(grace).await;
+        std::process::exit(code);
+    });
+    Ok(())
 }
 
 /// The `--secs` timer: the first stop when the limit passes, silent as it has always been.
@@ -808,6 +866,54 @@ mod goldens {
         assert_eq!(parse_line("  a hint about variance  "), Op::Snapshot("a hint about variance".into()));
     }
 
+    /// Pause and resume, typed (spec §9.6): the whole line, any case, trimmed, as `polish` is; anything longer is
+    /// still a hint for the snapshot.
+    #[test]
+    fn parse_command_adds_pause_and_resume_to_the_stdin_grammar() {
+        let kind = |l: &str| match parse_command(l) {
+            LectureCommand::Pause => "pause".to_string(),
+            LectureCommand::Resume => "resume".into(),
+            LectureCommand::Op(Op::Polish) => "polish".into(),
+            LectureCommand::Op(Op::Snapshot(h)) => format!("snapshot {h:?}"),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(kind("pause"), "pause");
+        assert_eq!(kind("  Pause "), "pause");
+        assert_eq!(kind("RESUME"), "resume");
+        assert_eq!(kind("polish"), "polish");
+        assert_eq!(kind(""), "snapshot \"\"");
+        assert_eq!(kind("pause the discussion of variance"), "snapshot \"pause the discussion of variance\"", "only the whole line is the command");
+    }
+
+    #[test]
+    fn a_pause_and_its_end_are_said_in_the_clis_words() {
+        assert_eq!(plain(&Event::Paused(true)), "  ◆ paused  nothing is recorded or transcribed until you resume; slides taken by hand and snapshots still work\n");
+        assert_eq!(plain(&Event::Paused(false)), "  ✓ resumed  recording and transcribing again, in a new file\n");
+    }
+
+    /// Nothing is recorded while paused, so the input is not "silent"; the watch starts afresh on the resume, and the
+    /// quiet seconds from before the pause do not count towards its ten.
+    #[test]
+    fn the_silence_watch_is_off_while_paused_and_starts_afresh_on_resume() {
+        let quiet = 0.000_01; // -100 dBFS
+        let mut watch = Some(SilenceWatch::new(-60.0, 10));
+        for _ in 0..5 {
+            shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch);
+        }
+        watch = watch_after(&Event::Paused(true), true, watch.take());
+        assert!(watch.is_none(), "paused: nothing watches");
+        assert_eq!(shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch), "", "and the meter's quiet says nothing");
+        watch = watch_after(&Event::Paused(false), true, watch.take());
+        let mut seen = String::new();
+        for _ in 0..9 {
+            seen += &shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch);
+        }
+        assert_eq!(seen, "", "nine quiet seconds after the resume warn nothing");
+        assert!(shown(pipe(OFF), &Event::Session(Notification::Level(quiet)), &mut watch).contains("no signal"), "the tenth does");
+        assert!(watch_after(&Event::Paused(false), false, None).is_none(), "an input that is never watched stays so");
+        assert!(watch_after(&Event::NothingNew, true, Some(SilenceWatch::new(-60.0, 10))).is_some(), "any other event leaves the watch as it was");
+    }
+
     fn date() -> chrono::NaiveDate {
         chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()
     }
@@ -826,7 +932,7 @@ mod goldens {
         String::from_utf8(out).unwrap()
     }
 
-    const HEADER: &str = "\n  Machine Learning  ›  Week 03 — Optimisation\n  listening on BlackHole 2ch\n  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop\n\n";
+    const HEADER: &str = "\n  Machine Learning  ›  Week 03 — Optimisation\n  listening on BlackHole 2ch\n  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop\n\n";
 
     #[test]
     fn print_prepared_for_a_created_folder() {
@@ -884,7 +990,7 @@ mod goldens {
     fn print_prepared_paints_the_header() {
         let mut out = Vec::new();
         print_prepared(&mut out, pipe(TRUE), &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
-        assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[1mMachine Learning\u{1b}[0m  \u{1b}[2m›\u{1b}[0m  Week 03 — Optimisation\n\u{1b}[2m  listening on BlackHole 2ch\u{1b}[0m\n\u{1b}[2m  ⏎ snapshot   a hint ⏎   polish ⏎   ^C stop\u{1b}[0m\n\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[1mMachine Learning\u{1b}[0m  \u{1b}[2m›\u{1b}[0m  Week 03 — Optimisation\n\u{1b}[2m  listening on BlackHole 2ch\u{1b}[0m\n\u{1b}[2m  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop\u{1b}[0m\n\n");
     }
 
     fn ended(report: StopReport, spend: &Spend) -> String {

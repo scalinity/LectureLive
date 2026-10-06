@@ -37,4 +37,4 @@
 " ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── "
 " ✓ polished  previous version in .live_notes/b.md  $0.04                                                                                    "
 " ◆  a hint, or ⏎ for a snapshot                                                                                                             "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^O activity   ^H help   ^C stop                                                              "
+" ⏎ snapshot   polish⏎   ^P pause   ^X cancel   Tab pane   ^O activity   ^H help   ^C stop                                                   "

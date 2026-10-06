@@ -237,29 +237,91 @@ fn a_held_ctrl_c_only_stops() {
     l.restored(stopping);
 }
 
-/// PTY 4: SIGTERM gives the terminal back, says so, and exits 143; no graceful stop is attempted.
+/// PTY 4: SIGTERM (`kill`, an app that quits other apps) tells the lecture to quit and waits for it, gives the
+/// terminal back, says the recording is saved, and exits 143. The scripted session logs what it was sent: a quit, not
+/// a stop, and the last snapshot, which writes for over a second, never happens (spec §9.6).
 #[test]
-fn sigterm_restores_then_exits_143() {
-    let mut l = tui("quiet", &[], 100, 30);
+fn sigterm_quits_the_lecture_then_restores_and_exits_143() {
+    let mut l = tui("ops", &[], 100, 30);
     let listening = l.listening();
     l.pty.signal(Signal::TERM);
     let status = l.pty.wait(SOON);
     assert_eq!(code(status, &l), Some(143));
+    assert_eq!(commands(&l), ["quit"], "the lecture was told to quit, once");
     let after = l.restored(listening);
-    l.at("Terminated;", after);
-    assert!(find(l.out(), b"Stopping", listening).is_none(), "SIGTERM is not a stop");
+    l.at("Terminated; the recording and transcript are saved", after);
+    assert!(find(l.out(), b"Stopping", listening).is_none(), "a quit is not the stop");
+    assert!(find(l.out(), b"the last of the lecture", listening).is_none(), "and takes no last snapshot");
 }
 
-/// PTY 4: SIGHUP attempts restoration (the terminal may be gone) and exits 129.
+/// PTY 4: SIGHUP (the terminal closed) does the same: the lecture is told to quit and waited for, restoration is
+/// attempted (the terminal may be gone), and the status is 129.
 #[test]
-fn sighup_restores_then_exits_129() {
-    let mut l = tui("quiet", &[], 100, 30);
+fn sighup_quits_the_lecture_then_restores_and_exits_129() {
+    let mut l = tui("ops", &[], 100, 30);
     let listening = l.listening();
     l.pty.signal(Signal::HUP);
     let status = l.pty.wait(SOON);
     assert_eq!(code(status, &l), Some(129));
+    assert_eq!(commands(&l), ["quit"], "the lecture was told to quit, once");
     l.restored(listening);
-    assert!(find(l.out(), b"Stopping", listening).is_none(), "SIGHUP is not a stop");
+    assert!(find(l.out(), b"Stopping", listening).is_none(), "a quit is not the stop");
+    assert!(find(l.out(), b"the last of the lecture", listening).is_none(), "and takes no last snapshot");
+}
+
+/// A quit while the lecture is already stopping: the person pressed Ctrl-C and the stop is writing its last
+/// snapshot when the signal comes. The quit cuts it short (core's does too), instead of waiting out the drain.
+#[test]
+fn sigterm_while_stopping_ends_the_stop_at_once() {
+    let mut l = tui("slow-stop", &[], 100, 30);
+    let listening = l.listening();
+    l.pty.write(CTRL_C);
+    let stopping = l.pty.wait_for("Stopping", listening, SOON);
+    l.pty.signal(Signal::TERM);
+    // the scripted last snapshot sleeps a minute; the grace is eight seconds; a quit ends it at once
+    let started = std::time::Instant::now();
+    let status = l.pty.wait(SOON);
+    assert_eq!(code(status, &l), Some(143));
+    assert!(started.elapsed() < Duration::from_secs(5), "the quit did not wait out the stop: {:?}", started.elapsed());
+    let after = l.restored(stopping);
+    l.at("Terminated; the recording and transcript are saved", after);
+}
+
+/// Pause (spec §9.6) in one real TUI: `pause` and Enter sends one pause; Ctrl-P, a real 0x10 byte, resumes it, and
+/// Ctrl-P again, past the held-key dwell, pauses again; a typed `resume` ends it; a half-typed hint is untouched by the
+/// key. The fixture's own log is the count. The header's words are the view tests' (the screen is drawn as diffs, and
+/// "Paused" over "Listening" shares a letter, so it is not written whole); here it is proved that the commands arrive
+/// once each, the TUI goes on drawing and typing through the events they cause, and the terminal is given back.
+#[test]
+fn pause_is_typed_or_a_key_and_each_is_one_command() {
+    let mut l = tui("ops", &[], 110, 32);
+    let listening = l.listening();
+    l.pty.write(b"pause\r");
+    assert_eq!(wait_commands(&l, 1), ["pause"]);
+    std::thread::sleep(ENTER_GAP); // the view follows core's event, which the key then reads: let it arrive
+    l.pty.write(b"focus on"); // half a hint, then the key
+    l.pty.write(b"\x10"); // Ctrl-P
+    assert_eq!(wait_commands(&l, 2)[1], "resume");
+    std::thread::sleep(STOP_DWELL); // past a held key's dwell: a new press
+    l.pty.write(b"\x10");
+    assert_eq!(wait_commands(&l, 3)[2], "pause");
+    // a held key's repeats: nothing more, whatever the dwell
+    for _ in 0..10 {
+        l.pty.write(b"\x10");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(commands(&l).len(), 3, "a held Ctrl-P is one press: {:?}", commands(&l));
+    // a typed resume: Ctrl-U clears the half-typed hint the key left alone, then the command
+    std::thread::sleep(ENTER_GAP);
+    l.pty.write(b"\x15resume\r");
+    assert_eq!(wait_commands(&l, 4)[3], "resume");
+    l.pty.write(CTRL_C);
+    let status = l.pty.wait(Duration::from_secs(20));
+    assert_eq!(code(status, &l), Some(0));
+    assert_eq!(commands(&l), ["pause", "resume", "pause", "resume", "stop"]);
+    let after = l.restored(listening);
+    l.at("saved", after);
 }
 
 /// PTY 5: a panic that cannot unwind (the release build's `panic = "abort"`, reproduced in the dev build by

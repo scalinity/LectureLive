@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use lecturelive_core::capture::detect::Thresholds;
+use lecturelive_core::capture::detect::{Thresholds, SAMPLE_INTERVAL};
 use lecturelive_core::capture::select::{Selection, Selections};
 use lecturelive_core::capture::window::SystemWindows;
 use lecturelive_core::capture::worker::CaptureState;
@@ -122,10 +122,10 @@ pub(crate) async fn forward(ctx: Option<Context>, mut from: UnboundedReceiver<Ev
 }
 
 /// The production setup, as the desktop builds it (plan Task 11): this Mac's windows, the course's
-/// saved selection, once a second, default thresholds, and the detector-input recording the
+/// saved selection, the live sampling rate and its thresholds, and the detector-input recording the
 /// environment names.
 pub(crate) fn setup(selection: Option<Selection>, record: Option<PathBuf>) -> CaptureSetup {
-    CaptureSetup { source: Box::new(SystemWindows), selection, interval: std::time::Duration::from_secs(1), thresholds: Thresholds::default(), record }
+    CaptureSetup { source: Box::new(SystemWindows), selection, interval: SAMPLE_INTERVAL, thresholds: Thresholds::live(), record }
 }
 
 /// `LECTURELIVE_RECORD` exactly as the desktop reads it (spec §11): the variable's value verbatim
@@ -530,8 +530,8 @@ mod tests {
         let built = setup(Some(saved()), record_path(Some("/tmp/detector".into())));
         assert_eq!(built.record, Some(PathBuf::from("/tmp/detector")));
         assert_eq!(built.selection, Some(saved()));
-        assert_eq!(built.interval, std::time::Duration::from_secs(1));
-        assert_eq!(built.thresholds, Thresholds::default());
+        assert_eq!(built.interval, SAMPLE_INTERVAL);
+        assert_eq!(built.thresholds, Thresholds::live());
         assert_eq!(setup(None, record_path(None)).record, None);
     }
 

@@ -13,4 +13,4 @@
 "                                                            "
 "                                                            "
 " ◆  a hint, or ⏎ for a snapshot                             "
-" ⏎ snapshot   polish⏎   Tab pane   ^H help   ^C stop        "
+" ⏎ snapshot   polish⏎   ^P pause   ^H help   ^C stop        "

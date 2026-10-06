@@ -269,7 +269,7 @@ pub(crate) fn stress_events(first: u64, revision: u64) -> Vec<Event> {
 }
 
 /// A command received, as the `ops` and `capture` logs record it: `snapshot<TAB>hint`, `polish`,
-/// `cancel`, `stop`, `capture-now`, or a `bind` with the window and enough of the selection to
+/// `cancel`, `stop`, `pause`, `resume`, `quit`, `capture-now`, or a `bind` with the window and enough of the selection to
 /// tell which candidate and region were sent.
 fn log_command(files: &LectureFiles, c: &Command) {
     use std::io::Write;
@@ -278,6 +278,9 @@ fn log_command(files: &LectureFiles, c: &Command) {
         Command::Op(Op::Polish) => "polish".into(),
         Command::Cancel => "cancel".into(),
         Command::Stop => "stop".into(),
+        Command::Pause => "pause".into(),
+        Command::Resume => "resume".into(),
+        Command::Quit => "quit".into(),
         Command::CaptureNow(_) => "capture-now".into(),
         Command::Bind { window, selection } => format!("bind\t{window}\t{}", selection_id(selection)),
         other => format!("{other:?}"),
@@ -482,6 +485,8 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
     let first = segments::read(&files.segments())?.len() as u64;
     let mut revision = Sidecar::load(&files.sidecar())?.map_or(0, |sc| sc.notes.revision);
     let (mut next, mut words, mut open) = (first, 0, true);
+    // A quit ends the session without its drain or last snapshot, as core's does.
+    let mut quit = false;
     // Scripted ups and downs for the session view (plan Task 6): a transcript gap that recovery
     // resolves, and a transcription reconnect. Only dim presentation comes of these; nothing here
     // writes a file. The `failures` scenario walks its own, longer list (plan Task 12); a session
@@ -685,6 +690,21 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                 }
             }
             c = commands.recv(), if open => match c {
+                // Pause and resume, as core answers them (spec §9.6): its event, and the log line where a log is kept.
+                Some(c @ (Command::Pause | Command::Resume)) => {
+                    if ops || cap {
+                        log_command(files, &c);
+                    }
+                    let _ = events.send(Event::Paused(matches!(c, Command::Pause)));
+                }
+                // Quit, as core takes it: the session ends at once, with no drain and no last snapshot.
+                Some(Command::Quit) => {
+                    if ops || cap {
+                        log_command(files, &Command::Quit);
+                    }
+                    quit = true;
+                    break;
+                }
                 Some(c) if (ops || cap) && !matches!(c, Command::Stop) => {
                     log_command(files, &c);
                     match c {
@@ -744,12 +764,12 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
         }
     }
     let _ = events.send(Event::Session(Notification::SourceEnded));
-    if ops {
-        // The drain, until a second stop or 8 s; then the last snapshot, which writes a while.
+    if ops && !quit {
+        // The drain, until a second stop or 8 s; then the last snapshot, which writes a while. A quit during it ends it.
         if let Ok(Some(c)) = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 match commands.recv().await {
-                    Some(c) if matches!(c, Command::Stop) => return Some(c),
+                    Some(c) if matches!(c, Command::Stop | Command::Quit) => return Some(c),
                     Some(c) => log_command(files, &c),
                     None => return None,
                 }
@@ -757,8 +777,11 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
         })
         .await
         {
+            quit = matches!(c, Command::Quit);
             log_command(files, &c);
         }
+    }
+    if ops && !quit {
         let _ = events.send(Event::Busy("snapshot, the last of the lecture".into()));
         for part in ["## What was left\n", "- The last words of the ", "lecture, folded in ", "by the last snapshot. "] {
             let _ = events.send(Event::Preview(part.into()));
@@ -768,14 +791,17 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
         let block = format!("\n<!-- {} -->\n## What was left\n- The last words of the lecture, folded in by the last snapshot.\n", Local::now().format("%H:%M:%S"));
         let _ = events.send(Event::Committed { words, slides: 0, block, usd: 0.0, confirmed: true, removed: 0, missing: 0, revision });
     }
-    if scenario == Scenario::SlowStop {
-        // The drain, until core has counted a second stop; then the last snapshot, which no stop cuts short.
+    if scenario == Scenario::SlowStop && !quit {
+        // The drain, until core has counted a second stop; then the last snapshot, which no stop cuts short — but a quit does.
         while let Some(c) = commands.recv().await {
-            if matches!(c, Command::Stop) {
+            if matches!(c, Command::Stop | Command::Quit) {
+                quit = matches!(c, Command::Quit);
                 break;
             }
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        if !quit {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(StopReport { segments: next - first, ..Default::default() })

@@ -15,7 +15,12 @@
     ended: ["Stopped", ""],
   };
 
-  const recording = $derived(["starting", "running", "stopping", "stopping_now"].includes(session.status.phase));
+  /** Paused (spec §9.6): the lecture runs, but nothing is recorded, so the red recording light goes out. */
+  const paused = $derived(session.paused && session.status.phase === "running");
+  const recording = $derived(!paused && ["starting", "running", "stopping", "stopping_now"].includes(session.status.phase));
+  const word = $derived(paused ? "Paused" : PHASE[session.status.phase][0]);
+  // While paused the footer says what a pause means, in full; here it would only be cut short beside the folder and clock.
+  const why = $derived(paused ? "" : PHASE[session.status.phase][1]);
   /** −60 dBFS is silence, 0 is full scale. */
   const meter = $derived(session.status.level_dbfs === null ? 0 : Math.min(1, Math.max(0, (session.status.level_dbfs + 60) / 60)));
 
@@ -43,22 +48,24 @@
 
 <header class="strip" data-tauri-drag-region="deep">
   <div class="left">
-    <span class="phase" class:on={recording}>
-      {#if recording}<span class="dot" aria-hidden="true"></span>{/if}{PHASE[session.status.phase][0]}
+    <span class="phase" class:on={recording || paused}>
+      {#if recording}<span class="dot" aria-hidden="true"></span>{:else if paused}<span class="pause" aria-hidden="true"></span>{/if}{word}
     </span>
-    {#if PHASE[session.status.phase][1]}<span class="why" title={PHASE[session.status.phase][1]}>{PHASE[session.status.phase][1]}</span>{/if}
+    {#if why}<span class="why" title={why}>{why}</span>{/if}
     {#if session.folder}
       <span class="folder" title="{session.folder.course} › {session.folder.name}"><span class="course">{session.folder.course} ›</span> {session.folder.name}</span>
     {/if}
     {#if session.status.source}
       <span class="source" title={session.status.source}>
         <span class="source-name">{session.status.source}</span>
-        <span class="meter" class:silent={session.status.silence} role="meter" aria-label="Input level" aria-valuemin={-60} aria-valuemax={0} aria-valuenow={session.status.level_dbfs ?? -60}>
+        <span class="meter" class:silent={session.status.silence} class:paused role="meter" aria-label={paused ? "Input level, not recorded while paused" : "Input level"} aria-valuemin={-60} aria-valuemax={0} aria-valuenow={session.status.level_dbfs ?? -60}>
           <span class="fill" style:width="{meter * 100}%"></span>
         </span>
       </span>
     {/if}
-    {#if session.elapsed !== null && recording}<span class="num">{clock(session.elapsed)}</span>{/if}
+    {#if paused && session.pausedFor !== null}
+      <span class="num" title="Paused for {clock(session.pausedFor)}">{clock(session.pausedFor)}</span>
+    {:else if session.elapsed !== null && recording}<span class="num">{clock(session.elapsed)}</span>{/if}
   </div>
   <div class="right">
     {#if session.status.phase !== "idle"}
@@ -149,6 +156,18 @@
     background: var(--signal);
   }
 
+  /* The pause glyph: two bars in the phase's ink. Red is only for recording, so a pause is never the red dot. */
+  .pause {
+    display: inline-block;
+    box-sizing: border-box;
+    width: 0.62em;
+    height: 0.72em;
+    margin-right: 0.45em;
+    border-left: 0.2em solid currentColor;
+    border-right: 0.2em solid currentColor;
+    vertical-align: -0.05em;
+  }
+
   .course {
     color: var(--graphite);
   }
@@ -176,6 +195,11 @@
 
   .meter.silent .fill {
     background: var(--signal);
+  }
+
+  /* Input still arrives while paused, so the meter moves; it is graphite because none of it is kept. */
+  .meter.paused .fill {
+    background: var(--graphite);
   }
 
   @media (max-width: 1100px) {

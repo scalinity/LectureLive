@@ -13,6 +13,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::audio::pause::Pausable;
 use crate::audio::source::Source;
 use crate::capture::detect::Thresholds;
 use crate::capture::select::Selection;
@@ -29,7 +30,7 @@ use crate::session::folder;
 
 use crate::session::notesfile::{self, sha256_hex};
 use crate::session::segments;
-use crate::session::sidecar::{Sidecar, SlideEntry};
+use crate::session::sidecar::{PauseSpan, Sidecar, SlideEntry};
 use crate::session::slides::{self, SlideMeta};
 use crate::session::spend::{Spend, SpendKind};
 
@@ -59,6 +60,15 @@ pub enum Command {
     Cancel,
     /// The first stops the lecture; a second stops waiting for recovery.
     Stop,
+    /// Records and transcribes nothing until `Resume` (spec §9.6), so a break costs no transcription; automatic slide
+    /// capture waits too. Notes, snapshots, and slides taken by hand carry on. Pausing a paused lecture does nothing.
+    Pause,
+    Resume,
+    /// Stops the lecture because the app is being quit: everything is saved as a stop saves it, but there is no last
+    /// snapshot, no wait for recovery and no operation left running, since a request taking minutes, and costing
+    /// money, must not hold up a quit. What the last snapshot would have taken waits for the next session in the
+    /// folder (spec §8, §9.6).
+    Quit,
     /// A consistent copy of the sidecar: from the session's one writer while it runs, from the file
     /// once the lecture is stopping (spec §3.6, §8).
     State(oneshot::Sender<Result<Sidecar, String>>),
@@ -102,6 +112,8 @@ pub enum Event {
     /// The watched window changed size and its slide is watched through the region for that size: saved by
     /// the adapter for the course, and said.
     CaptureMoved { selection: Selection, note: String },
+    /// The lecture was paused (true) or resumed (false) by the person.
+    Paused(bool),
     Warning(String),
 }
 
@@ -416,6 +428,7 @@ async fn slide_watcher(lec: Arc<Lecture>, store: Store, watch: SlideWatch, mut s
 
 /// A whole lecture: runs until stopped (or until its audio ends), then the last snapshot.
 pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>, watch: SlideWatch, capture: Option<CaptureSetup>, mut commands: UnboundedReceiver<Command>, events: UnboundedSender<Event>) -> Result<StopReport> {
+    let (source, pause) = Pausable::wrap(source);
     let (handle, mut notes, store) = coordinator::spawn_with_store(cfg, source);
     let pages = Arc::new(Mutex::new(Vec::new()));
     let (op_tx, op_rx) = mpsc::unbounded_channel();
@@ -432,14 +445,24 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
         }
         None => (None, None),
     };
+    // The pauses go into the sidecar in order, through one task that holds a store until the lecture stops.
+    let (pause_tx, pause_rx) = mpsc::unbounded_channel();
+    let pause_task = tokio::spawn(pause_log(store.clone(), pause_rx, events.clone()));
+    let mut pause_tx = Some(pause_tx);
+    let (mut paused, mut leaving) = (false, false);
     // Serves state reads until the lecture begins stopping: the session ends only once every store is dropped.
     let mut state_store = Some(store);
     let mut op_tx = Some(op_tx);
     let (mut stops, mut commands_open) = (0, true);
     let stopping = AtomicBool::new(false);
-    let begin_stop = |op_tx: &mut Option<UnboundedSender<(Op, u64)>>, state_store: &mut Option<Store>, capture: &mut Option<CaptureHandle>| {
+    let begin_stop = |op_tx: &mut Option<UnboundedSender<(Op, u64)>>, state_store: &mut Option<Store>, capture: &mut Option<CaptureHandle>, pause_tx: &mut Option<UnboundedSender<PauseLog>>, paused: &mut bool| {
         *state_store = None;
         *capture = None; // the worker stops; what it already saved is still registered
+        if let Some(tx) = pause_tx.take() {
+            if std::mem::take(paused) {
+                let _ = tx.send(PauseLog::End(Local::now())); // the lecture ended in a pause: the pause ends with it
+            }
+        }
         if !stopping.swap(true, Ordering::Relaxed) {
             let _ = stop_tx.send(true);
             *op_tx = None; // queued operations still run; nothing new is taken
@@ -449,7 +472,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
         tokio::select! {
             n = notes.recv() => match n {
                 Some(Notification::SourceEnded) => {
-                    begin_stop(&mut op_tx, &mut state_store, &mut capture);
+                    begin_stop(&mut op_tx, &mut state_store, &mut capture, &mut pause_tx, &mut paused);
                     let _ = events.send(Event::Session(Notification::SourceEnded));
                 }
                 Some(n) => { let _ = events.send(Event::Session(n)); }
@@ -468,11 +491,37 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                 Some(Command::Stop) => {
                     stops += 1;
                     handle.request_stop();
-                    begin_stop(&mut op_tx, &mut state_store, &mut capture);
+                    begin_stop(&mut op_tx, &mut state_store, &mut capture, &mut pause_tx, &mut paused);
                     if stops >= 2 {
                         hurry.store(true, Ordering::Relaxed);
                     }
                 }
+                Some(Command::Quit) => {
+                    leaving = true;
+                    generation.send_modify(|g| *g += 1); // an operation in flight is cancelled: nothing is written, all is kept
+                    hurry.store(true, Ordering::Relaxed);
+                    handle.request_stop();
+                    handle.request_stop(); // a second stop: recovery is not waited for either
+                    begin_stop(&mut op_tx, &mut state_store, &mut capture, &mut pause_tx, &mut paused);
+                }
+                Some(Command::Pause) => {
+                    if stopping.load(Ordering::Relaxed) {
+                        let _ = events.send(Event::Warning("The lecture is stopping; it cannot be paused.".into()));
+                    } else if !paused {
+                        paused = true;
+                        pause.set(true);
+                        if let Some(c) = &capture { c.send(CaptureCmd::Hold(true)) }
+                        if let Some(tx) = &pause_tx { let _ = tx.send(PauseLog::Begin(Local::now())); }
+                        let _ = events.send(Event::Paused(true));
+                    }
+                }
+                Some(Command::Resume) => if paused {
+                    paused = false;
+                    pause.set(false);
+                    if let Some(c) = &capture { c.send(CaptureCmd::Hold(false)) }
+                    if let Some(tx) = &pause_tx { let _ = tx.send(PauseLog::End(Local::now())); }
+                    let _ = events.send(Event::Paused(false));
+                },
                 Some(Command::CaptureNow(reply)) => match &capture {
                     Some(c) => c.send(CaptureCmd::Now(reply)),
                     None if stopping.load(Ordering::Relaxed) => { let _ = reply.send(Err("The lecture is stopping.".into())); }
@@ -497,8 +546,9 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
             },
         }
     }
-    begin_stop(&mut op_tx, &mut state_store, &mut capture);
+    begin_stop(&mut op_tx, &mut state_store, &mut capture, &mut pause_tx, &mut paused);
     let _ = watcher.await;
+    let _ = pause_task.await;
     if let Some(c) = capturer {
         let _ = c.await;
     }
@@ -513,18 +563,53 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
     // The last snapshot, after recovery has drained (spec §5.4), on the sidecar the session left: also after a
     // session that failed (a full disk), so what was logged reaches the notes before the failure is reported (§10).
     // Its failure goes into the report too, so the end never reads as if the notes were complete.
-    let failed = match Sidecar::load(&lec.files.sidecar()).and_then(|sc| sc.context("the session left no sidecar")) {
-        Ok(sc) => lec.snapshot(&Store::offline(sc, lec.files.sidecar()), "", &events).await.err(),
-        Err(e) if result.is_err() => Some(format!("{e:#}")),
-        Err(e) => return Err(e),
+    // A quit takes none: a request that takes minutes, and costs money, must not hold the app up, and everything it
+    // would have taken is pending for the next session in the folder, as after a crash.
+    let failed = if leaving {
+        None
+    } else {
+        match Sidecar::load(&lec.files.sidecar()).and_then(|sc| sc.context("the session left no sidecar")) {
+            Ok(sc) => lec.snapshot(&Store::offline(sc, lec.files.sidecar()), "", &events).await.err(),
+            Err(e) if result.is_err() => Some(format!("{e:#}")),
+            Err(e) => return Err(e),
+        }
     };
     if let Some(e) = &failed {
         let _ = events.send(Event::SnapshotFailed(format!("{e}; everything is kept for the next one")));
     }
     result.map(|mut report| {
-        report.last_snapshot = failed;
+        report.last_snapshot = if leaving { Some("the app was quit first".to_string()) } else { failed };
         report
     })
+}
+
+/// A pause beginning or ending, for the sidecar.
+enum PauseLog {
+    Begin(DateTime<Local>),
+    End(DateTime<Local>),
+}
+
+/// Writes each pause into the sidecar, in the order they were asked, through the one writer; it ends when the lecture
+/// stops and its channel closes.
+async fn pause_log(store: Store, mut rx: UnboundedReceiver<PauseLog>, events: UnboundedSender<Event>) {
+    while let Some(m) = rx.recv().await {
+        let saved = store
+            .update(move |sc| {
+                match m {
+                    PauseLog::Begin(at) => sc.pauses.push(PauseSpan { from: at, to: None }),
+                    PauseLog::End(at) => {
+                        if let Some(p) = sc.pauses.iter_mut().rev().find(|p| p.to.is_none()) {
+                            p.to = Some(at);
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = saved {
+            let _ = events.send(Event::Warning(format!("the pause could not be recorded: {e:#}")));
+        }
+    }
 }
 
 /// The sidecar as its file holds it: the one writer saves it atomically before every answer (spec §8).

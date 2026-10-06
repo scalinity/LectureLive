@@ -6,6 +6,8 @@ use crate::capture::detect::Region;
 
 /// Above this mean absolute difference (0–1) the best place is not the slide.
 const FOUND: f64 = 0.06;
+/// A match must score no worse than this share of what a plain area of the slide's own level would.
+const BEATS_PLAIN: f64 = 0.6;
 /// A slide with less contrast than this (standard deviation, 0–255) would match any plain area.
 const CONTRAST: f64 = 12.0;
 /// Widths of the window searched first, then around the first answer.
@@ -59,7 +61,9 @@ pub fn locate(window: &RgbaImage, kept: &GrayImage, aspect: f64, parts: &[Region
     }
     let g = gray_at(window, COARSE);
     let mut best: Option<(f64, u32, u32, u32)> = None;
-    for w in (COARSE / 4..=COARSE).step_by(2) {
+    // Not below half the window's width: a small patch of a sparse slide's own colour matches a blurred copy of it
+    // better than the slide itself matches a sharp one (a real class's search chose a 30%-wide corner).
+    for w in (COARSE / 2..=COARSE).step_by(2) {
         let h = (w as f64 / aspect).round() as u32;
         if h < 12 || h > g.height() {
             continue;
@@ -95,7 +99,17 @@ pub fn locate(window: &RgbaImage, kept: &GrayImage, aspect: f64, parts: &[Region
     }
     let (d, x, y, w, h) = fine?;
     let (fw, fh) = (FINE as f64, g2.height() as f64);
-    (d < FOUND).then(|| Region { x: x as f64 / fw, y: y as f64 / fh, w: w as f64 / fw, h: h as f64 / fh })
+    // A real match explains most of the slide's own structure: it must clearly beat a plain patch of the same level.
+    let (t, skip) = template(kept, w, h, parts);
+    (d < FOUND && d <= BEATS_PLAIN * from_plain(&t, &skip)).then(|| Region { x: x as f64 / fw, y: y as f64 / fh, w: w as f64 / fw, h: h as f64 / fh })
+}
+
+/// How far the template is from a plain area at its own mean level (mean absolute difference, 0–1): the score of
+/// a match that found nothing but a blank place.
+fn from_plain(t: &GrayImage, skip: &[bool]) -> f64 {
+    let seen: Vec<f64> = t.as_raw().iter().zip(skip).filter(|(_, s)| !**s).map(|(v, _)| *v as f64).collect();
+    let mean = seen.iter().sum::<f64>() / seen.len().max(1) as f64;
+    seen.iter().map(|v| (v - mean).abs()).sum::<f64>() / seen.len().max(1) as f64 / 255.0
 }
 
 #[cfg(test)]

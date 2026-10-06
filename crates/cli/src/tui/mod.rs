@@ -109,6 +109,8 @@ struct Ui {
     capture: Option<capture::Context>,
     /// Ctrl-S presses that act: a held key's repeats are one capture, never a slide each.
     capture_press: input::Held,
+    /// Ctrl-P presses that act: a held key must not flip the lecture between paused and not.
+    pause_press: input::Held,
     /// Where the last frame put things: reading moves count rows as the person sees them.
     drawn: view::Drawn,
     /// The preview as last parsed for drawing: at most every [`panes::PREVIEW_EVERY`], never per delta.
@@ -135,6 +137,9 @@ enum Act {
     /// Ctrl-S on the one window offered whose region is saved: kept for the course first, then
     /// exactly one `Bind` (plan Task 11) — none if the save fails.
     CaptureWatch { window: u32, selection: Selection },
+    /// `pause` and Enter, or Ctrl-P (spec §9.6); `typed` says it came from the hint line, which then empties.
+    Pause { typed: bool },
+    Resume { typed: bool },
 }
 
 /// What a Ctrl-S comes back as, off the reactor: the oneshot's answer to a capture-now, or the
@@ -161,6 +166,10 @@ const HINT_FULL: &str = "The hint is at its 8 KiB limit.";
 const PASTE_TOO_LONG: &str = "That paste would take the hint past 8 KiB; nothing of it was pasted.";
 /// A command the lecture can no longer take: it has ended.
 const ENDED: &str = "The lecture has ended; nothing was sent.";
+/// Ctrl-P while stopping: a lecture that is ending has nothing left to pause.
+const PAUSE_STOPPING: &str = "The lecture is stopping; it cannot be paused or resumed.";
+/// Ctrl-S while the lecture is paused: it is the lecture, not the window, that holds capture.
+const CAPTURE_PAUSED: &str = "The lecture is paused: slides are not captured until it resumes (^P). Screenshots (⌘⇧4) still become slides.";
 
 const PANES: [view::Pane; 3] = [view::Pane::Transcript, view::Pane::Notes, view::Pane::Slides];
 
@@ -181,6 +190,7 @@ impl Ui {
             help: 0,
             capture,
             capture_press: input::Held::default(),
+            pause_press: input::Held::default(),
             drawn: view::Drawn::default(),
             preview: panes::Preview::default(),
             theme,
@@ -337,6 +347,7 @@ impl Ui {
                 Act::Redraw
             }
             Key::Capture => self.capture_key(now),
+            Key::Pause => self.pause_key(now),
             Key::Read(m) => self.read(m),
             Key::Enter => self.enter(now),
             Key::Edit => match self.hint.edit(key) {
@@ -384,9 +395,26 @@ impl Ui {
         }
     }
 
+    /// Ctrl-P (spec §9.6): pause, or resume if the view says it is paused. A lecture that is stopping has nothing to
+    /// pause. Taken as a held key allows ([`input::Held`]), so one long press is one change, never a flicker.
+    fn pause_key(&mut self, now: std::time::Instant) -> Act {
+        if self.view.phase != Stage::Listening {
+            return self.say(PAUSE_STOPPING);
+        }
+        if !self.pause_press.take(now) {
+            return Act::Nothing;
+        }
+        if self.view.paused {
+            Act::Resume { typed: false }
+        } else {
+            Act::Pause { typed: false }
+        }
+    }
+
     /// Why Ctrl-S did nothing, in the state's own terms; the Slides pane holds the fuller story.
     fn capture_refusal(&self, why: capture::Refusal) -> String {
         match why {
+            capture::Refusal::Paused if self.view.paused => CAPTURE_PAUSED.into(),
             capture::Refusal::None => "Nothing is being watched yet.".into(),
             capture::Refusal::Unbound => "No window is chosen for this course yet: choose it once in the LectureLive app. Screenshots (⌘⇧4) still become slides.".into(),
             capture::Refusal::Paused => "Capture is paused; it comes back by itself when the window is back.".into(),
@@ -436,7 +464,11 @@ impl Ui {
         if self.view.phase != Stage::Listening {
             return self.say(STOPPING);
         }
-        Act::Op(plain::parse_line(self.hint.value()))
+        match plain::parse_command(self.hint.value()) {
+            Command::Pause => Act::Pause { typed: true },
+            Command::Resume => Act::Resume { typed: true },
+            _ => Act::Op(plain::parse_line(self.hint.value())),
+        }
     }
 
     /// A bracketed paste: text into the hint, never a key. Ignored below the minimum size.
@@ -474,6 +506,18 @@ impl Ui {
             Act::Cancel => {
                 if commands.send(Command::Cancel).is_ok() {
                     self.view.work.cancel();
+                    self.notice = None;
+                } else {
+                    self.notice = Some(ENDED.into());
+                }
+            }
+            // Not a notes request: nothing joins the queue, and the view changes only when core says it paused.
+            Act::Pause { typed } | Act::Resume { typed } => {
+                let command = if matches!(act, Act::Pause { .. }) { Command::Pause } else { Command::Resume };
+                if commands.send(command).is_ok() {
+                    if typed {
+                        self.hint.clear();
+                    }
                     self.notice = None;
                 } else {
                     self.notice = Some(ENDED.into());
@@ -537,13 +581,24 @@ fn send_stops(commands: &UnboundedSender<Command>, step: Step) {
     }
 }
 
+/// Tells the lecture to quit (it finalizes the recording and takes no last snapshot) and waits up to `grace` for it to
+/// end. Whether it did: a lecture that has ended already has nothing to wait for. One that does not end in time is left
+/// to the next session in the folder, which repairs what the quit did not reach.
+async fn quit_gracefully(commands: &UnboundedSender<Command>, lecture: &mut tokio::task::JoinHandle<Result<StopReport>>, grace: Duration) -> bool {
+    if commands.send(Command::Quit).is_err() {
+        return true;
+    }
+    tokio::time::timeout(grace, lecture).await.is_ok()
+}
+
 /// Why the reactor gave the terminal up.
 enum Exit {
     /// The lecture ended: its report, its error, or its panic.
     Ended(Result<Result<StopReport>, JoinError>),
     /// Stage 3: quit at once.
     Quit,
-    Terminated,
+    /// SIGTERM: whether the lecture had saved by the time the grace ran out.
+    Terminated { saved: bool },
     HungUp,
     /// The keyboard stream failed or ended: the terminal is gone.
     Lost(io::Error),
@@ -678,8 +733,16 @@ where
     loop {
         tokio::select! {
             biased;
-            _ = io.terminate.recv() => return (Exit::Terminated, ui),
-            _ = io.hangup.recv() => return (Exit::HungUp, ui),
+            // `kill`, an app that quits other apps, a shutdown; or the terminal closed (spec §9.6): the lecture is told
+            // to quit and given a few seconds to save before the terminal is given back and the process goes.
+            _ = io.terminate.recv() => {
+                let saved = quit_gracefully(&io.commands, &mut io.lecture, plain::QUIT_GRACE).await;
+                return (Exit::Terminated { saved }, ui);
+            }
+            _ = io.hangup.recv() => {
+                quit_gracefully(&io.commands, &mut io.lecture, plain::QUIT_GRACE).await;
+                return (Exit::HungUp, ui);
+            }
             // `kill -INT`: in raw mode the keyboard's Ctrl-C arrives as a key instead.
             _ = io.interrupt.recv() => match ui.stop(Origin::Signal, std::time::Instant::now()) {
                 Step::Quit => return (Exit::Quit, ui),
@@ -697,7 +760,7 @@ where
                     }
                     Act::Redraw => dirty = true,
                     Act::Nothing => {}
-                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. }) => {
+                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. } | Act::Pause { .. } | Act::Resume { .. }) => {
                         ui.send(act, &io.commands, &io.capture_tx);
                         dirty = true;
                     }
@@ -819,8 +882,8 @@ fn leave(exit: Exit) -> Result<StopReport> {
             say(Box::new(io::stdout()), "Stopped at once; the next session in this folder picks up what was left.");
             std::process::exit(130)
         }
-        Exit::Terminated => {
-            say(Box::new(io::stderr()), "Terminated; the next session in this folder picks up what was left.");
+        Exit::Terminated { saved } => {
+            say(Box::new(io::stderr()), if saved { "Terminated; the recording and transcript are saved, and the next session in this folder takes the last snapshot." } else { "Terminated; the next session in this folder picks up what was left." });
             std::process::exit(143)
         }
         Exit::HungUp => std::process::exit(129),
@@ -1079,7 +1142,7 @@ mod tests {
     /// A key as the reactor takes it: the Ui decides, and the one command a key may carry is sent.
     fn press(ui: &mut Ui, k: KeyEvent, now: Instant, tx: &UnboundedSender<Command>) -> Act {
         let act = ui.key(k, now);
-        if matches!(act, Act::Op(_) | Act::Cancel) {
+        if matches!(act, Act::Op(_) | Act::Cancel | Act::Pause { .. } | Act::Resume { .. }) {
             let (replies, _) = tokio::sync::mpsc::channel(1);
             ui.send(act, tx, &replies);
             return Act::Redraw;
@@ -1101,6 +1164,9 @@ mod tests {
                 Command::Op(Op::Polish) => "polish".into(),
                 Command::Cancel => "cancel".into(),
                 Command::Stop => "stop".into(),
+                Command::Pause => "pause".into(),
+                Command::Resume => "resume".into(),
+                Command::Quit => "quit".into(),
                 Command::CaptureNow(_) => "capture-now".into(),
                 Command::Bind { window, .. } => format!("bind {window}"),
                 other => format!("{other:?}"),
@@ -1154,6 +1220,99 @@ mod tests {
         type_in(&mut ui, "late", at(6100), &tx);
         press(&mut ui, key(KeyCode::Enter), at(7000), &tx);
         assert_eq!(sent(&mut rx), Vec::<String>::new());
+    }
+
+    /// Pause (spec §9.6): `pause` and `resume` typed and Enter, and Ctrl-P as the toggle the view's own state says; each
+    /// accepted press is one command and joins no notes queue. A typed command empties the hint line, a key does not
+    /// touch what is being typed, and a held Ctrl-P is one press: it never flips the lecture back and forth.
+    #[test]
+    fn pause_and_resume_are_typed_or_a_key_and_each_is_one_command() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut ui, t0) = (drawn_ui(), Instant::now());
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        type_in(&mut ui, " Pause ", at(0), &tx);
+        press(&mut ui, key(KeyCode::Enter), at(10), &tx);
+        assert_eq!(sent(&mut rx), ["pause"]);
+        assert_eq!(ui.hint.value(), "", "an accepted command empties the line");
+        assert!(!ui.view.work.mine(), "a pause is not a notes request");
+        assert!(!ui.view.paused, "the view follows core's own event, never the key");
+        ui.event(&Event::Paused(true), at(20));
+        type_in(&mut ui, "RESUME", at(30), &tx);
+        press(&mut ui, key(KeyCode::Enter), at(400), &tx);
+        assert_eq!(sent(&mut rx), ["resume"]);
+        ui.event(&Event::Paused(false), at(410));
+        // Ctrl-P toggles by what the view says, and leaves a half-typed hint alone
+        type_in(&mut ui, "focus on", at(500), &tx);
+        press(&mut ui, ctrl('p'), at(3000), &tx);
+        assert_eq!(sent(&mut rx), ["pause"]);
+        assert_eq!(ui.hint.value(), "focus on", "the key does not touch the hint");
+        ui.event(&Event::Paused(true), at(3010));
+        // a held Ctrl-P: repeats 33 ms apart send nothing more
+        for k in 1..60 {
+            press(&mut ui, ctrl('p'), at(3000 + 33 * k), &tx);
+        }
+        assert_eq!(sent(&mut rx), Vec::<String>::new(), "a held key does not flip back and forth");
+        press(&mut ui, ctrl('p'), at(6000), &tx);
+        assert_eq!(sent(&mut rx), ["resume"], "a new press, long after, resumes");
+    }
+
+    /// A lecture that is stopping cannot be paused or resumed: the key says so and sends nothing, and a typed command
+    /// is refused as every Enter is.
+    #[test]
+    fn a_stopping_lecture_cannot_be_paused() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut ui, t0) = (drawn_ui(), Instant::now());
+        ui.key(ctrl('c'), t0);
+        assert_eq!(press(&mut ui, ctrl('p'), t0 + ms(3000), &tx), Act::Redraw);
+        assert_eq!(ui.notice.as_deref(), Some(PAUSE_STOPPING));
+        type_in(&mut ui, "pause", t0 + ms(3100), &tx);
+        press(&mut ui, key(KeyCode::Enter), t0 + ms(4000), &tx);
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(ui.hint.value(), "pause", "what was typed stays");
+    }
+
+    /// Ctrl-S while the lecture is paused: the capture state says the worker is holding, and the words for that are
+    /// the lecture's pause, not "it comes back when the window is back".
+    #[test]
+    fn ctrl_s_while_paused_says_it_is_the_lecture_that_is_paused() {
+        use lecturelive_core::capture::worker::CaptureState;
+        let paused_state = CaptureState::Paused { window: "Zoom Meeting".into(), reason: "the lecture is paused; capture goes on when it resumes".into() };
+        let ctx = capture::Context { path: std::path::PathBuf::from("/nowhere/capture.json"), course: "Machine Learning".into(), saved: None, current: Some(paused_state) };
+        let mut ui = Ui::new(state::View::new(identity(), Hydration::empty(), Vec::new()), view::Theme::new(lecturelive_core::session::spend::Paint { color: true, truecolor: true }, true), Some(ctx));
+        frame(&mut ui, 110, 32);
+        let t0 = Instant::now();
+        ui.key(ctrl('s'), t0);
+        assert_eq!(ui.notice.as_deref(), Some("Capture is paused; it comes back by itself when the window is back."), "a window that is away says so");
+        ui.event(&Event::Paused(true), t0);
+        ui.key(ctrl('s'), t0 + ms(3000));
+        assert_eq!(ui.notice.as_deref(), Some(CAPTURE_PAUSED), "the lecture's pause says so");
+    }
+
+    /// SIGTERM and SIGHUP (spec §9.6): the lecture is told to quit and given the grace to save. One that ends in time
+    /// was saved; one that does not is left to the next session's repair, and the process still goes.
+    #[tokio::test]
+    async fn a_terminating_signal_tells_the_lecture_to_quit_and_waits_for_it_up_to_the_grace() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut obedient: tokio::task::JoinHandle<Result<StopReport>> = tokio::spawn(async move {
+            while let Some(c) = rx.recv().await {
+                if matches!(c, Command::Quit) {
+                    break;
+                }
+            }
+            Ok(StopReport::default())
+        });
+        assert!(quit_gracefully(&tx, &mut obedient, Duration::from_secs(5)).await, "a lecture that quits when told has saved");
+        // one that never answers: the grace runs out, and the caller goes without it
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut stuck: tokio::task::JoinHandle<Result<StopReport>> = tokio::spawn(std::future::pending());
+        let t0 = Instant::now();
+        assert!(!quit_gracefully(&tx, &mut stuck, ms(60)).await);
+        assert!(t0.elapsed() >= ms(60) && t0.elapsed() < Duration::from_secs(5), "it waited the grace, and no longer");
+        // one that has already ended: nothing to wait for
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        drop(rx);
+        let mut gone: tokio::task::JoinHandle<Result<StopReport>> = tokio::spawn(async { Ok(StopReport::default()) });
+        assert!(quit_gracefully(&tx, &mut gone, Duration::from_secs(5)).await);
     }
 
     /// Plan §J: while stopping, Enter is refused with the desktop's words and the text is kept.

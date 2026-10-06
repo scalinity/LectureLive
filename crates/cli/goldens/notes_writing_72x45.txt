@@ -42,4 +42,4 @@
 "         ▎   quadrupling                                                "
 "                                                                        "
 " ◆  a hint, or ⏎ for a snapshot                                         "
-" ⏎ snapshot   polish⏎   ^X cancel   Tab pane   ^H help   ^C stop        "
+" ⏎ snapshot   polish⏎   ^P pause   ^X cancel   ^H help   ^C stop        "

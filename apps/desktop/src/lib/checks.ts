@@ -230,10 +230,11 @@ function embeds(doc: string, n: number): number[] {
 }
 
 /** Slide capture in the running app, on a deck window the check opens itself (M5 plan, Task 10): the first
- *  frame and a build captured, a cover that changes nothing, a minimised window that pauses, a replaced
- *  window that asks and captures nothing until chosen, a manual capture and a dropped image; then the
- *  last snapshot embeds each slide once. */
-export async function captureCheck(session: Session, t: Transport, dir: string) {
+ *  frame and a build captured, a cover that changes nothing, a minimised window that pauses, the lecture's
+ *  pause, a replaced window that is followed with no one to click (M7.1), a control bar that comes and goes without
+ *  registering the slide again, a manual capture and a dropped image; then the last snapshot embeds each slide once,
+ *  or with `quit` the app is quit with the lecture running and no snapshot is taken. */
+export async function captureCheck(session: Session, t: Transport, dir: string, quit = false) {
   const steps: Step[] = [];
   const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
   const deck = (action: string) => t.call<number | null>("check_deck", { action });
@@ -275,16 +276,40 @@ export async function captureCheck(session: Session, t: Transport, dir: string) 
     await sleep(4000);
     log("back on screen: the change made meanwhile, once", count() === n + 1, { slides: count(), last: last() });
 
+    // The lecture's pause (spec §9.6): the strip says so, nothing is sampled, and what changed meanwhile is taken once after it.
     n = count();
+    await session.pause();
+    await until("paused", () => session.status.paused && session.capture.state === "paused", 10_000);
+    log("paused: the strip says paused and capture waits", true, { paused: session.status.paused, capture: session.capture });
+    await deck("show:10"); // a different slide: a one-line build (state 6) is at the detector's known blind spot
+    await sleep(3500);
+    log("nothing is sampled while the lecture is paused", count() === n, { slides: count() });
+    await session.resume();
+    await until("resumed", () => !session.status.paused && session.capture.state === "watching", 15_000);
+    await sleep(4000);
+    log("after the resume, the change made meanwhile is taken once", count() === n + 1, { slides: count(), last: last() });
+
+    // A window that is quit and opened again (a proctoring browser does it): followed with no one to click, and said.
+    n = count();
+    const noticesBefore = session.notices.length;
     const replaced = (await deck("replace"))!;
-    await until("asking about the new window", () => session.capture.state === "asking" && session.capture.candidates.some((c) => c.id === replaced), 20_000);
-    await sleep(3000);
-    log("a replaced window asks, and nothing is captured from it", count() === n, { capture: session.capture, slides: count() });
-    await session.captureWatch(replaced);
-    await until("watching the new window", () => session.capture.state === "watching", 15_000);
+    await until("the restarted window to be followed", () => session.notices.slice(noticesBefore).some((x) => x.label === "Found again" && /opened again/.test(x.detail)), 20_000);
+    log("a restarted window is followed with no click, and said", session.capture.state !== "asking", { replaced, capture: session.capture, notice: session.notices.slice(noticesBefore).at(-1) });
     await deck("show:8");
     await until("a slide from the new window", () => count() > n, 15_000);
-    log("after Watch it, the new window is captured", last()?.auto === true, { slides: count(), last: last() });
+    log("the new window is captured", last()?.auto === true, { slides: count(), last: last() });
+
+    // Zoom's control bar fades in and out of the region: a lasting change each time, not a new slide each time.
+    await deck("show:9");
+    await sleep(3500);
+    n = count();
+    for (let i = 0; i < 6; i++) {
+      await deck("bar:on");
+      await sleep(2500);
+      await deck("bar:off");
+      await sleep(2500);
+    }
+    log("a control bar coming and going twelve times registers at most two more slides", count() - n <= 2, { extra: count() - n, slides: count() });
 
     n = count();
     await session.captureNow();
@@ -297,11 +322,16 @@ export async function captureCheck(session: Session, t: Transport, dir: string) 
     log("a dropped image is a manual slide", last()?.auto === false, last());
 
     const total = count();
-    await session.stop();
-    await until("the end", () => session.status.phase === "ended", 300_000);
-    const st = await t.state();
-    const each = embeds(st.document, total);
-    log("the last snapshot embeds every slide exactly once", each.every((e) => e === 1), { slides: total, embeds: each, notices: session.notices.slice(-4) });
+    if (quit) {
+      // The report is written, then the app exits with the lecture running: a quit takes no last snapshot.
+      log("quitting with the lecture running", true, { slides: total });
+    } else {
+      await session.stop();
+      await until("the end", () => session.status.phase === "ended", 300_000);
+      const st = await t.state();
+      const each = embeds(st.document, total);
+      log("the last snapshot embeds every slide exactly once", each.every((e) => e === 1), { slides: total, embeds: each, notices: session.notices.slice(-4) });
+    }
   } catch (e) {
     log("failed", false, { error: String(e), capture: session.capture, slides: count(), notices: session.notices.slice(-6) });
   }
@@ -455,4 +485,68 @@ export async function faultsCheck(session: Session, t: Transport, dir: string, m
   await until("the lecture to end", () => { look(); return session.status.phase === "ended"; }, 600_000).catch(() => {});
   look();
   await finish(t, name, { dir, minutes, error: session.error, rows, notices: notices() });
+}
+
+/** A lecture left running for a harness to quit from outside (M7.1, V18): it starts one on the synthetic folder and writes a
+ *  report to say so, paused first when asked. It never ends by itself: whatever ends it is the check. */
+export async function idleCheck(session: Session, t: Transport, dir: string, paused: boolean) {
+  const steps: Step[] = [];
+  const log = (step: string, ok: boolean, detail?: unknown) => steps.push({ at: stamp(), step, ok, detail });
+  try {
+    await session.selectFolder(dir);
+    await session.start("loopback");
+    await until("running", () => session.status.phase === "running", 30_000);
+    let mic = await session.microphone();
+    for (let i = 0; i < 12 && mic === "undetermined"; i++) {
+      await sleep(1000); // the prompt is being answered: the status follows it
+      mic = await session.microphone();
+    }
+    log("started", true, { phase: session.status.phase, microphone: mic });
+    await sleep(4000); // long enough for the capture worker to try its window
+    log("capture", true, { state: session.capture.state, detail: session.capture.detail, recording: session.status.phase === "running" });
+    if (paused) {
+      await session.pause();
+      await until("paused", () => session.status.paused, 10_000);
+      log("paused", true);
+    }
+  } catch (e) {
+    log("failed", false, { error: String(e), shown: session.error, microphone: await session.microphone().catch(() => "unknown") });
+  }
+  await t.call("check_report", { name: paused ? "idle-paused" : "idle", json: JSON.stringify({ dir, steps }, null, 2) });
+  await sleep(30 * 60_000);
+}
+
+/** The app in each of its looks, for a harness to photograph (M7.1, V06 and V17): a lecture running and paused, each in
+ *  normal and in large type. A report is written as each look begins, and it is held for nine seconds; then the app quits
+ *  with the lecture running. */
+export async function looksCheck(session: Session, t: Transport, dir: string) {
+  const hold = 9_000;
+  const mark = (name: string) => t.call("check_report", { name, json: JSON.stringify({ at: stamp(), paused: session.status.paused, capture: session.capture }) });
+  const large = (on: boolean) => document.documentElement.classList.toggle("large", on);
+  try {
+    await session.selectFolder(dir);
+    await session.start("loopback");
+    await until("running", () => session.status.phase === "running", 30_000);
+    await sleep(4000);
+    await mark("looks-running");
+    await sleep(hold);
+    await session.pause();
+    await until("paused", () => session.status.paused, 10_000);
+    await sleep(2500);
+    await mark("looks-paused");
+    await sleep(hold);
+    large(true);
+    await sleep(2500);
+    await mark("looks-paused-large");
+    await sleep(hold);
+    await session.resume();
+    await until("resumed", () => !session.status.paused, 10_000);
+    await sleep(2500);
+    await mark("looks-running-large");
+    await sleep(hold);
+    large(false);
+  } catch (e) {
+    await t.call("check_report", { name: "looks-failed", json: JSON.stringify({ error: String(e) }) });
+  }
+  await t.call("exit_app");
 }

@@ -295,6 +295,16 @@ fn meaning(stage: Stage) -> &'static [&'static str] {
     }
 }
 
+/// Whether the header shows the lecture as paused (spec §9.6): one that is already stopping shows its stage instead.
+fn paused(v: &View) -> bool {
+    v.paused && v.phase == Stage::Listening
+}
+
+/// What a pause means for the lecture, in the header's first row: the full sentence, then shorter ones.
+fn paused_meaning(enter: &str) -> Vec<String> {
+    vec![format!("nothing is recorded or transcribed; ^P or resume{enter} goes on"), format!("not recording; ^P or resume{enter} goes on"), "^P goes on".to_string()]
+}
+
 /// The safety view's keys: what still works below the minimum size (typing is ignored there).
 const KEYS: [(&str, fn(Stage) -> &'static str); 2] = [("^L", redraw), ("^C", stop_key)];
 
@@ -366,6 +376,9 @@ fn footer(v: &View, c: &Chrome, room: usize) -> Vec<Span<'static>> {
             if listening {
                 parts.push((2, chord(g.enter, "snapshot", DIM)));
                 parts.push((4, chord(g.polish, "", DIM)));
+                // Ctrl-P is the break: it pauses what is recording, and resumes what was paused (spec §9.6).
+                // As polish's priority and after it, so a narrow footer keeps polish and drops the pane and activity keys first.
+                parts.push((4, chord("^P", if v.paused { "resume" } else { "pause" }, DIM)));
                 // Ctrl-S only where it does something: capture now while a window is watched,
                 // watch the one offered window when its region is saved (plan §H).
                 match c.capture {
@@ -671,11 +684,12 @@ fn help(frame: &mut Frame, area: Rect, c: &Chrome) -> usize {
 fn help_lines(g: &Glyphs, inner: usize) -> Vec<Line<'static>> {
     let hint = format!("hint {}", g.enter);
     let tabs = format!("Tab {}", g.backtab);
+    let pausing = format!("pause or resume (typed: pause{0}, resume{0})", g.enter);
     let groups: [(&str, Vec<(&str, &str)>); 5] = [
         ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests, running and queued")]),
         ("Reading", vec![(g.updown, "a row in the focused pane"), ("PgUp PgDn", "a page"), (tabs.as_str(), "the next or previous pane"), ("Esc", "back to live"), ("^T", "the focused pane fills the body; again to go back")]),
         ("Slides", vec![("^S", "capture the watched window's slide now"), ("^S", "watch the window offered, if its region is saved")]),
-        ("App", vec![("^O", "activity: this session's notices"), ("^H F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
+        ("App", vec![("^P", pausing.as_str()), ("^O", "activity: this session's notices"), ("^H F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
         (
             "Stopping",
             vec![
@@ -773,13 +787,15 @@ fn work_lane(v: &View, scrolled: bool, room: usize, t: &Theme) -> Option<Vec<Spa
 /// The dot is red only while recording; stopping, it is dim, and the word says the rest.
 fn first_row(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
     let g = c.theme.glyphs;
-    let dot = if v.phase == Stage::Listening { c.theme.signal() } else { DIM };
-    let mut spans = vec![Span::styled(g.dot, dot), Span::raw(" "), phase(v.phase)];
+    let paused = paused(v);
+    let dot = if v.phase == Stage::Listening && !paused { c.theme.signal() } else { DIM };
+    let mut spans = vec![Span::styled(g.dot, dot), Span::raw(" "), if paused { Span::styled("Paused", BOLD) } else { phase(v.phase) }];
     let room = max.saturating_sub(width(&spans) + 3 + 2 + clock(c.elapsed).len());
-    let middle = match meaning(v.phase) {
+    let phrasings: Vec<String> = if paused { paused_meaning(g.enter) } else { meaning(v.phase).iter().map(|m| m.to_string()).collect() };
+    let middle = match phrasings.as_slice() {
         [] if room >= 8 => Some(fit(&format!("{} {} {}", v.identity.course, g.chevron, v.identity.lecture), room, g.ellipsis)),
         [] => None,
-        phrasings => phrasings.iter().find(|m| Span::raw(**m).width() <= room).map(|m| m.to_string()),
+        phrasings => phrasings.iter().find(|m| Span::raw(m.as_str()).width() <= room).cloned(),
     };
     if let Some(m) = middle {
         spans.extend([Span::raw("   "), Span::styled(m, DIM)]);
@@ -792,8 +808,11 @@ fn first_row(v: &View, c: &Chrome, max: usize) -> Vec<Span<'static>> {
 /// connection's words shorten. The health, the connection's state and the gap count never go.
 fn second_row(v: &View, t: &Theme, max: usize) -> (Vec<Span<'static>>, Option<Vec<Span<'static>>>) {
     let g = t.glyphs;
+    let paused = paused(v);
     let health: Vec<Span<'static>> = match (&v.input_gone, v.silence, v.level) {
         (Some(_), _, _) => vec![Span::styled(format!("{} input gone", g.warn), t.signal().add_modifier(Modifier::BOLD))],
+        // paused, the input is metered but not recorded: neither a level nor a silence warning describes it
+        (None, _, _) if paused => vec![Span::styled("not recording", DIM)],
         (None, true, _) => vec![Span::styled("no signal", t.signal().add_modifier(Modifier::BOLD))],
         (None, false, Some(l)) => {
             let on = (((dbfs(l) + 60.0) / 60.0 * 8.0).round().clamp(0.0, 8.0)) as usize;
@@ -802,6 +821,8 @@ fn second_row(v: &View, t: &Theme, max: usize) -> (Vec<Span<'static>>, Option<Ve
         (None, false, None) => Vec::new(),
     };
     let (full, short) = match &v.stt {
+        // a pause closes the connection: whatever it said before is no longer true
+        _ if paused => (Span::styled("not transcribing", DIM), Span::styled("STT off", DIM)),
         None => (Span::styled("connecting", DIM), Span::styled(format!("STT {}", g.ellipsis), DIM)),
         Some(SttStatus::Connected) => (Span::styled("transcribing", DIM), Span::styled("STT ok", DIM)),
         Some(s) => {
@@ -932,7 +953,8 @@ fn keys(stage: Stage, t: &Theme) -> Vec<Span<'static>> {
 fn too_small(frame: &mut Frame, v: &View, c: &Chrome) {
     let area = frame.area();
     let (t, g) = (c.theme, c.theme.glyphs);
-    let head = Line::from(vec![Span::raw(" "), Span::styled(g.dot, if v.phase == Stage::Listening { t.signal() } else { DIM }), Span::raw(" "), phase(v.phase), Span::raw("  "), Span::raw(clock(c.elapsed))]);
+    let word = if paused(v) { Span::styled("Paused", BOLD) } else { phase(v.phase) };
+    let head = Line::from(vec![Span::raw(" "), Span::styled(g.dot, if v.phase == Stage::Listening && !paused(v) { t.signal() } else { DIM }), Span::raw(" "), word, Span::raw("  "), Span::raw(clock(c.elapsed))]);
     let mut keys_line = vec![Span::raw(" ")];
     keys_line.extend(keys(v.phase, t));
     let middle = [
@@ -1239,7 +1261,7 @@ mod tests {
     #[test]
     fn the_footer_follows_the_stop_stage() {
         for (stage, keys, safety) in [
-            (Stage::Listening, " ⏎ snapshot   polish⏎   Tab pane   ^O activity   ^H help   ^C stop", " ^L redraw   ^C stop"),
+            (Stage::Listening, " ⏎ snapshot   polish⏎   ^P pause   Tab pane   ^O activity   ^H help   ^C stop", " ^L redraw   ^C stop"),
             (Stage::Stopping, " Tab pane   ^O activity   ^H help   ^C stop waiting", " ^L redraw   ^C stop waiting"),
             (Stage::StopWaiting, " Tab pane   ^O activity   ^H help   ^C quit at once", " ^L redraw   ^C quit at once"),
         ] {
@@ -1250,6 +1272,67 @@ mod tests {
         assert_eq!(l[30], " ◆  a hint, or ⏎ for a snapshot", "the empty hint line says what Enter does, one cell after the cursor");
         assert_eq!(lines(&drawn(110, 32, &view(Stage::Stopping), None))[30], format!(" ◆  {STOPPING_PROMPT}"));
         assert!(!l.join("").contains("^S"), "no capture key before Task 11");
+    }
+
+    /// Pause (spec §9.6): the footer offers `^P pause` while listening and `^P resume` while paused, and nothing of
+    /// the kind once the lecture is stopping.
+    #[test]
+    fn the_footer_offers_pause_while_listening_and_resume_while_paused() {
+        let mut paused = view(Stage::Listening);
+        paused.paused = true;
+        let listening = lines(&drawn(110, 32, &view(Stage::Listening), None))[31].clone();
+        let resume = lines(&drawn(110, 32, &paused, None))[31].clone();
+        assert!(listening.contains("^P pause") && !listening.contains("resume"), "{listening:?}");
+        assert!(resume.contains("^P resume") && !resume.contains("^P pause"), "{resume:?}");
+        for stage in [Stage::Stopping, Stage::StopWaiting] {
+            assert!(!lines(&drawn(110, 32, &view(stage), None))[31].contains("^P"), "{stage:?}: a lecture that is ending has nothing to pause");
+        }
+        // narrow: the stop key always stays; pause outlasts the pane and activity keys
+        let narrow = lines(&drawn(60, 16, &view(Stage::Listening), None));
+        assert!(narrow[15].contains("^C stop"), "{:?}", narrow[15]);
+    }
+
+    /// A paused lecture must not look like a recording one: the header says Paused where it said Listening, its dot is
+    /// dim (never signal red, with or without colour), the meter's place says nothing is recorded, the connection is
+    /// off, and a silence warning that was standing when it was paused is not shown.
+    #[test]
+    fn a_paused_lecture_does_not_look_like_a_recording_one() {
+        let mut v = view(Stage::Listening);
+        v.silence = true;
+        v.paused = true;
+        for (paint, glyphs) in [(TRUE, true), (ANSI, true), (OFF, true), (OFF, false)] {
+            let b = drawn_with(140, 40, &v, None, &Theme::new(paint, glyphs)).backend().buffer().clone();
+            let l = lines(&b);
+            assert!(l[0].contains("Paused") && !l[0].contains("Listening"), "{:?}", l[0]);
+            assert!(l[0].contains("goes on"), "the header says how it goes on: {:?}", l[0]);
+            assert!(l[1].contains("not recording") && l[1].contains("not transcribing") && !l[1].contains("no signal"), "{:?}", l[1]);
+            let dot = if glyphs { "●" } else { "*" };
+            let (x, y) = at(&b, 0, dot);
+            assert_ne!(b[(x, y)].fg, SIGNAL, "the dot is not the recording red ({paint:?})");
+            assert_ne!(b[(x, y)].fg, Color::Red);
+            assert!(b[(x, y)].modifier.contains(Modifier::DIM), "dim, as while stopping");
+        }
+        // a recording lecture keeps its red dot and its meter
+        let mut live = view(Stage::Listening);
+        live.paused = false;
+        let b = drawn_with(140, 40, &live, None, &Theme::new(TRUE, true)).backend().buffer().clone();
+        let (x, y) = at(&b, 0, "●");
+        assert_eq!(b[(x, y)].fg, SIGNAL);
+        assert!(lines(&b)[0].contains("Listening") && lines(&b)[1].contains("transcribing"));
+        // stopping while paused: the stage wins, as it should
+        let mut ending = view(Stage::Stopping);
+        ending.paused = true;
+        assert!(lines(&drawn(140, 40, &ending, None))[0].contains("Stopping"));
+        // the safety view (below the minimum size) says it too
+        let small = lines(&drawn(40, 8, &v, None));
+        assert!(small[0].contains("Paused"), "{:?}", small[0]);
+    }
+
+    /// The help lists the pause: the key and both typed commands.
+    #[test]
+    fn the_help_lists_pause_and_resume() {
+        let help = help_lines(&UNICODE, 90).iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(help.contains("^P") && help.contains("pause⏎") && help.contains("resume⏎"), "{help}");
     }
 
     /// A refused key outranks the ordinary notice — it is about the keys just below it — but never

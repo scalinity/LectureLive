@@ -36,7 +36,11 @@
     });
   }
 
-  (globalThis as { __deck?: unknown }).__deck = { show: (i: number) => (at = i), start, count: steps.length };
+  /** Zoom's control bar fades in and out over the bottom of the window as the pointer moves: a lasting change to the
+   *  slide region each time, which a check toggles to see that the detector does not register the slide again. */
+  let controls = $state(false);
+
+  (globalThis as { __deck?: unknown }).__deck = { show: (i: number) => (at = i), start, bar: (on: boolean) => (controls = on), count: steps.length };
   // Inside the app, a check drives it from the title slide (show, or start to play the schedule).
 
   /** Bar heights for the animated charts: they cycle every 15 s and never rest. */
@@ -177,6 +181,9 @@
       </section>
     {/key}
   </div>
+  {#if controls}
+    <div class="controls" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+  {/if}
 </div>
 
 <style>
@@ -190,6 +197,27 @@
     position: fixed;
     inset: 0;
     background: #222;
+  }
+
+  /* A stand-in for Zoom's bottom control bar. */
+  .controls {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 9%;
+    background: #141414;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 6%;
+  }
+
+  .controls span {
+    width: 3.5%;
+    height: 40%;
+    border-radius: 4px;
+    background: #6b6b6b;
   }
 
   .stage {

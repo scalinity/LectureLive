@@ -113,6 +113,30 @@ export class Session {
     return at ? Math.max(0, Math.floor((this.clockNow - Date.parse(at)) / 1000)) : null;
   }
 
+  /** The person paused the lecture (spec §9.6): nothing is recorded or transcribed until they resume. */
+  get paused(): boolean {
+    return this.status.paused;
+  }
+
+  /** Only a running lecture can be paused; one that is stopping has no pause left to ask for. */
+  get canPause(): boolean {
+    return this.status.phase === "running";
+  }
+
+  /** When this page first saw the lecture paused: a page reloaded in a pause counts from the reload. */
+  private pausedAt = $state<number | null>(null);
+
+  /** Seconds the lecture has been paused, updated once a second; null while it is not. */
+  get pausedFor(): number | null {
+    return this.pausedAt === null ? null : Math.max(0, Math.floor((this.clockNow - this.pausedAt) / 1000));
+  }
+
+  /** Takes a status in. */
+  private take(status: Status) {
+    this.pausedAt = status.paused ? (this.pausedAt ?? Date.now()) : null;
+    this.status = status;
+  }
+
   /** The last command that failed, in the backend's words; cleared by the next one that succeeds. */
   error = $state<string | null>(null);
   private clockNow = $state(Date.now());
@@ -129,11 +153,23 @@ export class Session {
     }
   }
 
-  /** The CLI's command line: ⏎ is a snapshot, a hint then ⏎ a hinted one, `polish` ⏎ a polish. */
+  /** The CLI's command line: ⏎ is a snapshot, a hint then ⏎ a hinted one, `polish` ⏎ a polish, `pause` and `resume` ⏎ those. */
   async snapshot(hint: string) {
     const h = hint.trim();
-    if (h.toLowerCase() === "polish") return this.polish();
+    const word = h.toLowerCase();
+    if (word === "polish") return this.polish();
+    if (word === "pause") return this.pause();
+    if (word === "resume") return this.resume();
     await this.act("snapshot", { hint: h });
+  }
+
+  /** Nothing is recorded or transcribed until `resume` (spec §9.6); a break costs no transcription. */
+  async pause() {
+    await this.act("pause");
+  }
+
+  async resume() {
+    await this.act("resume");
   }
 
   async polish() {
@@ -307,7 +343,7 @@ export class Session {
     const st = await this.t!.state();
     this.session = st.session;
     this.lastSeq = { status: st.seq, transcript: st.seq, notes: st.seq };
-    this.status = st.status;
+    this.take(st.status);
     if (st.status.input_gone) void this.readFallbacks(st.status.input_gone); // a reload while the input is away
     this.notices = st.notices;
     this.segments = st.segments;
@@ -388,7 +424,7 @@ export class Session {
     if (m.type === "status") {
       const { type: _t, session: _s, seq: _q, ...status } = m;
       const gone = status.input_gone && status.input_gone !== this.status.input_gone ? status.input_gone : null;
-      this.status = status;
+      this.take(status);
       if (gone) void this.readFallbacks(gone);
     } else if (m.type === "notice") {
       const { type: _t, session: _s, seq: _q, ...notice } = m;

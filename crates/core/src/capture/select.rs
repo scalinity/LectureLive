@@ -81,10 +81,17 @@ impl Selection {
     /// seen (within 2%).
     pub fn at_size(&self, width: u32, height: u32) -> Option<Selection> {
         let probe = WindowInfo { id: 0, app: String::new(), bundle_id: None, title: String::new(), width, height, on_screen: true };
-        let known = if self.descriptor.same_size(&probe) {
+        let near = |s: &SizedRegion| Descriptor { width: s.width, height: s.height, ..self.descriptor.clone() }.same_size(&probe);
+        // A size seen exactly comes first: windowed and full screen can differ by a few pixels, within the 2% that
+        // names the same window, and lay the slide out in different places.
+        let known = if (self.descriptor.width, self.descriptor.height) == (width, height) {
+            self.clone()
+        } else if let Some(s) = self.sizes.iter().find(|s| (s.width, s.height) == (width, height)) {
+            self.with_size(s.width, s.height, s.region)
+        } else if self.descriptor.same_size(&probe) {
             self.clone()
         } else {
-            let s = self.sizes.iter().find(|s| Descriptor { width: s.width, height: s.height, ..self.descriptor.clone() }.same_size(&probe))?;
+            let s = self.sizes.iter().find(|s| near(s))?;
             self.with_size(s.width, s.height, s.region)
         };
         Some(Selection { descriptor: Descriptor { width, height, ..known.descriptor.clone() }, ..known })
@@ -224,6 +231,22 @@ mod tests {
         let old = r#"{"descriptor":{"bundle_id":"us.zoom.xos","app":"zoom.us","title":"Zoom Meeting","width":1600,"height":900},"region":{"x":0.1,"y":0.1,"w":0.8,"h":0.8}}"#;
         let loaded: Selection = serde_json::from_str(old).unwrap();
         assert!(loaded.sizes.is_empty() && loaded.leave_out.is_empty(), "an earlier capture.json still loads");
+    }
+
+    /// Live evidence (M7.1 class): on this Mac full screen is 1168 × 729 and the window 1168 × 733, within 2% of each
+    /// other, and leaving full screen kept the full-screen region on the windowed layout. The size seen exactly is
+    /// the one whose region is used.
+    #[test]
+    fn two_sizes_within_two_percent_keep_their_own_regions_when_met_exactly() {
+        let windowed = Region { x: 0.065, y: 0.218, w: 0.87, h: 0.782 };
+        let full = Region { x: 0.0, y: 0.07, w: 1.0, h: 0.88 };
+        let sel = Selection { descriptor: Descriptor::of(&win(1, "us.zoom.xos", "Zoom Meeting", 1168, 733)), region: windowed, leave_out: vec![], sizes: vec![] };
+        let at_full = sel.with_size(1168, 729, full);
+        assert_eq!(at_full.at_size(1168, 733).unwrap().region, windowed, "back in the window: its own region");
+        assert_eq!(at_full.at_size(1168, 729).unwrap().region, full);
+        assert_eq!(at_full.at_size(1168, 731).unwrap().region, full, "a size never met is the nearest this selection knows: the current one");
+        let at_window = at_full.at_size(1168, 733).unwrap();
+        assert_eq!(at_window.at_size(1168, 729).unwrap().region, full, "and forth again");
     }
 
     #[test]

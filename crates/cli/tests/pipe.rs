@@ -64,6 +64,101 @@ fn the_scripted_lecture_runs_plain_through_a_pipe() {
     assert!(empty(&home), "application data was touched: {:?}", std::fs::read_dir(&home).unwrap().flatten().map(|e| e.path()).collect::<Vec<_>>());
 }
 
+/// Starts the scripted `ops` lecture in plain mode, with stdin held open, and waits until a snapshot typed on it has
+/// reached the session, so the signals below find it running.
+fn running_plain(home: &Path, dir: &Path) -> (std::process::Child, std::process::ChildStdin) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lecturelive"))
+        .args(["lecture", "--dir", dir.to_str().unwrap(), "--course", "Fixture Course"])
+        .env("HOME", home)
+        .env(FIXTURE, "ops")
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"\n").unwrap();
+    let log = dir.join("fixture-commands.log");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_to_string(&log).is_ok_and(|s| !s.is_empty()) {
+        assert!(Instant::now() < deadline, "the scripted lecture never took the line");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child, stdin)
+}
+
+/// Waits for the child to end, up to `within`; its status, stdout and stderr.
+fn ended(mut child: std::process::Child, within: Duration) -> (std::process::ExitStatus, String, String) {
+    use std::io::Read;
+    let deadline = Instant::now() + within;
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the lecture did not end within {within:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (mut out, mut err) = (String::new(), String::new());
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    (status, out, err)
+}
+
+/// SIGTERM and SIGHUP in the plain frontend (spec §9.6): the lecture is told to quit and ends as a stop ends it — the
+/// summary is printed — but with no last snapshot, and the process exits with the signal's usual status. The scripted
+/// session's log shows a `quit`, not a `stop`.
+#[test]
+fn a_terminating_signal_in_plain_quits_the_lecture_and_exits_with_its_status() {
+    use rustix::process::{kill_process, Pid, Signal};
+    for (signal, status_code) in [(Signal::TERM, 143), (Signal::HUP, 129)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let dir = tmp.path().join("Week 01 — Fixture");
+        let (child, _stdin) = running_plain(&home, &dir);
+        kill_process(Pid::from_child(&child), signal).unwrap();
+        let (status, stdout, stderr) = ended(child, Duration::from_secs(20));
+        assert_eq!(status.code(), Some(status_code), "{signal:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(std::fs::read_to_string(dir.join("fixture-commands.log")).unwrap().lines().collect::<Vec<_>>(), ["snapshot\t", "quit"], "{signal:?}");
+        assert!(stdout.contains("  ▲ quit  saving the recording"), "{signal:?}: the quit is said:\n{stdout}");
+        assert!(stdout.contains("  ✓ saved  lecture_notes_"), "{signal:?}: the summary is printed, as after a stop:\n{stdout}");
+        assert!(!stdout.contains("the last of the lecture"), "{signal:?}: no last snapshot:\n{stdout}");
+        assert!(!stdout.contains("stopping"), "{signal:?}: a quit is not the stop:\n{stdout}");
+        assert!(!stdout.as_bytes().contains(&0x1b), "{signal:?}: a pipe carries no escapes");
+        assert!(empty(&home), "{signal:?}: application data was touched");
+    }
+}
+
+/// `pause` and `resume` are the stdin grammar's words (spec §9.6): each reaches the session once, is said in the plain
+/// lines' own words, and a hint that merely begins with the word is still a hint.
+#[test]
+fn pause_and_resume_are_stdin_commands_in_plain() {
+    use rustix::process::{kill_process, Pid, Signal};
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let dir = tmp.path().join("Week 01 — Fixture");
+    let (child, mut stdin) = running_plain(&home, &dir);
+    stdin.write_all(b"pause\nPAUSE the discussion\n  Resume  \n").unwrap();
+    let log = dir.join("fixture-commands.log");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while std::fs::read_to_string(&log).map_or(0, |s| s.lines().count()) < 4 {
+        assert!(Instant::now() < deadline, "the commands never arrived: {:?}", std::fs::read_to_string(&log));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    kill_process(Pid::from_child(&child), Signal::TERM).unwrap();
+    let (_, stdout, _) = ended(child, Duration::from_secs(20));
+    let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect();
+    assert_eq!(&lines[..4], ["snapshot\t", "pause", "snapshot\tPAUSE the discussion", "resume"], "{lines:?}");
+    assert!(stdout.contains("  ◆ paused  nothing is recorded or transcribed until you resume"), "{stdout}");
+    assert!(stdout.contains("  ✓ resumed  recording and transcribing again, in a new file"), "{stdout}");
+    assert!(stdout.contains("  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop"), "the key line lists them:\n{stdout}");
+}
+
 #[test]
 fn tui_is_refused_when_stdin_is_a_pipe() {
     let tmp = tempfile::tempdir().unwrap();
