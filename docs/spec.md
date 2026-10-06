@@ -556,41 +556,85 @@ data folder (`capture.json`).
 When a lecture starts, exactly one window matching the descriptor (at a size it has had, within 2%)
 is watched. Anything else asks, in the slides strip. "Watch it" is offered only for a window the
 selection matches, whose region at its size someone has chosen or found; any other window is chosen
-in the picker, where its region is drawn. Once a window is watched, nothing is watched in its place
+in the picker, where its region is drawn. A saved window that is not there at the start is watched
+once exactly one window matches it. Once a window is watched, no other window is watched in its place
 without the person:
 
 - it cannot be captured while off screen (minimised) for three samples in a row: capture pauses and
   resumes by itself when it is back. A moment off screen, as full screen animates, is not a pause;
-- it closes: capture pauses; a window matching the descriptor that opens, or is already on screen
-  while the old one is off screen (a closed window's id can stay listed), is offered with "Watch it";
+- it closes: capture pauses. When exactly one window matches the selection as one does at a lecture's
+  start (the same app and title, at a size it has had), that window is the saved one opened again,
+  as when its app is quit and started again by a proctoring browser: it is watched through the same
+  region, the slide on screen is judged against the last kept one so it is not taken twice, and the
+  strip says so. A closed window's id can stay listed off screen, so the one matching window on
+  screen counts as well. Several matching windows, or one at a size not seen before, are offered
+  with "Watch it" or asked about, as any other window is;
 - it changes size by any amount (full screen on or off, even within the 2% that names the same
-  window, moves the slide): once the new size has held for a sample, the region found or chosen at
-  exactly that size is used; otherwise the last kept slide is searched for in the new layout and,
-  when found closely, its place becomes the region for that size, saved and announced (at a size
-  within 2% of one it had, that region is used if the search finds nothing). A frame through the new
-  region that still shows the kept slide (no tile past twice the change threshold, since realigning
-  fine text moves a tile by up to about 0.06) becomes the kept frame, as do the two samples after
-  it, so a switch never takes the same slide twice; a different slide, one that changed as the
-  window did, is taken. A one-line build landing in the same second as a switch can be taken for the
-  kept slide. A slide that cannot be found asks, and is searched for again every 5 samples, since the
-  new layout may not be drawn yet;
+  window, moves the slide; on a display barely larger than the window, full screen is a few pixels
+  from windowed): once the new size has held for a second, the region found or chosen at exactly that
+  size is used (a size seen exactly comes before one merely within 2%, since the two lay the slide
+  out differently); otherwise the last kept slide is searched for in the new layout, at no less than
+  half the window's width and only where it matches clearly better than a plain patch of its own
+  colour does, and when found its place becomes the region for that size, saved and announced; and
+  when the kept slide is not on screen, the shared content's own edges give the region (below). At
+  a size within 2% of one it had, that region is used if neither finds anything. A frame through the
+  new region that still shows the kept slide (no tile past twice the change threshold, since
+  realigning fine text moves a tile by up to about 0.06) becomes the kept frame, as do the two
+  samples after it, so a switch never takes the same slide twice; a different slide, one that changed
+  as the window did, is taken. A one-line build landing in the same second as a switch can be taken
+  for the kept slide. A slide that cannot be found asks, and is searched for again every 5 seconds,
+  since the new layout may not be drawn yet;
 - captures fail (an error, a blank window, a black region): nothing is kept, and three in a row are
   shown with the reason.
 
+**The region is checked against the content.** Zoom draws its own screen in one flat dark that runs
+out to the window's edges: its bars, its margins, the gaps between the speakers' tiles. What is
+shared is the largest rectangle that is not that (`capture::layout`; text inside a slide may be the
+same dark, but it does not reach the window's edge through dark, so only the dark that does is
+Zoom's). On the first sample after any region is taken up, then every 5 samples, and every sample
+while a region looks wrong, the region is compared with that rectangle. When the rectangle has a
+slide's shape (1.1 to 2.4 wide to high) and reads as a slide (§7.2), and less than 80% of the region
+lies in it or the region covers less than half of it, the region is not looking at the slide: a
+corner of it, or the speaker's strip taken in with it. Two looks in a row that find it so move the
+region to the rectangle, saved and announced, and a region under suspicion takes nothing meanwhile.
+A region found wrongly while Zoom's window was still moving therefore cannot stay. A window with no
+dark of Zoom's to tell the content from (a slide that fills it, or a black one that is most of it)
+gives no rectangle and no opinion.
+
 ### 7.2 Change detection
 
-Every 1.0 s: capture, crop to the region, blank the parts left out, downscale to 256×144 grayscale,
-divide into 16×16 tiles (144 tiles). A tile has changed when its mean absolute difference from the
-last kept frame exceeds 0.05, and it is moving when it differs from the previous sample by more than
-0.03.
+Three times a second (`SAMPLE_HZ`): capture, crop to the region, blank the parts left out, downscale
+to 256×144 grayscale, divide into 16×16 tiles (144 tiles). A tile has changed when its mean absolute
+difference from the last kept frame exceeds 0.05, and it is moving when it differs from the previous
+sample by more than 0.03. The counts below are the values calibrated at one sample a second (M5)
+with each count of samples multiplied by the rate, so each stays the same in seconds.
 
+- **What the frame is** (`capture::scene`). The same 256×144 frame is measured: its mean level, the
+  share of pixels within 4 levels of its commonest level (`dominant`: a page's own colour), and the
+  shares with a gentle (`soft`, 3–36 levels in 3×3) or a sharp (`hard`) change nearby. A dark page
+  that is nearly all one level with next to no sharp edges (mean under 70, dominant at least 0.75,
+  hard under 0.05) is one of Zoom's own screens: a participant's name on a tile, or "has started
+  screen sharing". A frame that is gentle all over with no level most of it shares (soft at least
+  0.25, dominant under 0.40) and that is moving (the mean change from the sample before, over the
+  last 3 samples, at least 0.0004) is a camera; the same picture held still is a slide with a
+  photograph on it. Nothing is taken from a camera or a notice and the strip says what is showing
+  ("Zoom Meeting, waiting for a slide (a camera is showing)"); the first page that follows is
+  the lecture's first slide. A manual capture is the person's call and is not judged.
 - **Candidate**: at least one changed tile outside the mask. Its image and first-observed time are kept.
-- **Confirm**: on a later sample in which no tile outside the mask moved since the candidate, the
-  candidate becomes a slide (the region at full size, at most 1600 px, PNG). A candidate whose
-  changed tiles return to the kept frame is dropped.
-- **Animated tiles**: a tile moving on 3 consecutive samples is masked until the next kept slide, so
-  a looping animation neither blocks nor triggers capture.
-- **Expiry**: a candidate that has not settled after 10 samples is kept, flagged `uncertain`.
+- **Confirm**: once 2 samples in a row after the candidate (about two thirds of a second) show it
+  still, with no tile outside the mask having moved, the candidate becomes a slide (the region at full
+  size, at most 1600 px, PNG), taken from the latest of them: a share Zoom sends coarse first has
+  finished sharpening. A candidate whose changed tiles return to the kept frame is dropped.
+- **Animated tiles**: a tile moving for 3 s running (9 samples) is masked until the next kept slide,
+  so a looping animation neither blocks nor triggers capture.
+- **Expiry**: a candidate that has not settled after 10 s (30 samples) is kept, flagged `uncertain`.
+- **The same slide again**: a candidate that settles on a frame equal to one of the last 3 kept
+  frames (no unmasked tile past the change threshold), which was on screen within the last minute
+  (180 samples), is that slide shown again: it becomes the kept frame and is not registered. A control bar
+  that fades in and out of the region, or a step back and forward, would otherwise register one slide
+  once for every look, and each registered slide is sent to the model and embedded in the notes. A
+  slide returned to after a longer time registers again. Leaving the controls out of the region (a
+  part left out) is still the better arrangement.
 - The first valid frame of a lecture is kept unconditionally.
 - A manual capture becomes the kept frame, so auto capture does not take the same slide again.
 
@@ -599,8 +643,12 @@ synthetic lecture deck with builds, dissolves, animated charts and a blinking ca
 window and annotated from its schedule, and a recorded Zoom lecture, annotated by its still stretches
 and checked by eye. The measures are recall of states visible for at least 3 s and false captures per
 10 minutes (M5 Findings). A line of text on a slide changes its tiles by about 0.06, hence 0.05.
-Content shown for less than one sample interval can be missed, and marks thinner than about 1% of
-the slide's height (an underline) change too little of a tile to count; manual capture covers both.
+The scene measures are calibrated on the recording of a real Zoom class (M7.1): 127 of 128 frames
+before the share, a camera, were told as one and the other was a name tile, now told as such;
+737 of 737 frames of the share were pages, none with soft above 0.15 or dominant below 0.48.
+Content shown for less than about two thirds of a second can be missed, and marks thinner than about
+1% of the slide's height (an underline) change too little of a tile to count; manual capture covers
+both.
 
 ### 7.3 Manual and imported
 
@@ -630,7 +678,8 @@ once a real capture of the watched window has succeeded.
   recordings/session_YYYYMMDD_HHMMSS.wav
   .live_notes/<stem>.v2.json          sidecar: version, lecture date, recordings + anchors, gaps,
                                       open utterances, notes {revision, len, sha256,
-                                      segment_cursor, slide_index}, slides [{index, file, shown_at, auto, uncertain}]
+                                      segment_cursor, slide_index}, slides [{index, file, shown_at, auto, uncertain}],
+                                      pauses [{from, to}]
   .live_notes/<stem>.segments.jsonl   segment log: id, recording, samples, wall times, text, words,
                                       source (live | recovered | imported)
   .live_notes/<stem>.journal.json     pending commit, present only mid-commit
@@ -887,10 +936,11 @@ a submission.
 | Key | |
 |---|---|
 | printable, Backspace, Delete, ←/→, Home/End, Ctrl-A/E/K/U/W | edit the hint |
-| `⏎` | the CLI's grammar: empty → a snapshot; a hint → a snapshot that focuses on it; `polish` → a polish, which takes its own snapshot first. While stopping nothing is sent and the text is kept |
+| `⏎` | the CLI's grammar: empty → a snapshot; a hint → a snapshot that focuses on it; `polish` → a polish, which takes its own snapshot first; `pause` or `resume` as the whole line → that command (§9.6). While stopping nothing is sent and the text is kept |
+| `^P` | pause the lecture, or resume it, by the state core last reported (§9.6). A half-typed hint is left alone; while stopping nothing is sent |
 | `^H`, `F1` | help, in an overlay that scrolls itself and `Esc` closes |
 | `^O` | activity, this session's notices |
-| `^S` | capture now, or watch the one window offered (§9.5.6) |
+| `^S` | capture now, or watch the one window offered (§9.5.6); while paused it says that the lecture is paused |
 | `^X` | cancel this frontend's own notes requests, running and queued; the study page is not cancellable |
 | `^T` | the focused pane fills the body; again to go back |
 | `Tab`, `⇧Tab` | the next or previous pane, and the visible tab in a tabbed column |
@@ -965,6 +1015,52 @@ burst of 500 events a second are within the targets these constraints set, as M7
 acceptance measured. Events are applied in batches, and a slow terminal holds nothing up: the
 event channel is unbounded and core is never made to wait for a frontend.
 
+### 9.6 Pause and quit
+
+**Pause** is for breaks, a quiz, a lecturer's absence: stretches where listening costs money and yields
+nothing. `Command::Pause` and `Command::Resume` turn it on and off: the desktop's Pause and Resume
+control and `pause` and `resume` on its command line, the CLI's typed `pause` and `resume` (plain and
+terminal UI) and the terminal UI's `^P`. Pausing a paused lecture does nothing, and a lecture that is
+stopping takes neither. Paused is a state, not a phase: the lecture is still running. The desktop strip
+and the terminal UI's header say Paused in place of the recording light (never red), and show "not
+recording, not transcribing" where the meter was.
+
+- **Audio.** Between the real source and the coordinator sits a gate (`audio::pause`). While paused it
+  delivers no audio, so nothing is recorded and nothing is streamed to speech-to-text: the recording the
+  pause interrupts ends as any recording does (the open utterance is flushed, the connection closes),
+  and the first frame after the resume begins the next recording on a connection of its own. The real
+  device keeps running underneath, so the level meter moves and a resume needs no new stream. The next
+  recording is anchored where the source's own clock puts its first frame, so the stretch between the
+  two recordings is exactly the pause. A gap the source had open (a mixed input away) is carried across.
+  The silence warning (§10) is not raised while paused.
+- **Slides.** Automatic capture is held: nothing is sampled, and the strip reads Paused. What changed
+  on screen while it lasted is judged on the first sample after the resume, like any change. A slide
+  taken by hand (Capture, ⌘⇧2, a dropped image, a screenshot) still registers: it is the person's act.
+- **Notes.** Snapshots, polish and the study page work as usual while paused; pausing stops nothing
+  that the person asks for.
+- **Record.** The sidecar's `pauses` holds each pause (`from`, `to`; `to` is absent while it lasts or when
+  a crash ended the session in it). The audit counts the hole between the recordings either side as
+  explained by it; an open pause explains only the hole it began in. A lecture stopped while paused
+  closes the pause. Pause state is not kept across sessions: a lecture started again begins recording.
+
+**Quit** is how the app ends when something else ends it: Cmd-Q, the last window closing, a proctoring
+browser's quit request, `kill` (SIGTERM or SIGHUP). `Command::Quit` stops the lecture as a stop does,
+saving every file (the recording is finalized, the open utterance flushed, the sidecar written), but
+takes no last snapshot, does not wait for recovery, and cancels the notes request in flight: a request
+that takes minutes, and costs money, must not hold up a quit. What the last snapshot would have taken
+stays pending for the next session in the folder, and the end report says the last snapshot was not taken.
+The adapters wait for the lecture to end for a bounded time (about 8 s) and then exit regardless. A
+kill that cannot be caught (SIGKILL, power) is the crash case of §10.
+
+How a quit reaches each adapter. The desktop app (Tauri 2.11, tao 0.35 on macOS) receives Cmd-Q and an
+Apple-Event quit as `RunEvent::Exit` only, which cannot be cancelled: the main thread waits there for the
+lecture to save, which runs on Tauri's runtime. The last window closing, and `exit`, arrive as
+`RunEvent::ExitRequested`, which is prevented while the lecture saves. Nothing in Tauri handles SIGTERM,
+SIGHUP or SIGINT, so the app listens for them itself. One deadline, set by the first quit, is shared by
+every route, so a second quit by another route (an Apple Event, then a SIGTERM) waits for the same moment
+and a second signal exits at once. The CLI handles SIGTERM and SIGHUP in both frontends: it sends
+`Command::Quit`, waits for the lecture, restores the terminal in the terminal UI, and exits with 143 or 129.
+
 ## 10. Errors and robustness
 
 | Failure | Behaviour |
@@ -982,6 +1078,9 @@ event channel is unbounded and core is never made to wait for a frontend.
 | Disk write error | Session stops cleanly with the path in its message; the last snapshot is still attempted; the next launch repairs the recording |
 | Spend ledger write fails | Warning in the status; the request's result is kept and recording continues |
 | App crash | Recording valid to last checkpoint and repaired at launch; system output untouched; journal recovery; unclosed utterance becomes a gap |
+| App quit (Cmd-Q, window closed, SIGTERM, SIGHUP) | The lecture is quit (§9.6): files saved and finalized, no last snapshot, no repair at the next launch; what the snapshot would have taken is pending |
+| Zoom quit and opened again | Capture pauses, then watches the new window through the saved region once exactly one window matches; several, or a new size, ask (§7.1) |
+| Break, quiz, absence | Pause (§9.6): no recording, no transcription, no automatic slides; the hole between the recordings is explained by the sidecar's `pauses` |
 | External edit of notes | Accepted as new revision |
 
 ## 11. Testing
@@ -1026,4 +1125,4 @@ Deployment target macOS 13; toolchain pinned in `rust-toolchain.toml`.
 
 1. Loopback fallback if M0 routing fails: ScreenCaptureKit audio (`objc2-screen-capture-kit`, macOS 13+) or a Core Audio process tap (`AudioHardwareCreateProcessTap`, macOS 14.2+), which captures one app's output without a driver or output-device switching. Decide only on M0 evidence.
 2. `grok-4.7`'s context window and per-request latency at 50k–150k tokens, to set the §6.1 budget from measurement.
-3. Detector thresholds and cadence (§7.2). Calibrated at M5 on the synthetic deck recorded from a window and on a recorded Zoom lecture: change 0.05, settle 0.03, animated 3 samples, expiry 10 samples, a 1 s cadence. How they hold on a live Zoom meeting window is measured from the first real lecture's recording of the detector's input.
+3. Detector thresholds and cadence (§7.2). Calibrated at M5 on the synthetic deck recorded from a window and on a recorded Zoom lecture: change 0.05, settle 0.03, animated 3 s, expiry 10 s, at one sample a second; a lecture samples three times a second with the counts scaled, and keeps a slide after two further samples show it still. The scene measures were calibrated at M7.1 on the recording of a real class (`crates/core/examples/scene_stats.rs` prints them for any recording; `replay.rs` runs a recording through the worker). How they hold on other decks, dark ones above all, is open: a dark slide with next to no sharp edges would read as a notice, and the manual capture covers it.

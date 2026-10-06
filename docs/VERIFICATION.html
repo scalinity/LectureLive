@@ -200,7 +200,8 @@ footer p{max-width:var(--measure);margin:.3rem 0}
   <p class="mark"><b>LectureLive</b>checks for you</p>
   <h1>What LectureLive still needs from you</h1>
   <p class="lede">Everything the automated runs could not do: a real Zoom lecture, a pointer on the window, a prompt only macOS shows you, and two choices that are yours to make. Each item names the line of <code>docs/milestones.md</code> it comes from. Statuses and notes save in this browser; Export keeps a copy.</p>
-  <p class="updated">Last updated 26 September 2026, at the end of M6's build (the two-hour lecture and the desk checks V15 and V16 added; mixed mode passed its two-hour drift run and is available; D1 and D2 answered and done).</p>
+  <p class="lede">Most of the checks below can also be run with nobody at the Mac: <code>tools/verify/run.sh</code> plays synthetic speech into BlackHole, takes the network from the lecture alone, fills a scratch disk, removes a virtual receiver, kills and quits the app and the CLI, and drives the app's window, then writes a verdict and its evidence for each check. Its README says which checks it covers and which it cannot (V02, V04, V07, V08, V12, V16); a person's run of an item here is still the record of a real Zoom and a real receiver.</p>
+  <p class="updated">Last updated 6 October 2026, at the end of M7.1's build (the desk checks V17 to V20 added: pause, quit, a restarted Zoom window, the control bar; before that, 26 September 2026, at the end of M6's build: the two-hour lecture and the desk checks V15 and V16, mixed mode available, D1 and D2 answered and done).</p>
   <div class="tally">
     <div class="squares" id="squares" aria-label="Every item, in page order"></div>
     <p class="count" id="count"></p>
@@ -513,6 +514,82 @@ cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/desktop</code><
           <li>Above the bar: “Microphone access is off, so nothing can be recorded. Turn it on in System Settings, then press Refresh.” with <b>Open Settings</b>, and Start greyed out. Choosing folders and the study page still work.</li>
           <li><b>Open Settings</b> opens the Microphone pane.</li>
           <li>After turning it on and pressing Refresh, the line is gone and Start works.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V17" data-kind="check" data-from="M7.1" data-rev="r1">
+    <div class="gut"><span class="id">V17</span><span class="from">M7.1, spec §9.6</span></div>
+    <div class="body">
+      <div class="head"><h3>Pause a lecture for a break and resume it, in the app and in the terminal</h3><div class="status"></div></div>
+      <p class="closes">Spec §9.6, <b>pause</b>. The unit and gate tests show that nothing reaches speech-to-text while paused; this is you seeing it, and the look of the paused state in light, dark and large type.</p>
+      <p class="what">With a scratch folder and any input, start a lecture in the app and say a few sentences. Click <b>Pause</b>, wait half a minute while saying something, then <b>Resume</b> and say a few more sentences, then Stop. Repeat once in the terminal UI with <b>^P</b> (or typing <code>pause</code> and <code>resume</code>). Run the audit afterwards.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <pre class="cmd"><code>cd "$HOME/Documents/Tools/LectureLive" &amp;&amp; ./target/debug/lecturelive lecture audit --dir "&lt;the scratch lecture folder&gt;"</code></pre>
+        <ul>
+          <li>While paused: the strip says Paused with a pause mark, never the red recording dot; the meter is replaced by “nothing is recorded or transcribed”; the slides strip reads Paused; no words appear for what you said meanwhile. In the terminal UI the header says Paused and the footer offers <b>^P resume</b>.</li>
+          <li>After Resume: a new recording begins and words appear again. Pausing in light, dark and large type reads clearly in each.</li>
+          <li>The audit lists two recordings and a hole between them as “a pause (explained)”, and ends with 0 unexplained, 0 waiting.</li>
+          <li>Today's spend rises only for the sentences said while not paused.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V18" data-kind="check" data-from="M7.1" data-rev="r1">
+    <div class="gut"><span class="id">V18</span><span class="from">M7.1, spec §9.6</span></div>
+    <div class="body">
+      <div class="head"><h3>Quit the app and the terminal UI in the middle of a recording, four ways</h3><div class="status"></div></div>
+      <p class="closes">Spec §9.6, <b>quit</b>: Cmd-Q, an Apple-Event quit (what a proctoring browser sends), closing the window, and a signal. The code waits for the lecture to save; whether macOS lets it is only known by trying.</p>
+      <p class="what">Start a lecture in a scratch folder and say something. Quit the app by one way, then start it again on the same folder and look at what it says. Do each of the four in turn, and once with the lecture paused. Then do SIGTERM and SIGHUP on the terminal UI.</p>
+      <details class="how"><summary>Commands and what to expect</summary>
+        <pre class="cmd"><code># the app: a signal (the pid is the desktop process)
+kill -TERM $(pgrep -f 'target/debug/desktop')
+# the app: an Apple-Event quit, as a proctoring tool sends it
+osascript -e 'tell application "LectureLive" to quit'
+# the terminal UI, from another Terminal window
+kill -TERM $(pgrep -f 'lecturelive lecture')
+kill -HUP  $(pgrep -f 'lecturelive lecture')</code></pre>
+        <ul>
+          <li>Each ends within a couple of seconds, and a terminal UI leaves the terminal as it found it (no raw mode, no stray characters).</li>
+          <li>In the folder's <code>.live_notes/*.v2.json</code> every recording is <code>finalized</code>, none <code>open</code>.</li>
+          <li>The next start says nothing about “Repaired” or “Recovered”, and says the lines and slides since the last snapshot wait for the next one.</li>
+          <li>Nothing was spent on a last snapshot.</li>
+        </ul>
+        If a way does leave a recording <code>open</code>, say which: that is the result, and it names the quit the code cannot see.
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V19" data-kind="check" data-from="M7.1" data-rev="r1">
+    <div class="gut"><span class="id">V19</span><span class="from">M7.1, spec §7.1</span></div>
+    <div class="body">
+      <div class="head"><h3>Quit Zoom and open it again in the middle of a lecture</h3><div class="status"></div></div>
+      <p class="closes">Spec §7.1, <b>“it closes”</b>: a window that matches the saved one as at a lecture's start is watched again with no one to click. The gate tests show it against a fake window list; this is a real Zoom.</p>
+      <p class="what">Start a lecture with the slides strip on “Watching” a shared slide. Quit Zoom, wait a few seconds, open the same meeting and share a slide again.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>While Zoom is gone the strip says the window closed and capture is paused.</li>
+          <li>When the meeting window is back at a size it has had: a “Found again” notice, “Zoom Meeting opened again; watching it as before”, and the strip is Watching, with no click.</li>
+          <li>The slide that was up is not taken again; the next change is.</li>
+          <li>If the window comes back at another size, the strip asks as before: that is correct.</li>
+        </ul>
+      </details>
+    </div>
+  </article>
+
+  <article class="row item" id="V20" data-kind="check" data-from="M7.1" data-rev="r1">
+    <div class="gut"><span class="id">V20</span><span class="from">M7.1, spec §7.2</span></div>
+    <div class="body">
+      <div class="head"><h3>Move the pointer in and out of Zoom while the region includes its control bar</h3><div class="status"></div></div>
+      <p class="closes">Spec §7.2, <b>“the same slide again”</b>. A live class registered 24 slides in five minutes this way. The test shows nine registrations become two; this is a real Zoom control bar.</p>
+      <p class="what">Draw the region to the bottom of the Zoom window, so the control bar is inside it, and leave the camera strip out. Show one slide, and move the pointer onto and off the Zoom window ten times over a minute. Then redraw the region without the bar.</p>
+      <details class="how"><summary>What to expect</summary>
+        <ul>
+          <li>With the bar inside the region: at most two slides for that one slide (with the bar and without), not one per movement.</li>
+          <li>With the bar left out: one.</li>
+          <li>A real change of slide is still taken each time.</li>
         </ul>
       </details>
     </div>
