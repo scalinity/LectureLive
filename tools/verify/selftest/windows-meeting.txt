@@ -1,0 +1,9 @@
+    1316  Terminal             Terminal                                             1163x732
+     940  Zoom                 Login                                                1314x710
+     938  Zoom                 Zoom Meeting                                         1168x733
+     163  Terminal             Terminal                                             1163x732
+      45  Terminal                                                                  500x500
+      39  Terminal             ◐ Build the sample notes                             1163x732
+     937  Zoom                 Zoom Client Healthcheck                              880x600
+      63  Google Chrome        Join from Zoom Workplace app - Zoom                  1168x733
+     420  System Settings      Keyboard                                             740x734
