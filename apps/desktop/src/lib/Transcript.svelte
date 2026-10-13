@@ -5,19 +5,39 @@
 
   let pinned = $state(true);
   let lastTop = 0;
+  let lastHeight = 0;
 
   function onscroll(e: Event) {
     const el = e.currentTarget as HTMLElement;
-    // Only the reader scrolls up; a layout change that moves the end away must not unpin.
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 4) pinned = true;
-    else if (el.scrollTop < lastTop - 1) pinned = false;
+    // Only the reader scrolls up with the content the same height. Laying out the paragraphs that scroll in and
+    // out of view (`content-visibility`) resizes the content, and WebKit then moves `scrollTop` by more than the
+    // resize: a pane that took that for the reader stopped following a few seconds after "Jump to live".
+    else if (el.scrollTop < lastTop - 1 && el.scrollHeight === lastHeight) pinned = false;
     lastTop = el.scrollTop;
+    lastHeight = el.scrollHeight;
+  }
+
+  /** The wheel going up is the reader leaving the end, whatever the layout is doing. */
+  function onwheel(e: WheelEvent) {
+    if (e.deltaY < 0 && (e.currentTarget as HTMLElement).scrollTop > 0) pinned = false;
+  }
+
+  function toEnd(node: HTMLElement) {
+    node.scrollTop = node.scrollHeight;
+    lastTop = node.scrollTop;
+    lastHeight = node.scrollHeight;
   }
 
   /** After each frame, a pane that is pinned follows the newest words. */
   function follow(node: HTMLElement) {
     const off = session.onFrame(() => {
-      if (pinned) node.scrollTop = node.scrollHeight;
+      if (!pinned) return;
+      toEnd(node);
+      // The paragraphs that came into view are laid out at their real height after this write.
+      requestAnimationFrame(() => {
+        if (pinned) toEnd(node);
+      });
     });
     return { destroy: off };
   }
@@ -25,12 +45,12 @@
   let pane: HTMLElement;
   function jump() {
     pinned = true;
-    pane.scrollTop = pane.scrollHeight;
+    toEnd(pane);
   }
 </script>
 
 <section class="pane" aria-label="Transcript">
-  <div class="scroll" bind:this={pane} use:follow {onscroll}>
+  <div class="scroll" bind:this={pane} use:follow {onscroll} {onwheel}>
     {#if session.segments.length === 0 && !session.open}
       <p class="empty">The transcript appears here once the lecture starts.</p>
     {/if}
