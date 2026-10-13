@@ -107,6 +107,29 @@ export class Session {
     return b.startsWith("snapshot") || b.startsWith("polishing");
   }
 
+  /** When the step now running began, as this page saw it; null while nothing runs. */
+  private busyAt = $state<number | null>(null);
+
+  /** What is running, for the line that says so: the backend's words, set out for reading. A polish is a snapshot
+   *  first and then the rewrite, so it reads as one and then the other. */
+  get working(): { label: string; detail: string } | null {
+    const b = this.status.busy;
+    if (!b) return null;
+    if (b.startsWith("snapshot")) return { label: "Snapshot", detail: `${b.replace(/^snapshot,\s*/, "").replace(" to ", " sent to ")}, ${this.previewShown ? "writing" : "thinking"}` };
+    if (b.startsWith("polishing")) return { label: "Polish", detail: b.replace(/^polishing/, "rewriting") };
+    return { label: "Study page", detail: b };
+  }
+
+  /** Seconds the step now running has run, updated once a second. */
+  get busyFor(): number | null {
+    return this.busyAt === null ? null : Math.max(0, Math.floor((this.clockNow - this.busyAt) / 1000));
+  }
+
+  /** A snapshot is running and none of its words has streamed yet: the model is reading and thinking. */
+  get snapshotWaiting(): boolean {
+    return (this.status.busy ?? "").startsWith("snapshot") && this.previewShown === "";
+  }
+
   /** Seconds since the lecture started, updated once a second. */
   get elapsed(): number | null {
     const at = this.status.started_at;
@@ -142,6 +165,7 @@ export class Session {
   /** Takes a status in. */
   private take(status: Status) {
     this.pausedAt = status.paused ? (this.pausedAt ?? Date.now()) : null;
+    if (status.busy !== this.status.busy) this.busyAt = status.busy ? Date.now() : null;
     this.status = status;
   }
 

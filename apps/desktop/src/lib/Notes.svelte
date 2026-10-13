@@ -54,7 +54,7 @@
 
 <section class="pane" aria-label="Notes">
   <div class="scroll" use:follow {onscroll}>
-    {#if committed.length === 0 && preview.length === 0}
+    {#if committed.length === 0 && preview.length === 0 && !session.snapshotWaiting}
       <p class="empty">Notes appear here after the first snapshot.</p>
     {/if}
     {#each committed as p (p.key)}
@@ -63,6 +63,13 @@
         <div class="md">{@html p.html}</div>
       </div>
     {/each}
+    {#if session.snapshotWaiting}
+      <!-- The snapshot is under way and no word of it has arrived: the same teal rule the writing will use. -->
+      <div class="chunk preview">
+        <span class="at writing">thinking</span>
+        <p class="waiting">Reading the lecture so far…</p>
+      </div>
+    {/if}
     {#if preview.length}
       <div class="chunk preview" aria-live="off">
         <span class="at writing">writing</span>
@@ -124,6 +131,12 @@
 
   .done {
     animation: arrive var(--fade) ease-out;
+  }
+
+  .waiting {
+    margin: 0;
+    color: var(--graphite);
+    font-style: italic;
   }
 
   /* The rendered Markdown, on the app's 18 px / 1.2 scale. */

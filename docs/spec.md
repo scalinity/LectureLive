@@ -780,6 +780,13 @@ read, and the next line starts on a line of its own.
   and after a lecture the same bar holds the folder picker, the source (the inputs, and Zoom through
   "LectureLive Loopback" when BlackHole is present, else the install hint) and Start, with Polish (§6.3)
   and Study page once the folder has notes, one at a time.
+- **A running step is said, not inferred.** While a snapshot, polish or study page runs, a working row takes the
+  latest notice's place, so the footer does not move: a three-dot mark in the teal of "writing", what is running
+  and on what ("Snapshot 312 words sent to claude-opus-5-5, thinking"), and a clock for the step. Thinking becomes
+  writing when the first word streams. Snapshot and Polish read Snapshotting and Polishing and are disabled while
+  any step runs, one at a time with Cancel the way out; a polish reads as its snapshot and then its rewrite. While a
+  snapshot has streamed nothing yet, the notes pane holds a teal-ruled "Reading the lecture so far…" in its place.
+  The motion (the dots, the label's slow breathing) stops under reduced motion.
 - **Stop** has the CLI's three levels. Stop finishes the transcript and recovery, then takes the last
   snapshot; while that runs the button becomes Stop waiting, which stops waiting for recovery and drops
   queued requests; quitting the app is the third level, and the next session in the folder repairs,

@@ -18,6 +18,11 @@
   let pick = $state("");
   const chosen = $derived(session.fallbacks.some((i) => i.uid === pick) ? pick : (session.fallbacks[0]?.uid ?? ""));
 
+  /** m:ss, for how long a step has run. */
+  const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  const snapshotting = $derived(session.working?.label === "Snapshot");
+  const polishing = $derived(session.working?.label === "Polish");
+
   async function submit(e: SubmitEvent) {
     e.preventDefault();
     const h = hint;
@@ -55,6 +60,11 @@
     </div>
   {:else if session.error}
     <p class="line error" role="alert">▲ {session.error}</p>
+  {:else if session.working}
+    <!-- A step is running: what, on what, for how long. The clock is left out of the announcement, which would repeat every second. -->
+    <p class="working" role="status">
+      <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><strong>{session.working.label}</strong>{session.working.detail}<span class="num clock" aria-hidden="true">{clock(session.busyFor ?? 0)}</span>
+    </p>
   {:else if latest}
     <button class="line" onclick={() => (history = !history)} aria-expanded={history}>
       <span class="mark {latest.kind}">{MARK[latest.kind]}</span> <strong>{latest.label}</strong> {latest.detail}
@@ -75,9 +85,9 @@
         <input bind:value={hint} placeholder="a hint, or ⏎ for a snapshot" aria-label="Hint for the next snapshot" disabled={!session.canSnapshot} />
       </label>
       <!-- One filled action per state: while paused it is Resume. -->
-      <button class={session.paused ? "outline" : "primary"} type="submit" disabled={!session.canSnapshot}>Snapshot</button>
+      <button class={session.paused ? "outline" : "primary"} class:breathing={snapshotting} type="submit" disabled={!session.canSnapshot || session.busyOp} aria-busy={snapshotting}>{snapshotting ? "Snapshotting" : "Snapshot"}</button>
       {#if session.busyOp}<button class="cancel" type="button" onclick={() => session.cancel()}>Cancel</button>{/if}
-      <button class="outline" type="button" onclick={() => session.polish()} disabled={!session.canPolish}>Polish</button>
+      <button class="outline" class:breathing={polishing} type="button" onclick={() => session.polish()} disabled={!session.canPolish || session.busyOp} aria-busy={polishing}>{polishing ? "Polishing" : "Polish"}</button>
       <button class="outline" type="button" onclick={page} disabled={pageRunning}>{pageRunning ? "Typesetting" : "Study page"}</button>
       <button class={session.paused ? "primary" : "outline"} type="button" onclick={() => (session.paused ? session.resume() : session.pause())} disabled={!session.canPause} title={session.paused ? "Record and transcribe again, in a new file" : "Stop recording and transcribing until you resume; for a break"}>{session.paused ? "Resume" : "Pause"}</button>
       {#if session.stopLabel}
@@ -90,7 +100,7 @@
       {#if session.folder && session.document}
         <!-- After class (decision D1): one operation holds the folder at a time, so each waits for the other. -->
         <div class="after">
-          <button class="outline" onclick={() => session.polish()} disabled={!session.canPolish || pageRunning}>Polish</button>
+          <button class="outline" class:breathing={polishing} onclick={() => session.polish()} disabled={!session.canPolish || pageRunning} aria-busy={polishing}>{polishing ? "Polishing" : "Polish"}</button>
           <button class="outline" onclick={page} disabled={pageRunning || !!session.status.busy}>{pageRunning ? "Typesetting" : "Study page"}</button>
         </div>
       {/if}
@@ -127,6 +137,79 @@
     color: var(--ink);
     font-weight: 700;
     margin-right: 0.3em;
+  }
+
+  /* A step is running, said where the eye already is and in the colour of "writing": what it is, what it works on, and
+     for how long. It takes the notice line's place, so the footer does not move. */
+  .working {
+    margin: 0 0 0.45rem;
+    font-size: var(--step--1);
+    color: var(--graphite);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .working strong {
+    color: var(--ink);
+    font-weight: 700;
+    margin-right: 0.3em;
+  }
+
+  .working .clock {
+    margin-left: 0.6em;
+    color: var(--teal);
+  }
+
+  .dots {
+    display: inline-flex;
+    gap: 0.2rem;
+    margin-right: 0.55rem;
+    vertical-align: 0.1em;
+  }
+
+  .dots i {
+    width: 0.3rem;
+    height: 0.3rem;
+    border-radius: 50%;
+    background: var(--teal);
+    opacity: 0.35;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .dots i {
+      animation: wait 1.2s ease-in-out infinite;
+    }
+
+    .dots i:nth-child(2) {
+      animation-delay: 0.15s;
+    }
+
+    .dots i:nth-child(3) {
+      animation-delay: 0.3s;
+    }
+
+    :global(.command button.breathing) {
+      animation: breathe 1.6s ease-in-out infinite;
+    }
+  }
+
+  @keyframes wait {
+    0%,
+    80%,
+    100% {
+      opacity: 0.25;
+    }
+
+    40% {
+      opacity: 1;
+    }
+  }
+
+  @keyframes breathe {
+    50% {
+      opacity: 0.75;
+    }
   }
 
   .error {

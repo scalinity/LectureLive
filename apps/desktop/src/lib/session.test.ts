@@ -218,6 +218,33 @@ describe("session store", () => {
     expect(s.shownNotice?.label, "a warning that has passed is not shown").not.toBe("No signal");
   });
 
+  test("a running step is told in words with its clock, and a snapshot waits until its first word streams", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    const status = (over: object) => t.emitStatus({ type: "status", ...emptyState("s1").status, phase: "running", ...over });
+    status({});
+    frame();
+    expect([s.working, s.busyFor, s.snapshotWaiting], "nothing runs").toEqual([null, null, false]);
+    status({ busy: "snapshot, 312 words to claude-opus-5-5" });
+    frame();
+    expect(s.working).toEqual({ label: "Snapshot", detail: "312 words sent to claude-opus-5-5, thinking" });
+    expect([s.busyFor, s.snapshotWaiting, s.busyOp], "the clock starts with the step").toEqual([0, true, true]);
+    t.emitNotes({ type: "delta", op: 1, text: "## Gradient descent " });
+    frame();
+    expect(s.working?.detail, "the first word has streamed").toBe("312 words sent to claude-opus-5-5, writing");
+    expect(s.snapshotWaiting).toBe(false);
+    status({ busy: "polishing 1420 words" });
+    frame();
+    expect(s.working).toEqual({ label: "Polish", detail: "rewriting 1420 words" });
+    expect(s.snapshotWaiting, "a polish streams nothing and has no snapshot to wait for").toBe(false);
+    status({ busy: "distilling lecture_notes.md, a few minutes" });
+    frame();
+    expect(s.working?.label).toBe("Study page");
+    status({ busy: null });
+    frame();
+    expect([s.working, s.busyFor]).toEqual([null, null]);
+  });
+
   test("the command line maps to the CLI's operations and the stop button to its levels", async () => {
     const { t, s, ready, frame } = setup();
     await ready;
