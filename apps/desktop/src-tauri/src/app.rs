@@ -105,6 +105,9 @@ pub struct App {
     /// The running lecture's `run` has returned, so everything is saved. Set before anything that needs the main
     /// thread (the shortcut's removal does), because a quit may be holding that thread to wait for exactly this.
     run_over: AtomicBool,
+    /// The polish or study page running outside the lecture's own queue (after class, or the Study page button), with
+    /// what it is called: Cancel stops it by this handle.
+    job: StdMutex<Option<(tokio::task::AbortHandle, &'static str)>>,
     /// When a quit must have saved the running lecture by, whichever way the quit arrived (spec §9.6).
     quit: quit::Quit,
 }
@@ -118,6 +121,7 @@ impl App {
             folder: StdMutex::new(None),
             running: StdMutex::new(None),
             run_over: AtomicBool::new(false),
+            job: StdMutex::new(None),
             quit: quit::Quit::default(),
         }
     }
@@ -426,6 +430,10 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
                     pump.lock().await.notice(NoticeKind::Warn, "Capture", &format!("the region found again could not be saved: {err:#}"));
                 }
             }
+            // The page a polish typeset in the background opens by itself, as the Study page button's does.
+            if let Event::Page { outcome, .. } = &e {
+                let _ = open_in_browser(&outcome.path);
+            }
             pump.lock().await.apply(e);
         }
     });
@@ -520,12 +528,38 @@ pub async fn polish(app: State<'_, App>) -> Res<()> {
         return app.send(Command::Op(Op::Polish));
     }
     let folder = app.folder().ok_or("Choose a lecture folder first.")?;
-    let (lec, _lock) = idle_lecture(&folder)?;
-    let (tx, forward) = forward_events(&app);
-    let done = lec.polish_after(&tx).await;
-    drop(tx);
+    let (lec, lock) = idle_lecture(&folder)?;
+    let (tx, forward) = forward_events(&app, true);
+    let done = cancellable(&app, "the polish", async move {
+        let _lock = lock; // goes with the job when it is cancelled
+        lec.polish_after(&tx).await
+    })
+    .await;
     let _ = forward.await;
-    done
+    done.unwrap_or(Ok(()))
+}
+
+/// Runs a job that Cancel can stop: the work is a task of its own, and its abort handle is kept while it runs. None
+/// when it was cancelled. What it owns (the folder lock, the event sender) is dropped with it.
+async fn cancellable<T: Send + 'static>(app: &App, what: &'static str, work: impl std::future::Future<Output = T> + Send + 'static) -> Option<T> {
+    let task = tokio::spawn(work);
+    *app.job.lock().expect("the job lock") = Some((task.abort_handle(), what));
+    let done = task.await;
+    app.job.lock().expect("the job lock").take();
+    match done {
+        Ok(v) => Some(v),
+        Err(e) if e.is_cancelled() => None,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// Opens a study page in the default browser. A check typesets without it (the page loads its math and fonts from the
+/// web), unless asked to.
+fn open_in_browser(path: &Path) -> Res<()> {
+    if std::env::var_os("LECTURELIVE_CHECK").is_none() || std::env::var_os("LECTURELIVE_CHECK_OPEN").is_some() {
+        std::process::Command::new("open").arg(path).status().map_err(text)?;
+    }
+    Ok(())
 }
 
 /// The chosen folder's lecture while none runs, with the folder lock held for as long as it is kept.
@@ -538,11 +572,15 @@ fn idle_lecture(folder: &OpenFolder) -> Res<(Arc<Lecture>, FolderLock)> {
 }
 
 /// Core's events from an operation outside a lecture, applied to the pump as a lecture's are.
-fn forward_events(app: &App) -> (mpsc::UnboundedSender<Event>, tauri::async_runtime::JoinHandle<()>) {
+/// `open_pages`: a page typeset by this operation opens itself (a polish's does; the Study page button opens its own).
+fn forward_events(app: &App, open_pages: bool) -> (mpsc::UnboundedSender<Event>, tauri::async_runtime::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
     let pump = app.pump.clone();
     let forward = tauri::async_runtime::spawn(async move {
         while let Some(e) = rx.recv().await {
+            if let (true, Event::Page { outcome, .. }) = (open_pages, &e) {
+                let _ = open_in_browser(&outcome.path);
+            }
             pump.lock().await.apply(e);
         }
     });
@@ -550,8 +588,20 @@ fn forward_events(app: &App) -> (mpsc::UnboundedSender<Event>, tauri::async_runt
 }
 
 #[tauri::command]
-pub fn cancel(app: State<'_, App>) -> Res<()> {
-    app.send(Command::Cancel)
+pub async fn cancel(app: State<'_, App>) -> Res<()> {
+    // A polish or study page outside the lecture's own queue is a job of its own: after class there is no lecture to ask.
+    let job = app.job.lock().expect("the job lock").take();
+    if let Some((handle, what)) = &job {
+        handle.abort();
+        app.pump.lock().await.apply(Event::Cancelled((*what).into()));
+    }
+    if app.commands().is_some() {
+        app.send(Command::Cancel)
+    } else if job.is_some() {
+        Ok(())
+    } else {
+        Err("Nothing is running to cancel.".into())
+    }
 }
 
 /// The global shortcut for Capture (spec §7.3): away from Zoom's and macOS's own combinations.
@@ -756,7 +806,7 @@ pub fn open_screen_settings() -> Res<()> {
 #[tauri::command]
 pub async fn open_page(app: State<'_, App>) -> Res<String> {
     let running = app.running.lock().expect("the running lock").as_ref().map(|r| r.lecture.clone());
-    let (lec, _lock) = match running {
+    let (lec, lock) = match running {
         Some(l) => (l, None),
         None => {
             let folder = app.folder().ok_or("Choose a lecture folder first.")?;
@@ -767,16 +817,19 @@ pub async fn open_page(app: State<'_, App>) -> Res<String> {
             (lec, Some(lock))
         }
     };
-    let (tx, forward) = forward_events(&app);
-    let outcome = lec.page(&tx).await;
-    drop(tx);
+    let (tx, forward) = forward_events(&app, false);
+    let outcome = cancellable(&app, "the study page", async move {
+        let _lock = lock; // goes with the job when it is cancelled
+        lec.page(&tx).await
+    })
+    .await;
     let _ = forward.await;
+    // Cancelled: there is nothing to open, and Cancel has said so.
+    let Some(outcome) = outcome else { return Ok(String::new()) };
     let outcome = outcome?;
     // A check typesets without opening the default browser (the page itself loads math and fonts from the web), unless it is
     // asked to (`LECTURELIVE_CHECK_OPEN`): the check that the page opens is the person's V07.
-    if std::env::var_os("LECTURELIVE_CHECK").is_none() || std::env::var_os("LECTURELIVE_CHECK_OPEN").is_some() {
-        std::process::Command::new("open").arg(&outcome.path).status().map_err(text)?;
-    }
+    open_in_browser(&outcome.path)?;
     Ok(outcome.path.to_string_lossy().into_owned())
 }
 

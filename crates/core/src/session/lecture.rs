@@ -342,8 +342,11 @@ impl Lecture {
         Ok(())
     }
 
-    /// Spec §6.4: the study page from the notes as they are, without polishing again.
+    /// Spec §6.4: the study page from the notes as they are, without polishing again. One typeset runs at a time: a
+    /// polish starts its own page in the background, and a Study page pressed meanwhile used to start a second
+    /// full typeset, which cost the same again. It now waits, and finds the first one's cache.
     pub async fn page(&self, events: &UnboundedSender<Event>) -> Result<PageOutcome, String> {
+        let _one_at_a_time = PAGE_LOCK.lock().await;
         let before = self.spend.kind_total(SpendKind::Page);
         let progress = events.clone();
         let made = page::make_page(&self.chat, &self.course, &self.files.notes, &self.files.page_cache(), &self.name, page::TEMPLATE, &move |m| drop(progress.send(Event::Busy(m)))).await;
@@ -360,6 +363,10 @@ impl Lecture {
         }
     }
 }
+
+/// Held for the whole of a typeset, so that a second request for the same notes waits for the first instead of paying
+/// for another (`Lecture::page`). Dropped with the typeset when it is cancelled.
+static PAGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Runs operations one at a time; each is tagged with the cancel generation it was asked at.
 async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceiver<(Op, u64)>, events: UnboundedSender<Event>, pages: Arc<Mutex<Vec<JoinHandle<()>>>>, hurry: Arc<AtomicBool>, snapshotting: Arc<AtomicBool>, generation: watch::Receiver<u64>) {
@@ -501,7 +508,16 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
             },
             c = commands.recv(), if commands_open => match c {
                 Some(Command::Op(op)) => if let Some(tx) = &op_tx { let _ = tx.send((op, *generation.borrow())); },
-                Some(Command::Cancel) => generation.send_modify(|g| *g += 1),
+                Some(Command::Cancel) => {
+                    generation.send_modify(|g| *g += 1);
+                    // A study page being typeset in the background (a polish starts one) is stopped too: it is not an
+                    // operation of the queue, so the generation does not reach it.
+                    let mut typesetting = pages.lock().expect("the page list");
+                    if typesetting.iter().any(|p| !p.is_finished()) {
+                        typesetting.drain(..).for_each(|p| p.abort());
+                        let _ = events.send(Event::Cancelled("the study page".into()));
+                    }
+                }
                 Some(Command::State(reply)) => match &state_store {
                     Some(s) => {
                         let s = s.clone();

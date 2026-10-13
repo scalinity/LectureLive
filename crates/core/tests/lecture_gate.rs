@@ -296,6 +296,74 @@ async fn a_removed_slide_is_left_out_of_the_next_snapshot_and_a_used_one_cannot_
     assert!(f.slides.join("slide_02_100002.png").exists(), "the notes still show it");
 }
 
+/// A polish starts a page in the background and a Study page pressed meanwhile used to start a second full typeset: now the
+/// second waits, finds the first one's cache, and nothing is paid for twice.
+#[tokio::test]
+async fn two_requests_for_the_same_page_cost_one_typeset() {
+    use lecturelive_core::session::slides::{self, SlideMeta};
+    let dir = tempfile::tempdir().unwrap();
+    let (f, _) = offline_folder(dir.path());
+    let store = Store::offline(Sidecar::load(&f.sidecar()).unwrap().unwrap(), f.sidecar());
+    let tmp = f.slides.join(".capture-1.png");
+    support::slides::png(&tmp);
+    let at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 25, 10, 0, 1).unwrap();
+    slides::register(&f, &store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap();
+    let sse = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let (tx, _ev) = mpsc::unbounded_channel();
+    lec.snapshot(&store, "", &tx).await.unwrap();
+    let (a, b) = tokio::join!(lec.page(&tx), lec.page(&tx));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let typesets = sse.state.bodies().iter().filter(|b| b["system"].as_str().unwrap_or_default().starts_with("You make the high-yield study page")).count();
+    assert_eq!(typesets, 1, "the second request waited for the first instead of paying for another");
+    assert_eq!([a.cached, b.cached].iter().filter(|c| **c).count(), 1, "one typeset and one reuse of it");
+}
+
+/// A recording that begins and then waits to be stopped: no speech and no STT, so a test that only asks for operations
+/// leaves the machine to the suite's timing-sensitive tests.
+struct Idle;
+
+impl lecturelive_core::audio::source::Source for Idle {
+    fn run(self: Box<Self>, out: mpsc::Sender<lecturelive_core::audio::source::SourceEvent>, stop: Arc<std::sync::atomic::AtomicBool>) {
+        use lecturelive_core::audio::source::SourceEvent;
+        let id = uuid::Uuid::new_v4();
+        out.blocking_send(SourceEvent::Begin { recording_id: id, anchor: support::sources::anchor(), source_uid: "Test_UID".into(), input_rate: 16_000, channels: 1 }).unwrap();
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = out.blocking_send(SourceEvent::End { recording_id: id, samples: 0, stream_errors: 0 });
+    }
+}
+
+/// Cancel reaches a page a polish started in the background (it is not in the queue the cancel generation covers),
+/// and the typeset lock goes with it, so the next one is not held up.
+#[tokio::test]
+async fn the_page_a_polish_started_is_cancelled_with_it_and_the_next_typeset_is_not_held_up() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let stall = Arc::new(AtomicBool::new(true));
+    let held = stall.clone();
+    let sse = fake_sse::start(move |b| if held.load(SeqCst) && b["system"].as_str().unwrap_or_default().starts_with("You make the high-yield study page") { Reply::Stall } else { respond(b) }).await;
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec.clone(), session, Box::new(Idle), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+    cmd.send(Command::Op(Op::Polish)).unwrap();
+    until(&mut ev, "the page being typeset", |e| matches!(e, Event::Busy(m) if m.starts_with("distilling"))).await;
+    cmd.send(Command::Cancel).unwrap();
+    until(&mut ev, "the page cancelled", |e| matches!(e, Event::Cancelled(what) if what == "the study page")).await;
+    stall.store(false, SeqCst);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let again = tokio::time::timeout(Duration::from_secs(10), lec.page(&tx)).await.expect("the cancelled typeset let go of the lock").expect("a typeset after it works");
+    assert!(!again.cached, "the cancelled typeset saved nothing");
+    cmd.send(Command::Stop).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+}
+
 /// The model's thinking summary is told while a snapshot or a polish waits for its words, and is no part of the notes.
 #[tokio::test]
 async fn a_snapshot_and_a_polish_both_tell_the_models_thinking_as_it_streams() {

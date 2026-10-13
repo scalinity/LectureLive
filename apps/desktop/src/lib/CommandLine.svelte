@@ -20,6 +20,10 @@
 
   /** m:ss, for how long a step has run. */
   const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  // A page is typeset by this button, or by the polish that just ended (it starts one by itself): either way a second
+  // press would only wait for it, so the button says so and Cancel stops it.
+  const typesetting = $derived(pageRunning || session.working?.label === "Study page");
+  const cancellable = $derived(session.busyOp || typesetting);
   const snapshotting = $derived(session.working?.label === "Snapshot");
   const polishing = $derived(session.working?.label === "Polish");
 
@@ -86,9 +90,9 @@
       </label>
       <!-- One filled action per state: while paused it is Resume. -->
       <button class={session.paused ? "outline" : "primary"} class:breathing={snapshotting} type="submit" disabled={!session.canSnapshot || session.busyOp} aria-busy={snapshotting}>{snapshotting ? "Snapshotting" : "Snapshot"}</button>
-      {#if session.busyOp}<button class="cancel" type="button" onclick={() => session.cancel()}>Cancel</button>{/if}
+      {#if cancellable}<button class="cancel" type="button" onclick={() => session.cancel()}>Cancel</button>{/if}
       <button class="outline" class:breathing={polishing} type="button" onclick={() => session.polish()} disabled={!session.canPolish || session.busyOp} aria-busy={polishing}>{polishing ? "Polishing" : "Polish"}</button>
-      <button class="outline" type="button" onclick={page} disabled={pageRunning}>{pageRunning ? "Typesetting" : "Study page"}</button>
+      <button class="outline" class:breathing={typesetting} type="button" onclick={page} disabled={typesetting} aria-busy={typesetting} title="Open the study page: typeset first only when the notes have changed since it was made">{typesetting ? "Typesetting" : "Study page"}</button>
       <button class={session.paused ? "primary" : "outline"} type="button" onclick={() => (session.paused ? session.resume() : session.pause())} disabled={!session.canPause} title={session.paused ? "Record and transcribe again, in a new file" : "Stop recording and transcribing until you resume; for a break"}>{session.paused ? "Resume" : "Pause"}</button>
       {#if session.stopLabel}
         <button class={session.stopLabel === "Stop" ? "stop" : "stop waiting"} type="button" onclick={() => session.stop()}>{session.stopLabel}</button>
@@ -100,8 +104,9 @@
       {#if session.folder && session.document}
         <!-- After class (decision D1): one operation holds the folder at a time, so each waits for the other. -->
         <div class="after">
-          <button class="outline" class:breathing={polishing} onclick={() => session.polish()} disabled={!session.canPolish || pageRunning} aria-busy={polishing}>{polishing ? "Polishing" : "Polish"}</button>
-          <button class="outline" onclick={page} disabled={pageRunning || !!session.status.busy}>{pageRunning ? "Typesetting" : "Study page"}</button>
+          {#if cancellable}<button class="cancel" onclick={() => session.cancel()}>Cancel</button>{/if}
+          <button class="outline" class:breathing={polishing} onclick={() => session.polish()} disabled={!session.canPolish || typesetting} aria-busy={polishing}>{polishing ? "Polishing" : "Polish"}</button>
+          <button class="outline" class:breathing={typesetting} onclick={page} disabled={typesetting || !!session.status.busy} aria-busy={typesetting} title="Open the study page: typeset first only when the notes have changed since it was made">{typesetting ? "Typesetting" : "Study page"}</button>
         </div>
       {/if}
     </div>

@@ -774,7 +774,9 @@ read, and the next line starts on a line of its own.
   the spend view; a large-type toggle; the API key.
 - **Command line** (bottom), in the CLI's grammar: an empty ⏎ takes a snapshot, a hint then ⏎ a hinted
   snapshot, `polish` ⏎ a polish. Snapshot; Cancel, only while a snapshot or polish runs; Polish; Study
-  page (typesets first when the page is missing or stale, §6.4, then opens it in the default browser);
+  page (typesets first when the page is missing or stale, §6.4, then opens it in the default browser; while a page is
+  typeset it reads Typesetting and waits, since one typeset runs at a time and a second request for the same notes
+  waits for the first and then reuses it instead of paying again);
   Stop. The latest notice sits above the prompt in the CLI's marks (◆ notes, ▣ slide, ✦ page, ✓ done,
   ▲ warning) and opens the last eight; a command that fails shows the backend's message there. Before
   and after a lecture the same bar holds the folder picker, the source (the inputs, and Zoom through
@@ -795,8 +797,10 @@ read, and the next line starts on a line of its own.
   queued requests; quitting the app is the third level, and the next session in the folder repairs,
   recovers and notes what is left.
 - **Cancel** stops the notes request in flight and the requests queued behind it: nothing is written,
-  the batch stays pending, and the next snapshot sends the same material (§6.2). The study page is not
-  cancellable.
+  the batch stays pending, and the next snapshot sends the same material (§6.2). It also stops a study page being
+  typeset, whether a polish started it in the background or the Study page button did, and a polish run after
+  class (which has no lecture to ask, so the app stops that job itself); the notes are unchanged and the stopped
+  request records no cost. The bar shows Cancel while any of them runs, in class and after.
 - **Spend** (from the strip): a sheet beside the lecture with the CLI's `lecture spend` figures: all
   time, the last three months by course with bars, the eight most recent lectures by kind, and the
   share estimated from published rates rather than billed. The title and Close stay at the top while the list
@@ -974,7 +978,7 @@ a submission.
 | `^H`, `F1` | help, in an overlay that scrolls itself and `Esc` closes |
 | `^O` | activity, this session's notices |
 | `^S` | capture now, or watch the one window offered (§9.5.6); while paused it says that the lecture is paused |
-| `^X` | cancel this frontend's own notes requests, running and queued; the study page is not cancellable |
+| `^X` | cancel this frontend's own notes requests, running and queued, and a study page being typeset |
 | `^T` | the focused pane fills the body; again to go back |
 | `Tab`, `⇧Tab` | the next or previous pane, and the visible tab in a tabbed column |
 | `↑`/`↓`, `PgUp`/`PgDn`, wheel | scroll the focused pane, or the open overlay; `Esc` closes an overlay, else returns to live |

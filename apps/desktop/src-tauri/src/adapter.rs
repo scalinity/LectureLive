@@ -207,7 +207,14 @@ impl Pump {
             }
             Event::NothingNew => self.ended(Outcome::NothingNew, NoticeKind::Notes, "Snapshot", "nothing new since the last one".into()),
             Event::SnapshotFailed(m) => self.ended(Outcome::Failed, NoticeKind::Warn, "Snapshot failed", m),
-            Event::Cancelled(what) => self.ended(Outcome::Cancelled, NoticeKind::Warn, "Cancelled", format!("{what}; nothing was written, everything is kept for the next snapshot")),
+            Event::Cancelled(what) => {
+                let message = if what == "the study page" {
+                    "the study page was stopped; the notes are unchanged and it is typeset again when asked".to_string()
+                } else {
+                    format!("{what}; nothing was written, everything is kept for the next snapshot")
+                };
+                self.ended(Outcome::Cancelled, NoticeKind::Warn, "Cancelled", message)
+            }
             Event::Polished { backup, usd, revision } => {
                 self.mirror.status.busy = None;
                 self.emit(Stream::Notes, NotesMsg::Polished { revision });
@@ -549,6 +556,18 @@ mod tests {
         let state = p.state(Some(&sc), &[], String::new(), None);
         assert_eq!(state.slides.iter().map(|s| (s.index, s.noted)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false)], "a snapshot used the first two");
         assert_eq!(state.pending_slides, 1);
+    }
+
+    #[test]
+    fn a_cancelled_study_page_says_so_in_its_own_words_and_ends_the_busy_step() {
+        let (mut p, sink) = pump();
+        p.apply(Event::Busy("distilling 1200 words into at most 600".into()));
+        p.apply(Event::Cancelled("the study page".into()));
+        assert!(p.mirror().status.busy.is_none(), "the step ended");
+        let last = p.mirror().notices.back().cloned().unwrap();
+        assert_eq!(last.label, "Cancelled");
+        assert!(last.detail.contains("study page") && last.detail.contains("typeset again") && !last.detail.contains("next snapshot"), "{}", last.detail);
+        assert!(sink.on(Stream::Notes).iter().any(|m| m["type"] == "ended" && m["outcome"] == "cancelled"));
     }
 
     #[test]
