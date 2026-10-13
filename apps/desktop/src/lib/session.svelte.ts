@@ -118,6 +118,14 @@ export class Session {
     return this.status.paused;
   }
 
+  /** The notice the command bar shows: the newest one that is still true. While paused the line above says
+   *  "Paused", and "No signal" is a condition and not an event: it shows only while the input is silent now, and
+   *  never in a pause, which is silent on purpose. The history keeps both. */
+  get shownNotice(): Notice | undefined {
+    const silent = this.status.silence && !this.paused;
+    return this.notices.filter((n) => !(n.label === "Paused" && this.paused) && !(n.label === "No signal" && !silent)).at(-1);
+  }
+
   /** Only a running lecture can be paused; one that is stopping has no pause left to ask for. */
   get canPause(): boolean {
     return this.status.phase === "running";

@@ -185,6 +185,39 @@ describe("session store", () => {
     expect(s.pausedFor).toBe(0);
   });
 
+  test("a pause is not an error: the No signal that came before it is not shown in it, nor once the signal is back", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    const notice = (kind: "slide" | "warn" | "notes" | "done", label: string, detail: string) => t.emitStatus({ type: "notice", kind, label, detail, at: "12:00:00" });
+    const status = (over: object) => t.emitStatus({ type: "status", ...t.state_.status, phase: "running", ...over });
+    status({});
+    notice("slide", "Slide 11", "taken automatically, into the next snapshot");
+    // The break begins: ten quiet seconds warn, as they should while recording.
+    status({ silence: true });
+    notice("warn", "No signal", "10 s of silence on BlackHole");
+    frame();
+    expect(s.shownNotice?.label, "silent while recording: shown").toBe("No signal");
+    // The person pauses: the backend clears the flag and adds its own notice, which the line above already says.
+    status({ silence: false, paused: true });
+    notice("notes", "Paused", "nothing is recorded or transcribed until you resume");
+    frame();
+    expect(s.shownNotice?.label, "the break is not an error").toBe("Slide 11");
+    expect(s.notices.map((n) => n.label), "the history keeps all three").toEqual(["Slide 11", "No signal", "Paused"]);
+    // Resumed, and the room is quiet again for ten seconds: a real warning, shown again.
+    status({ paused: false });
+    notice("done", "Resumed", "recording again, in a new file");
+    frame();
+    expect(s.shownNotice?.label, "resumed: the old warning does not come back by itself").toBe("Resumed");
+    status({ silence: true });
+    notice("warn", "No signal", "10 s of silence on BlackHole");
+    frame();
+    expect(s.shownNotice?.label).toBe("No signal");
+    // The signal returns: the warning is no longer true.
+    status({ silence: false });
+    frame();
+    expect(s.shownNotice?.label, "a warning that has passed is not shown").not.toBe("No signal");
+  });
+
   test("the command line maps to the CLI's operations and the stop button to its levels", async () => {
     const { t, s, ready, frame } = setup();
     await ready;

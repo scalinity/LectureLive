@@ -12,8 +12,8 @@
 
   const MARK: Record<NoticeKind, string> = { notes: "◆", slide: "▣", page: "✦", done: "✓", warn: "▲" };
   const live = $derived(session.status.phase !== "idle" && session.status.phase !== "ended");
-  // While paused the line above says it, so the notice that repeats it is left to the history.
-  const latest = $derived(session.notices.filter((n) => !(session.paused && n.label === "Paused")).at(-1));
+  // The store keeps back what is no longer true: the "Paused" that the line above says, and a "No signal" that has passed.
+  const latest = $derived(session.shownNotice);
   // The fallback offer (spec §4.1): the first other input unless the person picked one.
   let pick = $state("");
   const chosen = $derived(session.fallbacks.some((i) => i.uid === pick) ? pick : (session.fallbacks[0]?.uid ?? ""));
