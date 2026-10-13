@@ -49,10 +49,11 @@ pub fn notes_words(doc: &str) -> usize {
     SLIDE_EMBED.replace_all(doc, "").split_whitespace().count()
 }
 
-/// Visible words the page may use: 40% of the notes, in fifties, from 800 to 3,000. Every technical explanation is
-/// followed by its plain-words twin, so the page has room for both; widget code and drawings are not words.
+/// Visible words the page may use: 30% of the notes, in fifties, from 700 to 2,500. The widgets carry the ideas, so the
+/// words are what is left to confirm them, a technical explanation and its plain-words twin; widget code and drawings
+/// are not words.
 pub fn page_budget(doc: &str) -> u32 {
-    (round_int(notes_words(doc) as f64 * 0.4 / 50.0) * 50).clamp(800, 3_000) as u32
+    (round_int(notes_words(doc) as f64 * 0.3 / 50.0) * 50).clamp(700, 2_500) as u32
 }
 
 /// Slides the page may redraw: 40% of them, from 3 to 10.
@@ -344,14 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_is_forty_percent_of_the_notes_in_fifties_between_800_and_3000() {
-        assert_eq!(page_budget(""), 800);
-        assert_eq!(page_budget(&words(2_000)), 800);
-        assert_eq!(page_budget(&words(2_500)), 1_000);
-        assert_eq!(page_budget(&words(2_575)), 1_050, "20.6 rounds up");
-        assert_eq!(page_budget(&words(7_119)), 2_850);
-        assert_eq!(page_budget(&words(10_000)), 3_000);
-        assert_eq!(page_budget(&format!("{} ![Slide 1](slides/a.png)", words(2_500))), 1_000, "embeds are not words");
+    fn the_budget_is_thirty_percent_of_the_notes_in_fifties_between_700_and_2500() {
+        assert_eq!(page_budget(""), 700);
+        assert_eq!(page_budget(&words(2_000)), 700);
+        assert_eq!(page_budget(&words(2_500)), 750);
+        assert_eq!(page_budget(&words(2_584)), 800, "15.504 rounds up");
+        assert_eq!(page_budget(&words(7_119)), 2_150);
+        assert_eq!(page_budget(&words(10_000)), 2_500);
+        assert_eq!(page_budget(&format!("{} ![Slide 1](slides/a.png)", words(2_500))), 750, "embeds are not words");
         assert_eq!([max_slides(0), max_slides(5), max_slides(10), max_slides(15), max_slides(40)], [3, 3, 4, 6, 10]);
     }
 

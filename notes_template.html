@@ -683,9 +683,9 @@ document.addEventListener("DOMContentLoaded", () => {
       ctx.fillStyle = w.c.muted;
       ctx.strokeStyle = w.c.grid;
       ctx.textAlign = "center";
-      niceTicks(x0, x1).forEach((t) => { ctx.beginPath(); ctx.moveTo(X(t), T); ctx.lineTo(X(t), B); ctx.stroke(); ctx.fillText(String(t), X(t), B + 16); });
+      if (o.xticks !== false) niceTicks(x0, x1).forEach((t) => { ctx.beginPath(); ctx.moveTo(X(t), T); ctx.lineTo(X(t), B); ctx.stroke(); ctx.fillText(String(t), X(t), B + 16); });
       ctx.textAlign = "right";
-      niceTicks(y0, y1).forEach((t) => { ctx.beginPath(); ctx.moveTo(L, Y(t)); ctx.lineTo(R, Y(t)); ctx.stroke(); if (Y(t) < B - 8) ctx.fillText(String(t), L - 6, Y(t) + 4); });
+      if (o.yticks !== false) niceTicks(y0, y1).forEach((t) => { ctx.beginPath(); ctx.moveTo(L, Y(t)); ctx.lineTo(R, Y(t)); ctx.stroke(); if (Y(t) < B - 8) ctx.fillText(String(t), L - 6, Y(t) + 4); });
       ctx.strokeStyle = w.c.muted;
       ctx.beginPath();
       ctx.moveTo(L, T);

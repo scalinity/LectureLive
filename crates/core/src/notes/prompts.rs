@@ -39,7 +39,7 @@ pub fn page_system(course: &str, budget: u32, max_slides: u32) -> String {
 
 How each topic is taught, in this order:
 1. A visual that carries the idea. Almost always an interactive widget: the student changes a parameter, a threshold, a sample or a choice and watches the result move. Where a widget cannot show it, a drawn figure.
-2. The technical explanation, short: what it is, the formula or rule, when it applies and when it does not. Do not describe in words what the visual already shows.
+2. The technical explanation, short: what it is, the formula or rule, when it applies and when it does not, in under about 90 words besides its formulas. Do not describe in words what the visual already shows.
 3. "In plain words", straight after each technical explanation: the same idea for someone who has never taken the course. One everyday comparison, no symbols, no jargon, two to four sentences. It is about this idea, not a generic one, and may point at the visual ("drag the slider and watch the red area grow").
 
 Every topic section has at least one widget or figure. The page has at least four widgets whenever the lecture has ideas that change with a parameter, a threshold, a sample size or a choice, which is nearly always. A topic that cannot be shown is merged into one that can, or cut.
@@ -69,7 +69,7 @@ w.button(label, fn) adds a button that runs fn(v) and then redraws; keep any sta
 w.readout(label, fn) shows a live number or phrase under the figure: fn(v) returns it, recomputed on every redraw. Put the quantity the lecture cares about here.
 w.draw(fn) is required. fn(ctx, v, W, H) paints the whole figure on every control change, resize and theme change. ctx is a 2D canvas context; W and H are in CSS pixels. Nothing persists between calls, so recompute everything from v and your own variables.
 w.click(fn) is optional: fn(x, y, v) runs when the student presses or drags on the canvas, in CSS pixels. Store what you need in your own variable and read it in draw.
-w.frame({{x: [lo, hi], y: [lo, hi], xlabel, ylabel}}) paints axes and a light grid when called inside draw, and returns {{X, Y, ix, iy, left, right, top, bottom}}: X(x) and Y(y) map data to pixels, ix(px) and iy(py) map back. What you draw after it is clipped to the plot area. Called outside draw (in a click handler, to turn a pixel into data) it paints nothing and only maps.
+w.frame({{x: [lo, hi], y: [lo, hi], xlabel, ylabel, xticks, yticks}}) paints axes and a light grid when called inside draw (xticks: false or yticks: false leaves that axis without numbers, for bars or categories you label yourself), and returns {{X, Y, ix, iy, left, right, top, bottom}}: X(x) and Y(y) map data to pixels, ix(px) and iy(py) map back. What you draw after it is clipped to the plot area. Called outside draw (in a click handler, to turn a pixel into data) it paints nothing and only maps.
 w.rng(seed) returns a seeded random function (0 to 1). Use it for any random data, with a fixed seed, so the figure is the same on every visit.
 w.c holds colours that follow light and dark: ink, muted, grid, bg, a (red), b (teal), aSoft, bSoft. Use a and b for two groups or two models, the same way throughout the page. Never write a colour yourself.
 

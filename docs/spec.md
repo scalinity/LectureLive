@@ -498,8 +498,9 @@ Each topic opens with a visual that carries the idea: an interactive widget wher
 threshold, a sample or a choice can move, else a drawn figure. A short technical explanation follows,
 and straight after each one an "In plain words" block for a reader new to the subject (one everyday
 comparison, no symbols, no jargon). The prompt asks for at least four widgets whenever the lecture has
-ideas that vary this way, which is nearly always. The budget is 40% of the notes' words, between 800
-and 3,000, split about 65% topics, 15% glossary and takeaways, 20% questions. Visible words are counted
+ideas that vary this way, which is nearly always. The budget is 30% of the notes' words, between 700
+and 2,500, split about 65% topics, 15% glossary and takeaways, 20% questions; a technical explanation is asked
+to stay under about 90 words besides its formulas. Visible words are counted
 from the output (widget code and drawings excluded); a draft more than 10% over budget gets one
 revision request, without images, that cuts the lowest-yield prose and keeps every widget and figure
 character for character, and the final count is reported with the page. At most 40% of the slides
