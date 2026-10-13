@@ -38,7 +38,7 @@ study document (`polish`).
 - G5 Human-readable files compatible with the CLI's (Markdown notes, transcript, `slides/`), with exact resume.
 - G6 Captured audio is durable to within the last one-second checkpoint after a crash, and every interval without durable audio or without committed transcript is reported as a gap.
 - G7 `polish` and hint input as in the CLI.
-- G8 A study page per lecture: polish also typesets the notes as one interactive HTML page, each slide redrawn as formulas, tables and diagrams and switchable back to its screenshot.
+- G8 A study page per lecture: polish also typesets the notes as one interactive HTML page: every topic has a visual (mostly widgets the student can move) and a plain-words explanation, with the best slides redrawn as figures and switchable back to their screenshots.
 
 ### 1.4 Non-goals (v1)
 
@@ -486,32 +486,48 @@ lands, in the app, the terminal UI and the plain CLI alike; a page cancelled or 
 polish does not. A scripted session opens nothing, and a check does not unless `LECTURELIVE_CHECK_OPEN`
 is set.
 
-The page is a condensation, not a copy: the notes stay the complete record, and the page
-holds what a student needs to revise. One chat request carries the whole notes and every
-slide image, at medium reasoning effort (at the default, high, one request over a
-two-hour lecture ran past ten minutes), so what earns space is decided across the whole lecture: flagged and
-examinable points first, then the formulas and decision rules needed to solve problems,
-then at most one worked example per method cut to its essential steps, then terms new in
-this lecture. Reviews of earlier weeks, digressions, logistics, repetition and software
-walkthroughs are cut. The budget is 30% of the notes' words, between 600 and 2,500, split
-about 65% topics, 15% glossary and takeaways, 20% questions. Visible words are counted
-from the output (drawings excluded); a draft more than 10% over budget gets one revision
-request, without images, that cuts the lowest-yield material, and the final count is
-reported with the page. At most 30% of the slides (2–8) are redrawn, only where a figure,
-table, diagram or formula block teaches faster than words and only the part that
-matters; every slide stays reachable in a collapsed All slides gallery. Prompts are
-`live_notes.py`'s `page_system` and `revise_system`, carried over with golden tests.
+The page is made to be learned from by looking and doing, not read: the notes stay the complete
+record, and the page is where the ideas become obvious. One chat request carries the whole notes and
+every slide image, at medium reasoning effort (at the default, high, one request over a two-hour
+lecture ran past ten minutes), so what earns a section is decided across the whole lecture: flagged
+and examinable points first, then the formulas and decision rules needed to solve problems and when
+each applies, then the lecture's own worked examples, then terms new in this lecture. Reviews of
+earlier weeks, digressions, logistics, repetition and software walkthroughs are cut.
 
-The output runs keystone (the lecture's governing formula or idea, set large at the top),
-a two-to-three-sentence lede, 4–7 topic sections, a glossary of at most 12 terms, at most
-5 key takeaways, and 4–5 check-yourself questions with brief worked answers. It is written
-in a fixed vocabulary the template styles: TeX math in `\( \)` and `\[ \]`; `formula`
-(named, collected into the formula sheet), `flag` (examinable, at most 4), `example` with
-numbered `steps`, `map` (situation → method), `takeaways`, `glossary`, and
-`figure.redraw[data-slide=N]` holding display math, a table (highlighted groups as cells
-`a`/`b`) or an inline SVG drawn only with the template's classes. Sections are re-cut at
-every `<h2>`, so the page's structure never depends on the model's own wrappers;
-`<script>`, `<style>`, event and style attributes are stripped.
+Each topic opens with a visual that carries the idea: an interactive widget where a parameter, a
+threshold, a sample or a choice can move, else a drawn figure. A short technical explanation follows,
+and straight after each one an "In plain words" block for a reader new to the subject (one everyday
+comparison, no symbols, no jargon). The prompt asks for at least four widgets whenever the lecture has
+ideas that vary this way, which is nearly always. The budget is 40% of the notes' words, between 800
+and 3,000, split about 65% topics, 15% glossary and takeaways, 20% questions. Visible words are counted
+from the output (widget code and drawings excluded); a draft more than 10% over budget gets one
+revision request, without images, that cuts the lowest-yield prose and keeps every widget and figure
+character for character, and the final count is reported with the page. At most 40% of the slides
+(3–10) are redrawn, only where a figure, table, diagram or formula block teaches faster than words; a
+redraw whose numbers can move is better as a widget; every slide stays reachable in a collapsed All
+slides gallery. The notes and polish prompts are `live_notes.py`'s, carried over with golden tests; the
+page's prompts are this project's own.
+
+The output runs lede (two sentences), keystone, 5–8 topic sections each headed by its claim, a
+glossary of at most 12 terms, at most 5 key takeaways, and 4–5 check-yourself questions with brief
+worked answers. The keystone is one formula or a sentence of at most 20 words, set under the lede as
+the one thing to remember. It is written in a fixed vocabulary the template styles: TeX math in `\( \)`
+and `\[ \]`; `eli5` (the plain-words block), `formula` (named, collected into the formula sheet), `flag`
+(examinable, at most 4), `example` with numbered `steps`, `map` (situation → method), `takeaways`,
+`glossary`, `figure.widget`, and `figure.redraw` (with `data-slide=N` for a slide's redraw) holding
+display math, a table (highlighted groups as cells `a`/`b`) or an inline SVG drawn only with the
+template's classes. Sections are re-cut at every `<h2>`, so the page's structure never depends on the
+model's own wrappers.
+
+A widget is a `figure.widget` with a `data-title`, an optional `data-aspect`, a caption saying what to
+try, and a `<script type="text/widget">`. The template's runtime gives the script one object: sliders
+(linear or logarithmic), toggles, choices, buttons, readouts, a draw function repainted on every
+change, resize and theme change, an optional click handler, an axes-and-grid helper that clips what
+follows to the plot, a seeded random generator and the theme's colours, so a widget follows light and
+dark. Each runs alone and cannot reach the network or the page's storage; one that throws, or never sets
+a draw function, says so in its own place and leaves the rest of the page working. A widget's script is
+the only script kept: every other `<script>`, `<style>`, and event and style attribute is stripped. A
+page without widgets or without plain-words blocks is reported as missing them.
 
 Each request gets one retry (a refusal gets none); if it still fails, no page is written and
 the notes are untouched. The typeset page is stored in `.live_notes/<stem>.page.json` keyed by

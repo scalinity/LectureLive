@@ -104,8 +104,10 @@ pub fn visible_words(html: &str) -> usize {
 /// widget's script (`<script type="text/widget">`), which the template's runtime runs alone, in its own place, against
 /// a fixed API; it is lifted out while the rest is stripped, so neither the script nor the code in it is touched.
 pub fn strip_unsafe(html: &str) -> String {
+    // the placeholders below are delimited by NUL, so none may come in with the text
+    let html = html.replace('\u{0}', "");
     let mut kept = Vec::new();
-    let lifted = WIDGET_SCRIPT.replace_all(html, |c: &Captures| {
+    let lifted = WIDGET_SCRIPT.replace_all(&html, |c: &Captures| {
         kept.push(c[0].to_string());
         format!("\u{0}widget{}\u{0}", kept.len() - 1)
     });
@@ -377,6 +379,8 @@ mod tests {
         assert_eq!(strip_unsafe(widget), widget);
         let mixed = format!("<script>alert(1)</script>{widget}<p onclick=\"x()\">a</p><script type=\"module\">evil()</script>{widget}");
         assert_eq!(strip_unsafe(&mixed), format!("{widget}<p>a</p>{widget}"), "two widgets keep their own code, in place");
+        let forged = "<p>\u{0}widget0\u{0}</p>";
+        assert_eq!(strip_unsafe(&format!("{forged}<script type=\"text/widget\">real()</script>")), "<p>widget0</p><script type=\"text/widget\">real()</script>", "text imitating a placeholder is not one");
         assert_eq!(strip_unsafe("<SCRIPT TYPE=\"text/widget\">w.draw(()=>{})</SCRIPT>"), "<SCRIPT TYPE=\"text/widget\">w.draw(()=>{})</SCRIPT>", "whatever the case");
     }
 

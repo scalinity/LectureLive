@@ -95,13 +95,13 @@ themselves; Zoom's speaker slider also lowers the level that gets transcribed.
 
 ### The study page
 
-`polish` also distils the polished notes into a high-yield study page named after the
-lecture (the folder `Week 06 — Statistical Analysis Methods` gives `Statistical Analysis
-Methods.html`). The notes stay the complete record; the page keeps what you need to revise,
-within a budget of 30% of the notes' words: flagged and examinable points, the formulas and
-when to use each, one compressed example per method, and new terms. The few slides whose
-figures teach best are redrawn as formulas, tables and diagrams, each with a switch back to
-the original, and all of them stay one click away in the collapsed All slides gallery.
+`polish` also makes a study page named after the lecture (the folder `Week 06 — Statistical
+Analysis Methods` gives `Statistical Analysis Methods.html`). The notes stay the complete
+record; the page is built to be learned from by looking and doing. Each topic opens with a
+visual, mostly small interactive figures with sliders and buttons you can move, then a short
+technical explanation and an "In plain words" version of it for someone new to the subject. The
+few slides whose figures teach best are redrawn as figures, each with a switch back to the
+original, and all of them stay one click away in the collapsed All slides gallery.
 Around that: a contents rail, a self-test mode that hides definitions, steps and formulas
 until clicked, glossary definitions on hover, a formula sheet, and check-yourself questions.
 
