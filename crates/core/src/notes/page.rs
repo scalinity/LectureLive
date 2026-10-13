@@ -403,4 +403,16 @@ mod tests {
         assert_eq!(load_cache(&path, "abc"), Some((f, 612)));
         assert_eq!(load_cache(&path, "abd"), None);
     }
+
+    /// Live (a class's page): a grid whose first column is `max-content` cannot wrap a long sentence, so the page grew
+    /// wider than the window and scrolled sideways, with the fixed rail covering the text. Such columns are capped.
+    #[test]
+    fn no_grid_in_the_template_has_a_first_column_that_cannot_wrap() {
+        let declarations: Vec<&str> = TEMPLATE.lines().filter(|l| l.contains("grid-template-columns:")).collect();
+        assert!(declarations.len() >= 3, "the grids this guards are still there");
+        for line in declarations {
+            let columns = line.split("grid-template-columns:").nth(1).unwrap().split(';').next().unwrap();
+            assert!(!columns.split_whitespace().any(|t| t == "max-content") && !columns.contains(", max-content)"), "an unbounded column: {line}");
+        }
+    }
 }

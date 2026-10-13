@@ -218,10 +218,11 @@ code { overflow-wrap: anywhere; }
   font-variant-numeric: tabular-nums;
 }
 .steps > li:last-child::before { background: var(--ink); color: var(--paper); }
-.terms, .glossary { display: grid; grid-template-columns: minmax(8rem, max-content) 1fr; gap: 0.6rem 1.5rem; }
+.terms, .glossary { display: grid; grid-template-columns: fit-content(20rem) minmax(0, 1fr); gap: 0.6rem 1.5rem; }
+.terms dt, .glossary dt { min-width: 8rem; }
 dt { font-weight: 720; }
 dd { margin: 0; }
-.map { display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem 1.25rem; align-items: baseline; }
+.map { display: grid; grid-template-columns: fit-content(22rem) minmax(0, 1fr); gap: 0.5rem 1.25rem; align-items: baseline; }
 .map dt { font-weight: 600; }
 .map dd { position: relative; padding-left: 1.5rem; }
 .map dd::before { content: ""; position: absolute; left: 0; top: 0.8em; width: 0.95rem; height: 1.5px; background: var(--graphite); }
