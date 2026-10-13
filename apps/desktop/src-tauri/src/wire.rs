@@ -53,6 +53,8 @@ pub enum Outcome {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NotesMsg {
     Delta { op: u64, text: String },
+    /// A piece of the model's summary of its thinking, from a snapshot or a polish; not part of any answer.
+    Thinking { op: u64, text: String },
     /// The canonical block that replaces the preview; `revision` is the notes' revision it produced.
     Committed { op: u64, revision: u64, block: String },
     Ended { op: u64, outcome: Outcome, message: String },

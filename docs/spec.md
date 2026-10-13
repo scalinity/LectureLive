@@ -785,7 +785,10 @@ read, and the next line starts on a line of its own.
   and on what ("Snapshot 312 words sent to claude-opus-5-5, thinking"), and a clock for the step. Thinking becomes
   writing when the first word streams. Snapshot and Polish read Snapshotting and Polishing and are disabled while
   any step runs, one at a time with Cancel the way out; a polish reads as its snapshot and then its rewrite. While a
-  snapshot has streamed nothing yet, the notes pane holds a teal-ruled "Reading the lecture so far…" in its place.
+  snapshot has streamed nothing yet, or while a polish runs (it streams no words), the notes pane holds a teal-ruled
+  block in its place: the model's own latest paragraph about what it is thinking, as it streams, else "Reading the
+  lecture so far…" or "Rewriting the notes as a study document…". Requests ask for summarized thinking, which is billed
+  as thinking is under any setting; the summary is shown and never written into the notes.
   The motion (the dots, the label's slow breathing) stops under reduced motion.
 - **Stop** has the CLI's three levels. Stop finishes the transcript and recovery, then takes the last
   snapshot; while that runs the button becomes Stop waiting, which stops waiting for recovery and drops

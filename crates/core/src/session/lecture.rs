@@ -109,6 +109,9 @@ pub enum Event {
     Page { outcome: PageOutcome, usd: f64 },
     PageFailed(String),
     Slide { index: u32, file: String, auto: bool, uncertain: bool, shown_at: DateTime<Local> },
+    /// A piece of the model's summary of its thinking, from a snapshot or a polish: shown while it works and no word
+    /// of its answer has streamed. It is not part of the answer.
+    Thinking(String),
     /// The person removed a slide no snapshot had used (spec §7.5).
     SlideRemoved { index: u32 },
     /// A snapshot took the slides through this index into the notes: they can no longer be removed.
@@ -233,8 +236,10 @@ impl Lecture {
         let _ = events.send(Event::Busy(format!("snapshot, {} words to {}", batch.words(), chat::MODEL)));
         let preview = events.clone();
         let mut on_delta = |d: &str| drop(preview.send(Event::Preview(d.to_string())));
+        let thinking = events.clone();
+        let mut on_thinking = |d: &str| drop(thinking.send(Event::Thinking(d.to_string())));
         let answer = tokio::select! {
-            a = self.chat.complete(&req, &mut on_delta) => a.map_err(|e| e.to_string())?,
+            a = self.chat.complete_with_thinking(&req, &mut on_delta, &mut on_thinking) => a.map_err(|e| e.to_string())?,
             _ = cancel.cancelled() => return Err(OpError::Cancelled),
         };
         if let Some(w) = answer.warning {
@@ -283,9 +288,12 @@ impl Lecture {
         let transcript = std::fs::read_to_string(&self.files.transcript).unwrap_or_default();
         let _ = events.send(Event::Busy(format!("polishing {} words", doc.split_whitespace().count())));
         let request = polish::request(&self.course, &self.title, &doc, &transcript);
+        // A polish is replaced as a whole once it is validated, so its words do not stream; its thinking does.
         let mut no_delta = |_: &str| {};
+        let thinking = events.clone();
+        let mut on_thinking = |d: &str| drop(thinking.send(Event::Thinking(d.to_string())));
         let answer = tokio::select! {
-            a = self.chat.complete(&request, &mut no_delta) => a,
+            a = self.chat.complete_with_thinking(&request, &mut no_delta, &mut on_thinking) => a,
             _ = cancel.cancelled() => {
                 let _ = events.send(Event::Cancelled("the polish".into()));
                 return false;

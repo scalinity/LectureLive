@@ -296,6 +296,37 @@ async fn a_removed_slide_is_left_out_of_the_next_snapshot_and_a_used_one_cannot_
     assert!(f.slides.join("slide_02_100002.png").exists(), "the notes still show it");
 }
 
+/// The model's thinking summary is told while a snapshot or a polish waits for its words, and is no part of the notes.
+#[tokio::test]
+async fn a_snapshot_and_a_polish_both_tell_the_models_thinking_as_it_streams() {
+    use lecturelive_core::session::slides::{self, SlideMeta};
+    let dir = tempfile::tempdir().unwrap();
+    let (f, _) = offline_folder(dir.path());
+    let store = Store::offline(Sidecar::load(&f.sidecar()).unwrap().unwrap(), f.sidecar());
+    let tmp = f.slides.join(".capture-1.png");
+    support::slides::png(&tmp);
+    let at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 25, 10, 0, 1).unwrap();
+    slides::register(&f, &store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap();
+    let sse = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let thought = |ev: &mut mpsc::UnboundedReceiver<Event>| {
+        let mut said = String::new();
+        while let Ok(e) = ev.try_recv() {
+            if let Event::Thinking(t) = e {
+                said += &t;
+            }
+        }
+        said
+    };
+    let (tx, mut ev) = mpsc::unbounded_channel();
+    lec.snapshot(&store, "", &tx).await.unwrap();
+    assert_eq!(thought(&mut ev), "Thinking about the notes.", "the snapshot's");
+    assert!(lec.polish(&store, &tx).await, "the polish goes through");
+    assert_eq!(thought(&mut ev), "Thinking about the notes.", "the polish's, though its words do not stream");
+    let notes = std::fs::read_to_string(&f.notes).unwrap();
+    assert!(!notes.contains("Thinking about"), "{notes}");
+}
+
 /// Final review, Important 3: a second stop also drops the operations still queued behind the one in
 /// flight, so a person who asked for a polish and then wants out is not held for minutes.
 #[tokio::test]

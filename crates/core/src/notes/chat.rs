@@ -84,9 +84,18 @@ pub struct Reply {
     pub done: bool,
 }
 
+/// What one event adds that can be shown at once.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Delta {
+    /// A piece of the answer.
+    Text(String),
+    /// A piece of the model's summary of its thinking: shown while it works, and never part of the answer.
+    Thinking(String),
+}
+
 impl Reply {
-    /// Applies one event's data; returns the text it adds. Thinking, pings and usage add none.
-    pub fn apply(&mut self, data: &str) -> Option<String> {
+    /// Applies one event's data; returns what it adds to show. Pings and usage add nothing.
+    pub fn apply(&mut self, data: &str) -> Option<Delta> {
         let v: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(e) => {
@@ -112,7 +121,10 @@ impl Reply {
             "content_block_delta" if v["delta"]["type"] == "text_delta" => {
                 let delta = v["delta"]["text"].as_str().filter(|s| !s.is_empty())?;
                 self.text.push_str(delta);
-                return Some(delta.to_string());
+                return Some(Delta::Text(delta.to_string()));
+            }
+            "content_block_delta" if v["delta"]["type"] == "thinking_delta" => {
+                return Some(Delta::Thinking(v["delta"]["thinking"].as_str().filter(|s| !s.is_empty())?.to_string()));
             }
             "message_stop" => self.done = true,
             _ => {}
@@ -199,7 +211,7 @@ impl ChatRequest {
             "model": model,
             "max_tokens": MAX_TOKENS,
             "stream": true,
-            "thinking": {"type": "adaptive"},
+            "thinking": {"type": "adaptive", "display": "summarized"},
             "output_config": {"effort": self.effort.unwrap_or(EFFORT)},
             "fallbacks": "default",
             "system": self.system,
@@ -268,8 +280,14 @@ impl ChatClient {
     /// reported is written to the ledger whether or not its text is used; a request that reported
     /// none records nothing.
     pub async fn complete(&self, req: &ChatRequest, on_delta: &mut (dyn FnMut(&str) + Send)) -> Result<Answer, ChatError> {
+        self.complete_with_thinking(req, on_delta, &mut |_| {}).await
+    }
+
+    /// As `complete`, and the pieces of the model's summary of its thinking go to `on_thinking` as they arrive: what
+    /// can be shown while the model works and no word of the answer has streamed.
+    pub async fn complete_with_thinking(&self, req: &ChatRequest, on_delta: &mut (dyn FnMut(&str) + Send), on_thinking: &mut (dyn FnMut(&str) + Send)) -> Result<Answer, ChatError> {
         let mut reply = Reply::default();
-        let sent = match tokio::time::timeout(req.timeout, self.stream(req, &mut reply, on_delta)).await {
+        let sent = match tokio::time::timeout(req.timeout, self.stream(req, &mut reply, on_delta, on_thinking)).await {
             Ok(r) => r,
             Err(_) => {
                 reply.broken.get_or_insert(format!("no complete answer within {:?}", req.timeout));
@@ -288,7 +306,7 @@ impl ChatClient {
         Ok(Answer { text: reply.text, usd: cost.map(|(usd, _)| usd), warning })
     }
 
-    async fn stream(&self, req: &ChatRequest, reply: &mut Reply, on_delta: &mut (dyn FnMut(&str) + Send)) -> Result<(), ChatError> {
+    async fn stream(&self, req: &ChatRequest, reply: &mut Reply, on_delta: &mut (dyn FnMut(&str) + Send), on_thinking: &mut (dyn FnMut(&str) + Send)) -> Result<(), ChatError> {
         let resp = self.http.post(&self.cfg.url).header("x-api-key", &self.cfg.api_key).header("anthropic-version", API_VERSION).header("anthropic-beta", FALLBACK_BETA).json(&req.body(&self.cfg.model)).send().await.map_err(|e| ChatError::Failed(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
@@ -311,8 +329,10 @@ impl ChatClient {
                 }
                 Ok(Some(Ok(bytes))) => {
                     for data in parser.feed(&bytes) {
-                        if let Some(d) = reply.apply(&data) {
-                            on_delta(&d);
+                        match reply.apply(&data) {
+                            Some(Delta::Text(d)) => on_delta(&d),
+                            Some(Delta::Thinking(d)) => on_thinking(&d),
+                            None => {}
                         }
                         if reply.done {
                             return Ok(());
@@ -352,7 +372,7 @@ mod tests {
         let (mut parser, mut reply, mut preview) = (SseParser::default(), Reply::default(), String::new());
         for c in chunks {
             for data in parser.feed(c) {
-                if let Some(d) = reply.apply(&data) {
+                if let Some(Delta::Text(d)) = reply.apply(&data) {
                     preview += &d;
                 }
             }
@@ -384,14 +404,15 @@ mod tests {
     }
 
     #[test]
-    fn non_text_events_never_reach_the_preview() {
+    fn thinking_is_told_apart_from_text_and_only_text_reaches_the_preview_and_the_answer() {
         let mut r = Reply::default();
-        assert_eq!(r.apply(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}"#), None);
+        assert_eq!(r.apply(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}"#), Some(Delta::Thinking("Let me think".to_string())));
+        assert_eq!(r.apply(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#), None);
         assert_eq!(r.apply(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":""}}"#), None);
         assert_eq!(r.apply(r#"{"type":"ping"}"#), None);
         assert_eq!(r.apply(r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}"#), None);
-        assert_eq!(r.apply(r###"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"## A"}}"###), Some("## A".to_string()));
-        assert_eq!((r.text.as_str(), r.finish), ("## A", None));
+        assert_eq!(r.apply(r###"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"## A"}}"###), Some(Delta::Text("## A".to_string())));
+        assert_eq!((r.text.as_str(), r.finish), ("## A", None), "the thinking is not in the answer");
     }
 
     #[test]
@@ -441,7 +462,7 @@ mod tests {
         let req = |effort, content| ChatRequest { what: SpendKind::Notes, system: "sys".into(), content, effort, timeout: Duration::from_secs(1) };
         let body = req(None, Content::Parts { text: "words".into(), images: vec![image] }).body(MODEL);
         assert_eq!((body["model"].as_str(), body["stream"].as_bool(), body["fallbacks"].as_str()), (Some("claude-opus-5-5"), Some(true), Some("default")));
-        assert_eq!((&body["thinking"], &body["output_config"]["effort"], &body["system"]), (&json!({"type": "adaptive"}), &json!("high"), &json!("sys")));
+        assert_eq!((&body["thinking"], &body["output_config"]["effort"], &body["system"]), (&json!({"type": "adaptive", "display": "summarized"}), &json!("high"), &json!("sys")));
         assert!(body.get("temperature").is_none() && body.get("stream_options").is_none());
         let parts = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(parts[0], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}), "images go first");

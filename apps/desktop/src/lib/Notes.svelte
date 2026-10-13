@@ -54,7 +54,7 @@
 
 <section class="pane" aria-label="Notes">
   <div class="scroll" use:follow {onscroll}>
-    {#if committed.length === 0 && preview.length === 0 && !session.snapshotWaiting}
+    {#if committed.length === 0 && preview.length === 0 && !session.waiting}
       <p class="empty">Notes appear here after the first snapshot.</p>
     {/if}
     {#each committed as p (p.key)}
@@ -63,11 +63,11 @@
         <div class="md">{@html p.html}</div>
       </div>
     {/each}
-    {#if session.snapshotWaiting}
-      <!-- The snapshot is under way and no word of it has arrived: the same teal rule the writing will use. -->
+    {#if session.waiting}
+      <!-- A step is under way and none of its words has arrived: the same teal rule the writing will use, with what the model says it is thinking. -->
       <div class="chunk preview">
         <span class="at writing">thinking</span>
-        <p class="waiting">Reading the lecture so far…</p>
+        <p class="waiting">{session.waiting.text}</p>
       </div>
     {/if}
     {#if preview.length}

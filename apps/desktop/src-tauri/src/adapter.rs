@@ -188,6 +188,10 @@ impl Pump {
                 self.mirror.preview.get_or_insert_with(|| PreviewView { op, text: String::new() }).text.push_str(&d);
                 self.emit(Stream::Notes, NotesMsg::Delta { op, text: d });
             }
+            Event::Thinking(text) => {
+                let op = self.mirror.op;
+                self.emit(Stream::Notes, NotesMsg::Thinking { op, text });
+            }
             Event::Committed { words, slides, block, usd, confirmed, missing, revision, .. } => {
                 let op = self.mirror.op;
                 self.end_op();
@@ -545,6 +549,16 @@ mod tests {
         let state = p.state(Some(&sc), &[], String::new(), None);
         assert_eq!(state.slides.iter().map(|s| (s.index, s.noted)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false)], "a snapshot used the first two");
         assert_eq!(state.pending_slides, 1);
+    }
+
+    #[test]
+    fn the_models_thinking_is_told_to_the_notes_stream_and_is_not_the_preview() {
+        let (mut p, sink) = pump();
+        p.apply(Event::Thinking("I should ".into()));
+        p.apply(Event::Thinking("include the rule.".into()));
+        let told: Vec<(String, String)> = sink.on(Stream::Notes).iter().map(|m| (m["type"].as_str().unwrap().to_string(), m["text"].as_str().unwrap().to_string())).collect();
+        assert_eq!(told, vec![("thinking".to_string(), "I should ".to_string()), ("thinking".to_string(), "include the rule.".to_string())]);
+        assert!(p.mirror().preview.is_none(), "what the model says about its thinking is not the notes' preview");
     }
 
     #[test]

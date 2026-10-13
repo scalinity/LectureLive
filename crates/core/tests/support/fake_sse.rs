@@ -61,6 +61,11 @@ pub async fn start(respond: impl Fn(&Value) -> Reply + Send + Sync + 'static) ->
 /// A response's events as the Messages API streams them: an empty thinking block, the text in deltas,
 /// the stop reason and, when `usage` is set, the token counts at the start and in `message_delta`.
 pub fn events(content: &[&str], stop: Option<&str>, usage: bool) -> Vec<u8> {
+    events_thinking(&[], content, stop, usage)
+}
+
+/// As `events`, with the pieces of the model's thinking summary streamed in the thinking block before the text.
+pub fn events_thinking(thoughts: &[&str], content: &[&str], stop: Option<&str>, usage: bool) -> Vec<u8> {
     let event = |name: &str, v: Value| format!("event: {name}\ndata: {v}\n\n");
     let counts = |input: u64, output: u64| if usage { json!({"input_tokens": input, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": output}) } else { Value::Null };
     let mut start = json!({"id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": null});
@@ -70,6 +75,9 @@ pub fn events(content: &[&str], stop: Option<&str>, usage: bool) -> Vec<u8> {
     let mut out = event("message_start", json!({"type": "message_start", "message": start}));
     out += &event("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}));
     out += &event("ping", json!({"type": "ping"}));
+    for t in thoughts {
+        out += &event("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": t}}));
+    }
     out += &event("content_block_stop", json!({"type": "content_block_stop", "index": 0}));
     out += &event("content_block_start", json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}));
     for c in content {
@@ -94,7 +102,7 @@ pub fn answer(text: &str) -> Reply {
 
 pub fn answer_bytes(text: &str) -> Vec<u8> {
     let deltas: Vec<&str> = text.split_inclusive(' ').collect();
-    events(&deltas, Some("end_turn"), true)
+    events_thinking(&["Thinking about ", "the notes."], &deltas, Some("end_turn"), true)
 }
 
 /// An error body as the API sends it.

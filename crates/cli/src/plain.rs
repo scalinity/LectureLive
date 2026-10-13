@@ -354,7 +354,7 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
         Event::Paused(true) => n("notes", "paused", "nothing is recorded or transcribed until you resume; slides taken by hand and snapshots still work".into()),
         Event::Paused(false) => n("done", "resumed", "recording and transcribing again, in a new file".into()),
         Event::Warning(m) => n("warn", "warning", m.clone()),
-        Event::Busy(_) | Event::Preview(_) | Event::SlideRemoved { .. } | Event::SlidesNoted { .. } => None,
+        Event::Busy(_) | Event::Preview(_) | Event::Thinking(_) | Event::SlideRemoved { .. } | Event::SlidesNoted { .. } => None,
     }
 }
 

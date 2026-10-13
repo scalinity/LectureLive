@@ -139,7 +139,7 @@ async fn requests_are_opus_5_5_with_the_key_the_version_and_the_fallback() {
     let body = &fake.state.bodies()[0];
     assert_eq!(body["model"], "claude-opus-5-5");
     assert_eq!(body["stream"], true);
-    assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive", "display": "summarized"}));
     assert_eq!(body["output_config"]["effort"], "high");
     assert_eq!(body["fallbacks"], "default");
     assert_eq!(body["system"], "the system prompt");
@@ -152,6 +152,18 @@ async fn requests_are_opus_5_5_with_the_key_the_version_and_the_fallback() {
     }
     assert!(!head.contains("authorization"), "{head}");
     assert_eq!(spend::read(&dir.path().join("spend.jsonl")).unwrap()[0].what, "page");
+}
+
+/// The model's thinking summary is told as it streams, apart from the answer.
+#[tokio::test]
+async fn the_thinking_summary_streams_to_its_own_callback_and_is_not_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_sse::start(|_| Reply::Stream(vec![fake_sse::events_thinking(&["I should include ", "the update rule."], &["## A\n", "- b"], Some("end_turn"), true)])).await;
+    let c = client(&fake.url, &dir.path().join("spend.jsonl"));
+    let (mut text, mut thought) = (String::new(), String::new());
+    let out = c.complete_with_thinking(&request(), &mut |d: &str| text.push_str(d), &mut |t: &str| thought.push_str(t)).await.unwrap();
+    assert_eq!(thought, "I should include the update rule.");
+    assert_eq!((text.as_str(), out.text.as_str()), ("## A\n- b", "## A\n- b"), "the summary is not in the answer or its preview");
 }
 
 /// M6, network loss for LectureLive alone: a connect address carries chat requests.

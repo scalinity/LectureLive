@@ -11,6 +11,9 @@ type Queued = [Stream, Envelope<StatusMsg | TranscriptMsg | NotesMsg>];
 
 /** Notices kept on screen and across a rehydration. */
 const NOTICES = 50;
+/** How much of the model's thinking summary is kept, and the longest line of it shown. */
+const THINKING_KEEP = 4000;
+const THINKING_LINE = 220;
 /** The preview is re-shown at most this often (spec §9.3). */
 const PARSE_MS = 100;
 
@@ -125,9 +128,25 @@ export class Session {
     return this.busyAt === null ? null : Math.max(0, Math.floor((this.clockNow - this.busyAt) / 1000));
   }
 
-  /** A snapshot is running and none of its words has streamed yet: the model is reading and thinking. */
-  get snapshotWaiting(): boolean {
-    return (this.status.busy ?? "").startsWith("snapshot") && this.previewShown === "";
+  /** The model's own summary of its thinking in the step now running, as it streams; not part of any answer. */
+  private thinking = $state("");
+
+  /** What the model last said about its thinking, as one line to show: its latest paragraph without markup, cut to its tail. */
+  get thinkingLine(): string {
+    const last = this.thinking.replace(/[*_`#]+/g, "").split(/\n+/).map((p) => p.trim()).filter(Boolean).at(-1) ?? "";
+    if (last.length <= THINKING_LINE) return last;
+    const tail = last.slice(-THINKING_LINE);
+    return "…" + tail.slice(tail.indexOf(" ") + 1);
+  }
+
+  /** The step running has no words to show yet (a snapshot before its first, a polish, which streams none): the model's
+   *  thinking when it has said some, else what the step is doing. */
+  get waiting(): { text: string } | null {
+    const b = this.status.busy ?? "";
+    const says = this.thinkingLine;
+    if (b.startsWith("snapshot") && this.previewShown === "") return { text: says || "Reading the lecture so far…" };
+    if (b.startsWith("polishing")) return { text: says || "Rewriting the notes as a study document…" };
+    return null;
   }
 
   /** Seconds since the lecture started, updated once a second. */
@@ -165,7 +184,10 @@ export class Session {
   /** Takes a status in. */
   private take(status: Status) {
     this.pausedAt = status.paused ? (this.pausedAt ?? Date.now()) : null;
-    if (status.busy !== this.status.busy) this.busyAt = status.busy ? Date.now() : null;
+    if (status.busy !== this.status.busy) {
+      this.busyAt = status.busy ? Date.now() : null;
+      this.thinking = ""; // each step says its own thinking
+    }
     this.status = status;
   }
 
@@ -506,6 +528,9 @@ export class Session {
         if (!this.preview || this.preview.op !== m.op) this.preview = { op: m.op, text: "" };
         this.preview.text += m.text;
         this.previewDirty = true;
+        return true;
+      case "thinking":
+        this.thinking = (this.thinking + m.text).slice(-THINKING_KEEP);
         return true;
       case "committed":
         if (m.revision <= this.revision) {

@@ -13,6 +13,7 @@ export type Outcome = "nothing_new" | "failed" | "cancelled";
 
 export type NotesMsg =
   | { type: "delta"; op: number; text: string }
+  | { type: "thinking"; op: number; text: string }
   | { type: "committed"; op: number; revision: number; block: string }
   | { type: "ended"; op: number; outcome: Outcome; message: string }
   | { type: "polished"; revision: number };
