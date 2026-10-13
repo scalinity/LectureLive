@@ -45,7 +45,8 @@ export type NoticeKind = "notes" | "slide" | "page" | "done" | "warn";
 export type Notice = { kind: NoticeKind; label: string; detail: string; at: string };
 
 /** `at` is when it was first on screen (HH:MM:SS); `auto` when the detector took it; `uncertain` when it was still changing. */
-export type SlideView = { index: number; file: string; path: string; at: string; auto: boolean; uncertain: boolean };
+/** `noted`: a snapshot has used it, so the notes embed its file and it can no longer be removed. */
+export type SlideView = { index: number; file: string; path: string; at: string; auto: boolean; uncertain: boolean; noted: boolean };
 
 export type CaptureWord = "unbound" | "ready" | "watching" | "paused" | "asking" | "denied" | "failing";
 
@@ -61,7 +62,7 @@ export type PreviewShot = { path: string; width: number; height: number };
 /** The course's saved region, and the parts of it left out as fractions of it. */
 export type SavedRegion = { region: Region; leave_out: Region[] };
 
-export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" } & SlideView);
+export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" } & SlideView) | { type: "slide_removed"; index: number } | { type: "slides_noted"; through: number };
 
 export type OpenView = { utterance: number; stable: string; tentative: string };
 

@@ -223,6 +223,16 @@ export class Session {
     await this.act("capture_now");
   }
 
+  /** A slide can be removed until a snapshot has used it, while the lecture runs and no snapshot or polish is under way. */
+  canRemove(s: SlideView): boolean {
+    return this.status.phase === "running" && !this.busyOp && !s.noted;
+  }
+
+  /** Takes a slide no snapshot has used out of the lecture; its file is kept in `slides/removed`. */
+  async removeSlide(index: number) {
+    await this.act("remove_slide", { index });
+  }
+
   async importSlides(paths: string[]) {
     await this.act("import_slides", { paths });
   }
@@ -437,6 +447,10 @@ export class Session {
     } else if (m.type === "notice") {
       const { type: _t, session: _s, seq: _q, ...notice } = m;
       this.notices = [...this.notices, notice].slice(-NOTICES);
+    } else if (m.type === "slide_removed") {
+      this.slides = this.slides.filter((s) => s.index !== m.index);
+    } else if (m.type === "slides_noted") {
+      this.slides = this.slides.map((s) => (s.index <= m.through && !s.noted ? { ...s, noted: true } : s));
     } else {
       const { type: _t, session: _s, seq: _q, ...slide } = m;
       this.slides = [...this.slides, slide];

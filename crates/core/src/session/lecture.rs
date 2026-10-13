@@ -78,6 +78,8 @@ pub enum Command {
     Bind { window: u32, selection: Selection },
     /// Images dropped on the app (spec §7.3).
     Import(Vec<PathBuf>),
+    /// Remove a slide no snapshot has used (spec §7.5).
+    RemoveSlide { index: u32, reply: oneshot::Sender<Result<(), String>> },
 }
 
 /// Slide capture for a lecture (spec §7): where windows come from, and the course's saved selection.
@@ -107,6 +109,10 @@ pub enum Event {
     Page { outcome: PageOutcome, usd: f64 },
     PageFailed(String),
     Slide { index: u32, file: String, auto: bool, uncertain: bool, shown_at: DateTime<Local> },
+    /// The person removed a slide no snapshot had used (spec §7.5).
+    SlideRemoved { index: u32 },
+    /// A snapshot took the slides through this index into the notes: they can no longer be removed.
+    SlidesNoted { through: u32 },
     /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
     Capture(CaptureState),
     /// The watched window changed size and its slide is watched through the region for that size: saved by
@@ -209,6 +215,7 @@ impl Lecture {
             })
             .await
             .map_err(text)?;
+            let _ = events.send(Event::SlidesNoted { through: slide_to });
         }
         if batch.is_empty() {
             let _ = events.send(Event::NothingNew);
@@ -244,6 +251,7 @@ impl Lecture {
             .await
             .map_err(text)?;
         let _ = events.send(Event::Committed { words: batch.words(), slides: batch.slides.len(), block, usd: answer.usd.unwrap_or(0.0), confirmed: cut.is_none_or(|c| c.confirmed), removed: repaired.removed, missing: repaired.missing.len(), revision });
+        let _ = events.send(Event::SlidesNoted { through: slide_to });
         Ok(())
     }
 
@@ -346,7 +354,7 @@ impl Lecture {
 }
 
 /// Runs operations one at a time; each is tagged with the cancel generation it was asked at.
-async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceiver<(Op, u64)>, events: UnboundedSender<Event>, pages: Arc<Mutex<Vec<JoinHandle<()>>>>, hurry: Arc<AtomicBool>, generation: watch::Receiver<u64>) {
+async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceiver<(Op, u64)>, events: UnboundedSender<Event>, pages: Arc<Mutex<Vec<JoinHandle<()>>>>, hurry: Arc<AtomicBool>, snapshotting: Arc<AtomicBool>, generation: watch::Receiver<u64>) {
     while let Some((op, asked_at)) = ops.recv().await {
         if hurry.load(Ordering::Relaxed) {
             continue; // a second stop: what was still queued is dropped; the last snapshot takes its material
@@ -355,6 +363,9 @@ async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceive
             continue; // cancelled while it waited
         }
         let mut cancel = Cancel { rx: generation.clone(), at: asked_at };
+        // Set before the batch is taken and kept until the cursor has moved: a slide removed in between would be
+        // named by the notes after its file had gone (`slides::remove` looks at this inside the sidecar's writer).
+        snapshotting.store(true, Ordering::SeqCst);
         match op {
             Op::Snapshot(hint) => match lec.snapshot_with(&store, &hint, &events, &mut cancel).await {
                 Ok(()) => {}
@@ -375,6 +386,7 @@ async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceive
                 }
             }
         }
+        snapshotting.store(false, Ordering::SeqCst);
     }
 }
 
@@ -433,8 +445,9 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
     let pages = Arc::new(Mutex::new(Vec::new()));
     let (op_tx, op_rx) = mpsc::unbounded_channel();
     let hurry = Arc::new(AtomicBool::new(false));
+    let snapshotting = Arc::new(AtomicBool::new(false));
     let (generation, generation_rx) = watch::channel(0u64);
-    let worker = tokio::spawn(notes_worker(lec.clone(), store.clone(), op_rx, events.clone(), pages.clone(), hurry.clone(), generation_rx));
+    let worker = tokio::spawn(notes_worker(lec.clone(), store.clone(), op_rx, events.clone(), pages.clone(), hurry.clone(), snapshotting.clone(), generation_rx));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let watcher = tokio::spawn(slide_watcher(lec.clone(), store.clone(), watch, stop_rx, events.clone()));
     let (mut capture, capturer) = match capture {
@@ -541,6 +554,21 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                         });
                     }
                     None => { let _ = events.send(Event::Warning("The lecture is stopping; images dropped now are not added.".into())); }
+                },
+                Some(Command::RemoveSlide { index, reply }) => match &state_store {
+                    Some(s) => {
+                        let (lec, s, events, snapshotting) = (lec.clone(), s.clone(), events.clone(), snapshotting.clone());
+                        tokio::spawn(async move {
+                            let _ = match slides::remove(&lec.files, &s, index, snapshotting).await {
+                                Ok(_) => {
+                                    let _ = events.send(Event::SlideRemoved { index });
+                                    reply.send(Ok(()))
+                                }
+                                Err(e) => reply.send(Err(format!("{e:#}"))),
+                            };
+                        });
+                    }
+                    None => { let _ = reply.send(Err("The lecture is stopping.".into())); }
                 },
                 None => commands_open = false, // input closed: the lecture runs until it is stopped or its audio ends
             },

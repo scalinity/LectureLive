@@ -202,6 +202,8 @@ pub struct SlideView {
     pub auto: bool,
     /// Kept after 10 s of change: it may show a transition.
     pub uncertain: bool,
+    /// A snapshot has used it, so the notes embed its file and it can no longer be removed.
+    pub noted: bool,
 }
 
 /// The status stream (a Tauri event).
@@ -211,6 +213,10 @@ pub enum StatusMsg {
     Status(Status),
     Notice(Notice),
     Slide(SlideView),
+    /// A slide no snapshot had used was removed.
+    SlideRemoved { index: u32 },
+    /// A snapshot used the slides through this index.
+    SlidesNoted { through: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

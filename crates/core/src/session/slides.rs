@@ -2,8 +2,10 @@
 //! dropped images are all moved into `slides/` under the CLI's name and recorded inside the sidecar's
 //! writer, so indexes never collide and no file is registered twice.
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 
 use crate::session::coordinator::Store;
@@ -77,6 +79,36 @@ pub async fn register(files: &LectureFiles, store: &Store, path: &Path, meta: Sl
             let entry = SlideEntry { index, file: relative(&files, &dest), shown_at: meta.shown_at, auto: meta.auto, uncertain: meta.uncertain };
             sc.slides.push(entry.clone());
             Ok(Some(entry))
+        })
+        .await
+}
+
+/// Where a removed slide's file goes inside `slides/`: out of the folder's slide files, so opening the lecture
+/// again does not register it back, and kept, so the person can take it back by hand.
+pub const REMOVED_DIR: &str = "removed";
+
+/// Takes a slide that no snapshot has used out of the lecture (spec §7.5), inside the sidecar's writer: its record
+/// goes and its file moves to `slides/removed/`. A slide the notes already hold stays, because the notes embed
+/// its file. `snapshotting` is set while a snapshot or polish runs: its batch may already hold the slide, and the
+/// check is made here, where nothing else writes, so a batch taken a moment earlier is seen too.
+pub async fn remove(files: &LectureFiles, store: &Store, index: u32, snapshotting: Arc<AtomicBool>) -> Result<SlideEntry> {
+    let files = files.clone();
+    store
+        .update(move |sc| {
+            let Some(at) = sc.slides.iter().position(|s| s.index == index) else { bail!("Slide {index} is not in this lecture") };
+            if index <= sc.notes.slide_index {
+                bail!("Slide {index} is already in the notes");
+            }
+            if snapshotting.load(Ordering::SeqCst) {
+                bail!("A snapshot is running and may be using slide {index}: remove it once the snapshot is done");
+            }
+            let from = files.dir.join(&sc.slides[at].file);
+            if let Some(name) = from.file_name().filter(|_| from.exists()) {
+                let dir = files.slides.join(REMOVED_DIR);
+                std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+                move_file(&from, &dir.join(name))?;
+            }
+            Ok(sc.slides.remove(at))
         })
         .await
 }
@@ -191,5 +223,81 @@ mod tests {
         assert!(a.exists() && b.exists(), "the originals stay where they were");
         assert_eq!(ok[1].index + 1, ok[2].index, "a second drop of the same file is a second slide");
         assert!(std::fs::read_dir(&files.slides).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    async fn three(files: &LectureFiles, store: &Store) -> Vec<SlideEntry> {
+        let mut out = Vec::new();
+        for k in 1..=3u32 {
+            let tmp = files.slides.join(format!(".capture-{k}.png.tmp"));
+            png(&tmp);
+            let at = Local.with_ymd_and_hms(2026, 9, 25, 10, 0, k).unwrap();
+            out.push(register(files, store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap());
+        }
+        out
+    }
+
+    fn idle() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[tokio::test]
+    async fn a_removed_slide_leaves_the_record_and_the_slide_files_but_is_kept() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        let gone = remove(&files, &store, 2, idle()).await.unwrap();
+        assert_eq!(gone, slides[1]);
+        assert_eq!(store.read().await.unwrap().slides, vec![slides[0].clone(), slides[2].clone()]);
+        assert!(!files.dir.join(&gone.file).exists(), "out of slides/");
+        assert!(files.slides.join(REMOVED_DIR).join("slide_02_100002.png").exists(), "kept where the person can take it back");
+        let on_disk: Vec<u32> = crate::session::folder::slide_files(&files).unwrap().iter().map(|s| s.index).collect();
+        assert_eq!(on_disk, vec![1, 3], "opening the folder again does not register it back");
+    }
+
+    #[tokio::test]
+    async fn a_slide_a_snapshot_has_used_stays_because_the_notes_embed_it() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        store.update(|sc| Ok(sc.notes.slide_index = 2)).await.unwrap();
+        for used in [1, 2] {
+            let e = remove(&files, &store, used, idle()).await.unwrap_err();
+            assert!(format!("{e}").contains("already in the notes"), "{e}");
+        }
+        assert!(files.dir.join(&slides[1].file).exists());
+        assert_eq!(store.read().await.unwrap().slides.len(), 3);
+        remove(&files, &store, 3, idle()).await.expect("the one after the snapshot's cursor is still pending");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_removed_while_a_snapshot_may_hold_the_slide() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        let busy = Arc::new(AtomicBool::new(true));
+        let e = remove(&files, &store, 3, busy.clone()).await.unwrap_err();
+        assert!(format!("{e}").contains("snapshot is running"), "{e}");
+        assert!(files.dir.join(&slides[2].file).exists() && store.read().await.unwrap().slides.len() == 3);
+        busy.store(false, Ordering::SeqCst);
+        remove(&files, &store, 3, busy).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_slide_is_an_error_and_a_slide_whose_file_is_gone_is_still_dropped() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        assert!(format!("{}", remove(&files, &store, 9, idle()).await.unwrap_err()).contains("not in this lecture"));
+        std::fs::remove_file(files.dir.join(&slides[0].file)).unwrap();
+        remove(&files, &store, 1, idle()).await.unwrap();
+        assert_eq!(store.read().await.unwrap().slides.len(), 2);
+        assert!(!files.slides.join(REMOVED_DIR).exists(), "there was no file to keep");
+    }
+
+    #[tokio::test]
+    async fn the_next_slide_after_the_newest_was_removed_takes_its_number_again() {
+        let (_d, files, store) = setup();
+        three(&files, &store).await;
+        remove(&files, &store, 3, idle()).await.unwrap();
+        let tmp = files.slides.join(".capture-4.png.tmp");
+        png(&tmp);
+        let s = register(&files, &store, &tmp, SlideMeta::manual(Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 0).unwrap())).await.unwrap().unwrap();
+        assert_eq!(s.index, 3, "nothing in the notes can name a slide that was never in a snapshot");
     }
 }

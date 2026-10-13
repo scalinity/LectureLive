@@ -84,7 +84,15 @@
             {@const b = badge(s)}
             <li>
               <span class="at"><span class="num">{s.at}</span><span class="badge" class:unsettled={s.uncertain} title={b.why}>{b.word}</span></span>
-              <img src={toUrl(s.path)} alt="Slide {s.index}, {s.auto ? 'taken automatically' : 'taken by you'} at {s.at}" title="Slide {s.index}" loading="lazy" decoding="async" />
+              <div class="shot">
+                <img src={toUrl(s.path)} alt="Slide {s.index}, {s.auto ? 'taken automatically' : 'taken by you'} at {s.at}" title="Slide {s.index}" loading="lazy" decoding="async" />
+                {#if session.canRemove(s)}
+                  <!-- A slide no snapshot has used: it can go before it reaches the notes. Its file is kept. -->
+                  <button class="remove" type="button" onclick={() => session.removeSlide(s.index)} aria-label="Remove slide {s.index}" title="Remove slide {s.index}: the next snapshot leaves it out, and its file is kept in slides/removed">
+                    <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" /></svg>
+                  </button>
+                {/if}
+              </div>
             </li>
           {/each}
         </ol>
@@ -247,11 +255,59 @@
     color: var(--ink);
   }
 
+  .shot {
+    position: relative;
+  }
+
   img {
     display: block;
     width: 100%;
     height: auto;
     border: 1px solid var(--rule);
+  }
+
+  /* Only while the pointer is on the slide (or the button has the keyboard): the red is the one thing here that
+     warns, and it appears when the pointer is on the control, with the slide it would remove outlined. */
+  .remove {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    border: 1px solid var(--rule);
+    background: color-mix(in srgb, var(--plate) 92%, transparent);
+    color: var(--graphite);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity var(--fade) ease-out, color var(--fade) ease-out, border-color var(--fade) ease-out;
+  }
+
+  .shot:hover .remove,
+  .remove:focus-visible {
+    opacity: 1;
+  }
+
+  .remove:hover {
+    color: var(--signal);
+    border-color: var(--signal);
+  }
+
+  .remove svg {
+    width: 0.6rem;
+    height: 0.6rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+  }
+
+  .shot:has(.remove:hover) img {
+    outline: 2px solid var(--signal);
+    outline-offset: -1px;
   }
 
   /* Covers the list while files are dragged over the window. */

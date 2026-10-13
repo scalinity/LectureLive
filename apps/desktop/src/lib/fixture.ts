@@ -84,8 +84,12 @@ export class FixtureTransport implements Transport {
     this.last?.();
   }
 
+  /** What a command does besides answering: the browser preview stands in for the backend with these. */
+  effects: Record<string, (args?: Record<string, unknown>) => void> = {};
+
   async call<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     this.calls.push([cmd, args]);
+    this.effects[cmd]?.(args);
     return this.answers[cmd] as T;
   }
 
@@ -213,12 +217,21 @@ export function demoWithNotes(): FixtureTransport {
   t.state_.document = DEMO_NOTES;
   t.state_.revision = 2;
   t.state_.slides = [
-    { index: 1, file: "slides/slide_01_100251.png", path: `${DEMO_DIR}/slides/slide_01_100251.png`, at: "10:02:51", auto: true, uncertain: false },
-    { index: 2, file: "slides/slide_02_100418.png", path: `${DEMO_DIR}/slides/slide_02_100418.png`, at: "10:04:18", auto: false, uncertain: false },
-    { index: 3, file: "slides/slide_03_100633.png", path: `${DEMO_DIR}/slides/slide_03_100633.png`, at: "10:06:33", auto: true, uncertain: true },
+    { index: 1, file: "slides/slide_01_100251.png", path: `${DEMO_DIR}/slides/slide_01_100251.png`, at: "10:02:51", auto: true, uncertain: false, noted: true },
+    { index: 2, file: "slides/slide_02_100418.png", path: `${DEMO_DIR}/slides/slide_02_100418.png`, at: "10:04:18", auto: false, uncertain: false, noted: true },
+    { index: 3, file: "slides/slide_03_100633.png", path: `${DEMO_DIR}/slides/slide_03_100633.png`, at: "10:06:33", auto: true, uncertain: true, noted: false },
   ];
   t.state_.status.capture = { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true };
   t.assetUrl = () => "/demo-slide.svg";
+  // The backend's answer to a removal: the slide goes, and the notice line says where its file is kept.
+  t.effects.remove_slide = (args) => {
+    const index = Number(args?.index);
+    const slide = t.state_.slides.find((s) => s.index === index);
+    if (!slide || slide.noted) return;
+    t.state_.slides = t.state_.slides.filter((s) => s.index !== index);
+    t.emitStatus({ type: "slide_removed", index });
+    t.emitStatus({ type: "notice", kind: "slide", label: `Slide ${index} removed`, detail: "kept in slides/removed, and left out of the next snapshot", at: new Date().toTimeString().slice(0, 8) });
+  };
   t.answers = { capture_windows: DEMO_WINDOWS, capture_preview: { path: "/demo-slide.svg", width: 1600, height: 900 }, capture_saved_region: { region: { x: 0.06, y: 0.1, w: 0.88, h: 0.8 }, leave_out: [{ x: 0.8, y: 0, w: 0.2, h: 0.22 }] }, capture_select: null, capture_now: null, import_slides: null, key_status: { stored: true, env_available: true }, inputs: [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }], loopback_status: { present: true, blackhole_present: true }, spend_summary: { total: 3.8412, estimated: 0.4071, calls: 57, months: [{ key: "2026-08", label: "August 2026", total: 1.2033, courses: [["Machine Learning", 0.9021], ["Statistics", 0.3012]] }, { key: "2026-09", label: "September 2026", total: 2.6379, courses: [["Machine Learning", 1.9112], ["Statistics", 0.6021], ["Biology", 0.1246]] }], recent: [{ day: "2026-09-25", label: "25 Sep", course: "Machine Learning", lecture: "Week 06 — Optimisation", total: 0.4402, kinds: [["page", 0.2727], ["notes", 0.1021], ["transcribe", 0.0533], ["polish", 0.0121]] }, { day: "2026-09-24", label: "24 Sep", course: "Statistics", lecture: "Week 05 — Hypothesis tests", total: 0.3104, kinds: [["notes", 0.1902], ["transcribe", 0.1202]] }, { day: "2026-09-22", label: "22 Sep", course: "Biology", lecture: "Week 02", total: 0.004, kinds: [["notes", 0.004]] }] } };
   (globalThis as { __fixture?: FixtureTransport }).__fixture = t; // the preview's checks drive states through it
   const words = DEMO_SNAPSHOT.match(/\S+\s*/g) ?? [];

@@ -59,6 +59,7 @@ pub fn run() {
             app::check_record,
             app::capture_now,
             app::import_slides,
+            app::remove_slide,
             app::open_screen_settings,
             app::microphone,
             app::open_microphone_settings,

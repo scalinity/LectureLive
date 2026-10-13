@@ -236,9 +236,14 @@ impl Pump {
                     (true, false) => ", taken automatically",
                     _ => "",
                 };
-                self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path, at: shown_at.format("%H:%M:%S").to_string(), auto, uncertain }));
+                self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path, at: shown_at.format("%H:%M:%S").to_string(), auto, uncertain, noted: false }));
                 self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}{how}, into the next snapshot"));
             }
+            Event::SlideRemoved { index } => {
+                self.emit(Stream::Status, StatusMsg::SlideRemoved { index });
+                self.notice(NoticeKind::Slide, &format!("Slide {index} removed"), "kept in slides/removed, and left out of the next snapshot");
+            }
+            Event::SlidesNoted { through } => self.emit(Stream::Status, StatusMsg::SlidesNoted { through }),
             Event::Capture(s) => self.capture_state(s),
             Event::CaptureMoved { note, .. } => self.notice(NoticeKind::Slide, "Found again", &note),
             Event::Paused(paused) => self.paused(paused),
@@ -372,7 +377,7 @@ impl Pump {
                 sc.notes.revision,
                 (segments.len() as u64).saturating_sub(sc.notes.segment_cursor),
                 sc.slides.iter().filter(|s| s.index > sc.notes.slide_index).count(),
-                sc.slides.iter().map(|s| SlideView { index: s.index, file: s.file.clone(), path: files.map_or_else(|| s.file.clone(), |f| f.dir.join(&s.file).to_string_lossy().into_owned()), at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain }).collect(),
+                sc.slides.iter().map(|s| SlideView { index: s.index, file: s.file.clone(), path: files.map_or_else(|| s.file.clone(), |f| f.dir.join(&s.file).to_string_lossy().into_owned()), at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain, noted: s.index <= sc.notes.slide_index }).collect(),
             ),
             None => (0, 0, 0, Vec::new()),
         };
@@ -518,6 +523,28 @@ mod tests {
         let seqs: Vec<u64> = all.iter().map(|(_, m)| m["seq"].as_u64().unwrap()).collect();
         assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1) && seqs[0] == 1, "{seqs:?}");
         assert_eq!(p.seq(), *seqs.last().unwrap());
+    }
+
+    #[test]
+    fn a_removed_or_used_slide_is_told_to_the_page_and_a_reloaded_page_is_told_which_are_used() {
+        use lecturelive_core::session::sidecar::{Sidecar, SlideEntry};
+        let (mut p, sink) = pump();
+        let at = Local::now();
+        p.apply(Event::Slide { index: 1, file: "slides/slide_01_100001.png".into(), auto: true, uncertain: false, shown_at: at });
+        p.apply(Event::SlideRemoved { index: 1 });
+        p.apply(Event::SlidesNoted { through: 3 });
+        let status = sink.on(Stream::Status);
+        let of = |t: &str| status.iter().find(|m| m["type"] == t).unwrap_or_else(|| panic!("{t} in {status:?}"));
+        assert_eq!(of("slide")["noted"], false, "a slide just taken is pending");
+        assert_eq!(of("slide_removed")["index"], 1);
+        assert_eq!(of("slides_noted")["through"], 3);
+        assert_eq!(p.mirror().notices.iter().rev().find(|n| n.label == "Slide 1 removed").map(|n| n.kind), Some(NoticeKind::Slide));
+        let mut sc = Sidecar::default();
+        sc.slides = (1..=3).map(|index| SlideEntry { index, file: format!("slides/slide_{index:02}_100001.png"), shown_at: at, auto: true, uncertain: false }).collect();
+        sc.notes.slide_index = 2;
+        let state = p.state(Some(&sc), &[], String::new(), None);
+        assert_eq!(state.slides.iter().map(|s| (s.index, s.noted)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false)], "a snapshot used the first two");
+        assert_eq!(state.pending_slides, 1);
     }
 
     #[test]

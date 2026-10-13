@@ -671,6 +671,22 @@ Screen Recording (TCC), verified in the packaged app; a binary run from a termin
 terminal's grant. Without it the strip says so and offers System Settings. The Capture button works
 once a real capture of the watched window has succeeded.
 
+### 7.5 Removing a slide
+
+A slide that no snapshot has used (an index above the notes' `slide_index`) can be removed while the lecture runs,
+so that a duplicate or an empty capture never reaches the model or the notes. In the strip, the slide under the
+pointer shows a quiet × at its top-right corner; with the pointer on the ×, it turns red and the slide it would
+remove is outlined. It is also reached with the keyboard. There is no confirmation: the slide's file moves to
+`slides/removed/`, where the folder's slide scan does not look, so it is not registered again when the folder is
+opened and the person can take it back by hand. The notice line says so.
+
+The strip offers the control only for a slide that is removable, and the core decides again when asked, inside
+the sidecar's writer: a slide a snapshot has used stays (the notes embed its file), and nothing is removed while a
+snapshot or polish runs, because its batch may already hold the slide. A removed slide's number is not kept: the
+next slide after the newest one takes it again, since nothing in the notes can name a slide that was never in a
+snapshot. Two messages keep the strip true: `slide_removed` when a slide goes, and `slides_noted` (through an
+index) when a snapshot commits, after which those slides lose the control.
+
 ## 8. Files, state, resume
 
 ```
@@ -679,7 +695,7 @@ once a real capture of the watched window has succeeded.
   <lecture title>.html                the study page, named after the lecture (§6.4)
   lecture_transcript_YYYYMMDD.txt     [HH:MM:SS] text, append-only, in commit order;
                                       --- started|resumed HH:MM:SS --- at each session
-  slides/slide_NN_HHMMSS.png|jpg
+  slides/slide_NN_HHMMSS.png|jpg      slides/removed/ holds the ones taken out before a snapshot used them (§7.5)
   recordings/session_YYYYMMDD_HHMMSS.wav
   .live_notes/<stem>.v2.json          sidecar: version, lecture date, recordings + anchors, gaps,
                                       open utterances, notes {revision, len, sha256,

@@ -676,6 +676,14 @@ pub async fn capture_now(app: State<'_, App>) -> Res<()> {
     rx.await.map_err(|_| "The lecture has ended.".to_string())?
 }
 
+/// The × on a slide in the strip: a slide no snapshot has used leaves the lecture, and its file is kept in `slides/removed`.
+#[tauri::command]
+pub async fn remove_slide(index: u32, app: State<'_, App>) -> Res<()> {
+    let (tx, rx) = oneshot::channel();
+    app.send(Command::RemoveSlide { index, reply: tx })?;
+    rx.await.map_err(|_| "The lecture has ended.".to_string())?
+}
+
 /// ⌘⇧2: as the Capture button; a refusal becomes a notice, since no button was pressed to show it.
 pub fn shortcut(handle: &AppHandle) {
     let handle = handle.clone();

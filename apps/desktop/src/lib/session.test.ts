@@ -282,7 +282,7 @@ describe("session store", () => {
   test("slides keep their badges, capture status arrives whole, and a drop imports its paths", async () => {
     const { t, s, ready, frame } = setup();
     await ready;
-    t.emitStatus({ type: "slide", index: 1, file: "slides/slide_01_100251.png", path: "/l/slides/slide_01_100251.png", at: "10:02:51", auto: true, uncertain: false });
+    t.emitStatus({ type: "slide", index: 1, file: "slides/slide_01_100251.png", path: "/l/slides/slide_01_100251.png", at: "10:02:51", auto: true, uncertain: false, noted: false });
     t.emitStatus({ type: "status", ...emptyState("s1").status, phase: "running", capture: { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true } });
     frame();
     expect(s.slides[0].auto).toBe(true);
@@ -293,6 +293,37 @@ describe("session store", () => {
     await Promise.resolve();
     expect(s.dragging).toBe(false);
     expect(t.calls.at(-1)).toEqual(["import_slides", { paths: ["/Desktop/board.png"] }]);
+  });
+
+  test("a slide can be removed until a snapshot has used it, and what the backend says about slides is applied", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    const status = (over: object) => t.emitStatus({ type: "status", ...emptyState("s1").status, phase: "running", ...over });
+    const slide = (index: number) => ({ type: "slide" as const, index, file: `slides/slide_0${index}_10000${index}.png`, path: `/l/slides/slide_0${index}_10000${index}.png`, at: `10:00:0${index}`, auto: true, uncertain: false, noted: false });
+    status({});
+    [1, 2, 3].forEach((i) => t.emitStatus(slide(i)));
+    frame();
+    expect(s.slides.every((x) => s.canRemove(x)), "pending slides of a running lecture").toBe(true);
+    await s.removeSlide(2);
+    expect(t.calls.at(-1)).toEqual(["remove_slide", { index: 2 }]);
+    expect(s.slides.map((x) => x.index), "the slide goes when the backend says so, not before").toEqual([1, 2, 3]);
+    t.emitStatus({ type: "slide_removed", index: 2 });
+    frame();
+    expect(s.slides.map((x) => x.index)).toEqual([1, 3]);
+    t.emitStatus({ type: "slides_noted", through: 1 });
+    frame();
+    expect(s.slides.map((x) => [x.index, x.noted])).toEqual([[1, true], [3, false]]);
+    expect(s.canRemove(s.slides[0]), "the notes embed a slide a snapshot used").toBe(false);
+    expect(s.canRemove(s.slides[1])).toBe(true);
+    status({ busy: "snapshot, 12 words to claude-opus-5-5" });
+    frame();
+    expect(s.canRemove(s.slides[1]), "its batch may hold the slide").toBe(false);
+    status({ busy: "polishing" });
+    frame();
+    expect(s.canRemove(s.slides[1])).toBe(false);
+    status({ busy: null, phase: "stopping" });
+    frame();
+    expect(s.canRemove(s.slides[1]), "the last snapshot takes what is left").toBe(false);
   });
 
   test("when the single input goes, the other inputs are offered, and the one chosen is sent", async () => {

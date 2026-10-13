@@ -258,6 +258,44 @@ async fn a_registered_slide_whose_file_is_gone_is_skipped_with_a_warning() {
     assert_eq!(Sidecar::load(&f.sidecar()).unwrap().unwrap().notes.slide_index, 2, "the cursor moves past the missing slide");
 }
 
+/// Removing a slide (spec §7.5): one taken out before the snapshot is not in its batch, so the model is not shown
+/// it and the notes do not name it; and once a snapshot has used a slide, the notes embed it and it stays.
+#[tokio::test]
+async fn a_removed_slide_is_left_out_of_the_next_snapshot_and_a_used_one_cannot_be_removed() {
+    use lecturelive_core::session::slides::{self, SlideMeta};
+    use std::sync::{atomic::AtomicBool, Arc};
+    let dir = tempfile::tempdir().unwrap();
+    let (f, _) = offline_folder(dir.path());
+    let store = Store::offline(Sidecar::load(&f.sidecar()).unwrap().unwrap(), f.sidecar());
+    for k in 1..=2u32 {
+        let tmp = f.slides.join(format!(".capture-{k}.png"));
+        support::slides::png(&tmp);
+        let at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 25, 10, 0, k).unwrap();
+        slides::register(&f, &store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap();
+    }
+    slides::remove(&f, &store, 1, Arc::new(AtomicBool::new(false))).await.expect("a slide no snapshot has used");
+    let sse = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    lec.snapshot(&store, "", &ev_tx).await.unwrap();
+    drop(ev_tx);
+    let mut noted = None;
+    while let Some(e) = ev.recv().await {
+        if let Event::SlidesNoted { through } = e {
+            noted = Some(through);
+        }
+    }
+    assert_eq!(noted, Some(2), "the snapshot says which slides it used");
+    let sent = &sse.state.bodies()[0];
+    assert_eq!(sent["messages"][0]["content"].as_array().unwrap().len(), 2, "the text and the one slide left");
+    assert!(user_text(sent).contains("slide_02_100002.png") && !user_text(sent).contains("slide_01_"), "{}", user_text(sent));
+    let notes = std::fs::read_to_string(&f.notes).unwrap();
+    assert!(notes.contains("![Slide 2](slides/slide_02_100002.png)") && !notes.contains("slide_01_"), "{notes}");
+    let again = slides::remove(&f, &store, 2, Arc::new(AtomicBool::new(false))).await.unwrap_err();
+    assert!(format!("{again}").contains("already in the notes"), "{again}");
+    assert!(f.slides.join("slide_02_100002.png").exists(), "the notes still show it");
+}
+
 /// Final review, Important 3: a second stop also drops the operations still queued behind the one in
 /// flight, so a person who asked for a polish and then wants out is not held for minutes.
 #[tokio::test]
