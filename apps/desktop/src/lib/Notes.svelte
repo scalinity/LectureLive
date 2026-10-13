@@ -131,10 +131,13 @@
     margin-top: 0;
   }
 
+  /* The title is the document's own, with no snapshot time in the gutter: it spans the pane, as far in from the left
+     as the pane's padding is from the right, and centres there, instead of sitting in the column the gutter pushes right. */
   .md :global(h1) {
     font-size: var(--step-2);
     line-height: 1.25;
-    margin: 0 0 0.8rem;
+    margin: 0 0 0.8rem calc(1.5rem - 4.9rem);
+    text-align: center;
   }
 
   .md :global(h2) {
