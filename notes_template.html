@@ -155,16 +155,21 @@ body {
 /* Reading column */
 main { margin-left: var(--rail-w); padding: 4.5rem clamp(1.5rem, 5vw, 5rem) 6rem; }
 .title-page { max-width: 52rem; margin-bottom: 4.5rem; }
+.keystone-wrap:empty { display: none; }
 .keystone {
-  margin: 0 0 2.75rem;
-  font-size: clamp(1.5rem, 3.6vw, 2.6rem);
-  line-height: 1.2;
+  max-width: var(--measure);
+  margin: 2.25rem 0 0;
+  padding: 0.15rem 0 0.15rem 1.25rem;
+  border-left: 4px solid var(--teal);
+  font-size: clamp(1.3rem, 2.4vw, 1.75rem);
+  line-height: 1.3;
   overflow-x: auto;
   overflow-y: hidden;
 }
+.keystone::before { content: "The one thing to remember"; display: block; margin-bottom: 0.3rem; color: var(--teal); font-size: 0.88rem; font-weight: 700; letter-spacing: 0; }
 .keystone .katex-display { margin: 0; text-align: left; }
 .keystone .katex-display > .katex { text-align: left; }
-.keystone p { margin: 0; max-width: 26ch; font-weight: 750; letter-spacing: -0.02em; }
+.keystone p { margin: 0; font-weight: 700; letter-spacing: -0.01em; }
 h1 { max-width: 18ch; margin: 0 0 1rem; font-size: clamp(2.3rem, 4.8vw, 3.5rem); font-weight: 800; line-height: 1.05; letter-spacing: -0.025em; }
 .meta { margin: 0 0 2rem; color: var(--graphite); font-size: 1rem; line-height: 1.5; }
 .summary { max-width: var(--measure); font-size: 1.25rem; line-height: 1.55; }
@@ -199,6 +204,9 @@ code { overflow-wrap: anywhere; }
 .flag { margin: 1.5rem 0; padding: 0.1rem 0 0.1rem 1.1rem; border-left: 3px solid var(--signal); }
 .flag::before { content: "Flagged in lecture"; display: block; margin-bottom: 0.15rem; color: var(--signal); font-size: 0.88rem; font-weight: 700; }
 .flag > :last-child { margin-bottom: 0; }
+.eli5 { margin: 1.4rem 0; padding: 0.1rem 0 0.1rem 1.1rem; border-left: 3px solid var(--teal); }
+.eli5::before { content: "In plain words"; display: block; margin-bottom: 0.15rem; color: var(--teal); font-size: 0.88rem; font-weight: 700; }
+.eli5 > :last-child { margin-bottom: 0; }
 .example { margin: 2.2rem 0; padding-top: 1.1rem; border-top: 2px solid var(--ink); }
 .steps { list-style: none; padding: 0; counter-reset: step; }
 .steps > li { position: relative; margin: 0.6rem 0; padding-left: 2.3rem; counter-increment: step; }
@@ -277,6 +285,30 @@ svg.drawing { display: block; width: 100%; height: auto; max-height: 26rem; over
 .drawing .dot { fill: var(--ink); stroke: none; }
 .drawing .dot.a { fill: var(--signal); }
 .drawing .dot.b { fill: var(--teal); }
+
+/* Widgets: small interactive figures, drawn on a canvas by the script the page's author wrote against the runtime below */
+.part > figure.widget { max-width: 52rem; margin: 2rem 0 2.2rem; padding: 1.1rem 1.25rem 0.9rem; border-radius: 3px; background: var(--plate); }
+.w-title { margin: 0 0 0.7rem; font-size: 1.02rem; font-weight: 720; line-height: 1.3; }
+.w-stage canvas { display: block; width: 100%; touch-action: pan-y; }
+.w-clickable canvas { cursor: crosshair; touch-action: none; }
+.w-ui { display: flex; flex-wrap: wrap; gap: 0.7rem 1.75rem; margin-top: 0.9rem; }
+.w-ctl { display: grid; grid-template-columns: 1fr auto; gap: 0.1rem 0.75rem; flex: 1 1 14rem; min-width: min(14rem, 100%); font-size: 0.92rem; }
+.w-name { color: var(--graphite); font-weight: 600; }
+.w-ctl output { font-weight: 700; font-variant-numeric: tabular-nums; }
+.w-ctl input[type="range"] { grid-column: 1 / -1; width: 100%; margin: 0.2rem 0 0; accent-color: var(--teal); }
+.w-toggle { display: flex; flex: 0 1 auto; align-items: center; gap: 0.5rem; min-width: 0; cursor: pointer; }
+.w-toggle input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--teal); }
+.w-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; font-size: 0.92rem; }
+.w-btn, .w-choice button { padding: 0.38rem 0.7rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--paper); color: var(--ink); font: 600 0.88rem/1.2 var(--text); cursor: pointer; }
+.w-btn:hover, .w-choice button:hover { border-color: var(--graphite); }
+.w-choice button[aria-pressed="true"] { border-color: var(--teal); background: var(--teal); color: var(--paper); }
+.w-out { display: flex; flex-wrap: wrap; gap: 0.25rem 1.75rem; margin-top: 0.8rem; font-variant-numeric: tabular-nums; }
+.w-out:empty { display: none; }
+.w-read { margin: 0; font-size: 0.97rem; }
+.w-read .w-name { margin-right: 0.4rem; }
+.w-read strong { font-weight: 720; }
+figure.widget figcaption { margin-top: 0.8rem; padding-top: 0.7rem; border-top: 1px solid var(--rule); }
+.w-error { margin: 0; padding: 1.5rem 0.5rem; color: var(--graphite); font-size: 0.95rem; }
 
 .part > .gallery { max-width: 60rem; }
 .gallery summary { color: var(--teal); font-weight: 650; cursor: pointer; }
@@ -361,7 +393,7 @@ dialog.sheet::backdrop { background: var(--scrim); }
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
 @media print {
-  .rail, .topbar, .flip, .reveal, .tool, dialog, .tip, .skip { display: none !important; }
+  .rail, .topbar, .flip, .reveal, .tool, dialog, .tip, .skip, .w-ui { display: none !important; }
   body { background: #fff; color: #000; font-size: 11pt; }
   main { margin: 0; padding: 0; }
   .answer[hidden] { display: block !important; }
@@ -395,10 +427,10 @@ dialog.sheet::backdrop { background: var(--scrim); }
 
 <main id="notes">
   <header class="title-page">
-    <div class="keystone-wrap">{{keystone}}</div>
     <h1>{{title}}</h1>
     <p class="meta">{{course}}<br>{{date}}</p>
     <div class="summary">{{summary}}</div>
+    <div class="keystone-wrap">{{keystone}}</div>
   </header>
 {{content}}
 </main>
@@ -502,6 +534,195 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     foot.append(btn);
   });
+
+  // Widgets: each figure.widget holds a script the page's author wrote against the small API below (`w`). Each runs
+  // alone: one that fails says so in its own place and leaves the rest of the page as it was.
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const colours = () => ({ ink: css("--ink"), muted: css("--graphite"), grid: css("--rule"), bg: css("--plate"), paper: css("--paper"), a: css("--signal"), b: css("--teal"), aSoft: css("--signal-soft"), bSoft: css("--teal-soft") });
+  const niceTicks = (a, b, n = 5) => {
+    const raw = (b - a) / n, p = 10 ** Math.floor(Math.log10(raw)), m = raw / p, step = (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p, out = [];
+    for (let t = Math.ceil(a / step - 1e-9) * step; t <= b + step * 1e-9; t += step) out.push(+t.toPrecision(12));
+    return out;
+  };
+  const seeded = (seed) => () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls || "", textContent: text || "" });
+  const redrawers = [];
+  $$("figure.widget").forEach((fig) => {
+    const script = $(":scope > script[type='text/widget']", fig);
+    const code = script ? script.textContent : "";
+    if (script) script.remove();
+    const cap = $(":scope > figcaption", fig);
+    const ratio = /^\d+(\.\d+)?\/\d+(\.\d+)?$/.test(fig.dataset.aspect || "") ? fig.dataset.aspect.split("/").reduce((a, b) => a / b) : 16 / 9;
+    const stage = el("div", "w-stage"), canvas = document.createElement("canvas"), ui = el("div", "w-ui"), out = el("div", "w-out");
+    canvas.tabIndex = 0;
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", fig.dataset.title || "Interactive figure");
+    stage.append(canvas);
+    fig.prepend(...(fig.dataset.title ? [el("p", "w-title", fig.dataset.title)] : []), stage);
+    fig.append(ui, out);
+    if (cap) fig.append(cap);
+    const ctx = canvas.getContext("2d");
+    const v = {}, readouts = [];
+    let W = 0, H = 0, dpr = 1, drawFn = null, clickFn = null, failed = false, drawing = false;
+    const fail = (e) => {
+      failed = true;
+      console.error("widget failed:", fig.dataset.title, e);
+      stage.replaceChildren(el("p", "w-error", `This interactive could not run (${e && e.message ? e.message : e}). The text around it holds the idea.`));
+      ui.remove();
+      out.remove();
+    };
+    const fit = () => {
+      W = Math.max(240, Math.round(stage.getBoundingClientRect().width));
+      H = Math.round(W / ratio);
+      dpr = window.devicePixelRatio || 1;
+      canvas.style.height = `${H}px`;
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+    };
+    const w = { v, c: colours(), W: 0, H: 0 };
+    const render = () => {
+      if (failed || !drawFn) return;
+      w.c = colours();
+      w.W = W;
+      w.H = H;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = w.c.bg;
+      ctx.fillRect(0, 0, W, H);
+      ctx.font = `13px ${css("--text")}`;
+      ctx.lineWidth = 1.6;
+      ctx.lineCap = ctx.lineJoin = "round";
+      ctx.strokeStyle = ctx.fillStyle = w.c.ink;
+      ctx.textBaseline = "alphabetic";
+      ctx.save();
+      drawing = true;
+      try {
+        drawFn(ctx, v, W, H);
+        readouts.forEach((r) => { r.out.textContent = String(r.fn(v)); });
+      } catch (e) {
+        fail(e);
+      } finally {
+        drawing = false;
+        ctx.restore();
+      }
+    };
+    w.redraw = render;
+    w.rng = seeded;
+    w.draw = (fn) => { drawFn = fn; };
+    w.click = (fn) => {
+      clickFn = fn;
+      fig.classList.add("w-clickable");
+    };
+    w.slider = (id, o = {}) => {
+      const { min = 0, max = 1, step = "any", log = false, label = id, format = (x) => String(+x.toPrecision(3)) } = o;
+      const lab = el("label", "w-ctl"), name = el("span", "w-name", label), shown = el("output"), input = document.createElement("input");
+      input.type = "range";
+      const to = (t) => (log ? min * (max / min) ** (t / 1000) : +t);
+      if (log) Object.assign(input, { min: 0, max: 1000, step: 1, value: Math.round(1000 * Math.log(Math.max(o.value ?? min, min) / min) / Math.log(max / min)) });
+      else Object.assign(input, { min, max, step, value: o.value ?? min });
+      const set = () => { v[id] = to(input.value); shown.textContent = format(v[id]); };
+      input.addEventListener("input", () => { set(); render(); });
+      set();
+      lab.append(name, shown, input);
+      ui.append(lab);
+    };
+    w.toggle = (id, o = {}) => {
+      const lab = el("label", "w-toggle"), box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = !!o.value;
+      v[id] = box.checked;
+      box.addEventListener("change", () => { v[id] = box.checked; render(); });
+      lab.append(box, el("span", "w-name", o.label || id));
+      ui.append(lab);
+    };
+    w.choice = (id, o = {}) => {
+      const opts = (o.options || []).map((x) => (typeof x === "object" ? x : { value: x, label: String(x) }));
+      const group = el("div", "w-choice");
+      group.setAttribute("role", "group");
+      if (o.label) group.append(el("span", "w-name", o.label));
+      v[id] = o.value ?? (opts[0] && opts[0].value);
+      const buttons = opts.map((x) => {
+        const b = el("button", "", x.label);
+        b.type = "button";
+        b.addEventListener("click", () => { v[id] = x.value; buttons.forEach((y) => y.setAttribute("aria-pressed", String(y === b))); render(); });
+        b.setAttribute("aria-pressed", String(x.value === v[id]));
+        return b;
+      });
+      group.append(...buttons);
+      ui.append(group);
+    };
+    w.button = (label, fn) => {
+      const b = el("button", "w-btn", label);
+      b.type = "button";
+      b.addEventListener("click", () => { try { fn(v); } catch (e) { return fail(e); } render(); });
+      ui.append(b);
+    };
+    w.readout = (label, fn) => {
+      const p = el("p", "w-read"), strong = document.createElement("strong");
+      p.append(el("span", "w-name", label), strong);
+      out.append(p);
+      readouts.push({ fn, out: strong });
+    };
+    w.frame = (o) => {
+      const pad = { l: 46, r: 16, t: 14, b: 36, ...o.pad };
+      const [x0, x1] = o.x, [y0, y1] = o.y, L = pad.l, R = W - pad.r, T = pad.t, B = H - pad.b;
+      const X = (x) => L + ((x - x0) / (x1 - x0)) * (R - L), Y = (y) => B - ((y - y0) / (y1 - y0)) * (B - T);
+      const map = { X, Y, left: L, right: R, top: T, bottom: B, ix: (px) => x0 + ((px - L) / (R - L)) * (x1 - x0), iy: (py) => y0 + ((B - py) / (B - T)) * (y1 - y0) };
+      // outside a draw (a click asking where a pixel is) it only maps; inside, it paints and clips what follows to the plot
+      if (!drawing) return map;
+      ctx.save();
+      ctx.font = `12px ${css("--text")}`;
+      ctx.lineWidth = 1;
+      ctx.fillStyle = w.c.muted;
+      ctx.strokeStyle = w.c.grid;
+      ctx.textAlign = "center";
+      niceTicks(x0, x1).forEach((t) => { ctx.beginPath(); ctx.moveTo(X(t), T); ctx.lineTo(X(t), B); ctx.stroke(); ctx.fillText(String(t), X(t), B + 16); });
+      ctx.textAlign = "right";
+      niceTicks(y0, y1).forEach((t) => { ctx.beginPath(); ctx.moveTo(L, Y(t)); ctx.lineTo(R, Y(t)); ctx.stroke(); if (Y(t) < B - 8) ctx.fillText(String(t), L - 6, Y(t) + 4); });
+      ctx.strokeStyle = w.c.muted;
+      ctx.beginPath();
+      ctx.moveTo(L, T);
+      ctx.lineTo(L, B);
+      ctx.lineTo(R, B);
+      ctx.stroke();
+      ctx.textAlign = "center";
+      if (o.xlabel) ctx.fillText(o.xlabel, (L + R) / 2, H - 4);
+      if (o.ylabel) { ctx.translate(12, (T + B) / 2); ctx.rotate(-Math.PI / 2); ctx.fillText(o.ylabel, 0, 0); }
+      ctx.restore();
+      ctx.beginPath();
+      ctx.rect(L, T, R - L, B - T);
+      ctx.clip();
+      return map;
+    };
+    let pressed = false;
+    const at = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    const pointer = (e) => { try { clickFn(...at(e), v); } catch (err) { return fail(err); } render(); };
+    canvas.addEventListener("pointerdown", (e) => { if (!clickFn) return; pressed = true; canvas.setPointerCapture(e.pointerId); pointer(e); });
+    canvas.addEventListener("pointermove", (e) => { if (pressed) pointer(e); });
+    canvas.addEventListener("pointerup", () => { pressed = false; });
+    canvas.addEventListener("pointercancel", () => { pressed = false; });
+    try {
+      fit();
+      // the author's code gets `w` and nothing that reaches the network or the page's storage
+      new Function("w", "fetch", "XMLHttpRequest", "WebSocket", "localStorage", "sessionStorage", "indexedDB", `"use strict";\n${code}`)(w);
+      if (!drawFn) throw new Error("it never set a draw function");
+    } catch (e) {
+      return fail(e);
+    }
+    render();
+    redrawers.push({ fit, render, stage, last: W });
+  });
+  if (redrawers.length) {
+    const again = () => redrawers.forEach((r) => { r.fit(); r.render(); });
+    new ResizeObserver(() => redrawers.forEach((r) => { const width = Math.round(r.stage.getBoundingClientRect().width); if (width && width !== r.last) { r.last = width; r.fit(); r.render(); } })).observe(main);
+    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", again);
+    document.fonts.ready.then(again);
+  }
 
   // All slides: the page redraws only the few that teach best; every slide stays one click away.
   const shots = Object.entries(slides).sort((a, b) => a[0] - b[0]);

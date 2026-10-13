@@ -1,4 +1,5 @@
-//! The prompts, carried over unchanged from `live_notes.py` (spec §6.1, §6.4) and pinned to its source by the tests.
+//! The prompts. The notes and polish prompts are carried over unchanged from `live_notes.py` (spec §6.1) and pinned to
+//! its source by the tests; the study page's own prompts (spec §6.4) are this project's design and are not.
 use chrono::NaiveDate;
 
 use crate::pyjson::round_int;
@@ -34,40 +35,90 @@ pub fn page_system(course: &str, budget: u32, max_slides: u32) -> String {
     let b = budget as f64;
     let (topics, glossary, questions) = (round_int(b * 0.65), round_int(b * 0.15), round_int(b * 0.2));
     format!(
-        r##"You make the high-yield study page for a lecture in the course "{course}". You receive the lecture's complete notes and its slide screenshots. The notes are long; the page must not be. Its reader is a student revising for a quiz or exam who wants everything that will matter and nothing that will not. Condensing is the whole job: a short page that keeps what matters beats a complete one.
+        r##"You build the study page for a lecture in the course "{course}". You receive the lecture's complete notes and, when the lecture had slides, their screenshots. The reader is a student who learns by seeing and doing: they open this page after class, drag things, watch what changes, and read the words only to confirm what they just saw. A page that is mostly paragraphs and bullets has failed, however accurate. The notes stay the complete record; this page is where the ideas become obvious.
 
-Budget: at most {budget} words of visible text in total, counting the summary, every section, the glossary, the takeaways and the questions with their answers; math counts as words. Spend about {topics} on the topic sections, {glossary} on the glossary and takeaways, and {questions} on the questions. This is a ceiling, not a target.
+How each topic is taught, in this order:
+1. A visual that carries the idea. Almost always an interactive widget: the student changes a parameter, a threshold, a sample or a choice and watches the result move. Where a widget cannot show it, a drawn figure.
+2. The technical explanation, short: what it is, the formula or rule, when it applies and when it does not. Do not describe in words what the visual already shows.
+3. "In plain words", straight after each technical explanation: the same idea for someone who has never taken the course. One everyday comparison, no symbols, no jargon, two to four sentences. It is about this idea, not a generic one, and may point at the visual ("drag the slider and watch the red area grow").
 
-Choose before you write. What earns space, in order:
-1. What the lecturer flagged as examinable or stressed, and what a quiz is likely to test.
-2. The formulas and decision rules needed to solve problems: what each method is for, when to use it rather than its alternatives, and its assumptions.
-3. At most one worked example per method, cut to the steps that carry the method, with the lecture's own numbers.
-4. Terms introduced in this lecture.
-Cut: reviews of earlier weeks beyond a line, digressions, logistics, repetition, the lecturer's asides and hedges, step-by-step software walkthroughs (keep only which function does what), and anything you would not put on a one-page exam sheet. Merge overlapping topics. Prefer a table, a situation-to-method map or a short list over prose; one idea per bullet; no sentence that restates another.
+Every topic section has at least one widget or figure. The page has at least four widgets whenever the lecture has ideas that change with a parameter, a threshold, a sample size or a choice, which is nearly always. A topic that cannot be shown is merged into one that can, or cut.
 
-Slides: redraw at most {max_slides}, choosing those whose figure, table, diagram or formula block teaches faster than words, and redraw only the part that matters, not the slide's text. Text-only and title slides are never redrawn; their substance, if it earns space, goes in the text. Copy numbers and symbols exactly.
+What earns a section, in order: what the lecturer flagged or stressed, and what a quiz is likely to test; the methods, formulas and decision rules needed to solve problems, and when each applies rather than its alternatives; the lecture's own worked example, as a widget when its numbers can move; terms introduced in this lecture. Cut reviews of earlier weeks, logistics, repetition, asides and software walkthroughs.
 
-Output exactly this, in order, and nothing else: no code fences, no <script> or <style>, no style or event attributes.
-<div class="keystone">…</div>: the single formula (\[ … \]) or idea (<p>) to remember if nothing else.
-<p class="lede">…</p>: two or three sentences on what the lecture covered and what it lets you do.
-4 to 7 <section class="part"> blocks, one per topic, each opening with an <h2>.
+Budget: at most {budget} words of visible text in total, counting the lede, every section, the plain-words blocks, the glossary, the takeaways and the questions with their answers; math counts as words, widget code and drawings do not. Spend about {topics} on the topic sections, {glossary} on the glossary and takeaways, and {questions} on the questions. This is a ceiling, not a target: a visual replaces words.
+
+Slides: redraw at most {max_slides}, choosing those whose figure, table, diagram or formula block teaches faster than words. A redraw whose numbers can move is better as a widget. Text-only and title slides are never redrawn. Copy numbers and symbols exactly.
+
+Output exactly this, in order, and nothing else: no code fences, no <style>, no style or event attributes, and no <script> except the one inside a widget.
+<div class="keystone">…</div>: the one thing to remember if nothing else: a single formula (\[ … \]), or one <p> of at most 20 words.
+<p class="lede">…</p>: two sentences on what the lecture covered and what it lets you do.
+5 to 8 <section class="part"> blocks, one per topic, each opening with an <h2> that states the claim ("Lower cut-offs catch more disease and raise more false alarms"), not the subject.
 <section class="part"><h2>Glossary</h2><dl class="glossary">…</dl></section>: at most 12 terms, one line each.
 <section class="part"><h2>Key takeaways</h2><ul class="takeaways">…</ul></section>: at most 5.
-<ol class="quiz">…</ol>: 4 or 5 questions, each <p class="q">…</p><div class="answer">…</div>, answers brief with the key working.
+<ol class="quiz">…</ol>: 4 or 5 questions, each <p class="q">…</p><div class="answer">…</div>, specific and answerable, each answer leading with the result.
 
-Markup inside sections: <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, and <table> with <thead> and <tbody>. Math is TeX, \( … \) inline and \[ … \] displayed, never Unicode symbols or entities and never inside <code>. R code goes in <pre><code>, function names in <code>.
+Widgets. One per interactive figure, inside a section:
+<figure class="widget" data-title="what the student can move, in a few words" data-aspect="16/9"><figcaption>Try: one sentence saying what to do and what to notice.</figcaption><script type="text/widget">…JavaScript…</script></figure>
+data-aspect is the canvas's width/height (default 16/9; 2/1 or 3/1 for wide, thin plots).
+The script is the body of a function that receives `w` and nothing else: no network, no page access, no libraries. It runs once, declares its controls, and sets one draw function.
+w.slider(id, {{label, min, max, value, step, log, format}}) adds a slider; w.v[id] is its number. log:true spaces it logarithmically (min above 0). format(x) returns the text shown beside it.
+w.toggle(id, {{label, value}}) adds a checkbox; w.v[id] is a boolean.
+w.choice(id, {{label, options: ["a", "b"] or [{{value, label}}], value}}) adds a row of buttons; w.v[id] is the chosen value.
+w.button(label, fn) adds a button that runs fn(v) and then redraws; keep any state in your own variables.
+w.readout(label, fn) shows a live number or phrase under the figure: fn(v) returns it, recomputed on every redraw. Put the quantity the lecture cares about here.
+w.draw(fn) is required. fn(ctx, v, W, H) paints the whole figure on every control change, resize and theme change. ctx is a 2D canvas context; W and H are in CSS pixels. Nothing persists between calls, so recompute everything from v and your own variables.
+w.click(fn) is optional: fn(x, y, v) runs when the student presses or drags on the canvas, in CSS pixels. Store what you need in your own variable and read it in draw.
+w.frame({{x: [lo, hi], y: [lo, hi], xlabel, ylabel}}) paints axes and a light grid when called inside draw, and returns {{X, Y, ix, iy, left, right, top, bottom}}: X(x) and Y(y) map data to pixels, ix(px) and iy(py) map back. What you draw after it is clipped to the plot area. Called outside draw (in a click handler, to turn a pixel into data) it paints nothing and only maps.
+w.rng(seed) returns a seeded random function (0 to 1). Use it for any random data, with a fixed seed, so the figure is the same on every visit.
+w.c holds colours that follow light and dark: ink, muted, grid, bg, a (red), b (teal), aSoft, bSoft. Use a and b for two groups or two models, the same way throughout the page. Never write a colour yourself.
+
+A widget that works:
+- It means something before anyone touches it: the starting values are the lecture's own example, and the first frame already shows the idea.
+- One idea, labels written next to the shapes they name (no legend to decode), at most three controls, and a readout with the numbers that change.
+- Use the lecture's own numbers and examples. Where it gave none, invent small illustrative data and say "Illustrative data" in the caption; never present invented data as a result.
+- The mathematics matches the notes: when a widget shows a formula's result, compute it with that formula.
+- Plain JavaScript and Math. Each draw takes under 20 ms (at most a few thousand points or grid cells). No eval, no timers, no DOM access, no external code. Text on the canvas is 12 to 14 px and stays inside it at 320 px wide.
+
+A complete widget:
+<figure class="widget" data-title="Move the cut-off and trade sensitivity for specificity" data-aspect="2/1"><figcaption>Try: slide the cut-off right. Fewer healthy people are flagged, and more sick people are missed. Illustrative data.</figcaption><script type="text/widget">
+const gauss = (x, m) => Math.exp(-0.5 * (x - m) ** 2) / 2.5066;
+const cdf = (z) => {{ const t = 1 / (1 + 0.2316419 * Math.abs(z)), d = 0.3989423 * Math.exp(-z * z / 2), p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274)))); return z > 0 ? 1 - p : p; }};
+w.slider("cut", {{ label: "Cut-off", min: -1, max: 6, value: 2.5, step: 0.05 }});
+w.readout("Sensitivity", (v) => (1 - cdf(v.cut - 4)).toFixed(2));
+w.readout("Specificity", (v) => cdf(v.cut - 1).toFixed(2));
+w.draw((ctx, v, W, H) => {{
+  const f = w.frame({{ x: [-2, 7], y: [0, 0.5], xlabel: "test value" }});
+  ctx.lineWidth = 2;
+  [[1, w.c.b, "healthy"], [4, w.c.a, "disease"]].forEach(([m, col, name]) => {{
+    ctx.strokeStyle = ctx.fillStyle = col;
+    ctx.beginPath();
+    for (let x = -2; x <= 7.001; x += 0.05) {{ const px = f.X(x), py = f.Y(gauss(x, m)); x === -2 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); }}
+    ctx.stroke();
+    ctx.fillText(name, f.X(m) - 20, f.Y(0.44));
+  }});
+  ctx.strokeStyle = w.c.ink;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(f.X(v.cut), f.top); ctx.lineTo(f.X(v.cut), f.bottom); ctx.stroke();
+}});
+</script></figure>
+
+Static markup inside sections: <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, and <table> with <thead> and <tbody>. Prose is for the technical explanation and stays short; bullets only for parallel items, a table only when items are compared along the same dimensions. Math is TeX, \( … \) inline and \[ … \] displayed, never Unicode symbols or entities and never inside <code>. R code goes in <pre><code>, function names in <code>.
+- The plain-words block: <aside class="eli5"><p>…</p></aside>
 - A formula to memorise: <div class="formula" data-name="short plain-text name">\[ … \]</div>
 - A point flagged as examinable, at most 4 on the page: <aside class="flag">…</aside>
-- A worked example: <div class="example"><h4>its title</h4><p>the setup</p><ol class="steps"><li>one step each, the last stating the result</li></ol></div>
+- A worked example that does not need a widget: <div class="example"><h4>its title</h4><p>the setup</p><ol class="steps"><li>one step each, the last stating the result</li></ol></div>
 - Situations mapped to methods: <dl class="map"><dt>situation</dt><dd>method</dd></dl>
-- A slide redraw: <figure class="redraw" data-slide="N">…<figcaption>one sentence</figcaption></figure> holding display math, a <table> (cells of a highlighted group class="a", a second group class="b"), or one inline <svg viewBox="0 0 640 H"> without width or height attributes.
-SVG: no fill, stroke, color, style or font-family attributes; draw only with these classes. Lines and text are ink by default; "muted" for axes, grid lines and secondary labels; "a" and "b" for two series or groups; "area-a" and "area-b" for shaded regions such as rejection regions; "dot" for filled points; "thick" and "dash" for emphasis and reference lines. Text is <text> with a font-size from 13 to 18, kept inside the viewBox."##
+- A slide redraw: <figure class="redraw" data-slide="N">…<figcaption>one sentence</figcaption></figure>; a diagram of your own is the same without data-slide. Either holds display math, a <table> (cells of a highlighted group class="a", a second group class="b"), or one inline <svg viewBox="0 0 640 H"> without width or height attributes.
+SVG: no fill, stroke, color, style or font-family attributes; draw only with these classes. Lines and text are ink by default; "muted" for axes, grid lines and secondary labels; "a" and "b" for two series or groups; "area-a" and "area-b" for shaded regions such as rejection regions; "dot" for filled points; "thick" and "dash" for emphasis and reference lines. Text is <text> with a font-size from 13 to 18, kept inside the viewBox.
+
+Write the words as part of the design. Sentence case; plain verbs and the active voice; each element does one job; no section opens by restating its heading; ground every sentence in this lecture's own terms, numbers and examples, not generic study-guide filler."##
     )
 }
 
 pub fn revise_system(budget: u32) -> String {
     format!(
-        r##"You shorten a study page that is over its length budget. Rewrite it to at most {budget} words of visible text, math counting as words, by cutting the lowest-yield material first: second examples, secondary detail, lesser glossary terms, extra questions, restatements. Keep its order, its markup and components exactly as they are used, every formula a problem needs, and every figure you keep unchanged. Output the complete page in the same format and nothing else."##
+        r##"You shorten a study page that is over its length budget. Rewrite it to at most {budget} words of visible text, math counting as words and widget code and drawings not counting, by cutting the lowest-yield prose first: second examples, secondary detail, lesser glossary terms, extra questions, restatements. Keep its order, its markup and components exactly as they are used, every formula a problem needs, a plain-words block for every technical explanation that stays, and every widget and figure unchanged, widget scripts included, character for character. Output the complete page in the same format and nothing else."##
     )
 }
 
@@ -172,22 +223,32 @@ mod tests {
     }
 
     #[test]
-    fn system_prompts_are_live_notes_py_literals() {
+    fn the_notes_and_polish_prompts_are_live_notes_py_literals() {
         let src = excerpt();
         for course in ["Machine Learning", "Statistik für KI — Grundlagen"] {
             assert_eq!(notes_system(course), python_fstring(&src, "notes_system", &[("course", course)]));
             assert_eq!(polish_system(course), python_fstring(&src, "polish_system", &[("course", course)]));
-            for budget in [600u32, 650, 1_150, 2_500] {
-                for max_slides in [2u32, 5, 8] {
-                    let (b, m) = (budget.to_string(), max_slides.to_string());
-                    let expected = python_fstring(&src, "page_system", &[("course", course), ("budget", &b), ("max_slides", &m)]);
-                    assert_eq!(page_system(course, budget, max_slides), expected, "{budget} {max_slides}");
-                }
-            }
         }
-        for budget in [600u32, 2_500] {
-            assert_eq!(revise_system(budget), python_fstring(&src, "revise_system", &[("budget", &budget.to_string())]));
+    }
+
+    /// The study page's prompt is its own design (visual first, interactive, plain words after each technical
+    /// explanation), no longer the Python CLI's condensing brief: its parts are all there, every placeholder is filled,
+    /// and its worked widget is one the sanitiser keeps whole.
+    #[test]
+    fn the_page_prompt_asks_for_widgets_and_plain_words_and_its_example_survives_the_sanitiser() {
+        let p = page_system("Machine Learning", 1_000, 5);
+        assert!(p.contains("\"Machine Learning\"") && p.contains("at most 1000 words") && p.contains("redraw at most 5"), "course, budget and slides are filled in");
+        assert!(p.contains("about 650 on the topic sections, 150 on the glossary and takeaways, and 200 on the questions"), "the budget's split is filled in");
+        assert!(!p.contains("{budget}") && !p.contains("{topics}") && !p.contains("{{") && !p.contains("}}"), "every placeholder and escape was resolved");
+        for part in ["class=\"eli5\"", "class=\"widget\"", "text/widget", "w.slider(", "w.toggle(", "w.choice(", "w.button(", "w.readout(", "w.draw(", "w.click(", "w.frame(", "w.rng(", "w.c ", "class=\"keystone\"", "at least four widgets"] {
+            assert!(p.contains(part), "the prompt lost {part:?}");
         }
+        let start = p.find("<figure class=\"widget\" data-title=\"Move the cut-off").expect("the worked example");
+        let end = start + p[start..].find("</figure>").unwrap() + "</figure>".len();
+        let example = &p[start..end];
+        assert_eq!(crate::notes::page::strip_unsafe(example), example, "scripts, and the code in them, are kept");
+        let revise = revise_system(900);
+        assert!(revise.contains("at most 900 words") && revise.contains("widget scripts included"), "{revise}");
     }
 
     /// Hand goldens from live_notes.py's make_notes, polish_notes, typeset_page and the title line.

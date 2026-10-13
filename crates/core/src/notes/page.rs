@@ -23,14 +23,6 @@ use crate::session::spend::SpendKind;
 
 /// The study page's design, embedded unchanged at build time (spec §3.1, §6.4).
 pub const TEMPLATE: &str = include_str!("../../../../notes_template.html");
-/// The frontend-design discipline, put to the page's author after `page_system`. The template fixes the
-/// typography, colour and layout, so what is left to design is the hierarchy, structure, figures and wording.
-const DESIGN: &str = r##"Design discipline. The page's template fixes its typography, colour and layout, so your design is the hierarchy, structure and wording inside it. None of this overrides the output rules above.
-- Plan before writing: decide the keystone, the four to seven topics that earn a section, and the slides that earn a redraw. Then write; do not narrate the plan.
-- Structure is information. A table appears only when items are compared along the same dimensions, a list only when its items are parallel, <ol class="steps"> only for a real sequence, a formula or flag only for what the student must remember. Never use a component as decoration or to fill space.
-- Ground every element in this lecture's own terms, numbers and examples, not generic study-guide filler. No section opens by restating its heading, and no label stands above content that already says what it is.
-- A redraw shows one idea. Label shapes directly instead of adding a legend, give "a" and "b" a meaning only where two groups are being contrasted, keep spacing and proportions even, and leave out anything decorative. A figure is finished when nothing in it can be removed.
-- Words are part of the design. Headings are sentence case and name the content ("When ridge beats lasso", not "Overview"); use the active voice and plain verbs; each element does one job. Quiz questions are specific and answerable, and each answer leads with the result."##;
 const TIMEOUT: Duration = Duration::from_secs(1_200);
 const EMBED_JPEG_QUALITY: u32 = 80;
 
@@ -39,7 +31,9 @@ fn re(p: &str) -> Regex {
 }
 
 static SLIDE_EMBED: LazyLock<Regex> = LazyLock::new(|| re(r"!\[Slide (\d+)\]\(([^)]+)\)"));
-static TAGS: LazyLock<Regex> = LazyLock::new(|| re(r"(?is)<svg\b.*?</svg>|<[^>]+>"));
+static TAGS: LazyLock<Regex> = LazyLock::new(|| re(r"(?is)<svg\b.*?</svg>|<script\b.*?</script\s*>|<[^>]+>"));
+/// A widget's script: the one kind of script the page keeps (spec §6.4).
+static WIDGET_SCRIPT: LazyLock<Regex> = LazyLock::new(|| re(r#"(?is)<script\s+type="text/widget"\s*>.*?</script\s*>"#));
 static UNSAFE: LazyLock<Regex> = LazyLock::new(|| re(r#"(?is)<script\b.*?</script\s*>|<style\b.*?</style\s*>|\s(?:on\w+|style)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)"#));
 static KEYSTONE: LazyLock<Regex> = LazyLock::new(|| re(r#"(?s)<div class="keystone">.*?</div>"#));
 static LEDE: LazyLock<Regex> = LazyLock::new(|| re(r#"(?s)<p class="lede">.*?</p>"#));
@@ -55,14 +49,15 @@ pub fn notes_words(doc: &str) -> usize {
     SLIDE_EMBED.replace_all(doc, "").split_whitespace().count()
 }
 
-/// Visible words the page may use: 30% of the notes, in fifties, from 600 to 2,500.
+/// Visible words the page may use: 40% of the notes, in fifties, from 800 to 3,000. Every technical explanation is
+/// followed by its plain-words twin, so the page has room for both; widget code and drawings are not words.
 pub fn page_budget(doc: &str) -> u32 {
-    (round_int(notes_words(doc) as f64 * 0.3 / 50.0) * 50).clamp(600, 2_500) as u32
+    (round_int(notes_words(doc) as f64 * 0.4 / 50.0) * 50).clamp(800, 3_000) as u32
 }
 
-/// Slides the page may redraw: 30% of them, from 2 to 8.
+/// Slides the page may redraw: 40% of them, from 3 to 10.
 pub fn max_slides(slides: usize) -> u32 {
-    round_int(slides as f64 * 0.3).clamp(2, 8) as u32
+    round_int(slides as f64 * 0.4).clamp(3, 10) as u32
 }
 
 /// The HTML entities a page uses, as Python's `html.unescape` reads them; others stay as written.
@@ -105,9 +100,20 @@ pub fn visible_words(html: &str) -> usize {
     unescape(&TAGS.replace_all(html, " ")).split_whitespace().count()
 }
 
-/// The template owns all styling and behaviour: generated fragments may not bring their own.
+/// The template owns all styling and behaviour: generated fragments may not bring their own. The one exception is a
+/// widget's script (`<script type="text/widget">`), which the template's runtime runs alone, in its own place, against
+/// a fixed API; it is lifted out while the rest is stripped, so neither the script nor the code in it is touched.
 pub fn strip_unsafe(html: &str) -> String {
-    UNSAFE.replace_all(html, "").into_owned()
+    let mut kept = Vec::new();
+    let lifted = WIDGET_SCRIPT.replace_all(html, |c: &Captures| {
+        kept.push(c[0].to_string());
+        format!("\u{0}widget{}\u{0}", kept.len() - 1)
+    });
+    let mut clean = UNSAFE.replace_all(&lifted, "").into_owned();
+    for (n, script) in kept.iter().enumerate() {
+        clean = clean.replace(&format!("\u{0}widget{n}\u{0}"), script);
+    }
+    clean
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,7 +138,7 @@ impl Fills {
         if !self.content.contains("<section class=\"part\">") {
             out.push("sections");
         }
-        for (class, name) in [("glossary", "glossary"), ("takeaways", "takeaways"), ("quiz", "questions")] {
+        for (class, name) in [("widget", "interactive figures"), ("eli5", "plain-words explanations"), ("glossary", "glossary"), ("takeaways", "takeaways"), ("quiz", "questions")] {
             if !self.content.contains(&format!("class=\"{class}\"")) {
                 out.push(name);
             }
@@ -301,7 +307,7 @@ pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Pa
     let doc = std::fs::read_to_string(notes).with_context(|| format!("read {}", notes.display()))?;
     let budget = page_budget(&doc);
     let embeds: Vec<(String, String)> = SLIDE_EMBED.captures_iter(&doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
-    let system = format!("{}\n\n{DESIGN}", page_system(course, budget, max_slides(embeds.len())));
+    let system = page_system(course, budget, max_slides(embeds.len()));
     let key = sha256_hex(format!("{system}{doc}").as_bytes());
     let (fills, words, cached) = match load_cache(cache, &key) {
         Some((fills, words)) => (fills, words, true),
@@ -336,20 +342,23 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_is_thirty_percent_of_the_notes_in_fifties_between_600_and_2500() {
-        assert_eq!(page_budget(""), 600);
-        assert_eq!(page_budget(&words(2_500)), 750);
-        assert_eq!(page_budget(&words(2_584)), 800, "15.504 rounds up");
-        assert_eq!(page_budget(&words(2_750)), 800, "16.5 rounds to even, as Python rounds");
-        assert_eq!(page_budget(&words(10_000)), 2_500);
-        assert_eq!(page_budget(&format!("{} ![Slide 1](slides/a.png)", words(2_500))), 750, "embeds are not words");
-        assert_eq!([max_slides(0), max_slides(5), max_slides(10), max_slides(15), max_slides(40)], [2, 2, 3, 4, 8]);
+    fn the_budget_is_forty_percent_of_the_notes_in_fifties_between_800_and_3000() {
+        assert_eq!(page_budget(""), 800);
+        assert_eq!(page_budget(&words(2_000)), 800);
+        assert_eq!(page_budget(&words(2_500)), 1_000);
+        assert_eq!(page_budget(&words(2_575)), 1_050, "20.6 rounds up");
+        assert_eq!(page_budget(&words(7_119)), 2_850);
+        assert_eq!(page_budget(&words(10_000)), 3_000);
+        assert_eq!(page_budget(&format!("{} ![Slide 1](slides/a.png)", words(2_500))), 1_000, "embeds are not words");
+        assert_eq!([max_slides(0), max_slides(5), max_slides(10), max_slides(15), max_slides(40)], [3, 3, 4, 6, 10]);
     }
 
     #[test]
     fn visible_words_skip_markup_and_drawings_and_split_on_non_breaking_spaces() {
         let html = "<p>one &amp; two</p><svg viewBox=\"0 0 1 1\"><text>not counted</text></svg><p>three&nbsp;four</p>";
         assert_eq!(visible_words(html), 5);
+        let widget = "<p>one two</p><figure class=\"widget\"><script type=\"text/widget\">const words = 'many many many'; w.draw(() => {});</script><figcaption>three</figcaption></figure>";
+        assert_eq!(visible_words(widget), 3, "a widget's code is not words");
         assert_eq!(unescape("&lt;a&gt; &#39;b&#x27; &quot;c&quot; &amp;amp;"), "<a> 'b' \"c\" &amp;");
         assert_eq!(escape("A & B <x> \"q\" Rock'n'Roll"), "A &amp; B &lt;x&gt; &quot;q&quot; Rock&#x27;n&#x27;Roll");
     }
@@ -358,6 +367,17 @@ mod tests {
     fn scripts_styles_and_event_or_style_attributes_are_stripped() {
         let html = "<p onclick=\"x()\" style='color:red' class=\"a\">a</p><script>alert(1)</script><STYLE>p{}</style><svg onload=go>b</svg>";
         assert_eq!(strip_unsafe(html), "<p class=\"a\">a</p><svg>b</svg>");
+    }
+
+    /// A widget's script is the one script kept, with the code in it untouched: `style` and `on…` inside code are not
+    /// attributes, and a script of any other type goes as before.
+    #[test]
+    fn a_widgets_script_is_kept_whole_and_every_other_script_is_stripped() {
+        let widget = "<figure class=\"widget\" data-title=\"t\"><figcaption>Try</figcaption><script type=\"text/widget\">\nw.draw((ctx) => { ctx.canvas.style = 'x'; const onload = 1; });\n</script></figure>";
+        assert_eq!(strip_unsafe(widget), widget);
+        let mixed = format!("<script>alert(1)</script>{widget}<p onclick=\"x()\">a</p><script type=\"module\">evil()</script>{widget}");
+        assert_eq!(strip_unsafe(&mixed), format!("{widget}<p>a</p>{widget}"), "two widgets keep their own code, in place");
+        assert_eq!(strip_unsafe("<SCRIPT TYPE=\"text/widget\">w.draw(()=>{})</SCRIPT>"), "<SCRIPT TYPE=\"text/widget\">w.draw(()=>{})</SCRIPT>", "whatever the case");
     }
 
     #[test]
@@ -371,7 +391,9 @@ mod tests {
             "<section class=\"part\">\n<h2>A</h2><p>a</p>\n</section>\n<section class=\"part\">\n<h2>B</h2><p>b</p>\n</section>\n<section class=\"part\">\n<h2>Glossary</h2><dl class=\"glossary\"><dt>t</dt><dd>d</dd></dl>\n</section>\n<section class=\"part check\">\n<h2>Check yourself</h2>\n<ol class=\"quiz\"><li><p class=\"q\">Q?</p><div class=\"answer\">A.</div></li></ol>\n</section>"
         );
         assert_eq!(f.slides, "{\"3\": \"slides/x<\\/y.png\", \"7\": \"slides/b.png\"}", "the CLI's JSON, safe inside a script element");
-        assert_eq!(f.missing(), vec!["takeaways"]);
+        assert_eq!(f.missing(), vec!["interactive figures", "plain-words explanations", "takeaways"]);
+        let full = Fills { content: format!("{}<figure class=\"widget\"></figure><aside class=\"eli5\"></aside>", f.content), ..f };
+        assert_eq!(full.missing(), vec!["takeaways"], "a page with a widget and a plain-words block lacks neither");
     }
 
     #[test]

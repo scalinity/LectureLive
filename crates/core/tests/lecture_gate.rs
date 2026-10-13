@@ -314,7 +314,7 @@ async fn two_requests_for_the_same_page_cost_one_typeset() {
     lec.snapshot(&store, "", &tx).await.unwrap();
     let (a, b) = tokio::join!(lec.page(&tx), lec.page(&tx));
     let (a, b) = (a.unwrap(), b.unwrap());
-    let typesets = sse.state.bodies().iter().filter(|b| b["system"].as_str().unwrap_or_default().starts_with("You make the high-yield study page")).count();
+    let typesets = sse.state.bodies().iter().filter(|b| b["system"].as_str().unwrap_or_default().starts_with("You build the study page")).count();
     assert_eq!(typesets, 1, "the second request waited for the first instead of paying for another");
     assert_eq!([a.cached, b.cached].iter().filter(|c| **c).count(), 1, "one typeset and one reuse of it");
 }
@@ -346,7 +346,7 @@ async fn the_page_a_polish_started_is_cancelled_with_it_and_the_next_typeset_is_
     folder::open(&f, TITLE, false).unwrap();
     let stall = Arc::new(AtomicBool::new(true));
     let held = stall.clone();
-    let sse = fake_sse::start(move |b| if held.load(SeqCst) && b["system"].as_str().unwrap_or_default().starts_with("You make the high-yield study page") { Reply::Stall } else { respond(b) }).await;
+    let sse = fake_sse::start(move |b| if held.load(SeqCst) && b["system"].as_str().unwrap_or_default().starts_with("You build the study page") { Reply::Stall } else { respond(b) }).await;
     let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
     let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), ..Default::default() };
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
