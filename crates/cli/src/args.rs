@@ -37,7 +37,7 @@ pub(crate) enum Cmd {
         /// Delete closed recordings older than this many days that have no unresolved gap
         #[arg(long)]
         keep_days: Option<u32>,
-        /// Stream to Grok speech-to-text and write the transcript (GROK_API_KEY from the repository's .env or the environment)
+        /// Stream to Grok speech-to-text and write the transcript (GROK_API_KEY from the repository's .env or the environment; the notes use ANTHROPIC_API_KEY the same way)
         #[arg(long)]
         stt: bool,
         /// A term to bias recognition toward (repeatable; up to 100, each at most 50 characters)
@@ -45,8 +45,9 @@ pub(crate) enum Cmd {
         keyterms: Vec<String>,
     },
     /// A lecture with live notes, as live_notes.py does it: Enter takes a snapshot, a hint then Enter
-    /// adds a focus hint, polish then Enter polishes and typesets the page, pause then Enter stops
-    /// recording and transcribing until resume then Enter. On a terminal it opens
+    /// adds a focus hint, polish then Enter polishes and typesets the page, which then opens, pause
+    /// then Enter stops recording and transcribing until resume then Enter, remove 3 then Enter takes
+    /// slide 3 out of the lecture while no snapshot has used it. On a terminal it opens
     /// full-screen with its transcript, notes and slides; --plain keeps the line-by-line output
     /// instead. Ctrl-C stops, and Ctrl-C again stops waiting for recovery
     Lecture(LectureArgs),

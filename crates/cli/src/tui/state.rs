@@ -11,6 +11,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Instant;
 
 use chrono::{DateTime, Local};
 use lecturelive_core::audio::level::{dbfs, SilenceWatch};
@@ -167,7 +168,21 @@ pub(crate) struct Work {
     polishing: bool,
     last: bool,
     page: bool,
+    /// Words of the step now running have started to stream: before that the model is reading and thinking.
+    writing: bool,
+    /// What the model says about its thinking in the step now running, as it streams (never part of the notes).
+    thinking: String,
+    /// When the step now running began, as the reactor saw it; set by the reactor, which knows the time.
+    pub(crate) since: Option<Instant>,
 }
+
+/// How much of the model's thinking summary is kept.
+const THINKING_KEEP: usize = 4_000;
+
+/// What core says a cancelled study page was (`Event::Cancelled`): the page lane's own terminal event.
+pub(crate) const CANCELLED_PAGE: &str = "the study page";
+/// The longest line of the model's thinking shown.
+const THINKING_LINE: usize = 200;
 
 impl Work {
     /// An op the frontend has sent: queued behind whatever is in flight, with no limit.
@@ -176,8 +191,8 @@ impl Work {
     }
 
     /// Ctrl-X: core drops what is queued and stops what runs; nothing of this TUI's is pending any
-    /// more. Whether there was anything to cancel. The page and the last snapshot are not own
-    /// requests and are untouched.
+    /// more. Whether there was anything to cancel. The last snapshot is not an own request and is untouched; the
+    /// page typesetting stops when core says so (`Cancelled`), not before.
     pub(crate) fn cancel(&mut self) -> bool {
         let had = !self.fifo.is_empty();
         self.fifo.clear();
@@ -192,6 +207,38 @@ impl Work {
 
     pub(crate) fn mine(&self) -> bool {
         !self.fifo.is_empty()
+    }
+
+    /// Words of the step now running have started to stream.
+    pub(crate) fn writing(&self) -> bool {
+        self.writing
+    }
+
+    /// The step now running has no words to show yet: a snapshot before its first, or a polish's rewrite, which streams
+    /// none. What the model says about its thinking fills the place until they come.
+    pub(crate) fn waiting(&self) -> bool {
+        match self.lane() {
+            Lane::Snapshot | Lane::PolishSnapshotFirst | Lane::LastSnapshot => !self.writing,
+            Lane::Polishing => true,
+            Lane::Idle => false,
+        }
+    }
+
+    /// The model's latest paragraph about its thinking, without markup, cut to its tail; empty before it has said any.
+    pub(crate) fn thinking_line(&self) -> String {
+        let clean: String = self.thinking.chars().filter(|c| !matches!(c, '*' | '_' | '`' | '#')).collect();
+        let last = clean.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
+        let chars: Vec<char> = last.chars().collect();
+        if chars.len() <= THINKING_LINE {
+            return last.to_string();
+        }
+        let tail: String = chars[chars.len() - THINKING_LINE..].iter().collect();
+        format!("…{}", tail.split_once(' ').map_or(tail.as_str(), |(_, rest)| rest))
+    }
+
+    /// The page is being typeset.
+    pub(crate) fn typesetting(&self) -> bool {
+        self.page
     }
 
     pub(crate) fn lane(&self) -> Lane {
@@ -224,7 +271,32 @@ impl Work {
     /// last snapshot's.
     fn event(&mut self, e: &Event, stopping: bool) {
         let head = self.fifo.front().copied();
+        // What the model says about its thinking, and whether words have begun, belong to the step now running.
+        match e {
+            Event::Thinking(d) => {
+                self.thinking.push_str(d);
+                if self.thinking.len() > THINKING_KEEP {
+                    let cut = self.thinking.len() - THINKING_KEEP;
+                    let at = (cut..self.thinking.len()).find(|&i| self.thinking.is_char_boundary(i)).unwrap_or(cut);
+                    self.thinking.drain(..at);
+                }
+            }
+            Event::Preview(_) => self.writing = true,
+            // A new step: a polish's snapshot, then its rewrite, each begins with its own busy text.
+            Event::Busy(_) => {
+                self.thinking.clear();
+                self.writing = false;
+            }
+            Event::Committed { .. } | Event::NothingNew | Event::SnapshotFailed(_) | Event::Cancelled(_) | Event::Polished { .. } | Event::PolishStopped(_) | Event::PolishFailed(_) => {
+                self.thinking.clear();
+                self.writing = false;
+                self.since = None;
+            }
+            _ => {}
+        }
         match (e, head) {
+            // Not the head's: the study page has no place in the queue, and its cancel must not pop an own request.
+            (Event::Cancelled(what), _) if what == CANCELLED_PAGE => self.page = false,
             (Event::Preview(_), None) if stopping => self.last = true,
             (Event::Committed { .. } | Event::NothingNew, Some(OwnOp::Snapshot)) | (Event::SnapshotFailed(_), Some(OwnOp::Snapshot)) => self.pop(),
             // the polish's own snapshot is done; the polish itself goes on
@@ -368,6 +440,10 @@ pub(crate) struct View {
     pub(crate) open: Option<OpenUtterance>,
     pub(crate) notes: Notes,
     pub(crate) slides: Vec<SlideLine>,
+    /// The slides up to this index are in the notes: a snapshot used them, and they can no longer be removed.
+    pub(crate) slides_noted: u32,
+    /// Slides the person removed: a stale read of the sidecar must not bring one back.
+    removed: BTreeSet<u32>,
     /// The work lanes the notes heading shows: this TUI's own requests, the last snapshot, the page.
     pub(crate) work: Work,
 
@@ -422,6 +498,8 @@ impl View {
             open: None,
             notes: Notes::default(),
             slides: Vec::new(),
+            slides_noted: 0,
+            removed: BTreeSet::new(),
             work: Work::default(),
             spend: None,
             activity: Ring::default(),
@@ -458,6 +536,11 @@ impl View {
                 effect.hydrate = true;
             }
             Event::Slide { index, file, auto, uncertain, shown_at } => self.slide(*index, file, *auto, *uncertain, *shown_at),
+            Event::SlideRemoved { index } => {
+                self.slides.retain(|s| s.index != *index);
+                self.removed.insert(*index);
+            }
+            Event::SlidesNoted { through } => self.slides_noted = self.slides_noted.max(*through),
             Event::Capture(s) => self.capture = Some(capture_cleaned(s)),
             // Nothing is recorded while paused, so nothing is silent; the watch starts afresh on the resume.
             Event::Paused(p) => {
@@ -692,6 +775,7 @@ impl View {
     /// A slide registration upserts by index (plan §F): a duplicate index refreshes what is shown.
     fn slide(&mut self, index: u32, file: &str, auto: bool, uncertain: bool, shown_at: DateTime<Local>) {
         let line = SlideLine { index, file: plain::clean(file), shown_at, auto, uncertain };
+        self.removed.remove(&index); // the newest slide's number is free again once it was removed
         match self.slides.iter_mut().find(|s| s.index == index) {
             Some(s) => *s = line,
             None => match self.slides.iter().position(|s| s.index > index) {
@@ -738,8 +822,9 @@ impl View {
         }
 
         // Slides: fill the indices the projection does not hold; live registrations keep their state.
+        self.slides_noted = self.slides_noted.max(h.slides_noted);
         for s in h.slides {
-            if !self.slides.iter().any(|x| x.index == s.index) {
+            if !self.removed.contains(&s.index) && !self.slides.iter().any(|x| x.index == s.index) {
                 let line = slide_line(&s);
                 match self.slides.iter().position(|x| x.index > line.index) {
                     Some(i) => self.slides.insert(i, line),
@@ -866,7 +951,7 @@ mod tests {
     }
 
     fn hydration(notes: NotesSnapshot) -> Hydration {
-        Hydration { segments: Vec::new(), notes, slides: Vec::new(), gaps: Vec::new() }
+        Hydration { segments: Vec::new(), notes, slides: Vec::new(), slides_noted: 0, gaps: Vec::new() }
     }
 
     /// Plan §J: an Open utterance appears provisionally, a newer Open replaces it, and the live
@@ -979,6 +1064,7 @@ mod tests {
             segments: (0..=10).map(|id| seg(id, &format!("line {id}"), SegmentSource::Live)).collect(),
             notes: NotesSnapshot::At { revision: 1, document: "only the first block\n".into() },
             slides: vec![SlideEntry { index: 2, file: "slides/slide_02_100000.png".into(), shown_at: at(), auto: false, uncertain: false }],
+            slides_noted: 0,
             gaps: Vec::new(),
         };
         v.merge(stale);
@@ -987,6 +1073,90 @@ mod tests {
         assert!(v.notes.document.contains("Block 2"), "the document still holds revision 2's block");
         assert!(v.slides.iter().any(|s| s.index == 5), "a live registration is not removed");
         assert!(v.slides.iter().any(|s| s.index == 2), "and the read's older slide was added");
+    }
+
+    fn slide_event(index: u32) -> Event {
+        Event::Slide { index, file: format!("slides/slide_{index:02}_100000.png"), auto: true, uncertain: false, shown_at: at() }
+    }
+
+    fn slide_entry(index: u32) -> SlideEntry {
+        SlideEntry { index, file: format!("slides/slide_{index:02}_100000.png"), shown_at: at(), auto: true, uncertain: false }
+    }
+
+    /// Spec §7.5: a removed slide leaves the list, and a read of the sidecar that began before the removal cannot
+    /// bring it back; a slide registered later under the freed number is a new slide.
+    #[test]
+    fn a_removed_slide_stays_removed_when_a_stale_read_lists_it() {
+        let indices = |v: &View| v.slides.iter().map(|s| s.index).collect::<Vec<_>>();
+        let mut v = view();
+        for i in 1..=3 {
+            v.reduce(&slide_event(i), at());
+        }
+        v.reduce(&Event::SlideRemoved { index: 3 }, at());
+        assert_eq!(indices(&v), [1, 2]);
+        v.merge(Hydration { slides: vec![slide_entry(1), slide_entry(2), slide_entry(3)], ..Hydration::empty() });
+        assert_eq!(indices(&v), [1, 2], "the stale read did not restore slide 3");
+        v.reduce(&slide_event(3), at());
+        assert_eq!(indices(&v), [1, 2, 3], "the next slide takes the freed number");
+        v.merge(Hydration { slides: vec![slide_entry(1), slide_entry(2), slide_entry(3)], ..Hydration::empty() });
+        assert_eq!(indices(&v), [1, 2, 3], "and the read adds nothing twice");
+    }
+
+    /// The slides a snapshot has used are marked from the event and from a hydration, and the mark only moves forward.
+    #[test]
+    fn the_slides_in_the_notes_only_move_forward() {
+        let mut v = view();
+        v.reduce(&Event::SlidesNoted { through: 2 }, at());
+        assert_eq!(v.slides_noted, 2);
+        v.reduce(&Event::SlidesNoted { through: 1 }, at());
+        assert_eq!(v.slides_noted, 2, "an older cursor does not move it back");
+        v.merge(Hydration { slides_noted: 4, ..Hydration::empty() });
+        assert_eq!(v.slides_noted, 4);
+        v.merge(Hydration { slides_noted: 3, ..Hydration::empty() });
+        assert_eq!(v.slides_noted, 4, "nor does a stale read");
+    }
+
+    /// A step with no words says so from typed events alone: the model's thinking is kept for the step now running,
+    /// words end the wait, and a polish's rewrite, which streams none, waits until it is done.
+    #[test]
+    fn the_step_waits_until_words_arrive_and_the_thinking_belongs_to_it() {
+        let mut w = Work::default();
+        assert!(!w.waiting(), "nothing is running");
+        w.submit(OwnOp::Snapshot);
+        assert!(w.waiting() && !w.writing());
+        w.event(&Event::Thinking("**Reading the slide**\n\nThe slide shows se ".into()), false);
+        w.event(&Event::Thinking("and sd.".into()), false);
+        assert_eq!(w.thinking_line(), "The slide shows se and sd.", "the latest paragraph, without markup");
+        w.event(&Event::Preview("## Standard error".into()), false);
+        assert!(w.writing() && !w.waiting(), "words end the wait");
+        w.event(&committed(1), false);
+        assert!(!w.writing() && w.thinking_line().is_empty(), "the step's words and thinking go with it");
+        w.submit(OwnOp::Polish);
+        w.event(&Event::Busy("polishing".into()), false);
+        w.event(&Event::NothingNew, false);
+        assert_eq!(w.lane(), Lane::Polishing);
+        assert!(w.waiting(), "the rewrite streams no words");
+        w.event(&Event::Thinking("old".into()), false);
+        w.event(&Event::Busy("rewriting 12 blocks".into()), false);
+        assert_eq!(w.thinking_line(), "", "each step opens with its own busy line, and starts afresh");
+        w.event(&Event::Thinking("x".repeat(THINKING_KEEP + 500).as_str().into()), false);
+        assert!(w.thinking_line().chars().count() <= THINKING_LINE + 1, "what is shown is bounded");
+    }
+
+    /// The study page is a lane of its own: it starts with a polish, ends with its page or its cancel, and a cancel
+    /// of the page is not a cancel of the request queued beside it.
+    #[test]
+    fn the_page_lane_is_cancelled_apart_from_the_queue() {
+        let mut w = Work::default();
+        w.submit(OwnOp::Polish);
+        w.event(&Event::NothingNew, false);
+        w.event(&Event::Polished { backup: "b.md".into(), usd: 0.0, revision: 2 }, false);
+        assert!(w.typesetting() && !w.mine());
+        w.submit(OwnOp::Snapshot);
+        w.event(&Event::Cancelled(CANCELLED_PAGE.into()), false);
+        assert!(!w.typesetting() && w.mine(), "the queued snapshot is still ahead");
+        w.event(&Event::Cancelled("the snapshot".into()), false);
+        assert!(!w.mine(), "while any other cancel pops the head");
     }
 
     /// Plan §J: the connection's ups and downs change only its own words.

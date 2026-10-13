@@ -118,6 +118,12 @@ struct Ui {
     /// Colour and glyphs, the terminal's for the whole session: read once, as the plain CLI reads them.
     theme: view::Theme,
     view: View,
+    /// A polish has ended and the page it typeset is on the way: the next page that lands is the person's to read.
+    polished: bool,
+    /// That page, once it lands; the reactor takes it and opens it.
+    to_open: Option<std::path::PathBuf>,
+    /// Whether the reactor opens such a page: not in a scripted session, and not in a test.
+    open_pages: bool,
 }
 
 /// What a key asks of the reactor: at most one command per key (plan §C 8).
@@ -140,6 +146,9 @@ enum Act {
     /// `pause` and Enter, or Ctrl-P (spec §9.6); `typed` says it came from the hint line, which then empties.
     Pause { typed: bool },
     Resume { typed: bool },
+    /// `remove N` and Enter (spec §7.5): one pending slide taken out of the lecture. Core answers a refusal as a
+    /// warning event, so no reply is waited for here; the hint empties once the command is out.
+    RemoveSlide(u32),
 }
 
 /// What a Ctrl-S comes back as, off the reactor: the oneshot's answer to a capture-now, or the
@@ -161,7 +170,7 @@ enum CaptureReply {
 /// Enter while stopping: nothing is sent, and what was typed stays (plan §H).
 pub(crate) const STOPPING: &str = "The lecture is stopping; the last snapshot takes what is left.";
 /// Ctrl-X with nothing of this TUI's to cancel.
-pub(crate) const NOTHING_TO_CANCEL: &str = "No notes request of yours is running.";
+pub(crate) const NOTHING_TO_CANCEL: &str = "Nothing of yours is running to cancel.";
 const HINT_FULL: &str = "The hint is at its 8 KiB limit.";
 const PASTE_TOO_LONG: &str = "That paste would take the hint past 8 KiB; nothing of it was pasted.";
 /// A command the lecture can no longer take: it has ended.
@@ -195,6 +204,9 @@ impl Ui {
             preview: panes::Preview::default(),
             theme,
             view,
+            polished: false,
+            to_open: None,
+            open_pages: false,
         }
     }
 
@@ -230,6 +242,22 @@ impl Ui {
             }
         }
         let effect = self.view.reduce(e, Local::now());
+        // Each step of the notes work (a polish's snapshot, then its rewrite) opens with its own busy line: the clock
+        // beside the lane counts from there. The time is the caller's, so a test sets it.
+        if matches!(e, Event::Busy(_)) {
+            self.view.work.since = Some(now);
+        }
+        // The page a polish typeset opens for reading, as the desktop app's does; one the person cancelled does not.
+        match e {
+            Event::Polished { .. } => self.polished = true,
+            Event::Page { outcome, .. } => {
+                if std::mem::take(&mut self.polished) && self.open_pages {
+                    self.to_open = Some(outcome.path.clone());
+                }
+            }
+            Event::PageFailed(_) | Event::Cancelled(_) | Event::PolishFailed(_) | Event::PolishStopped(_) => self.polished = false,
+            _ => {}
+        }
         let step = matches!(e, Event::Session(Notification::SourceEnded)).then(|| self.stop(Origin::SourceEnded, now));
         (step, effect.hydrate)
     }
@@ -327,7 +355,7 @@ impl Ui {
             Key::Clear => Act::Clear,
             _ if self.drawn.small => Act::Nothing,
             Key::Nothing => Act::Nothing,
-            Key::Cancel if self.view.work.mine() => Act::Cancel,
+            Key::Cancel if self.view.work.mine() || self.view.work.typesetting() => Act::Cancel,
             Key::Cancel => self.say(NOTHING_TO_CANCEL),
             Key::Help => self.toggle(input::Overlay::Help),
             Key::Activity => self.toggle(input::Overlay::Activity),
@@ -359,8 +387,9 @@ impl Ui {
     }
 
     /// What the frame needs besides the session view, from the reactor's own state.
-    fn chrome(&self, elapsed: Duration) -> view::Chrome<'_> {
-        view::Chrome { elapsed, refused: self.notice.as_deref(), focus: self.focus, zoom: self.zoom, transcript: &self.transcript, notes: &self.notes, slides: &self.slides, preview: &self.preview, hint: &self.hint, overlay: self.overlay, activity: &self.activity, help: self.help, capture: self.capture_action(), theme: &self.theme }
+    fn chrome(&self, elapsed: Duration, now: std::time::Instant) -> view::Chrome<'_> {
+        let step = self.view.work.since.map(|since| now.saturating_duration_since(since));
+        view::Chrome { elapsed, step, refused: self.notice.as_deref(), focus: self.focus, zoom: self.zoom, transcript: &self.transcript, notes: &self.notes, slides: &self.slides, preview: &self.preview, hint: &self.hint, overlay: self.overlay, activity: &self.activity, help: self.help, capture: self.capture_action(), theme: &self.theme }
     }
 
     fn say(&mut self, notice: impl Into<String>) -> Act {
@@ -467,6 +496,7 @@ impl Ui {
         match plain::parse_command(self.hint.value()) {
             Command::Pause => Act::Pause { typed: true },
             Command::Resume => Act::Resume { typed: true },
+            Command::RemoveSlide { index, .. } => Act::RemoveSlide(index),
             _ => Act::Op(plain::parse_line(self.hint.value())),
         }
     }
@@ -518,6 +548,14 @@ impl Ui {
                     if typed {
                         self.hint.clear();
                     }
+                    self.notice = None;
+                } else {
+                    self.notice = Some(ENDED.into());
+                }
+            }
+            Act::RemoveSlide(index) => {
+                if commands.send(Command::RemoveSlide { index, reply: None }).is_ok() {
+                    self.hint.clear();
                     self.notice = None;
                 } else {
                     self.notice = Some(ENDED.into());
@@ -723,6 +761,7 @@ where
 {
     // Colour and glyphs are the terminal's for the whole session: read once, as the plain CLI reads them.
     let mut ui = Ui::new(view, view::Theme::detect(), capture);
+    ui.open_pages = std::env::var_os(crate::lecture::FIXTURE_ENV).is_none();
     let mut timer = secs.map(|s| started + Duration::from_secs(s));
     let mut clock = interval_at(started + Duration::from_secs(1), Duration::from_secs(1));
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -760,7 +799,7 @@ where
                     }
                     Act::Redraw => dirty = true,
                     Act::Nothing => {}
-                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. } | Act::Pause { .. } | Act::Resume { .. }) => {
+                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. } | Act::Pause { .. } | Act::Resume { .. } | Act::RemoveSlide(_)) => {
                         ui.send(act, &io.commands, &io.capture_tx);
                         dirty = true;
                     }
@@ -798,6 +837,9 @@ where
                     let Some(f) = next.take() else { break };
                     taken += 1;
                     let (step, hydrate) = ui.forwarded(&f, std::time::Instant::now());
+                    if let Some(page) = ui.to_open.take() {
+                        plain::open_in_browser(&page);
+                    }
                     if let Some(step) = step {
                         send_stops(&io.commands, step);
                     }
@@ -851,7 +893,7 @@ where
         if dirty && Instant::now() >= drawn_at + FRAME {
             // An ended preview is dropped here, before the frame that shows its commit.
             preview_due = ui.preview.refresh(&ui.view.notes, std::time::Instant::now()).map(Instant::from_std);
-            let chrome = ui.chrome(started.elapsed());
+            let chrome = ui.chrome(started.elapsed(), std::time::Instant::now());
             let mut drawn = ui.drawn;
             // The cap is measured draw-start to draw-start, so a frame's own duration never
             // stretches the period past FRAME (and the worst key-to-draw past 50 ms): starts are
@@ -1004,7 +1046,7 @@ mod tests {
     fn frame(ui: &mut Ui, width: u16, height: u16) -> Vec<String> {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         ui.preview.refresh(&ui.view.notes, std::time::Instant::now());
-        let chrome = ui.chrome(Duration::from_secs(60));
+        let chrome = ui.chrome(Duration::from_secs(60), std::time::Instant::now());
         let mut drawn = ui.drawn;
         terminal.draw(|f| drawn = view::render(f, &ui.view, &chrome)).unwrap();
         ui.drawn = drawn;
@@ -1142,7 +1184,7 @@ mod tests {
     /// A key as the reactor takes it: the Ui decides, and the one command a key may carry is sent.
     fn press(ui: &mut Ui, k: KeyEvent, now: Instant, tx: &UnboundedSender<Command>) -> Act {
         let act = ui.key(k, now);
-        if matches!(act, Act::Op(_) | Act::Cancel | Act::Pause { .. } | Act::Resume { .. }) {
+        if matches!(act, Act::Op(_) | Act::Cancel | Act::Pause { .. } | Act::Resume { .. } | Act::RemoveSlide(_)) {
             let (replies, _) = tokio::sync::mpsc::channel(1);
             ui.send(act, tx, &replies);
             return Act::Redraw;
@@ -1271,6 +1313,67 @@ mod tests {
         assert_eq!(ui.hint.value(), "pause", "what was typed stays");
     }
 
+    /// `remove 3` and Enter (spec §7.5): one command for that slide, no notes request joins the queue, and the hint
+    /// empties. Anything longer than the whole line is still a hint for the snapshot, and a stopping lecture refuses it.
+    #[test]
+    fn typed_remove_sends_one_command_and_is_not_a_notes_request() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut ui, t0) = (drawn_ui(), Instant::now());
+        type_in(&mut ui, "remove 3", t0, &tx);
+        press(&mut ui, key(KeyCode::Enter), t0 + ms(100), &tx);
+        assert_eq!(sent(&mut rx), ["RemoveSlide { index: 3, reply: None }"]);
+        assert_eq!(ui.hint.value(), "", "it is out, so the hint empties");
+        assert!(!ui.view.work.mine(), "a removal is not a notes request");
+        // an Enter close behind the last is a held key's repeat, so the next press is a second later
+        type_in(&mut ui, "remove 3 and 4", t0 + ms(2000), &tx);
+        press(&mut ui, key(KeyCode::Enter), t0 + ms(3000), &tx);
+        assert_eq!(sent(&mut rx), ["snapshot \"remove 3 and 4\""], "only the whole line is the command");
+        ui.key(ctrl('c'), t0 + ms(4000));
+        type_in(&mut ui, "remove 3", t0 + ms(5000), &tx);
+        press(&mut ui, key(KeyCode::Enter), t0 + ms(6000), &tx);
+        assert!(sent(&mut rx).is_empty(), "a stopping lecture takes nothing");
+    }
+
+    /// The page a polish typeset opens for reading; a page the person asked for apart from a polish, a cancelled one and
+    /// a scripted session's do not. The reactor takes `to_open`, so a test sees what it would open.
+    #[test]
+    fn the_page_a_polish_typeset_is_the_one_that_opens() {
+        let page = |path: &str| Event::Page { outcome: lecturelive_core::notes::page::PageOutcome { path: path.into(), words: 900, budget: 1200, cached: false, missing: Vec::new() }, usd: 0.1 };
+        let polished = Event::Polished { backup: "b.md".into(), usd: 0.04, revision: 2 };
+        let (mut ui, t0) = (drawn_ui(), Instant::now());
+        ui.open_pages = true;
+        ui.event(&polished, t0);
+        ui.event(&page("/x/lecture_page.html"), t0);
+        assert_eq!(ui.to_open.take().as_deref(), Some(std::path::Path::new("/x/lecture_page.html")));
+        ui.event(&page("/x/lecture_page.html"), t0);
+        assert!(ui.to_open.is_none(), "a page from the study-page request, with no polish before it, is not opened for them");
+        ui.event(&polished, t0);
+        ui.event(&Event::Cancelled(state::CANCELLED_PAGE.into()), t0);
+        ui.event(&page("/x/late.html"), t0);
+        assert!(ui.to_open.is_none(), "a cancelled page is not opened if it lands anyway");
+        let mut scripted = drawn_ui();
+        scripted.event(&polished, t0);
+        scripted.event(&page("/x/lecture_page.html"), t0);
+        assert!(scripted.to_open.is_none(), "a session that opens nothing is not asked to");
+    }
+
+    /// The clock beside the lane counts the step now running: from its busy line, as the reactor saw it.
+    #[test]
+    fn the_step_clock_runs_from_the_busy_line() {
+        let (mut ui, t0) = (drawn_ui(), Instant::now());
+        assert!(ui.chrome(Duration::from_secs(1), t0).step.is_none(), "nothing is running");
+        ui.view.work.submit(OwnOp::Snapshot);
+        ui.event(&Event::Busy("snapshot, 12 words to claude-opus-5-5".into()), t0);
+        assert_eq!(ui.chrome(Duration::from_secs(1), t0 + Duration::from_secs(75)).step, Some(Duration::from_secs(75)));
+        ui.event(&Event::Committed { words: 12, slides: 0, block: "<!-- 10:00:00 -->\n- x\n".into(), usd: 0.0, confirmed: true, removed: 0, missing: 0, revision: 1 }, t0 + Duration::from_secs(80));
+        assert!(ui.chrome(Duration::from_secs(1), t0 + Duration::from_secs(81)).step.is_none(), "the step ended, so the clock did");
+        ui.view.work.submit(OwnOp::Polish);
+        ui.event(&Event::Busy("polishing".into()), t0 + Duration::from_secs(90));
+        ui.event(&Event::NothingNew, t0 + Duration::from_secs(95));
+        ui.event(&Event::Busy("rewriting 12 blocks".into()), t0 + Duration::from_secs(96));
+        assert_eq!(ui.chrome(Duration::from_secs(1), t0 + Duration::from_secs(100)).step, Some(Duration::from_secs(4)), "the polish's rewrite starts its own");
+    }
+
     /// Ctrl-S while the lecture is paused: the capture state says the worker is holding, and the words for that are
     /// the lecture's pause, not "it comes back when the window is back".
     #[test]
@@ -1354,17 +1457,25 @@ mod tests {
         assert!(!ui.view.work.mine(), "the queue emptied");
         press(&mut ui, ctrl('x'), t0 + ms(600), &tx);
         assert!(sent(&mut rx).is_empty(), "nothing of this TUI's is left");
-        // a typesetting page and the last snapshot are not cancellable
+        // the study page typesetting is cancellable on its own: nothing of this TUI's is queued, and Ctrl-X still stops it
         let mut ui = drawn_ui();
         ui.view.work.submit(OwnOp::Polish);
         ui.event(&Event::NothingNew, t0);
         ui.event(&Event::Polished { backup: "b.md".into(), usd: 0.0, revision: 1 }, t0);
+        assert!(ui.view.work.page() && !ui.view.work.mine());
+        press(&mut ui, ctrl('x'), t0 + ms(100), &tx);
+        assert_eq!(sent(&mut rx), ["cancel"], "the page is stopped by the same key");
+        assert!(ui.view.work.page(), "and it stops when core says so, not before");
+        ui.event(&Event::Cancelled(state::CANCELLED_PAGE.into()), t0 + ms(200));
+        assert!(!ui.view.work.page());
+        // the last snapshot, with no page, is not cancellable
+        let mut ui = drawn_ui();
         ui.key(ctrl('c'), t0);
         ui.event(&Event::Preview("the last snapshot ".into()), t0);
         assert_eq!(ui.view.work.lane(), state::Lane::LastSnapshot, "the automatic last snapshot is not taken for the person's own");
         press(&mut ui, ctrl('x'), t0 + ms(100), &tx);
         assert!(sent(&mut rx).is_empty());
-        assert!(ui.view.work.page());
+        assert_eq!(ui.notice.as_deref(), Some(NOTHING_TO_CANCEL));
     }
 
     /// Plan §J `cancel_then_commit_accepts_committed_reality`, through the reactor's own path: a
@@ -2535,7 +2646,7 @@ mod task13 {
                     // the clock moves, so the frame is never an artificially static no-op
                     let t0 = std::time::Instant::now();
                     ui.preview.refresh(&ui.view.notes, std::time::Instant::now());
-                    let chrome = ui.chrome(Duration::from_millis(250 * i as u64));
+                    let chrome = ui.chrome(Duration::from_millis(250 * i as u64), std::time::Instant::now());
                     let mut drawn = ui.drawn;
                     terminal.draw(|f| drawn = view::render(f, &ui.view, &chrome)).unwrap();
                     ui.drawn = drawn;

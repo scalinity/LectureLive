@@ -387,7 +387,7 @@ fn footer(v: &View, c: &Chrome, room: usize) -> Vec<Span<'static>> {
                     capture::Action::Refused(_) => {}
                 }
             }
-            if v.work.mine() {
+            if v.work.mine() || v.work.typesetting() {
                 parts.push((2, chord("^X", "cancel", DIM)));
             }
             parts.push((5, chord("Tab", "pane", DIM)));
@@ -466,6 +466,8 @@ fn clip(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> Vec<Span<'stat
 /// notes and the activity, the parsed preview, the hint line, the overlay, the theme.
 pub(crate) struct Chrome<'a> {
     pub(crate) elapsed: Duration,
+    /// How long the notes step now running has taken, when the reactor has a clock to say; None in a test's frame.
+    pub(crate) step: Option<Duration>,
     pub(crate) refused: Option<&'a str>,
     pub(crate) focus: Pane,
     pub(crate) zoom: bool,
@@ -558,14 +560,22 @@ pub(crate) fn render(frame: &mut Frame, v: &View, c: &Chrome) -> Drawn {
             Pane::Notes => {
                 // stacked's heading is a rule: a space ends the rule before the lane
                 let gap = usize::from(col.ruled);
-                if let Some(mut lane) = work_lane(v, c.notes.scrolled(), room.saturating_sub(gap), c.theme) {
+                if let Some(mut lane) = work_lane(v, c.notes.scrolled(), c.step, room.saturating_sub(gap), c.theme) {
                     if col.ruled {
                         lane.insert(0, Span::raw(" "));
                     }
                     frame.render_widget(Line::from(lane).right_aligned(), col.heading);
                 }
                 let ink = panes::Ink { edge: g.edge, bullet: g.bullet, quote: g.bar, slide: g.slide, rule: g.rule, warn: g.warn, teal: c.theme.teal() };
-                panes::notes(frame.buffer_mut(), col.body, v, c.preview, c.notes, &ink);
+                // While the step has no words to show, the model's own account of its thinking fills the last row.
+                let notes_body = match thinking_row(v, col.body, g.ellipsis) {
+                    Some((row, line)) => {
+                        frame.render_widget(line, row);
+                        Rect { height: col.body.height - 1, ..col.body }
+                    }
+                    None => col.body,
+                };
+                panes::notes(frame.buffer_mut(), notes_body, v, c.preview, c.notes, &ink);
                 drawn.notes = Some(col.body);
             }
             Pane::Slides if col.body.height > 0 => {
@@ -685,10 +695,11 @@ fn help_lines(g: &Glyphs, inner: usize) -> Vec<Line<'static>> {
     let hint = format!("hint {}", g.enter);
     let tabs = format!("Tab {}", g.backtab);
     let pausing = format!("pause or resume (typed: pause{0}, resume{0})", g.enter);
+    let remove = format!("remove 3{}", g.enter);
     let groups: [(&str, Vec<(&str, &str)>); 5] = [
-        ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests, running and queued")]),
+        ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests or the study page")]),
         ("Reading", vec![(g.updown, "a row in the focused pane"), ("PgUp PgDn", "a page"), (tabs.as_str(), "the next or previous pane"), ("Esc", "back to live"), ("^T", "the focused pane fills the body; again to go back")]),
-        ("Slides", vec![("^S", "capture the watched window's slide now"), ("^S", "watch the window offered, if its region is saved")]),
+        ("Slides", vec![("^S", "capture the watched window's slide now"), ("^S", "watch the window offered, if its region is saved"), (remove.as_str(), "take a slide out; only one no snapshot used")]),
         ("App", vec![("^P", pausing.as_str()), ("^O", "activity: this session's notices"), ("^H F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
         (
             "Stopping",
@@ -752,23 +763,62 @@ fn reading_lane(new: usize, room: usize, t: &Theme) -> Option<Vec<Span<'static>>
     forms.into_iter().find(|f| width(f) <= room)
 }
 
+/// The last row of the notes pane while a step has no words yet: what the model says it is thinking (its latest
+/// sentence, cut from the front so the newest words stay), or what the step is doing until it says anything. The row
+/// is taken from the pane only then, and only when the pane has room to keep three rows of notes.
+fn thinking_row(v: &View, body: Rect, ellipsis: &str) -> Option<(Rect, Line<'static>)> {
+    if !v.work.waiting() || body.height < 4 || body.width < 12 {
+        return None;
+    }
+    let said = v.work.thinking_line();
+    let text = if said.is_empty() {
+        match v.work.lane() {
+            Lane::Polishing => "reading the notes and rewriting them".to_string(),
+            _ => "reading the transcript and the new slides".to_string(),
+        }
+    } else {
+        said
+    };
+    let room = usize::from(body.width).saturating_sub(2);
+    let line = if Span::raw(text.as_str()).width() <= room {
+        text
+    } else {
+        // cut from the front until the ellipsis and what is left fit: the newest words are the ones worth reading
+        let mut tail = text.as_str();
+        while !tail.is_empty() && Span::raw(format!("{ellipsis}{tail}")).width() > room {
+            let mut chars = tail.chars();
+            chars.next();
+            tail = chars.as_str();
+        }
+        format!("{ellipsis}{tail}")
+    };
+    Some((Rect { y: body.y + body.height - 1, height: 1, ..body }, Line::from(Span::styled(format!(" {line}"), DIM))))
+}
+
 /// The notes heading's lane, right of its name: what the notes work is doing — this TUI's own
 /// request at the head (teal: it is live), how many wait behind it, and the study page
 /// typesetting — and, while the reader is scrolled up, the way back. From typed state only (plan §C 13).
 /// As the heading narrows the page goes first, then the queue, then the way back; the head's state
 /// goes last.
-fn work_lane(v: &View, scrolled: bool, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
+fn work_lane(v: &View, scrolled: bool, step: Option<Duration>, room: usize, t: &Theme) -> Option<Vec<Span<'static>>> {
     let w = &v.work;
+    // "writing" only once words are streaming: before that the model is reading and thinking, and saying it writes
+    // would make the wait look stuck.
+    let doing = if w.writing() { "writing" } else { "thinking" };
     let head = match w.lane() {
         Lane::Idle => None,
-        Lane::Snapshot => Some("snapshot: writing"),
-        Lane::PolishSnapshotFirst => Some("polish: snapshot first"),
-        Lane::Polishing => Some("polishing"),
-        Lane::LastSnapshot => Some("last snapshot: writing"),
+        Lane::Snapshot => Some(format!("snapshot: {doing}")),
+        Lane::PolishSnapshotFirst => Some("polish: snapshot first".to_string()),
+        Lane::Polishing => Some("polishing".to_string()),
+        Lane::LastSnapshot => Some(format!("last snapshot: {doing}")),
     };
     let mut parts: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
     if let Some(head) = head {
-        parts.push((0, vec![Span::styled(head, t.teal())]));
+        let mut spans = vec![Span::styled(head, t.teal())];
+        if let Some(step) = step {
+            spans.push(Span::styled(format!(" {}:{:02}", step.as_secs() / 60, step.as_secs() % 60), DIM));
+        }
+        parts.push((0, spans));
     }
     if scrolled {
         parts.push((1, chord("Esc", "live", DIM)));
@@ -1016,7 +1066,7 @@ mod tests {
     /// The frame's chrome as a test draws it: the hint empty, no overlay, the notes and activity
     /// following, at 0:42:18.
     fn chrome<'a>(theme: &'a Theme, transcript: &'a Scroll, preview: &'a Preview, focus: Pane, refused: Option<&'a str>) -> Chrome<'a> {
-        Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused, focus, zoom: false, transcript, notes: Box::leak(Box::default()), slides: Box::leak(Box::default()), preview, hint: Box::leak(Box::default()), overlay: Overlay::None, activity: Box::leak(Box::default()), help: 0, capture: capture::Action::Refused(capture::Refusal::None), theme }
+        Chrome { elapsed: Duration::from_secs(42 * 60 + 18), step: None, refused, focus, zoom: false, transcript, notes: Box::leak(Box::default()), slides: Box::leak(Box::default()), preview, hint: Box::leak(Box::default()), overlay: Overlay::None, activity: Box::leak(Box::default()), help: 0, capture: capture::Action::Refused(capture::Refusal::None), theme }
     }
 
     fn drawn_with(width: u16, height: u16, v: &View, refused: Option<&str>, theme: &Theme) -> Terminal<TestBackend> {
@@ -2081,7 +2131,7 @@ mod tests {
             (Work::Writing, Some("snapshot: writing")),
             (Work::PolishFirst, Some("polish: snapshot first   1 queued")),
             (Work::Polishing, Some("polishing")),
-            (Work::Page, Some("snapshot: writing   1 queued   study page: typesetting")),
+            (Work::Page, Some("snapshot: thinking   1 queued   study page: typesetting")),
         ] {
             let b = framed(140, 40, &noted(work), Pane::Transcript, &theme).backend().buffer().clone();
             let row = &lines(&b)[3];
@@ -2091,7 +2141,7 @@ mod tests {
             }
         }
         let b = framed(140, 40, &noted(Work::Page), Pane::Transcript, &theme).backend().buffer().clone();
-        let (x, y) = at(&b, 3, "snapshot: writing");
+        let (x, y) = at(&b, 3, "snapshot: thinking");
         assert_eq!(b[(x, y)].fg, TEAL);
         let (x, y) = at(&b, 3, "1 queued");
         assert_eq!(b[(x, y)].modifier, Modifier::DIM);
@@ -2099,13 +2149,66 @@ mod tests {
         assert_eq!(b[(x, y)].modifier, Modifier::DIM);
         // narrower: the page goes, then the queue
         let l = lines(&framed(100, 24, &noted(Work::Page), Pane::Transcript, &theme).backend().buffer().clone());
-        assert!(l[3].contains("snapshot: writing   1 queued") && !l[3].contains("study page"), "{:?}", l[3]);
+        assert!(l[3].contains("snapshot: thinking   1 queued") && !l[3].contains("study page"), "{:?}", l[3]);
         let l = lines(&framed(60, 16, &noted(Work::Page), Pane::Notes, &theme).backend().buffer().clone());
-        assert!(l[2].starts_with(" Transcript   Notes   Slides") && l[2].ends_with("snapshot: writing"), "{:?}", l[2]);
+        assert!(l[2].starts_with(" Transcript   Notes   Slides") && l[2].ends_with("snapshot: thinking"), "{:?}", l[2]);
         // stacked: the lane ends the notes rule
         let l = lines(&framed(72, 45, &noted(Work::Writing), Pane::Transcript, &theme).backend().buffer().clone());
         let rule = l.iter().find(|r| r.contains("── Notes ")).unwrap();
         assert!(rule.ends_with("─ snapshot: writing"), "{rule:?}");
+    }
+
+    /// A step with no words yet says it is thinking, not writing, and counts its time; the model's own account of
+    /// its thinking fills the last row of the notes until words arrive.
+    #[test]
+    fn a_step_without_words_says_thinking_and_shows_what_the_model_says() {
+        use crate::tui::state::OwnOp;
+        let theme = Theme::new(TRUE, true);
+        let mut v = noted(Work::Committed);
+        v.work.submit(OwnOp::Snapshot);
+        let rows = |v: &View, w: u16, h: u16| lines(&framed(w, h, v, Pane::Transcript, &theme).backend().buffer().clone());
+        let l = rows(&v, 140, 40);
+        assert!(l[3].contains("snapshot: thinking │ Slides"), "{:?}", l[3]);
+        assert!(l.iter().any(|r| r.contains("reading the transcript and the new slides")), "the row says what the step is doing before the model has said anything");
+        v.reduce(&Event::Thinking("**Weighing the slide against the talk**\n\nThe lecturer moved from the mean to its spread, so ".into()), fixed());
+        let l = rows(&v, 140, 40);
+        assert!(l.iter().any(|r| r.contains("The lecturer moved from the mean to its spread, so")) && !l.iter().any(|r| r.contains("Weighing")), "the latest paragraph, without markup");
+        // too narrow for it all: the newest words stay
+        v.reduce(&Event::Thinking("and the newest words are the ones that matter to read, which is why the front is cut".into()), fixed());
+        let l = rows(&v, 100, 30);
+        let row = l.iter().find(|r| r.contains("the front is cut")).expect("the tail is kept");
+        assert!(row.contains('…'), "{row:?}");
+        // words arrive: the lane says writing and the row is given back to the notes
+        v.reduce(&Event::Preview(PROVISIONAL.into()), fixed());
+        let l = rows(&v, 140, 40);
+        assert!(l[3].contains("snapshot: writing │ Slides") && !l.iter().any(|r| r.contains("the front is cut") || r.contains("reading the transcript")), "{:?}", l[3]);
+        // a polish's rewrite streams no words: its row stays until the page is made
+        let mut v = noted(Work::Polishing);
+        let l = rows(&v, 140, 40);
+        assert!(l[3].contains("polishing │ Slides") && l.iter().any(|r| r.contains("reading the notes and rewriting them")), "{:?}", l[3]);
+        v.reduce(&Event::Polished { backup: "b.md".into(), usd: 0.04, revision: 2 }, fixed());
+        assert!(!rows(&v, 140, 40).iter().any(|r| r.contains("rewriting them")), "gone with the step");
+    }
+
+    /// The clock beside the lane is the step's own, from the reactor's time; a test's frame has none.
+    #[test]
+    fn the_step_clock_follows_the_lane() {
+        use crate::tui::state::OwnOp;
+        let theme = Theme::new(TRUE, true);
+        let mut v = noted(Work::Committed);
+        v.work.submit(OwnOp::Snapshot);
+        let mut preview = Preview::default();
+        preview.refresh(&v.notes, std::time::Instant::now());
+        let scroll = Scroll::default();
+        let mut c = chrome(&theme, &scroll, &preview, Pane::Transcript, None);
+        c.step = Some(Duration::from_secs(75));
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| {
+            render(f, &v, &c);
+        })
+        .unwrap();
+        let l = lines(&terminal.backend().buffer().clone());
+        assert!(l[3].contains("snapshot: thinking 1:15 │ Slides"), "{:?}", l[3]);
     }
 
     /// `NO_COLOR`: no colour, and the preview still reads as provisional by its word and its edge.
@@ -2154,7 +2257,7 @@ mod tests {
         let mut preview = Preview::default();
         preview.refresh(&v.notes, std::time::Instant::now());
         let scroll = Scroll::default();
-        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), refused: look.refused, focus: look.focus.unwrap_or(Pane::Transcript), zoom: look.zoom, transcript: &scroll, notes: &look.notes, slides: &look.slides, preview: &preview, hint: &look.hint, overlay: look.overlay, activity: &look.activity, help: look.help, capture: look.capture.clone().unwrap_or_else(|| capture::action(v.capture.as_ref(), look.saved.as_ref())), theme };
+        let chrome = Chrome { elapsed: Duration::from_secs(42 * 60 + 18), step: None, refused: look.refused, focus: look.focus.unwrap_or(Pane::Transcript), zoom: look.zoom, transcript: &scroll, notes: &look.notes, slides: &look.slides, preview: &preview, hint: &look.hint, overlay: look.overlay, activity: &look.activity, help: look.help, capture: look.capture.clone().unwrap_or_else(|| capture::action(v.capture.as_ref(), look.saved.as_ref())), theme };
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut drawn = Drawn::default();
         terminal.draw(|f| drawn = render(f, v, &chrome)).unwrap();
@@ -2266,7 +2369,7 @@ mod tests {
     #[test]
     fn the_help_overlay() {
         let theme = Theme::new(TRUE, true);
-        let (t, drawn) = looked(140, 40, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
+        let (t, drawn) = looked(140, 42, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
         let l = lines(t.backend().buffer());
         let top = l.iter().position(|r| r.contains("┌─ Help ")).unwrap();
         let bottom = l.iter().rposition(|r| r.contains('┘')).unwrap();
@@ -2284,7 +2387,7 @@ mod tests {
         assert!(prose.contains("Spend is this lecture's cost today; speech-to-text is added when a recording closes."), "{prose}");
         assert!(text.contains("^S"), "Task 11's capture key is documented");
         assert!(prose.contains("capture the watched window's slide now") && prose.contains("watch the window offered, if its region is saved"), "{prose}");
-        assert_eq!(drawn.help_max, 0, "it all fits at 140×40");
+        assert_eq!(drawn.help_max, 0, "it all fits at 140×42");
         assert!(l[bottom].contains("Esc closes"));
         // small: it scrolls, and the border says there is more
         let (t, drawn) = looked(60, 16, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);

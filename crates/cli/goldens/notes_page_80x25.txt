@@ -1,6 +1,6 @@
 " ● Listening   Machine Learning › Week 03 — Optimisation                0:42:18 "
 " BlackHole 2ch  ■■■■■□□□  transcribing  0 gaps                      $0.18 today "
-" Transcript   Notes   Slides 1                     snapshot: writing   1 queued "
+" Transcript   Notes   Slides 1                    snapshot: thinking   1 queued "
 "           Statistics — Week 04 — Sampling                                      "
 "                                                                                "
 " 10:39:12  Sampling distributions                                               "
@@ -19,7 +19,7 @@
 "           • The statistic is computed from the sample; the parameter belongs   "
 "             to the population.                                                 "
 "           • 標本平均 is the sample mean 🎓                                     " Hidden by multi-width symbols: [(14, " "), (16, " "), (18, " "), (20, " "), (42, " ")]
-"                                                                                "
+"  reading the transcript and the new slides                                     "
 " ✓ polished  previous version in .live_notes/b.md  $0.04                        "
 " ◆  a hint, or ⏎ for a snapshot                                                 "
 " ⏎ snapshot   polish⏎   ^P pause   ^X cancel   Tab pane   ^H help   ^C stop     "

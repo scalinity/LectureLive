@@ -152,7 +152,7 @@ fn choose_mode(tui: bool, plain: bool, ttys: Ttys, term: Option<&str>) -> Result
 }
 
 /// Names the scripted session that debug builds run in place of a recording (plan §H).
-const FIXTURE_ENV: &str = "LECTURELIVE_CLI_FIXTURE";
+pub(crate) const FIXTURE_ENV: &str = "LECTURELIVE_CLI_FIXTURE";
 
 /// A live session not yet started, for either frontend to await or spawn.
 type Engine = std::pin::Pin<Box<dyn std::future::Future<Output = Result<StopReport>> + Send>>;
@@ -412,7 +412,10 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let mut watch = (uid == loopback::BLACKHOLE_UID || mixed).then(|| SilenceWatch::new(-60.0, 10));
     let watched = watch.is_some();
     let words = capture::Words::new(&course);
+    // A scripted session opens no browser; a real polish opens its page, as the desktop app does.
+    let open_pages = fixture.is_none();
     let printer = tokio::spawn(async move {
+        let mut printer = plain::Printer::default();
         while let Some(f) = events.recv().await {
             watch = plain::watch_after(&f.event, watched, watch.take()); // nothing is silent while the lecture is paused
             match &f.capture_persistence {
@@ -422,7 +425,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
                     let (kind, label, detail) = capture::unsaved_words(error);
                     plain::say(&mut std::io::stdout().lock(), out, kind, label, &detail);
                 }
-                _ => plain::show(&mut std::io::stdout().lock(), out, &f.event, &mut watch, &words, mixed),
+                _ => printer.show(&mut std::io::stdout().lock(), out, &f.event, &mut watch, &words, mixed, open_pages),
             }
         }
     });

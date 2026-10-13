@@ -1129,6 +1129,8 @@ pub(crate) fn slides(buf: &mut Buffer, body: Rect, v: &View, scroll: &SlidesScro
                 (true, true) => "auto / unsettled",
                 _ => "manual",
             };
+            // a slide a snapshot has used is in the notes and can no longer be removed (spec §7.5): the pane says so
+            let how = if s.index <= v.slides_noted { format!("{how} / in notes") } else { how.to_string() };
             buf.set_stringn(list.x, y, how, list.width as usize, DIM);
         }
     }
@@ -1993,6 +1995,11 @@ mod tests {
         // an unsettled auto says so
         let (_, l) = draw_slides(&slides_view(3, CaptureState::Watching { window: "Zoom Meeting".into() }), &SlidesScroll::default(), &watch, 28, 12);
         assert_eq!(l[8], "auto / unsettled");
+        // a slide a snapshot has used says so, and one that came after does not
+        let mut used = slides_view(3, CaptureState::Watching { window: "Zoom Meeting".into() });
+        used.slides_noted = 2;
+        let (_, l) = draw_slides(&used, &SlidesScroll::default(), &watch, 28, 12);
+        assert_eq!((l[4].as_str(), l[6].as_str(), l[8].as_str()), ("manual / in notes", "auto / in notes", "auto / unsettled"));
         // empty: the placeholder is gone, the state still heads the pane
         let empty = slides_view(0, CaptureState::Watching { window: "Zoom Meeting".into() });
         let (_, l) = draw_slides(&empty, &SlidesScroll::default(), &watch, 28, 4);

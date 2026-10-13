@@ -343,6 +343,7 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
             let name = Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             n("slide", &format!("slide {index}{how}"), format!("{name}, into the next snapshot"))
         }
+        Event::SlideRemoved { index } => n("slide", &format!("slide {index} removed"), "kept in slides/removed, and left out of the next snapshot".into()),
         Event::Capture(s) => {
             let (kind, label, detail) = capture::state_words(s, words);
             n(kind, label, detail)
@@ -354,7 +355,7 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
         Event::Paused(true) => n("notes", "paused", "nothing is recorded or transcribed until you resume; slides taken by hand and snapshots still work".into()),
         Event::Paused(false) => n("done", "resumed", "recording and transcribing again, in a new file".into()),
         Event::Warning(m) => n("warn", "warning", m.clone()),
-        Event::Busy(_) | Event::Preview(_) | Event::Thinking(_) | Event::SlideRemoved { .. } | Event::SlidesNoted { .. } => None,
+        Event::Busy(_) | Event::Preview(_) | Event::Thinking(_) | Event::SlidesNoted { .. } => None,
     }
 }
 
@@ -432,20 +433,119 @@ pub(crate) fn show(out: &mut impl Write, d: Display, e: &Event, watch: &mut Opti
     }
 }
 
+/// The model's thinking arrives a few words at a time, and a log line wants a finished thought: this holds the words
+/// and gives back a line for each sentence as it ends.
+#[derive(Debug, Default)]
+pub(crate) struct Thoughts {
+    held: String,
+}
+
+impl Thoughts {
+    /// Takes in a piece; the sentences it completes, each as one line. The model's markdown is dropped on the way in,
+    /// so a sentence closed by `.**` still ends where it reads as ending.
+    pub(crate) fn push(&mut self, piece: &str) -> Vec<String> {
+        self.held.extend(piece.chars().filter(|c| !matches!(c, '*' | '_' | '`' | '#')));
+        let mut lines = Vec::new();
+        loop {
+            // A sentence ends at a full stop, ! or ? that is followed by space, or at a line break.
+            let end = self.held.char_indices().find(|&(i, c)| c == '\n' || (matches!(c, '.' | '!' | '?') && self.held[i + 1..].starts_with(char::is_whitespace))).map(|(i, c)| i + c.len_utf8());
+            let Some(end) = end else { break };
+            let line: String = self.held.drain(..end).collect();
+            if let Some(line) = Self::line(&line) {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// What is held, as a line; None when nothing is. Said before anything else is, so the order of events is kept.
+    pub(crate) fn flush(&mut self) -> Option<String> {
+        Self::line(&std::mem::take(&mut self.held))
+    }
+
+    fn line(text: &str) -> Option<String> {
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+}
+
+/// The plain CLI's printing of a live lecture: [`show`], plus what needs memory across events. The model's thinking
+/// is said a sentence at a time, and a page that a polish typeset is opened, as the desktop does.
+#[derive(Debug, Default)]
+pub(crate) struct Printer {
+    thoughts: Thoughts,
+    /// A polish has ended and its page is on the way.
+    polished: bool,
+}
+
+impl Printer {
+    /// `open_pages`: a page this session's polish typeset opens in the default browser when it is ready.
+    pub(crate) fn show(&mut self, out: &mut impl Write, d: Display, e: &Event, watch: &mut Option<SilenceWatch>, words: &capture::Words, mixed: bool, open_pages: bool) {
+        if let Event::Thinking(piece) = e {
+            for line in self.thoughts.push(piece) {
+                say_thought(out, d, &line);
+            }
+            return;
+        }
+        if let Some(rest) = self.thoughts.flush() {
+            say_thought(out, d, &rest);
+        }
+        show(out, d, e, watch, words, mixed);
+        match e {
+            Event::Polished { .. } => self.polished = true,
+            Event::Page { outcome, .. } => {
+                if std::mem::take(&mut self.polished) && open_pages {
+                    open_in_browser(&outcome.path);
+                }
+            }
+            Event::PageFailed(_) | Event::Cancelled(_) | Event::PolishFailed(_) | Event::PolishStopped(_) => self.polished = false,
+            _ => {}
+        }
+    }
+}
+
+/// One sentence of the model's thinking, as the busy line is said: dim, and led by what it is.
+fn say_thought(out: &mut impl Write, d: Display, line: &str) {
+    writeln!(out, "{}", d.paint.paint(&format!("  … thinking: {}", d.safe(line)), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+}
+
+/// Opens a study page in the default browser (macOS `open`); a page that cannot be opened is still on disk, so the
+/// failure is not worth a line. A check typesets without opening it, as the app's checks do (the page loads its math
+/// and fonts from the web), unless `LECTURELIVE_CHECK_OPEN` asks for it.
+pub(crate) fn open_in_browser(path: &Path) {
+    if std::env::var_os("LECTURELIVE_CHECK").is_some() && std::env::var_os("LECTURELIVE_CHECK_OPEN").is_none() {
+        return;
+    }
+    let _ = std::process::Command::new("open").arg(path).status();
+}
+
 /// The stdin grammar: an empty line takes a snapshot, `polish` polishes, and any other line is the snapshot's hint.
 pub(crate) fn parse_line(line: &str) -> Op {
     let text = line.trim().to_string();
     if text.eq_ignore_ascii_case("polish") { Op::Polish } else { Op::Snapshot(text) }
 }
 
-/// The whole grammar a line of input is read in: the notes operations above, and `pause` and `resume` (spec §9.6),
-/// each only as the whole line, so a hint that merely begins with the word is still a hint.
+/// The slide a typed `remove 12` (or `remove slide 12`) names, only as the whole line: a hint that merely begins with
+/// the word is still a hint.
+fn remove_index(line: &str) -> Option<u32> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    match words.as_slice() {
+        [remove, n] | [remove, _, n] if remove.eq_ignore_ascii_case("remove") && (words.len() == 2 || words[1].eq_ignore_ascii_case("slide")) => n.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The whole grammar a line of input is read in: the notes operations above, `pause` and `resume` (spec §9.6), and
+/// `remove N` (spec §7.5), each only as the whole line, so a hint that merely begins with the word is still a hint.
 pub(crate) fn parse_command(line: &str) -> LectureCommand {
     let text = line.trim();
     if text.eq_ignore_ascii_case("pause") {
         LectureCommand::Pause
     } else if text.eq_ignore_ascii_case("resume") {
         LectureCommand::Resume
+    } else if let Some(index) = remove_index(text) {
+        // No reply is waited for: a refusal comes back as a warning in the event stream, which both frontends show.
+        LectureCommand::RemoveSlide { index, reply: None }
     } else {
         LectureCommand::Op(parse_line(line))
     }
@@ -883,6 +983,70 @@ mod goldens {
         assert_eq!(kind("polish"), "polish");
         assert_eq!(kind(""), "snapshot \"\"");
         assert_eq!(kind("pause the discussion of variance"), "snapshot \"pause the discussion of variance\"", "only the whole line is the command");
+    }
+
+    /// `remove N` (spec §7.5): the whole line, any case, with or without the word slide; a number that is not one, or
+    /// words after it, is still a hint for the snapshot.
+    #[test]
+    fn parse_command_reads_remove_n_as_the_whole_line_only() {
+        let kind = |l: &str| match parse_command(l) {
+            LectureCommand::RemoveSlide { index, reply: None } => format!("remove {index}"),
+            LectureCommand::Op(Op::Snapshot(h)) => format!("snapshot {h:?}"),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(kind("remove 12"), "remove 12");
+        assert_eq!(kind("  Remove slide 3 "), "remove 3");
+        assert_eq!(kind("REMOVE SLIDE 7"), "remove 7");
+        assert_eq!(kind("remove"), "snapshot \"remove\"");
+        assert_eq!(kind("remove x"), "snapshot \"remove x\"");
+        assert_eq!(kind("remove -1"), "snapshot \"remove -1\"");
+        assert_eq!(kind("remove 3 and 4"), "snapshot \"remove 3 and 4\"");
+        assert_eq!(kind("remove the slide 3"), "snapshot \"remove the slide 3\"");
+        assert_eq!(kind("please remove 3"), "snapshot \"please remove 3\"");
+    }
+
+    #[test]
+    fn a_removed_slide_is_said_with_where_it_went() {
+        assert_eq!(plain(&Event::SlideRemoved { index: 4 }), "  ▣ slide 4 removed  kept in slides/removed, and left out of the next snapshot\n");
+        assert_eq!(plain(&Event::SlidesNoted { through: 4 }), "", "the notes cursor is for the panes, not the log");
+    }
+
+    /// The model's thinking arrives in pieces: a line is said for each finished sentence, and what is left is said
+    /// before anything else is, so the order of the log is the order of events.
+    #[test]
+    fn thoughts_are_said_a_sentence_at_a_time() {
+        let mut t = Thoughts::default();
+        assert!(t.push("**Weighing the slide").is_empty());
+        assert_eq!(t.push(" against the talk.** The speaker moved to spread. Then"), ["Weighing the slide against the talk.", "The speaker moved to spread."]);
+        assert!(t.push(" the formula").is_empty(), "a sentence not yet ended waits");
+        assert_eq!(t.push(" gives se.\nNext"), ["Then the formula gives se.", ], "a full stop before the break ends it");
+        assert_eq!(t.flush().as_deref(), Some("Next"));
+        assert_eq!(t.flush(), None);
+        assert!(t.push("3.5 is a number").is_empty(), "a full stop inside a number is not the end");
+    }
+
+    #[test]
+    fn the_printer_says_thoughts_before_the_next_event_and_in_its_order() {
+        let mut p = Printer::default();
+        let mut out = Vec::new();
+        let words = capture::Words::new("Statistics");
+        let mut say = |p: &mut Printer, e: &Event| p.show(&mut out, pipe(OFF), e, &mut None, &words, false, false);
+        say(&mut p, &Event::Thinking("Checking the slide. Then the spre".into()));
+        say(&mut p, &Event::Thinking("ad of the sample".into()));
+        say(&mut p, &Event::NothingNew);
+        assert_eq!(String::from_utf8(out).unwrap(), "  … thinking: Checking the slide.\n  … thinking: Then the spread of the sample\n  ◆ snapshot  nothing new since the last one\n");
+    }
+
+    #[test]
+    fn a_polish_that_ends_marks_the_next_page_to_open_and_a_cancel_clears_it() {
+        let mut p = Printer::default();
+        let mut out = Vec::new();
+        let words = capture::Words::new("Statistics");
+        let polished = Event::Polished { backup: "b.md".into(), usd: 0.04, revision: 2 };
+        p.show(&mut out, pipe(OFF), &polished, &mut None, &words, false, false);
+        assert!(p.polished, "a polish started the typeset that follows it");
+        p.show(&mut out, pipe(OFF), &Event::Cancelled("the study page".into()), &mut None, &words, false, false);
+        assert!(!p.polished, "a page the person cancelled is not opened later");
     }
 
     #[test]

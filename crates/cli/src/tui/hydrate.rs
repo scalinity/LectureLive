@@ -38,6 +38,8 @@ pub(crate) struct Hydration {
     pub(crate) notes: NotesSnapshot,
     /// The registered slides, in registration order.
     pub(crate) slides: Vec<SlideEntry>,
+    /// The notes' slide cursor: the slides up to this index are in the notes, and the rest wait for a snapshot.
+    pub(crate) slides_noted: u32,
     /// The sidecar's transcript gaps, resolved or not: the projection reconciles its waiting set by
     /// each gap's identity, so a recovery whose notification was missed still clears (plan §F).
     /// Audio gaps are not here: nothing recovers them.
@@ -54,7 +56,7 @@ impl Hydration {
     /// No canonical state at all: a folder before anything was recorded.
     #[cfg(test)]
     pub(crate) fn empty() -> Hydration {
-        Hydration { segments: Vec::new(), notes: NotesSnapshot::At { revision: 0, document: String::new() }, slides: Vec::new(), gaps: Vec::new() }
+        Hydration { segments: Vec::new(), notes: NotesSnapshot::At { revision: 0, document: String::new() }, slides: Vec::new(), slides_noted: 0, gaps: Vec::new() }
     }
 }
 
@@ -99,8 +101,9 @@ fn read_once(files: &LectureFiles) -> Result<Hydration> {
         },
     };
     let gaps = sc.as_ref().map_or_else(Vec::new, |s| s.gaps.iter().filter(|g| g.kind.is_transcript()).cloned().collect());
+    let slides_noted = sc.as_ref().map_or(0, |s| s.notes.slide_index);
     let slides = sc.map_or_else(Vec::new, |mut s| std::mem::take(&mut s.slides));
-    Ok(Hydration { segments, notes, slides, gaps })
+    Ok(Hydration { segments, notes, slides, slides_noted, gaps })
 }
 
 #[cfg(test)]

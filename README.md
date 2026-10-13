@@ -42,7 +42,9 @@ and the audio input from `LECTURE_DEVICE` in `.env` (else the system input, else
 | ------------------ | ---------------------------------------------------------------------- |
 | `Enter`            | Snapshot: fold everything since the last snapshot into today's notes   |
 | `<hint>` + `Enter` | Same, with a focus hint for the note-taker                             |
-| `polish` + `Enter` | Rewrite today's notes into one clean study document, then its HTML page |
+| `polish` + `Enter` | Rewrite today's notes into one clean study document, then its HTML page, which opens when it is ready |
+| `remove 3` + `Enter` | Take slide 3 out of the lecture, while no snapshot has used it (it is kept in `slides/removed/`) |
+| `Ctrl+X`           | Full-screen only: cancel the notes request that is running or queued, or the study page being made |
 | `Ctrl+C`           | Stop (takes a final snapshot first)                                    |
 
 While it records, the transcript scrolls above a footer that stays at the bottom: the

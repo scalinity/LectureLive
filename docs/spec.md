@@ -481,7 +481,10 @@ after the lecture: the lecture folder's title without its week prefix (`Week 06 
 Statistical Analysis Methods` gives `Statistical Analysis Methods.html`), with the date
 added only when the folder holds more than one day's notes. The same step runs on its own
 from the notes (`lecture page`, or the app's Open study page when the page is missing or
-stale), without polishing again.
+stale), without polishing again. The page a polish typesets opens in the default browser as it
+lands, in the app, the terminal UI and the plain CLI alike; a page cancelled or asked for apart from a
+polish does not. A scripted session opens nothing, and a check does not unless `LECTURELIVE_CHECK_OPEN`
+is set.
 
 The page is a condensation, not a copy: the notes stay the complete record, and the page
 holds what a student needs to revise. One chat request carries the whole notes and every
@@ -678,7 +681,9 @@ so that a duplicate or an empty capture never reaches the model or the notes. In
 pointer shows a quiet × at its top-right corner; with the pointer on the ×, it turns red and the slide it would
 remove is outlined. It is also reached with the keyboard. There is no confirmation: the slide's file moves to
 `slides/removed/`, where the folder's slide scan does not look, so it is not registered again when the folder is
-opened and the person can take it back by hand. The notice line says so.
+opened and the person can take it back by hand. The notice line says so. The CLI reaches it with
+`remove N` (or `remove slide N`) as the whole line; no reply is waited for, so a refusal comes back as a
+warning in the event stream and the plain CLI prints a removal as `slide N removed`.
 
 The strip offers the control only for a slide that is removable, and the core decides again when asked, inside
 the sidecar's writer: a slide a snapshot has used stays (the notes embed its file), and nothing is removed while a
@@ -939,9 +944,13 @@ The snapshot being written is provisional and looks it: `writing` in the gutter,
 on every row, the text dim, parsed at most ten times a second, shown up to its last whitespace, and
 capped at 1 MiB with a notice when it passes. The committed block replaces it in the same state
 update that ends the work, so no frame shows both. The heading carries the work lane — the head's
-state (`snapshot: writing`, `polish: snapshot first`, `polishing`, `last snapshot: writing`), how many
+state (`snapshot: thinking`, `polish: snapshot first`, `polishing`, `last snapshot: thinking`; a
+snapshot reads `writing` once its first word has streamed), a clock for the step now running, how many
 of this frontend's requests wait behind it, and `study page: typesetting` — from typed events and its
-own submissions alone, never from the busy text. The notes scroll and return to live like the
+own submissions alone, never from the busy text. While a step has no words to show, the last row of the
+notes holds the model's own latest sentence about what it is thinking, else "reading the transcript and
+the new slides" or "reading the notes and rewriting them"; it is never part of the notes. The plain CLI says
+the same thinking a sentence at a time, dim, as `… thinking: …`. The notes scroll and return to live like the
 transcript, anchored on a chunk, a block and a byte.
 
 #### 9.5.6 Slides and capture
@@ -951,7 +960,7 @@ The slides pane heads with the capture state in words: watching a window (teal e
 with its reason; asking, with `^S watch it` where that is possible; Screen Recording off, naming the
 host and the settings path; capture failing, with its reason. It then lists the registered slides,
 newest last and followed, each with its time, its `Slide N`, and how it came to be (`auto`,
-`auto / unsettled`, `manual`). The pane is a column where there is room and a tab otherwise, carrying
+`auto / unsettled`, `manual`, with `/ in notes` after a slide a snapshot has used). The pane is a column where there is room and a tab otherwise, carrying
 the slide count and a `▲` while capture needs the person.
 
 `^S` captures the watched window now; while there is exactly one window offered, it is the saved
@@ -973,7 +982,7 @@ a submission.
 | Key | |
 |---|---|
 | printable, Backspace, Delete, ←/→, Home/End, Ctrl-A/E/K/U/W | edit the hint |
-| `⏎` | the CLI's grammar: empty → a snapshot; a hint → a snapshot that focuses on it; `polish` → a polish, which takes its own snapshot first; `pause` or `resume` as the whole line → that command (§9.6). While stopping nothing is sent and the text is kept |
+| `⏎` | the CLI's grammar: empty → a snapshot; a hint → a snapshot that focuses on it; `polish` → a polish, which takes its own snapshot first; `pause` or `resume` as the whole line → that command (§9.6); `remove N` as the whole line → take slide N out (§7.5). While stopping nothing is sent and the text is kept |
 | `^P` | pause the lecture, or resume it, by the state core last reported (§9.6). A half-typed hint is left alone; while stopping nothing is sent |
 | `^H`, `F1` | help, in an overlay that scrolls itself and `Esc` closes |
 | `^O` | activity, this session's notices |
