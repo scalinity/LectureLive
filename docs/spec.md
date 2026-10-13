@@ -796,7 +796,9 @@ read, and the next line starts on a line of its own.
   cancellable.
 - **Spend** (from the strip): a sheet beside the lecture with the CLI's `lecture spend` figures: all
   time, the last three months by course with bars, the eight most recent lectures by kind, and the
-  share estimated from published rates rather than billed.
+  share estimated from published rates rather than billed. The title and Close stay at the top while the list
+  scrolls, with a hairline under them once content passes beneath; on opening, the sheet itself holds focus, not
+  Close, so no ring appears there until the keyboard goes to it.
 - **API key**: a dialog that stores the key in the Keychain (or moves the CLI's `GROK_API_KEY` there),
   opened at start when none is stored.
 

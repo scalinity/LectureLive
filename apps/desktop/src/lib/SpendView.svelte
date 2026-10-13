@@ -5,10 +5,15 @@
 
   let dialog: HTMLDialogElement;
   let s = $state<SpendSummary | undefined>(undefined);
+  /** Content is scrolling under the header: it gets its hairline. */
+  let scrolled = $state(false);
 
   export async function show() {
     s = await session.spendSummary();
+    scrolled = false;
     dialog.showModal();
+    // showModal puts focus on the first control, and the ring round Close reads as something chosen: the sheet takes it instead.
+    dialog.focus();
   }
 
   /** The CLI's money: two decimals, thousands grouped, "<$0.01" for a sliver. */
@@ -20,8 +25,8 @@
   const share = $derived(s && s.total > 0 ? Math.round((100 * s.estimated) / s.total) : 0);
 </script>
 
-<dialog bind:this={dialog} class="sheet" aria-labelledby="spend-title">
-  <div class="head">
+<dialog bind:this={dialog} class="sheet" tabindex="-1" aria-labelledby="spend-title" onscroll={(e) => (scrolled = e.currentTarget.scrollTop > 2)}>
+  <div class="head" class:scrolled>
     <h2 id="spend-title">Spend</h2>
     <button class="close" onclick={() => dialog.close()}>Close</button>
   </div>
@@ -65,7 +70,7 @@
     height: 100vh;
     max-height: 100vh;
     width: min(34rem, 100vw);
-    padding: 1.4rem 1.6rem 2rem;
+    padding: 0 1.6rem 2rem;
     border: 0;
     border-left: 1px solid var(--rule);
     background: var(--paper);
@@ -76,14 +81,31 @@
     background: var(--scrim);
   }
 
+  .sheet:focus {
+    outline: none;
+  }
+
+  /* Stays at the top of the sheet, so Close is there wherever the list has been scrolled to. */
   .head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
     display: flex;
     justify-content: space-between;
     align-items: baseline;
+    margin: 0 -1.6rem;
+    padding: 1.4rem 1.6rem 1rem;
+    background: var(--paper);
+    border-bottom: 1px solid transparent;
+    transition: border-color var(--fade) ease-out;
+  }
+
+  .head.scrolled {
+    border-bottom-color: var(--rule);
   }
 
   h2 {
-    margin: 0 0 1rem;
+    margin: 0;
     font-size: var(--step-2);
   }
 
