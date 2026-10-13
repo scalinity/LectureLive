@@ -364,6 +364,30 @@ async fn the_page_a_polish_started_is_cancelled_with_it_and_the_next_typeset_is_
     tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
 }
 
+/// A removal the lecture refuses is told to the caller that waits for an answer (the desktop's command), and as a
+/// warning to one that has no reply channel (a typed `remove`, which hears nothing else).
+#[tokio::test]
+async fn when_a_removal_is_refused_the_caller_hears_why_or_the_event_stream_warns() {
+    use tokio::sync::oneshot;
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    folder::open(&f, TITLE, false).unwrap();
+    let sse = fake_sse::start(respond).await;
+    let lec = Arc::new(lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl")));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Idle), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+    let (tx, rx) = oneshot::channel();
+    cmd.send(Command::RemoveSlide { index: 9, reply: Some(tx) }).unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), rx).await.expect("an answer").unwrap();
+    assert!(answer.unwrap_err().contains("not in this lecture"));
+    cmd.send(Command::RemoveSlide { index: 9, reply: None }).unwrap();
+    until(&mut ev, "the warning", |e| matches!(e, Event::Warning(m) if m.contains("Slide 9 is not in this lecture"))).await;
+    cmd.send(Command::Stop).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+}
+
 /// The model's thinking summary is told while a snapshot or a polish waits for its words, and is no part of the notes.
 #[tokio::test]
 async fn a_snapshot_and_a_polish_both_tell_the_models_thinking_as_it_streams() {

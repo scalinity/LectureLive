@@ -730,7 +730,7 @@ pub async fn capture_now(app: State<'_, App>) -> Res<()> {
 #[tauri::command]
 pub async fn remove_slide(index: u32, app: State<'_, App>) -> Res<()> {
     let (tx, rx) = oneshot::channel();
-    app.send(Command::RemoveSlide { index, reply: tx })?;
+    app.send(Command::RemoveSlide { index, reply: Some(tx) })?;
     rx.await.map_err(|_| "The lecture has ended.".to_string())?
 }
 

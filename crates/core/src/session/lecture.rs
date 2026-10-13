@@ -78,8 +78,9 @@ pub enum Command {
     Bind { window: u32, selection: Selection },
     /// Images dropped on the app (spec §7.3).
     Import(Vec<PathBuf>),
-    /// Remove a slide no snapshot has used (spec §7.5).
-    RemoveSlide { index: u32, reply: oneshot::Sender<Result<(), String>> },
+    /// Remove a slide no snapshot has used (spec §7.5). `reply` answers the caller that waits for the result (the
+    /// desktop's command); without one, a refusal is told as a `Warning`, which is how a typed `remove` hears it.
+    RemoveSlide { index: u32, reply: Option<oneshot::Sender<Result<(), String>>> },
 }
 
 /// Slide capture for a lecture (spec §7): where windows come from, and the course's saved selection.
@@ -364,6 +365,14 @@ impl Lecture {
     }
 }
 
+/// A removal that was refused: told to the caller that waits for an answer, else as a warning in the event stream.
+fn refused(reply: Option<oneshot::Sender<Result<(), String>>>, events: &UnboundedSender<Event>, why: String) {
+    match reply {
+        Some(r) => drop(r.send(Err(why))),
+        None => drop(events.send(Event::Warning(why))),
+    }
+}
+
 /// Held for the whole of a typeset, so that a second request for the same notes waits for the first instead of paying
 /// for another (`Lecture::page`). Dropped with the typeset when it is cancelled.
 static PAGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -583,16 +592,18 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                     Some(s) => {
                         let (lec, s, events, snapshotting) = (lec.clone(), s.clone(), events.clone(), snapshotting.clone());
                         tokio::spawn(async move {
-                            let _ = match slides::remove(&lec.files, &s, index, snapshotting).await {
+                            match slides::remove(&lec.files, &s, index, snapshotting).await {
                                 Ok(_) => {
                                     let _ = events.send(Event::SlideRemoved { index });
-                                    reply.send(Ok(()))
+                                    if let Some(r) = reply {
+                                        let _ = r.send(Ok(()));
+                                    }
                                 }
-                                Err(e) => reply.send(Err(format!("{e:#}"))),
-                            };
+                                Err(e) => refused(reply, &events, format!("{e:#}")),
+                            }
                         });
                     }
-                    None => { let _ = reply.send(Err("The lecture is stopping.".into())); }
+                    None => refused(reply, &events, "The lecture is stopping.".into()),
                 },
                 None => commands_open = false, // input closed: the lecture runs until it is stopped or its audio ends
             },
