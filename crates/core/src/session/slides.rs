@@ -104,6 +104,12 @@ pub async fn remove(files: &LectureFiles, store: &Store, index: u32, snapshottin
             }
             let from = files.dir.join(&sc.slides[at].file);
             if let Some(name) = from.file_name().filter(|_| from.exists()) {
+                // The record's path is whatever the sidecar says, and only a file inside the slides folder is the app's
+                // to move: compared as real paths, so a `..`, an absolute path or a link pointing out is refused.
+                let inside = from.canonicalize().ok().zip(files.slides.canonicalize().ok()).is_some_and(|(file, folder)| file.starts_with(folder));
+                if !inside {
+                    bail!("Slide {index}'s file is not in the slides folder, so it is left where it is");
+                }
                 let dir = files.slides.join(REMOVED_DIR);
                 std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
                 move_file(&from, &dir.join(name))?;
@@ -288,6 +294,25 @@ mod tests {
         remove(&files, &store, 1, idle()).await.unwrap();
         assert_eq!(store.read().await.unwrap().slides.len(), 2);
         assert!(!files.slides.join(REMOVED_DIR).exists(), "there was no file to keep");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_names_a_file_outside_the_slides_folder_moves_nothing() {
+        let (_d, files, store) = setup();
+        three(&files, &store).await;
+        let outside = files.dir.join("not-a-slide.png");
+        png(&outside);
+        let link = files.slides.join("slide_09_100009.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        // The sidecar is a file anyone can edit: records are pointed at a `..` path, an absolute path and a link.
+        for (index, file) in [(1u32, "slides/../not-a-slide.png".to_string()), (2, outside.to_string_lossy().into_owned()), (3, "slides/slide_09_100009.png".to_string())] {
+            store.update(move |sc| Ok(sc.slides.iter_mut().find(|s| s.index == index).unwrap().file = file)).await.unwrap();
+            let e = remove(&files, &store, index, idle()).await.unwrap_err();
+            assert!(format!("{e}").contains("not in the slides folder"), "{e}");
+        }
+        assert!(outside.exists() && link.exists(), "nothing was moved");
+        assert!(!files.slides.join(REMOVED_DIR).exists());
+        assert_eq!(store.read().await.unwrap().slides.len(), 3, "the records stay");
     }
 
     #[tokio::test]
