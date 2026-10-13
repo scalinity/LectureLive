@@ -630,10 +630,15 @@ with each count of samples multiplied by the rate, so each stays the same in sec
 - **Expiry**: a candidate that has not settled after 10 s (30 samples) is kept, flagged `uncertain`.
 - **The same slide again**: a candidate that settles on a frame equal to one of the last 3 kept
   frames (no unmasked tile past the change threshold), which was on screen within the last minute
-  (180 samples), is that slide shown again: it becomes the kept frame and is not registered. A control bar
-  that fades in and out of the region, or a step back and forward, would otherwise register one slide
-  once for every look, and each registered slide is sent to the model and embedded in the notes. A
-  slide returned to after a longer time registers again. Leaving the controls out of the region (a
+  (180 samples), is that slide shown again: it becomes the kept frame and is not registered. A step back
+  and forward would otherwise register one slide once for every look, and each registered slide is sent to
+  the model and embedded in the notes. A slide returned to after a longer time registers again.
+- **The control bar**: Zoom draws its control bar over the bottom of the share when the pointer moves over the
+  window, and takes it off a few seconds later. A change is the bar's, and starts nothing, when every changed
+  tile lies in the bottom 2 tile rows, the changed tiles span at least 12 of the 16 columns, and their mean
+  difference is at least 0.15 (a line of text changes its tiles by 0.06–0.08). The kept frame is left as it
+  is, whichever way the bar is going, and the rule holds however long the slide has been up. A slide that
+  changes while the bar is up is registered with the bar on it. Leaving the controls out of the region (a
   part left out) is still the better arrangement.
 - The first valid frame of a lecture is kept unconditionally.
 - A manual capture becomes the kept frame, so auto capture does not take the same slide again.

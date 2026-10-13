@@ -1,7 +1,8 @@
 //! Slide change detection (spec §7.2): each sample is cropped to the slide region and shrunk to 256×144
 //! grayscale; its 16×16 tiles are compared with the last kept frame. A change becomes a candidate, a
 //! candidate that holds still for a sample becomes a slide, tiles that keep moving are masked, and a
-//! candidate that never settles is kept after 10 samples, flagged uncertain.
+//! candidate that never settles is kept after 10 samples, flagged uncertain. A change that is only the window's
+//! control bar coming or going along the bottom is not a candidate.
 use image::{imageops::FilterType, DynamicImage, GrayImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -14,6 +15,12 @@ pub const TILES: usize = ((W / TILE) * (H / TILE)) as usize;
 pub const RECENT_KEPT: usize = 3;
 /// ...when that frame was on screen within this many samples (about a second each) of now.
 pub const RECENT_SAMPLES: u64 = 60;
+/// Tile rows along the bottom of the region where a window's control bar draws itself over the share.
+const BAR_ROWS: usize = 2;
+/// A control bar spans the window, so a change that is only the bar touches at least this many of the 16 tile columns.
+const BAR_COLUMNS: usize = 12;
+/// A flat bar against a page changes its tiles far more than a line of text does (text: about 0.06–0.08).
+const BAR_STRENGTH: f32 = 0.15;
 /// Samples a lecture takes each second. A slide held for 1–2 s was seen twice only half the time at one a
 /// second, which is how a lecturer paging through a deck lost slides (M7.1 class); at three it is seen twice
 /// from about 0.7 s.
@@ -161,6 +168,22 @@ fn tile_diffs(a: &GrayImage, b: &GrayImage) -> [f32; TILES] {
     sums.map(|s| s as f32 / (TILE * TILE) as f32 / 255.0)
 }
 
+/// Whether the tiles that changed are only a control bar along the bottom coming or going: all of them in the
+/// last `BAR_ROWS` rows, across the width, and strongly different. The pointer moving over a Zoom window brings
+/// the bar up over the slide, and it goes again a few seconds later; neither is a slide.
+fn bar_only(changed: &[usize], diffs: &[f32; TILES]) -> bool {
+    let cols = (W / TILE) as usize;
+    let first_bar_row = TILES / cols - BAR_ROWS;
+    if changed.is_empty() || changed.iter().any(|&i| i / cols < first_bar_row) {
+        return false;
+    }
+    let mut spanned = vec![false; cols];
+    for &i in changed {
+        spanned[i % cols] = true;
+    }
+    spanned.iter().filter(|&&s| s).count() >= BAR_COLUMNS && changed.iter().map(|&i| diffs[i]).sum::<f32>() / changed.len() as f32 >= BAR_STRENGTH
+}
+
 /// `T` is when a sample was taken: a wall-clock time in the app, a sample time in tests.
 pub struct Detector<T> {
     t: Thresholds,
@@ -241,7 +264,11 @@ impl<T: Clone> Detector<T> {
                 self.moving[i] = 0;
             }
         }
-        let changed: Vec<usize> = (0..TILES).filter(|&i| !self.masked[i] && d_ref[i] > self.t.change).collect();
+        let mut changed: Vec<usize> = (0..TILES).filter(|&i| !self.masked[i] && d_ref[i] > self.t.change).collect();
+        // The control bar over the slide, or off it again, leaves the reference as it is and starts nothing.
+        if bar_only(&changed, &d_ref) {
+            changed.clear();
+        }
         self.prev = Some(frame.clone());
         let Some(c) = self.candidate.as_mut() else {
             if !changed.is_empty() {
@@ -334,10 +361,11 @@ mod tests {
     }
 
     /// Live evidence (M6, a Zoom lecture): the window's control bar fades in and out inside the region, and each
-    /// stable state of the same slide was kept as a new slide, 24 in five minutes. A frame that matches one of the
-    /// last few kept frames is the same slide again: it becomes the reference and is not registered.
+    /// stable state of the same slide was kept as a new slide, 24 in five minutes. Live again (a class, 12:04 and
+    /// 12:05): the bar's first look was still kept, and after a minute of the same slide, so was the next one. The
+    /// bar is Zoom's, not the slide's, whenever it comes or goes.
     #[test]
-    fn a_control_bar_that_comes_and_goes_registers_the_slide_once_per_look_not_every_time() {
+    fn a_control_bar_that_comes_and_goes_registers_nothing() {
         let a = page();
         let bar = with_bar(a.clone(), 0, 128, W, 16, 15); // the toolbar: a dark strip along the bottom
         let (a, bar) = (|| a.clone(), || bar.clone());
@@ -346,7 +374,48 @@ mod tests {
             frames.extend([bar(), bar(), bar(), a(), a(), a()]);
         }
         let got = run(&mut Detector::new(Thresholds::default()), &frames);
-        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 3], "the first frame and the bar's first look: {got:?}");
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0], "only the first frame: {got:?}");
+    }
+
+    /// The class: slide seven kept, the pointer moved 49 seconds later, and the bar's look became slide eight.
+    /// Nothing about the bar depends on how long the slide has been up.
+    #[test]
+    fn a_control_bar_over_a_slide_held_for_minutes_is_not_a_new_slide() {
+        let a = page();
+        let bar = with_bar(a.clone(), 0, 112, W, 32, 15); // two tile rows tall, the most it may be
+        let mut frames = vec![a.clone(); 2 * RECENT_SAMPLES as usize];
+        frames.extend(vec![bar; 5]);
+        frames.extend(vec![a; 5]);
+        let got = run(&mut Detector::new(Thresholds::default()), &frames);
+        assert_eq!(got.len(), 1, "only the first frame: {got:?}");
+    }
+
+    /// The lecturer changes slide while the bar is up: that is a slide, and the bar going afterwards is not another.
+    #[test]
+    fn a_slide_change_under_the_bar_is_kept_once_and_the_bar_leaving_adds_nothing() {
+        let a = page();
+        let b = with_bar(a.clone(), 16, 32, 120, 6, 40);
+        let b_bar = with_bar(b.clone(), 0, 128, W, 16, 15);
+        let got = run(&mut Detector::new(Thresholds::default()), &[a.clone(), a, b_bar.clone(), b_bar.clone(), b_bar, b.clone(), b.clone(), b]);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 3], "the first frame and the new slide: {got:?}");
+    }
+
+    /// The rule must not swallow a slide: a bar-height change that does not span the window, or a wide line of
+    /// text that is as faint as text is, is still a build.
+    #[test]
+    fn a_bottom_change_that_is_not_a_bar_is_still_a_build() {
+        let a = page();
+        let narrow = with_bar(a.clone(), 16, 128, 96, 16, 15); // a dark box a third of the width
+        let got = run(&mut Detector::new(Thresholds::default()), &[a.clone(), a.clone(), narrow.clone(), narrow]);
+        assert_eq!(got.len(), 2, "a narrow change at the bottom is a build: {got:?}");
+        let mut line = a.clone();
+        for x in (8..248).step_by(2) {
+            for y in 130..133 {
+                line.put_pixel(x, y, Luma([40])); // text strokes across 15 of 16 columns
+            }
+        }
+        let got = run(&mut Detector::new(Thresholds::default()), &[a.clone(), a, line.clone(), line]);
+        assert_eq!(got.len(), 2, "a last line of text across the page is a build: {got:?}");
     }
 
     #[test]
