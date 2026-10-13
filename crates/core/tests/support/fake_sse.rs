@@ -1,5 +1,5 @@
-//! A fake chat-completions endpoint (spec §11): answers each request by a script, streaming SSE the
-//! way api.x.ai does (plan research: reasoning, content, a finish chunk, the usage chunk, [DONE]).
+//! A fake Messages endpoint (spec §11): answers each request by a script, streaming SSE the way
+//! api.anthropic.com does (message_start, a thinking block, text deltas, message_delta with the stop reason, message_stop).
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,12 +18,18 @@ pub enum Reply {
 #[derive(Default)]
 pub struct SseState {
     bodies: Mutex<Vec<Value>>,
+    heads: Mutex<Vec<String>>,
 }
 
 impl SseState {
     /// Every request's JSON body, in arrival order.
     pub fn bodies(&self) -> Vec<Value> {
         self.bodies.lock().unwrap().clone()
+    }
+
+    /// Every request's header block (request line included), in arrival order.
+    pub fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 
     pub fn requests(&self) -> usize {
@@ -40,7 +46,7 @@ type Respond = dyn Fn(&Value) -> Reply + Send + Sync;
 
 pub async fn start(respond: impl Fn(&Value) -> Reply + Send + Sync + 'static) -> FakeSse {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+    let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
     let state = Arc::new(SseState::default());
     let (st, respond): (_, Arc<Respond>) = (state.clone(), Arc::new(respond));
     tokio::spawn(async move {
@@ -52,39 +58,48 @@ pub async fn start(respond: impl Fn(&Value) -> Reply + Send + Sync + 'static) ->
     FakeSse { url, state }
 }
 
-/// A response's events as api.x.ai streams them.
-pub fn events(content: &[&str], finish: Option<&str>, ticks: Option<u64>) -> Vec<u8> {
-    let chunk = |choices: Value, usage: Option<Value>| {
-        let mut v = json!({"id": "fake", "object": "chat.completion.chunk", "created": 0, "model": "grok-4.7", "choices": choices});
-        if let Some(u) = usage {
-            v["usage"] = u;
-        }
-        format!("data: {v}\n\n")
-    };
-    let mut out = chunk(json!([{"index": 0, "delta": {"reasoning_content": "Thinking", "role": "assistant"}}]), None);
+/// A response's events as the Messages API streams them: an empty thinking block, the text in deltas,
+/// the stop reason and, when `usage` is set, the token counts at the start and in `message_delta`.
+pub fn events(content: &[&str], stop: Option<&str>, usage: bool) -> Vec<u8> {
+    let event = |name: &str, v: Value| format!("event: {name}\ndata: {v}\n\n");
+    let counts = |input: u64, output: u64| if usage { json!({"input_tokens": input, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": output}) } else { Value::Null };
+    let mut start = json!({"id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": null});
+    if usage {
+        start["usage"] = counts(100, 1);
+    }
+    let mut out = event("message_start", json!({"type": "message_start", "message": start}));
+    out += &event("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}));
+    out += &event("ping", json!({"type": "ping"}));
+    out += &event("content_block_stop", json!({"type": "content_block_stop", "index": 0}));
+    out += &event("content_block_start", json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}));
     for c in content {
-        out += &chunk(json!([{"index": 0, "delta": {"content": c}}]), None);
+        out += &event("content_block_delta", json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": c}}));
     }
-    if let Some(f) = finish {
-        out += &chunk(json!([{"index": 0, "delta": {}, "finish_reason": f}]), None);
-    }
-    if let Some(t) = ticks {
-        out += &chunk(json!([]), Some(json!({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120, "prompt_tokens_details": {"cached_tokens": 0}, "cost_in_usd_ticks": t})));
-    }
-    if finish.is_some() {
-        out += "data: [DONE]\n\n";
+    out += &event("content_block_stop", json!({"type": "content_block_stop", "index": 1}));
+    if let Some(reason) = stop {
+        let mut delta = json!({"type": "message_delta", "delta": {"stop_reason": reason, "stop_details": null}});
+        if usage {
+            delta["usage"] = counts(100, 20);
+        }
+        out += &event("message_delta", delta);
+        out += &event("message_stop", json!({"type": "message_stop"}));
     }
     out.into_bytes()
 }
 
-/// A successful answer, its text in word-sized deltas, sent in 1 KB pieces.
-pub fn answer(text: &str, ticks: u64) -> Reply {
-    let deltas: Vec<&str> = text.split_inclusive(' ').collect();
-    Reply::Stream(pieces(events(&deltas, Some("stop"), Some(ticks)), 1024))
+/// A successful answer with its token counts, its text in word-sized deltas, sent in 1 KB pieces.
+pub fn answer(text: &str) -> Reply {
+    Reply::Stream(pieces(answer_bytes(text), 1024))
 }
 
-pub fn fixture(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{}/tests/fixtures/notes/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+pub fn answer_bytes(text: &str) -> Vec<u8> {
+    let deltas: Vec<&str> = text.split_inclusive(' ').collect();
+    events(&deltas, Some("end_turn"), true)
+}
+
+/// An error body as the API sends it.
+pub fn error_body(kind: &str, message: &str) -> String {
+    json!({"type": "error", "error": {"type": kind, "message": message}}).to_string()
 }
 
 pub fn pieces(bytes: Vec<u8>, n: usize) -> Vec<Vec<u8>> {
@@ -117,6 +132,7 @@ async fn handle(mut tcp: TcpStream, respond: &Respond, st: &SseState) {
     }
     let body: Value = serde_json::from_slice(&buf[head_end..head_end + len]).unwrap();
     st.bodies.lock().unwrap().push(body.clone());
+    st.heads.lock().unwrap().push(head);
     const STREAM_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
     match respond(&body) {
         Reply::Status(code, text) => {

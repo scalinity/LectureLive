@@ -1,6 +1,6 @@
-//! Live checks against api.x.ai (spec §6), on synthetic material only, within the M3 cap of $2:
+//! Live checks against api.anthropic.com (spec §6), on synthetic material only, within the M3 cap of $2:
 //!     cargo test -p lecturelive-core --test notes_live -- --ignored --nocapture --test-threads 1
-//! Each prints its cost from usage.cost_in_usd_ticks.
+//! Each prints its cost, computed from the usage tokens.
 mod support;
 
 use std::path::Path;
@@ -18,11 +18,11 @@ use lecturelive_core::session::spend::{self, Spend};
 use tokio::sync::mpsc;
 
 fn api_key() -> String {
-    if let Ok(k) = std::env::var("GROK_API_KEY") {
+    if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
         return k;
     }
-    let env = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env")).expect("GROK_API_KEY in the environment or the repository's .env");
-    env.lines().find_map(|l| l.strip_prefix("GROK_API_KEY=")).map(|v| v.trim().trim_matches('"').to_string()).expect("GROK_API_KEY in .env")
+    let env = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env")).expect("ANTHROPIC_API_KEY in the environment or the repository's .env");
+    env.lines().find_map(|l| l.strip_prefix("ANTHROPIC_API_KEY=")).map(|v| v.trim().trim_matches('"').to_string()).expect("ANTHROPIC_API_KEY in .env")
 }
 
 fn live(ledger: &Path, lecture: &str) -> (ChatClient, Spend) {
@@ -32,7 +32,7 @@ fn live(ledger: &Path, lecture: &str) -> (ChatClient, Spend) {
 
 #[tokio::test]
 #[ignore]
-async fn a_live_snapshot_streams_commits_and_reports_its_billed_cost() {
+async fn a_live_snapshot_streams_commits_and_reports_its_computed_cost() {
     let dir = tempfile::tempdir().unwrap();
     let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap());
     let title = "# M3 synthetic — Week 01 — Optimisation — 2026-09-25";
@@ -51,8 +51,8 @@ async fn a_live_snapshot_streams_commits_and_reports_its_billed_cost() {
     println!("{notes}");
     assert_eq!(notes.matches("<!-- ").count(), 1);
     let entries = spend::read(&ledger).unwrap();
-    println!("cost: ${:.6} (billed: {})", entries[0].usd, entries[0].billed);
-    assert!(entries.len() == 1 && entries[0].billed && entries[0].what == "notes");
+    println!("cost: ${:.6}", entries[0].usd);
+    assert!(entries.len() == 1 && !entries[0].billed && entries[0].what == "notes");
 }
 
 #[tokio::test]

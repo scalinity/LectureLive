@@ -32,10 +32,15 @@ pub fn delete(service: &str) -> Result<()> {
 /// The repository's `.env`, where the CLI keeps the key; found at compile time, as the CLI finds it.
 const REPO_ENV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.env");
 
+/// `name` from the environment, else the repository's `.env`.
+pub fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| dotenvy::from_path_iter(REPO_ENV).ok()?.flatten().find(|(k, _)| k == name).map(|(_, v)| v).filter(|v| !v.is_empty()))
+}
+
 /// `GROK_API_KEY` from the environment, else the repository's `.env`: offered once, to move the key
 /// the CLI already uses into the Keychain.
 pub fn env_key() -> Option<String> {
-    std::env::var(ACCOUNT).ok().filter(|v| !v.is_empty()).or_else(|| dotenvy::from_path_iter(REPO_ENV).ok()?.flatten().find(|(k, _)| k == ACCOUNT).map(|(_, v)| v).filter(|v| !v.is_empty()))
+    env_value(ACCOUNT)
 }
 
 #[cfg(test)]

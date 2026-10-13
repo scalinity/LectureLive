@@ -37,23 +37,23 @@ fn files(dir: &Path) -> LectureFiles {
 }
 
 fn user_text(body: &Value) -> String {
-    let c = &body["messages"][1]["content"];
-    c.as_str().map(str::to_string).unwrap_or_else(|| c[0]["text"].as_str().unwrap_or_default().to_string())
+    let c = &body["messages"][0]["content"];
+    c.as_str().map(str::to_string).unwrap_or_else(|| c.as_array().and_then(|a| a.iter().find_map(|p| p["text"].as_str())).unwrap_or_default().to_string())
 }
 
 /// The model, played by the fake: notes that place every embed, a polish that keeps them, a page within budget.
 fn respond(body: &Value) -> Reply {
-    let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+    let system = body["system"].as_str().unwrap_or_default();
     let user = user_text(body);
     if system.starts_with("You are the note-taker") {
         let embeds: Vec<&str> = user.lines().filter(|l| l.starts_with("![Slide ")).collect();
-        fake_sse::answer(&format!("## Gradient descent\n- Steps against the gradient.\n{}", embeds.join("\n")), 1_000_000)
+        fake_sse::answer(&format!("## Gradient descent\n- Steps against the gradient.\n{}", embeds.join("\n")))
     } else if system.starts_with("You turn raw") {
         let title = user.lines().next().unwrap_or_default().trim_start_matches("Use this exact title line: ").to_string();
         let doc = user.split("Notes as written during the lecture:\n<<<\n").nth(1).and_then(|s| s.split("\n>>>").next()).unwrap_or_default();
-        fake_sse::answer(&format!("{title}\n\nThe lecture covered gradient descent.\n\n## Gradient descent\n- Steps against the gradient.\n{}\n\n## Key takeaways\n- Scale the rate.", embeds_in(doc).join("\n")), 2_000_000)
+        fake_sse::answer(&format!("{title}\n\nThe lecture covered gradient descent.\n\n## Gradient descent\n- Steps against the gradient.\n{}\n\n## Key takeaways\n- Scale the rate.", embeds_in(doc).join("\n")))
     } else {
-        fake_sse::answer(&fake_sse::study_page(300), 3_000_000)
+        fake_sse::answer(&fake_sse::study_page(300))
     }
 }
 
@@ -151,8 +151,8 @@ async fn a_whole_lecture_runs_headless_from_first_word_to_study_page() {
     }
     let bodies = sse.state.bodies();
     assert!(bodies.iter().any(|b| user_text(b).contains("Focus hint from the student: focus on momentum")));
-    let first = &bodies[0]["messages"][1]["content"];
-    assert!(first[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"), "the slide goes with its snapshot");
+    let first = &bodies[0]["messages"][0]["content"];
+    assert_eq!(first[0]["source"]["media_type"], "image/png", "the slide goes with its snapshot, before the text");
     assert!(user_text(&bodies[0]).contains(">>> Slide 1 shown (embed: ![Slide 1](slides/slide_01_"));
 }
 
@@ -173,9 +173,9 @@ async fn failed_empty_and_truncated_answers_leave_the_notes_untouched_and_the_ba
     let dir = tempfile::tempdir().unwrap();
     let (f, store) = offline_folder(dir.path());
     let replies = Arc::new(Mutex::new(vec![
-        Reply::Stream(fake_sse::pieces(fake_sse::fixture("stream_usage.sse")[..9_000].to_vec(), 64)), // cut off mid-answer
-        Reply::Stream(vec![b"data: [DONE]\n\n".to_vec()]),                                            // empty
-        Reply::Stream(fake_sse::pieces(fake_sse::fixture("stream_length.sse"), 64)),                  // truncated by length
+        Reply::Stream(fake_sse::pieces({ let b = fake_sse::answer_bytes("## Gradient descent\n- Steps against the gradient."); b[..b.len() * 3 / 4].to_vec() }, 64)), // cut off mid-answer
+        Reply::Stream(vec![fake_sse::events(&[], None, false)]),                                                                                                        // empty
+        Reply::Stream(vec![fake_sse::events(&["## Gradient descent\n- Steps"], Some("max_tokens"), true)]),                                                              // truncated by length
     ]));
     let queue = replies.clone();
     let sse = fake_sse::start(move |b| queue.lock().unwrap().pop().map_or_else(|| respond(b), |r| r)).await;
@@ -200,7 +200,7 @@ async fn failed_empty_and_truncated_answers_leave_the_notes_untouched_and_the_ba
     let (ev_tx, mut ev) = mpsc::unbounded_channel();
     assert!(!lec.polish(&store, &ev_tx).await);
     assert!(matches!(ev.recv().await, Some(Event::PolishStopped(_)) | Some(Event::Busy(_))));
-    assert!(sse.state.bodies().iter().all(|b| !b["messages"][0]["content"].as_str().unwrap().starts_with("You turn raw")));
+    assert!(sse.state.bodies().iter().all(|b| !b["system"].as_str().unwrap().starts_with("You turn raw")));
     assert_eq!(std::fs::read_to_string(&f.notes).unwrap(), notes);
 }
 
@@ -251,7 +251,7 @@ async fn a_registered_slide_whose_file_is_gone_is_skipped_with_a_warning() {
     }
     assert!(warned, "the person is told which slide was skipped");
     let sent = &sse.state.bodies()[0];
-    assert_eq!(sent["messages"][1]["content"].as_array().unwrap().len(), 2, "the text and the one slide that exists");
+    assert_eq!(sent["messages"][0]["content"].as_array().unwrap().len(), 2, "the text and the one slide that exists");
     assert!(!user_text(sent).contains("slide_02_"), "the missing slide is not offered to the model");
     let notes = std::fs::read_to_string(&f.notes).unwrap();
     assert!(notes.contains("![Slide 1](slides/slide_01_100001.png)") && !notes.contains("Slide 2"));
@@ -283,7 +283,7 @@ async fn a_second_stop_skips_queued_operations() {
     cmd.send(Command::Stop).unwrap();
     cmd.send(Command::Stop).unwrap();
     tokio::time::timeout(Duration::from_secs(20), run).await.expect("the lecture ends").unwrap().unwrap();
-    let systems: Vec<String> = sse.state.bodies().iter().map(|b| b["messages"][0]["content"].as_str().unwrap_or_default().chars().take(22).collect()).collect();
+    let systems: Vec<String> = sse.state.bodies().iter().map(|b| b["system"].as_str().unwrap_or_default().chars().take(22).collect()).collect();
     assert_eq!(systems.iter().filter(|s| s.starts_with("You are the note-taker")).count(), 2, "the snapshot in flight and the last one: {systems:?}");
     assert!(!systems.iter().any(|s| s.starts_with("You turn raw")), "the queued polish was skipped");
 }
@@ -334,7 +334,7 @@ async fn a_cancelled_snapshot_writes_nothing_drops_the_queue_and_its_material_go
     cmd.send(Command::Stop).unwrap();
     tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
     let bodies = sse.state.bodies();
-    assert!(!bodies.iter().any(|b| b["messages"][0]["content"].as_str().unwrap_or_default().starts_with("You turn raw")), "the queued polish never sent its request");
+    assert!(!bodies.iter().any(|b| b["system"].as_str().unwrap_or_default().starts_with("You turn raw")), "the queued polish never sent its request");
     let cancelled: Vec<String> = user_text(&bodies[0]).lines().filter(|l| l.starts_with('[')).map(str::to_string).collect();
     assert!(!cancelled.is_empty());
     assert!(cancelled.iter().all(|l| user_text(&bodies[1]).contains(l.as_str())), "the cancelled material went again");
@@ -437,7 +437,7 @@ async fn a_polish_after_the_lecture_repairs_the_folder_first_then_polishes_and_t
 
     until(&mut ev, "the polish", |e| matches!(e, Event::Polished { .. })).await;
     until(&mut ev, "the page", |e| matches!(e, Event::Page { .. })).await;
-    let sent = sse.state.bodies().into_iter().find(|b| b["messages"][0]["content"].as_str().unwrap_or_default().starts_with("You turn raw")).expect("a polish request");
+    let sent = sse.state.bodies().into_iter().find(|b| b["system"].as_str().unwrap_or_default().starts_with("You turn raw")).expect("a polish request");
     assert!(user_text(&sent).contains("Gradients point uphill."), "the edit made after class is polished");
     assert!(!user_text(&sent).contains("## Momentum"), "the torn block is removed before the polish");
     assert!(!f.journal().exists());
@@ -703,7 +703,7 @@ async fn a_quit_finalizes_the_recording_drops_the_request_in_flight_and_takes_no
     // The request would hold a stop for its 30 s timeout; a quit does not wait for it.
     let report = tokio::time::timeout(Duration::from_secs(10), run).await.expect("a quit is prompt").unwrap().unwrap();
     assert!(report.last_snapshot.is_some_and(|m| m.contains("quit")), "the report says the last snapshot was not taken");
-    let systems: Vec<String> = sse.state.bodies().iter().map(|b| b["messages"][0]["content"].as_str().unwrap_or_default().chars().take(22).collect()).collect();
+    let systems: Vec<String> = sse.state.bodies().iter().map(|b| b["system"].as_str().unwrap_or_default().chars().take(22).collect()).collect();
     // The fake records a request when it completes, and the one in flight was cancelled; a last snapshot against this
     // stalling server would have waited out its 30 s timeout, so the prompt end above is the proof it was not taken.
     assert!(systems.len() <= 1, "no request but the one that was in flight: {systems:?}");

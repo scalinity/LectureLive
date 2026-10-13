@@ -1,6 +1,6 @@
 //! How much of the notes a snapshot request carries (spec §6.1).
 
-/// `grok-4.7`'s long-context threshold: above it the whole request is billed at twice the rate (plan research).
+/// The most notes text a snapshot carries, which keeps a long lecture's request fast and its cost bounded.
 pub const BUDGET_TOKENS: usize = 200_000;
 /// Reasoning plus the block the model writes.
 pub const OUTPUT_TOKENS: usize = 16_000;

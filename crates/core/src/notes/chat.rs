@@ -1,6 +1,6 @@
-//! The notes model over SSE (spec §6.2): chat completions with `stream: true` and the usage chunk.
-//! Plan research: reasoning deltas come before content, the finish chunk carries `finish_reason`,
-//! and the cost arrives once, in a chunk of its own after it, only when `include_usage` is asked.
+//! The notes model over SSE (spec §6.2): the Claude Messages API with `stream: true`, Opus 5.5 at high
+//! effort with adaptive thinking. Thinking deltas come before the text, the stop reason arrives in
+//! `message_delta`, and usage is tokens only (no price), so every cost here is computed.
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,15 +10,19 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::session::spend::{Spend, SpendKind};
-use crate::stt::protocol::{is_refusal, refusal_message};
+use crate::stt::protocol::is_refusal;
 
-pub const CHAT_URL: &str = "https://api.x.ai/v1/chat/completions";
-pub const MODEL: &str = "grok-4.7";
-pub const TICKS_PER_USD: f64 = 1e10;
-/// The Python CLI's fallback rates per token (input, cached, output), used only when a response reports tokens but no cost.
-const USD_PER_TOKEN: (f64, f64, f64) = (2.20e-6, 0.55e-6, 6.60e-6);
-/// Above this the whole request is billed at twice the rate.
-const LONG_PROMPT_TOKENS: u64 = 200_000;
+pub const CHAT_URL: &str = "https://api.anthropic.com/v1/messages";
+pub const MODEL: &str = "claude-opus-5-5";
+/// Every request runs at this effort unless it names another.
+pub const EFFORT: &str = "high";
+/// Thinking counts toward this; streaming keeps a large ceiling clear of HTTP timeouts.
+const MAX_TOKENS: u32 = 64_000;
+const API_VERSION: &str = "2023-06-01";
+/// A request the safety classifiers decline is re-run on Anthropic's recommended fallback model, inside the same call.
+const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// Claude Opus 5.5 list prices per token (input, cache read, output).
+const USD_PER_TOKEN: (f64, f64, f64) = (4.0e-6, 0.2e-6, 20.0e-6);
 
 /// SSE framing: bytes in as they arrive, the data of each completed event out. A line is decoded
 /// only once its newline has arrived, so a character split across reads is never broken.
@@ -50,30 +54,18 @@ impl SseParser {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Usage {
+    /// Everything sent, cached or not.
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// Thinking included: it is billed as output.
     pub completion_tokens: u64,
-    pub ticks: Option<u64>,
 }
 
 impl Usage {
-    fn from_json(u: &Value) -> Self {
-        Self {
-            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
-            cached_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-            ticks: u["cost_in_usd_ticks"].as_u64(),
-        }
-    }
-
-    /// What the request cost and whether that is the billed figure (the Python CLI's `chat_cost`).
+    /// What the request cost; Anthropic reports tokens, not a price, so the figure is never the billed one.
     pub fn cost(&self) -> (f64, bool) {
-        if let Some(t) = self.ticks {
-            return (t as f64 / TICKS_PER_USD, true);
-        }
         let (input, cached, output) = USD_PER_TOKEN;
-        let usd = self.prompt_tokens.saturating_sub(self.cached_tokens) as f64 * input + self.cached_tokens as f64 * cached + self.completion_tokens as f64 * output;
-        (if self.prompt_tokens > LONG_PROMPT_TOKENS { usd * 2.0 } else { usd }, false)
+        (self.prompt_tokens.saturating_sub(self.cached_tokens) as f64 * input + self.cached_tokens as f64 * cached + self.completion_tokens as f64 * output, false)
     }
 }
 
@@ -82,6 +74,8 @@ impl Usage {
 pub struct Reply {
     pub text: String,
     pub finish: Option<String>,
+    /// Why a refusal was given (`stop_details.category`).
+    pub category: Option<String>,
     pub usage: Option<Usage>,
     /// An error the server sent inside the stream.
     pub error: Option<String>,
@@ -91,12 +85,8 @@ pub struct Reply {
 }
 
 impl Reply {
-    /// Applies one event's data; returns the content it adds. Role, reasoning and usage add none.
+    /// Applies one event's data; returns the text it adds. Thinking, pings and usage add none.
     pub fn apply(&mut self, data: &str) -> Option<String> {
-        if data == "[DONE]" {
-            self.done = true;
-            return None;
-        }
         let v: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(e) => {
@@ -104,31 +94,58 @@ impl Reply {
                 return None;
             }
         };
-        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
-            self.error.get_or_insert(e.get("message").and_then(Value::as_str).map_or_else(|| e.to_string(), str::to_string));
-            return None;
+        match v["type"].as_str()? {
+            "error" => {
+                let e = &v["error"];
+                self.error.get_or_insert(e["message"].as_str().map_or_else(|| e.to_string(), str::to_string));
+            }
+            "message_start" => self.add_usage(&v["message"]["usage"]),
+            "message_delta" => {
+                if let Some(reason) = v["delta"]["stop_reason"].as_str() {
+                    self.finish = Some(reason.to_string());
+                    self.category = v["delta"]["stop_details"]["category"].as_str().map(str::to_string);
+                }
+                self.add_usage(&v["usage"]);
+            }
+            // The model that declined wrote part of an answer; the fallback model's answer replaces it.
+            "content_block_start" if v["content_block"]["type"] == "fallback" => self.text.clear(),
+            "content_block_delta" if v["delta"]["type"] == "text_delta" => {
+                let delta = v["delta"]["text"].as_str().filter(|s| !s.is_empty())?;
+                self.text.push_str(delta);
+                return Some(delta.to_string());
+            }
+            "message_stop" => self.done = true,
+            _ => {}
         }
-        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            self.usage = Some(Usage::from_json(u));
-        }
-        let choice = v["choices"].get(0)?;
-        if let Some(f) = choice["finish_reason"].as_str() {
-            self.finish = Some(f.to_string());
-        }
-        let delta = choice["delta"]["content"].as_str().filter(|s| !s.is_empty())?;
-        self.text.push_str(delta);
-        Some(delta.to_string())
+        None
     }
 
-    /// Spec §6.2: successful only with a normal finish reason and non-empty output.
+    /// Usage arrives twice, at the start and in `message_delta`, and the later figures are the running totals.
+    fn add_usage(&mut self, u: &Value) {
+        if u.is_null() {
+            return;
+        }
+        let usage = self.usage.get_or_insert(Usage { prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0 });
+        if let Some(input) = u["input_tokens"].as_u64() {
+            let (read, written) = (u["cache_read_input_tokens"].as_u64().unwrap_or(0), u["cache_creation_input_tokens"].as_u64().unwrap_or(0));
+            usage.prompt_tokens = input + read + written;
+            usage.cached_tokens = read;
+        }
+        if let Some(output) = u["output_tokens"].as_u64() {
+            usage.completion_tokens = output;
+        }
+    }
+
+    /// Spec §6.2: successful only with a normal stop and non-empty output.
     pub fn outcome(&self) -> Result<(), String> {
         if let Some(e) = &self.error {
             return Err(format!("the server reported an error: {e}"));
         }
         match self.finish.as_deref() {
-            Some("stop") if !self.text.trim().is_empty() => Ok(()),
-            Some("stop") => Err("the response was empty".into()),
-            Some(other) => Err(format!("the response ended early (finish_reason {other:?})")),
+            Some("end_turn" | "stop_sequence") if !self.text.trim().is_empty() => Ok(()),
+            Some("end_turn" | "stop_sequence") => Err("the response was empty".into()),
+            Some("refusal") => Err(format!("Claude declined to answer{}", self.category.as_deref().map(|c| format!(" ({c})")).unwrap_or_default())),
+            Some(other) => Err(format!("the response ended early (stop_reason {other:?})")),
             None => Err(match &self.broken {
                 Some(e) => format!("the stream broke off before the response finished: {e}"),
                 None => "the stream ended before the response finished".into(),
@@ -168,25 +185,26 @@ pub struct ChatRequest {
 }
 
 impl ChatRequest {
+    /// Images go before the text they are about, as Anthropic recommends.
     pub fn body(&self, model: &str) -> Value {
         let content = match &self.content {
             Content::Text(t) => json!(t),
             Content::Parts { text, images } => {
-                let mut parts = vec![json!({"type": "text", "text": text})];
-                parts.extend(images.iter().map(|i| json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", i.mime, i.base64), "detail": "high"}})));
+                let mut parts: Vec<Value> = images.iter().map(|i| json!({"type": "image", "source": {"type": "base64", "media_type": i.mime, "data": i.base64}})).collect();
+                parts.push(json!({"type": "text", "text": text}));
                 Value::Array(parts)
             }
         };
-        let mut body = json!({
+        json!({
             "model": model,
-            "messages": [{"role": "system", "content": self.system}, {"role": "user", "content": content}],
+            "max_tokens": MAX_TOKENS,
             "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        if let Some(e) = self.effort {
-            body["reasoning_effort"] = json!(e);
-        }
-        body
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": self.effort.unwrap_or(EFFORT)},
+            "fallbacks": "default",
+            "system": self.system,
+            "messages": [{"role": "user", "content": content}],
+        })
     }
 }
 
@@ -195,7 +213,7 @@ pub struct ChatConfig {
     pub url: String,
     pub api_key: String,
     pub model: String,
-    /// Longest silence inside a stream; reasoning deltas keep a healthy one talking.
+    /// Longest silence inside a stream; pings and thinking deltas keep a healthy one talking.
     pub idle_timeout: Duration,
     /// Connect here for the URL's host (TLS still for that host): a check's forwarder (`net::API_ADDR_VAR`).
     pub connect_to: Option<std::net::SocketAddr>,
@@ -271,11 +289,11 @@ impl ChatClient {
     }
 
     async fn stream(&self, req: &ChatRequest, reply: &mut Reply, on_delta: &mut (dyn FnMut(&str) + Send)) -> Result<(), ChatError> {
-        let resp = self.http.post(&self.cfg.url).bearer_auth(&self.cfg.api_key).json(&req.body(&self.cfg.model)).send().await.map_err(|e| ChatError::Failed(e.to_string()))?;
+        let resp = self.http.post(&self.cfg.url).header("x-api-key", &self.cfg.api_key).header("anthropic-version", API_VERSION).header("anthropic-beta", FALLBACK_BETA).json(&req.body(&self.cfg.model)).send().await.map_err(|e| ChatError::Failed(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            let msg = format!("{status}: {}", refusal_message(&body));
+            let msg = format!("{status}: {}", api_error(&body));
             return Err(if is_refusal(status.as_u16()) { ChatError::Refused(msg) } else { ChatError::Failed(msg) });
         }
         let mut parser = SseParser::default();
@@ -306,11 +324,29 @@ impl ChatClient {
     }
 }
 
+/// The message of an Anthropic error body (`{"type": "error", "error": {"message": …}}`), else the body as it came.
+fn api_error(body: &str) -> String {
+    serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"]["message"].as_str().map(str::to_string)).unwrap_or_else(|| body.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const RECORDED: &[u8] = include_bytes!("../../tests/fixtures/notes/stream_image_medium.sse");
+    /// A stream as the Messages API sends it: an empty thinking block, then text with a multibyte character, usage twice, a ping.
+    const STREAM: &str = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":120,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: ping\ndata: {\"type\": \"ping\"}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"## é—𝛼 \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"∇\\n- a\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_details\":null},\"usage\":{\"input_tokens\":120,\"cache_read_input_tokens\":30,\"output_tokens\":55}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
 
     fn replay(chunks: &[&[u8]]) -> (Reply, String) {
         let (mut parser, mut reply, mut preview) = (SseParser::default(), Reply::default(), String::new());
@@ -325,24 +361,17 @@ mod tests {
     }
 
     #[test]
-    fn every_split_of_a_recorded_stream_gives_the_same_reply() {
-        let (whole, preview) = replay(&[RECORDED]);
-        assert_eq!((whole.finish.as_deref(), whole.done), (Some("stop"), true));
-        assert_eq!(whole.usage.as_ref().and_then(|u| u.ticks), Some(14_780_000));
-        assert_eq!(preview, whole.text, "only content reaches the preview");
+    fn every_split_of_a_stream_gives_the_same_reply() {
+        let bytes = STREAM.as_bytes();
+        let (whole, preview) = replay(&[bytes]);
+        assert_eq!((whole.finish.as_deref(), whole.done), (Some("end_turn"), true));
+        assert_eq!(whole.text, "## é—𝛼 ∇\n- a");
+        assert_eq!(whole.usage, Some(Usage { prompt_tokens: 150, cached_tokens: 30, completion_tokens: 55 }), "the later figures replace the first");
+        assert_eq!(preview, whole.text, "only text reaches the preview");
         assert!(whole.outcome().is_ok());
-        for at in 1..RECORDED.len() {
-            let (r, p) = replay(&[&RECORDED[..at], &RECORDED[at..]]);
+        for at in 1..bytes.len() {
+            let (r, p) = replay(&[&bytes[..at], &bytes[at..]]);
             assert_eq!((&r.text, &r.finish, &r.usage, &p), (&whole.text, &whole.finish, &whole.usage, &preview), "split at {at}");
-        }
-    }
-
-    #[test]
-    fn a_character_split_across_reads_is_whole_in_the_text() {
-        let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"é—𝛼 ∇\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_bytes();
-        for at in 1..stream.len() {
-            let (r, _) = replay(&[&stream[..at], &stream[at..]]);
-            assert_eq!(r.text, "é—𝛼 ∇", "split at {at}");
         }
     }
 
@@ -355,34 +384,75 @@ mod tests {
     }
 
     #[test]
-    fn non_content_deltas_never_reach_the_preview() {
+    fn non_text_events_never_reach_the_preview() {
         let mut r = Reply::default();
-        assert_eq!(r.apply(r#"{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me think"}}]}"#), None);
-        assert_eq!(r.apply(r#"{"choices":[{"index":0,"delta":{"content":""}}]}"#), None);
-        assert_eq!(r.apply(r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost_in_usd_ticks":5000}}"#), None);
-        assert_eq!(r.apply(r###"{"choices":[{"index":0,"delta":{"content":"## A"}}]}"###), Some("## A".to_string()));
-        assert_eq!(r.text, "## A");
-        assert_eq!(r.usage.as_ref().unwrap().cost(), (5e-7, true));
+        assert_eq!(r.apply(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}"#), None);
+        assert_eq!(r.apply(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":""}}"#), None);
+        assert_eq!(r.apply(r#"{"type":"ping"}"#), None);
+        assert_eq!(r.apply(r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}"#), None);
+        assert_eq!(r.apply(r###"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"## A"}}"###), Some("## A".to_string()));
+        assert_eq!((r.text.as_str(), r.finish), ("## A", None));
     }
 
     #[test]
-    fn success_is_a_normal_finish_with_output() {
+    fn success_is_a_normal_stop_with_output() {
         let with = |text: &str, finish: Option<&str>, error: Option<&str>| Reply { text: text.into(), finish: finish.map(String::from), error: error.map(String::from), ..Reply::default() }.outcome();
-        assert!(with("- a", Some("stop"), None).is_ok());
-        assert!(with("  \n", Some("stop"), None).unwrap_err().contains("empty"));
-        assert!(with("- a", Some("length"), None).unwrap_err().contains("length"));
-        assert!(with("- a", Some("content_filter"), None).unwrap_err().contains("content_filter"));
+        assert!(with("- a", Some("end_turn"), None).is_ok());
+        assert!(with("  \n", Some("end_turn"), None).unwrap_err().contains("empty"));
+        assert!(with("- a", Some("max_tokens"), None).unwrap_err().contains("max_tokens"));
         assert!(with("- a", None, None).unwrap_err().contains("before the response finished"));
-        assert!(with("- a", Some("stop"), Some("overloaded")).unwrap_err().contains("overloaded"));
+        assert!(with("- a", Some("end_turn"), Some("overloaded")).unwrap_err().contains("overloaded"));
     }
 
     #[test]
-    fn a_cost_without_ticks_is_computed_from_the_clis_rates() {
-        let u = Usage { prompt_tokens: 1_000, cached_tokens: 200, completion_tokens: 100, ticks: None };
+    fn a_refusal_names_its_category_and_an_error_event_is_kept() {
+        let (r, _) = replay(&[br#"data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":null}},"usage":{"output_tokens":3}}
+
+"#]);
+        assert_eq!(r.outcome().unwrap_err(), "Claude declined to answer (cyber)");
+        let (e, _) = replay(&[br#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+
+"#]);
+        assert!(e.outcome().unwrap_err().contains("Overloaded"));
+    }
+
+    #[test]
+    fn what_a_declining_model_wrote_is_dropped_when_the_fallback_answers() {
+        let (r, _) = replay(&[concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"the answer\"}}\n\n",
+        )
+        .as_bytes()]);
+        assert_eq!(r.text, "the answer");
+    }
+
+    #[test]
+    fn a_cost_is_computed_from_opus_5_5_list_prices() {
+        let u = Usage { prompt_tokens: 1_000, cached_tokens: 200, completion_tokens: 100 };
         let (usd, billed) = u.cost();
-        assert!(!billed);
-        assert!((usd - (800.0 * 2.20e-6 + 200.0 * 0.55e-6 + 100.0 * 6.60e-6)).abs() < 1e-12);
-        let long = Usage { prompt_tokens: 200_001, cached_tokens: 0, completion_tokens: 0, ticks: None };
-        assert!((long.cost().0 - 200_001.0 * 2.20e-6 * 2.0).abs() < 1e-9);
+        assert!(!billed, "Anthropic reports tokens, not a price");
+        assert!((usd - (800.0 * 4.0e-6 + 200.0 * 0.2e-6 + 100.0 * 20.0e-6)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_request_is_opus_5_5_on_high_with_adaptive_thinking_and_the_fallback() {
+        let image = Image { mime: "image/png", base64: "QUJD".into() };
+        let req = |effort, content| ChatRequest { what: SpendKind::Notes, system: "sys".into(), content, effort, timeout: Duration::from_secs(1) };
+        let body = req(None, Content::Parts { text: "words".into(), images: vec![image] }).body(MODEL);
+        assert_eq!((body["model"].as_str(), body["stream"].as_bool(), body["fallbacks"].as_str()), (Some("claude-opus-5-5"), Some(true), Some("default")));
+        assert_eq!((&body["thinking"], &body["output_config"]["effort"], &body["system"]), (&json!({"type": "adaptive"}), &json!("high"), &json!("sys")));
+        assert!(body.get("temperature").is_none() && body.get("stream_options").is_none());
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}), "images go first");
+        assert_eq!(parts[1], json!({"type": "text", "text": "words"}));
+        let text = req(Some("medium"), Content::Text("hi".into())).body(MODEL);
+        assert_eq!((&text["messages"][0]["content"], &text["output_config"]["effort"]), (&json!("hi"), &json!("medium")));
+    }
+
+    #[test]
+    fn an_error_body_gives_its_message() {
+        assert_eq!(api_error(r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: too large"}}"#), "max_tokens: too large");
+        assert_eq!(api_error("  not json "), "not json");
     }
 }

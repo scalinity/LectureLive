@@ -179,6 +179,11 @@ pub fn attach(transcript: Channel<Value>, notes: Channel<Value>, app: State<'_, 
 
 /// The API key: from the Keychain; a check run (`LECTURELIVE_CHECK`) takes the repository's `.env` instead, so it
 /// needs no Keychain prompt after a rebuild changes the dev binary's signature.
+/// The notes model's key: `ANTHROPIC_API_KEY` from the environment, else the repository's `.env`, where the CLI reads it.
+fn claude_key() -> Res<String> {
+    keychain::env_value("ANTHROPIC_API_KEY").ok_or_else(|| "ANTHROPIC_API_KEY is not in the environment or the repository's .env.".to_string())
+}
+
 fn api_key() -> Res<String> {
     if std::env::var_os("LECTURELIVE_CHECK").is_some() {
         if let Some(k) = keychain::env_key() {
@@ -295,6 +300,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     }
     let folder = app.folder().ok_or("Choose a lecture folder first.")?;
     let key = api_key()?;
+    let claude_key = claude_key()?;
     if matches!(permission::microphone(), MicPermission::Denied | MicPermission::Restricted) {
         return Err("Microphone access is denied: System Settings → Privacy & Security → Microphone.".into());
     }
@@ -326,7 +332,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let files = folder.files.clone();
     let lock = FolderLock::acquire(&files.dir).map_err(chain)?;
     let spend = Spend::open(&app_ledger, &folder.course, &folder.name, files.date).map_err(chain)?;
-    let chat = ChatClient::new(ChatConfig::new(key.clone()), Some(spend.clone())).map_err(chain)?;
+    let chat = ChatClient::new(ChatConfig::new(claude_key), Some(spend.clone())).map_err(chain)?;
     let lec = Arc::new(Lecture { files: files.clone(), course: folder.course.clone(), name: folder.name.clone(), title: folder.title.clone(), chat, spend: spend.clone() });
     let session = uuid::Uuid::new_v4().to_string();
     {
@@ -524,7 +530,7 @@ pub async fn polish(app: State<'_, App>) -> Res<()> {
 
 /// The chosen folder's lecture while none runs, with the folder lock held for as long as it is kept.
 fn idle_lecture(folder: &OpenFolder) -> Res<(Arc<Lecture>, FolderLock)> {
-    let key = api_key()?;
+    let key = claude_key()?;
     let lock = FolderLock::acquire(&folder.files.dir).map_err(chain)?;
     let spend = Spend::open(&data_dir()?.join("spend.jsonl"), &folder.course, &folder.name, folder.files.date).map_err(chain)?;
     let chat = ChatClient::new(ChatConfig::new(key), Some(spend.clone())).map_err(chain)?;

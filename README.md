@@ -2,7 +2,7 @@
 
 Live lecture transcription with slide capture and LLM-written notes, for a single
 person on a Mac. Audio goes to Grok Voice Transcribe, the running transcript and
-slide screenshots go to `grok-4.7` on demand, and the result is one Markdown notes
+slide screenshots go to Claude (Opus 5.5, high effort) on demand, and the result is one Markdown notes
 document per lecture that grows during class and can be rewritten into a clean study
 document afterwards.
 
@@ -19,7 +19,7 @@ A native companion app (Tauri + Svelte, Rust pipeline) is proposed in
 ## Setup
 
 ```bash
-cp .env.example .env                  # then fill in GROK_API_KEY (and LECTURE_DEVICE, see below)
+cp .env.example .env                  # then fill in GROK_API_KEY and ANTHROPIC_API_KEY (and LECTURE_DEVICE, see below)
 uv tool install --editable .          # puts `lecture` on your PATH; code edits apply without reinstalling
 ```
 
@@ -130,12 +130,12 @@ the last snapshot are picked up, nothing is re-processed, and no new document is
 
 Every paid call is appended to `spend.jsonl` next to `live_notes.py`: when, which course
 and lecture, what it was for (`transcribe`, `notes`, `polish`, `page`) and what it cost.
-`grok-4.7` calls record the cost xAI reports with each response (`billed`); transcription
-responses carry no cost, so those are worked out from the audio length at the published
-$0.10 per hour (`estimated`). The recording footer shows today's total for the lecture,
+Claude calls report tokens, not a price, so their cost is worked out from the tokens at
+Opus 5.5's published rates; transcription responses carry no cost either, so those are
+worked out from the audio length at the published $0.10 per hour (both `estimated`). The recording footer shows today's total for the lecture,
 and `lecture spend` summarises by month, course and lecture.
 
 Transcription is the smallest share, about $0.20 for a two-hour lecture. Each snapshot
-is one `grok-4.7` call carrying the notes so far, the new transcript and the new slide
+is one Claude call carrying the notes so far, the new transcript and the new slide
 images; polish is one larger call; the study page is one call per section plus one for
 the keystone and questions, each carrying that section's slides.

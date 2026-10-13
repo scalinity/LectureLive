@@ -593,14 +593,14 @@ const TITLE: &str = "# Machine Learning — Week 01 — Optimisation — 2026-09
 const NAME: &str = "Week 01 — Optimisation";
 
 fn user_text(body: &Value) -> String {
-    let c = &body["messages"][1]["content"];
-    c.as_str().map(str::to_string).unwrap_or_else(|| c[0]["text"].as_str().unwrap_or_default().to_string())
+    let c = &body["messages"][0]["content"];
+    c.as_str().map(str::to_string).unwrap_or_else(|| c.as_array().and_then(|a| a.iter().find_map(|p| p["text"].as_str())).unwrap_or_default().to_string())
 }
 
 /// The model, played by the fake: notes that place every embed they are given.
 fn respond(body: &Value) -> Reply {
     let embeds: Vec<String> = user_text(body).lines().filter(|l| l.starts_with("![Slide ")).map(str::to_string).collect();
-    fake_sse::answer(&format!("## Gradient descent\n- Steps against the gradient.\n{}", embeds.join("\n")), 1_000_000)
+    fake_sse::answer(&format!("## Gradient descent\n- Steps against the gradient.\n{}", embeds.join("\n")))
 }
 
 async fn until(events: &mut mpsc::UnboundedReceiver<Event>, what: &str, want: impl Fn(&Event) -> bool) -> Event {

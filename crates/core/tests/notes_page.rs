@@ -31,10 +31,10 @@ async fn the_fixture_lecture_distils_within_its_budget_and_rerenders_from_cache_
     let (dir, notes) = lecture();
     let budget = page::page_budget(&std::fs::read_to_string(&notes).unwrap()) as usize;
     let fake = fake_sse::start(move |body| {
-        let system = body["messages"][0]["content"].as_str().unwrap();
+        let system = body["system"].as_str().unwrap();
         // A first draft half again over budget; the revision within it.
         let words = if system.starts_with("You shorten") { budget * 9 / 10 } else { budget * 3 / 2 };
-        fake_sse::answer(&study_page(words), 30_000_000)
+        fake_sse::answer(&study_page(words))
     })
     .await;
     let chat = client(&fake.url, dir.path());
@@ -44,10 +44,10 @@ async fn the_fixture_lecture_distils_within_its_budget_and_rerenders_from_cache_
     let first = make_page(&chat, "Machine Learning", &notes, &cache, name, TEMPLATE, &|_| {}).await.unwrap();
     assert_eq!(fake.state.requests(), 2, "a draft over budget gets one revision");
     let bodies = fake.state.bodies();
-    assert_eq!(bodies[0]["reasoning_effort"], "medium");
-    assert_eq!(bodies[0]["messages"][1]["content"].as_array().unwrap().len(), 4, "the notes and every slide image");
-    assert!(bodies[1]["messages"][0]["content"].as_str().unwrap().starts_with("You shorten"));
-    assert!(bodies[1]["messages"][1]["content"].is_string(), "the revision carries no images");
+    assert_eq!(bodies[0]["output_config"]["effort"], "high");
+    assert_eq!(bodies[0]["messages"][0]["content"].as_array().unwrap().len(), 4, "the notes and every slide image");
+    assert!(bodies[1]["system"].as_str().unwrap().starts_with("You shorten"));
+    assert!(bodies[1]["messages"][0]["content"].is_string(), "the revision carries no images");
     assert!(!first.cached);
     assert!(first.words <= first.budget as usize, "{} words of {}", first.words, first.budget);
     assert!(first.missing.is_empty(), "complete: {:?}", first.missing);
@@ -75,7 +75,7 @@ async fn the_fixture_lecture_distils_within_its_budget_and_rerenders_from_cache_
 #[tokio::test]
 async fn a_page_that_fails_after_its_retry_writes_nothing() {
     let (dir, notes) = lecture();
-    let fake = fake_sse::start(|_| fake_sse::Reply::Stream(vec![b"data: [DONE]\n\n".to_vec()])).await;
+    let fake = fake_sse::start(|_| fake_sse::Reply::Stream(vec![fake_sse::events(&[], None, false)])).await;
     let chat = client(&fake.url, dir.path());
     let before = std::fs::read(&notes).unwrap();
     let err = make_page(&chat, "Machine Learning", &notes, &dir.path().join(".live_notes/p.json"), "Week 03 — Optimisation", TEMPLATE, &|_| {}).await;

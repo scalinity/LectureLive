@@ -192,9 +192,13 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     if a.command.as_deref() == Some("audit") {
         return audit_cmd(&dir);
     }
-    let key = match fixture {
-        Some(_) => String::new(), // nothing is sent
-        None => env_value("GROK_API_KEY").context("GROK_API_KEY is not set (the environment, a .env here or above, or the repository's .env)")?,
+    // Grok transcribes; Claude writes the notes, the polish and the page.
+    let (key, claude_key) = match fixture {
+        Some(_) => (String::new(), String::new()), // nothing is sent
+        None => (
+            env_value("GROK_API_KEY").context("GROK_API_KEY is not set (the environment, a .env here or above, or the repository's .env)")?,
+            env_value("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set (the environment, a .env here or above, or the repository's .env)")?,
+        ),
     };
     let course = a.course.or_else(|| course_from_path(&dir)).or_else(|| env_value("LECTURE_COURSE")).unwrap_or_else(|| "Lecture".into());
     let recording = a.command.is_none();
@@ -216,7 +220,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let resolve = |f: Option<PathBuf>| f.map(|f| if f.is_absolute() { f } else { dir.join(f) });
     let files = LectureFiles::custom(&dir, today, resolve(a.notes), resolve(a.transcript), resolve(a.slides_dir));
     let spend = Spend::open(&app_ledger, &course, &name, today)?;
-    let chat = ChatClient::new(ChatConfig::new(key.clone()), Some(spend.clone()))?;
+    let chat = ChatClient::new(ChatConfig::new(claude_key), Some(spend.clone()))?;
     let title = prompts::title(&course, &name, today);
     let lec = Arc::new(Lecture { files: files.clone(), course: course.clone(), name: name.clone(), title: title.clone(), chat, spend: spend.clone() });
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();

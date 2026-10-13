@@ -12,7 +12,7 @@ formats are the baseline, and its checkpoint behaviour is replaced (§8).
 Voice Transcribe's REST endpoint, appends `[HH:MM:SS] text` lines to a transcript,
 watches the macOS screenshot folder for slide captures, and on Enter sends the notes
 document (tail-capped at 40,000 characters) plus the new transcript and slides to
-`grok-4.7`, appending only the new notes under a `<!-- HH:MM:SS -->` marker. It resumes
+Claude Opus 5.5, appending only the new notes under a `<!-- HH:MM:SS -->` marker. It resumes
 after a restart from a `noted_through` timestamp and can rewrite the document into a
 study document (`polish`).
 
@@ -52,7 +52,7 @@ slides, a past-lectures browser, cloud sync, accounts, telemetry, Windows/Linux.
 | Pipeline runtime | Rust, inside the Tauri process, plus a Rust CLI on the same core | No Python at runtime; one implementation of every semantic |
 | Frontend | Svelte 5 + TypeScript, Tauri 2 | Runes handle streams without effect hooks; small bundle |
 | Speech-to-text | Grok Voice Transcribe 2.0 over WebSocket, `interim_results=true`; REST for gap recovery | Partials every ~500 ms, word timestamps, keyterms; REST re-transcribes recorded intervals |
-| Notes model | `grok-4.7`, chat completions, `stream: true` | Same key; vision for slides; SSE token stream |
+| Notes model | `claude-opus-5-5`, Messages API, `stream: true`, adaptive thinking, effort `high` | `ANTHROPIC_API_KEY`; vision for slides; SSE token stream; refusals fall back server-side |
 | Loopback | BlackHole 2ch, conditional on the M0 routing gate | Plain input device from Rust; ScreenCaptureKit or a Core Audio process tap is the fallback (§14) |
 | Source of truth | Markdown, transcript and slides on disk; a versioned sidecar records exactly what is committed | Human-readable and tool-independent; the sidecar makes resume exact |
 | Target | macOS 13+, Apple Silicon, one user | |
@@ -407,8 +407,8 @@ first-shown time is split at that point using word timings, for the prompt only.
 from the Python CLI are segments of source `imported`: second resolution, no words, never split.
 
 Context: the whole document is sent while the request fits the budget of 200,000 tokens,
-`grok-4.7`'s long-context threshold (its window is 500,000; above the threshold every token of
-the request is billed at twice the rate). The estimate counts text at three characters per
+a ceiling that keeps a long lecture's request fast and its cost bounded (the window is 1,000,000).
+The estimate counts text at three characters per
 token, 1,800 tokens per slide and 16,000 for the output. Above the budget, the prompt carries the
 omitted prefix's own `#` headings, then the most recent part verbatim from a line start. The
 outline comes from the document itself: no summary request, nothing to cache. Text is cut at

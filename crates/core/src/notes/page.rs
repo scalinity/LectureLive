@@ -23,8 +23,14 @@ use crate::session::spend::SpendKind;
 
 /// The study page's design, embedded unchanged at build time (spec §3.1, §6.4).
 pub const TEMPLATE: &str = include_str!("../../../../notes_template.html");
-/// At the default (high) one request over a two-hour lecture ran past ten minutes (spec §6.4).
-pub const EFFORT: &str = "medium";
+/// The frontend-design discipline, put to the page's author after `page_system`. The template fixes the
+/// typography, colour and layout, so what is left to design is the hierarchy, structure, figures and wording.
+const DESIGN: &str = r##"Design discipline. The page's template fixes its typography, colour and layout, so your design is the hierarchy, structure and wording inside it. None of this overrides the output rules above.
+- Plan before writing: decide the keystone, the four to seven topics that earn a section, and the slides that earn a redraw. Then write; do not narrate the plan.
+- Structure is information. A table appears only when items are compared along the same dimensions, a list only when its items are parallel, <ol class="steps"> only for a real sequence, a formula or flag only for what the student must remember. Never use a component as decoration or to fill space.
+- Ground every element in this lecture's own terms, numbers and examples, not generic study-guide filler. No section opens by restating its heading, and no label stands above content that already says what it is.
+- A redraw shows one idea. Label shapes directly instead of adding a legend, give "a" and "b" a meaning only where two groups are being contrasted, keep spacing and proportions even, and leave out anything decorative. A figure is finished when nothing in it can be removed.
+- Words are part of the design. Headings are sentence case and name the content ("When ridge beats lasso", not "Overview"); use the active voice and plain verbs; each element does one job. Quiz questions are specific and answerable, and each answer leads with the result."##;
 const TIMEOUT: Duration = Duration::from_secs(1_200);
 const EMBED_JPEG_QUALITY: u32 = 80;
 
@@ -271,7 +277,7 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
 
 /// One request with one retry: a failed request would otherwise cost the whole page.
 async fn ask(chat: &ChatClient, system: String, content: Content) -> Result<String> {
-    let req = ChatRequest { what: SpendKind::Page, system, content, effort: Some(EFFORT), timeout: TIMEOUT };
+    let req = ChatRequest { what: SpendKind::Page, system, content, effort: None, timeout: TIMEOUT };
     let answer = match chat.complete(&req, &mut |_| {}).await {
         Ok(a) => a,
         Err(ChatError::Failed(_)) => chat.complete(&req, &mut |_| {}).await.map_err(|e| anyhow!("{e}"))?,
@@ -295,7 +301,7 @@ pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Pa
     let doc = std::fs::read_to_string(notes).with_context(|| format!("read {}", notes.display()))?;
     let budget = page_budget(&doc);
     let embeds: Vec<(String, String)> = SLIDE_EMBED.captures_iter(&doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
-    let system = page_system(course, budget, max_slides(embeds.len()));
+    let system = format!("{}\n\n{DESIGN}", page_system(course, budget, max_slides(embeds.len())));
     let key = sha256_hex(format!("{system}{doc}").as_bytes());
     let (fills, words, cached) = match load_cache(cache, &key) {
         Some((fills, words)) => (fills, words, true),
