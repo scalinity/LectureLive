@@ -38,7 +38,7 @@ study document (`polish`).
 - G5 Human-readable files compatible with the CLI's (Markdown notes, transcript, `slides/`), with exact resume.
 - G6 Captured audio is durable to within the last one-second checkpoint after a crash, and every interval without durable audio or without committed transcript is reported as a gap.
 - G7 `polish` and hint input as in the CLI.
-- G8 A study page per lecture: polish also typesets the notes as one interactive HTML page: every topic has a visual (mostly widgets the student can move) and a plain-words explanation, with the best slides redrawn as figures and switchable back to their screenshots.
+- G8 A study page per lecture: polish also typesets the notes as one interactive HTML page: every topic has a visual (mostly widgets the student can move, drawing the class's own data) and two plain-language explanations, with the best slides redrawn as figures and switchable back to their screenshots.
 
 ### 1.4 Non-goals (v1)
 
@@ -496,8 +496,10 @@ earlier weeks, digressions, logistics, repetition and software walkthroughs are 
 
 Each topic opens with a visual that carries the idea: an interactive widget where a parameter, a
 threshold, a sample or a choice can move, else a drawn figure. A short technical explanation follows,
-and straight after each one an "In plain words" block for a reader new to the subject (one everyday
-comparison, no symbols, no jargon). The prompt asks for at least four widgets whenever the lecture has
+and straight after each one two plain-language blocks for different readers: "Explained like I'm five" (a
+child's picture of the idea: one concrete comparison, one or two short sentences) and "In everyday terms"
+(an intelligent adult outside the field: a real situation, two or three sentences), neither using formulas
+or jargon and never the same text at two lengths. The prompt asks for at least four widgets whenever the lecture has
 ideas that vary this way, which is nearly always. The budget is 30% of the notes' words, between 700
 and 2,500, split about 65% topics, 15% glossary and takeaways, 20% questions; a technical explanation is asked
 to stay under about 90 words besides its formulas. Visible words are counted
@@ -513,22 +515,32 @@ The output runs lede (two sentences), keystone, 5–8 topic sections each headed
 glossary of at most 12 terms, at most 5 key takeaways, and 4–5 check-yourself questions with brief
 worked answers. The keystone is one formula or a sentence of at most 20 words, set under the lede as
 the one thing to remember. It is written in a fixed vocabulary the template styles: TeX math in `\( \)`
-and `\[ \]`; `eli5` (the plain-words block), `formula` (named, collected into the formula sheet), `flag`
+and `\[ \]`; `eli5` and `everyday` (the two plain-language blocks), `formula` (named, collected into the formula sheet), `flag`
 (examinable, at most 4), `example` with numbered `steps`, `map` (situation → method), `takeaways`,
 `glossary`, `figure.widget`, and `figure.redraw` (with `data-slide=N` for a slide's redraw) holding
 display math, a table (highlighted groups as cells `a`/`b`) or an inline SVG drawn only with the
 template's classes. Sections are re-cut at every `<h2>`, so the page's structure never depends on the
 model's own wrappers.
 
+The notebook and datasets in the lecture folder and the folders below it (not slides, recordings,
+submissions, hidden folders or links; a duplicate once; at most two notebooks, and three CSVs of up to 300 KB each)
+are read fresh and added to the request: the notebook's cells and printed output, which hold the numbers the
+class computed, and a description of each dataset. The page carries the datasets in a `course-data` script, so
+a widget draws what the student has already seen in their notebook, and the page is typeset again when its
+materials change. They are data, never instructions to the model. The prompt carries the honesty rules: a
+number the notebook printed is shown as the notebook's and never recomputed as that result; a model a widget
+fits in the browser is labelled a re-implementation; the words beside a widget are true of it; a difference is
+given with its size and, where it is about one case, what one case is worth.
+
 A widget is a `figure.widget` with a `data-title`, an optional `data-aspect`, a caption saying what to
 try, and a `<script type="text/widget">`. The template's runtime gives the script one object: sliders
 (linear or logarithmic), toggles, choices, buttons, readouts, a draw function repainted on every
 change, resize and theme change, an optional click handler, an axes-and-grid helper that clips what
-follows to the plot, a seeded random generator and the theme's colours, so a widget follows light and
-dark. Each runs alone and cannot reach the network or the page's storage; one that throws, or never sets
+follows to the plot, a seeded random generator, the course's datasets, one case shared by every widget on the page (a click in
+any widget moves it in all) and the theme's colours, so a widget follows light and dark. Each runs alone and cannot reach the network or the page's storage; one that throws, or never sets
 a draw function, says so in its own place and leaves the rest of the page working. A widget's script is
 the only script kept: every other `<script>`, `<style>`, and event and style attribute is stripped. A
-page without widgets or without plain-words blocks is reported as missing them.
+page without widgets, or without either plain-language block, is reported as missing them.
 
 Each request gets one retry (a refusal gets none); if it still fails, no page is written and
 the notes are untouched. The typeset page is stored in `.live_notes/<stem>.page.json` keyed by

@@ -99,7 +99,9 @@ themselves; Zoom's speaker slider also lowers the level that gets transcribed.
 Analysis Methods` gives `Statistical Analysis Methods.html`). The notes stay the complete
 record; the page is built to be learned from by looking and doing. Each topic opens with a
 visual, mostly small interactive figures with sliders and buttons you can move, then a short
-technical explanation and an "In plain words" version of it for someone new to the subject. The
+technical explanation and two plain-language versions of it, "Explained like I'm five" and "In everyday
+terms". When the lecture folder holds the class's notebook and data (a `Live Coding` folder, say), the
+page reads the notebook and its figures draw that data. The
 few slides whose figures teach best are redrawn as figures, each with a switch back to the
 original, and all of them stay one click away in the collapsed All slides gallery.
 Around that: a contents rail, a self-test mode that hides definitions, steps and formulas
