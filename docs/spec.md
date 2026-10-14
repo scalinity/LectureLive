@@ -690,7 +690,8 @@ both.
 ### 7.3 Manual and imported
 
 The Capture button, the global shortcut ⌘⇧2 (registered only while a lecture runs), images dropped
-on the window, and screenshots taken with macOS (⌘⇧4, from its screenshot folder) all go through the
+on the window, and screenshots taken with macOS (⌘⇧4, from its screenshot folder, and only while the lecture
+is recording: not before it starts, in a pause or once it is stopping) all go through the
 one registration path and index allocator that auto capture uses. A file reaches `slides/` under a
 temporary name, and registration renames it to `slide_NN_HHMMSS.png|jpg` inside the sidecar's
 writer. A file already registered is never registered again. Dropped images are copied, so the
@@ -1110,7 +1111,9 @@ recording, not transcribing" where the meter was.
   The silence warning (§10) is not raised while paused.
 - **Slides.** Automatic capture is held: nothing is sampled, and the strip reads Paused. What changed
   on screen while it lasted is judged on the first sample after the resume, like any change. A slide
-  taken by hand (Capture, ⌘⇧2, a dropped image, a screenshot) still registers: it is the person's act.
+  taken by hand (Capture, ⌘⇧2, a dropped image) still registers: it is the person's act. A macOS screenshot does
+  not: the screenshot folder is read only while the lecture records, so one taken in a pause is ignored for good,
+  and does not arrive with the resume.
 - **Notes.** Snapshots, polish and the study page work as usual while paused; pausing stops nothing
   that the person asks for.
 - **Record.** The sidecar's `pauses` holds each pause (`from`, `to`; `to` is absent while it lasts or when

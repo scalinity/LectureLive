@@ -872,3 +872,49 @@ async fn a_quit_finalizes_the_recording_drops_the_request_in_flight_and_takes_no
     assert!(sc.recordings.iter().all(|r| r.state == lecturelive_core::session::sidecar::RecState::Finalized), "no repair is left for the next session: {:?}", sc.recordings);
     assert_eq!(sc.notes.segment_cursor, 0, "what the snapshot would have taken is still pending");
 }
+
+/// A macOS screenshot is a slide only if it was taken while the lecture was recording: one taken in a pause is
+/// ignored, and stays ignored after the resume rather than arriving with it.
+#[tokio::test]
+async fn a_screenshot_taken_while_paused_never_becomes_a_slide() {
+    let dir = tempfile::tempdir().unwrap();
+    let shots = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let sse = fake_sse::start(respond).await;
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec, session, Box::new(Idle), SlideWatch { screenshots: Some(shots.path().to_path_buf()), poll: ms(20) }, None, cmd_rx, ev_tx));
+    let slides_in = |ev: &mut mpsc::UnboundedReceiver<Event>| {
+        let mut n = 0;
+        while let Ok(e) = ev.try_recv() {
+            n += usize::from(matches!(e, Event::Slide { .. }));
+        }
+        n
+    };
+
+    tokio::time::sleep(ms(300)).await; // the lecture has begun: a screenshot older than its start is not its slide
+    support::slides::png(&shots.path().join("Screenshot while recording.png"));
+    until(&mut ev, "the first screenshot as a slide", |e| matches!(e, Event::Slide { .. })).await;
+
+    cmd.send(Command::Pause).unwrap();
+    until(&mut ev, "the pause", |e| matches!(e, Event::Paused(true))).await;
+    support::slides::png(&shots.path().join("Screenshot while paused.png"));
+    tokio::time::sleep(ms(400)).await;
+    assert_eq!(slides_in(&mut ev), 0, "a screenshot taken in a pause is not taken in");
+
+    cmd.send(Command::Resume).unwrap();
+    until(&mut ev, "the resume", |e| matches!(e, Event::Paused(false))).await;
+    tokio::time::sleep(ms(400)).await;
+    assert_eq!(slides_in(&mut ev), 0, "and does not arrive with the resume");
+
+    support::slides::png(&shots.path().join("Screenshot after the resume.png"));
+    until(&mut ev, "the screenshot after the resume as a slide", |e| matches!(e, Event::Slide { .. })).await;
+    cmd.send(Command::Stop).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert_eq!(sc.slides.len(), 2, "the slides are the two taken while recording: {:?}", sc.slides);
+}

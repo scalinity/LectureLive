@@ -44,7 +44,7 @@
 <footer class="command">
   {#if live && session.paused}
     <p class="paused" role="status">
-      <span class="pause" aria-hidden="true"></span><strong>Paused.</strong> Nothing is recorded or sent for transcription, and slides are not taken by themselves. Notes, snapshots and screenshots still work.
+      <span class="pause" aria-hidden="true"></span><strong>Paused.</strong> Nothing is recorded or sent for transcription, and slides are not taken by themselves, and screenshots are not picked up. Notes, snapshots and the Capture button still work.
     </p>
   {/if}
   {#if live && session.status.input_gone}

@@ -178,7 +178,7 @@ const ENDED: &str = "The lecture has ended; nothing was sent.";
 /// Ctrl-P while stopping: a lecture that is ending has nothing left to pause.
 const PAUSE_STOPPING: &str = "The lecture is stopping; it cannot be paused or resumed.";
 /// Ctrl-S while the lecture is paused: it is the lecture, not the window, that holds capture.
-const CAPTURE_PAUSED: &str = "The lecture is paused: slides are not captured until it resumes (^P). Screenshots (⌘⇧4) still become slides.";
+const CAPTURE_PAUSED: &str = "The lecture is paused: slides are not captured until it resumes (^P), and screenshots (⌘⇧4) taken meanwhile are not taken in.";
 
 const PANES: [view::Pane; 3] = [view::Pane::Transcript, view::Pane::Notes, view::Pane::Slides];
 

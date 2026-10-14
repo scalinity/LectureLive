@@ -129,7 +129,8 @@ pub enum Event {
 
 #[derive(Debug, Clone)]
 pub struct SlideWatch {
-    /// Where macOS saves screenshots; those taken after the lecture started are taken in as slides.
+    /// Where macOS saves screenshots; those taken while the lecture is recording are taken in as slides, and none
+    /// taken while it is paused, before it started or after it began stopping.
     pub screenshots: Option<PathBuf>,
     pub poll: Duration,
 }
@@ -418,17 +419,26 @@ fn listing(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default()
 }
 
-/// The CLI's `slide_watcher`: images dropped into `slides/`, and screenshots taken after the start,
-/// once their size has stopped changing.
-async fn slide_watcher(lec: Arc<Lecture>, store: Store, watch: SlideWatch, mut stop: tokio::sync::watch::Receiver<bool>, events: UnboundedSender<Event>) {
-    let started = SystemTime::now();
+/// Whether the lecture is recording, for what may be taken in from the screenshot folder: a screenshot is a slide only
+/// if it was taken while the lecture was recording, so one taken in a pause is never a slide, not even after the resume.
+#[derive(Debug, Clone, Copy)]
+struct Recording {
+    paused: bool,
+    /// The start, or the last resume: screenshots older than this were taken before the lecture was recording.
+    since: SystemTime,
+}
+
+/// The CLI's `slide_watcher`: images dropped into `slides/`, and, while the lecture records, screenshots taken since
+/// it started or last resumed, once their size has stopped changing.
+async fn slide_watcher(lec: Arc<Lecture>, store: Store, watch: SlideWatch, recording: tokio::sync::watch::Receiver<Recording>, mut stop: tokio::sync::watch::Receiver<bool>, events: UnboundedSender<Event>) {
     let mut known: HashSet<PathBuf> = listing(&lec.files.slides).into_iter().collect();
     let mut sizes: HashMap<PathBuf, u64> = HashMap::new();
     loop {
         let mut candidates = listing(&lec.files.slides);
-        if let Some(dir) = &watch.screenshots {
+        let rec = *recording.borrow();
+        if let (Some(dir), false) = (&watch.screenshots, rec.paused) {
             candidates.extend(listing(dir).into_iter().filter(|p| {
-                p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("Screen")) && std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t >= started)
+                p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("Screen")) && std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t >= rec.since)
             }));
         }
         for p in candidates {
@@ -473,7 +483,8 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
     let (generation, generation_rx) = watch::channel(0u64);
     let worker = tokio::spawn(notes_worker(lec.clone(), store.clone(), op_rx, events.clone(), pages.clone(), hurry.clone(), snapshotting.clone(), generation_rx));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let watcher = tokio::spawn(slide_watcher(lec.clone(), store.clone(), watch, stop_rx, events.clone()));
+    let (recording_tx, recording_rx) = watch::channel(Recording { paused: false, since: SystemTime::now() });
+    let watcher = tokio::spawn(slide_watcher(lec.clone(), store.clone(), watch, recording_rx, stop_rx, events.clone()));
     let (mut capture, capturer) = match capture {
         Some(c) => {
             let (tx, rx) = mpsc::unbounded_channel();
@@ -556,6 +567,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                     } else if !paused {
                         paused = true;
                         pause.set(true);
+                        recording_tx.send_replace(Recording { paused: true, since: SystemTime::now() });
                         if let Some(c) = &capture { c.send(CaptureCmd::Hold(true)) }
                         if let Some(tx) = &pause_tx { let _ = tx.send(PauseLog::Begin(Local::now())); }
                         let _ = events.send(Event::Paused(true));
@@ -564,6 +576,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                 Some(Command::Resume) => if paused {
                     paused = false;
                     pause.set(false);
+                    recording_tx.send_replace(Recording { paused: false, since: SystemTime::now() });
                     if let Some(c) = &capture { c.send(CaptureCmd::Hold(false)) }
                     if let Some(tx) = &pause_tx { let _ = tx.send(PauseLog::End(Local::now())); }
                     let _ = events.send(Event::Paused(false));
