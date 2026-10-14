@@ -84,3 +84,44 @@ async fn a_page_that_fails_after_its_retry_writes_nothing() {
     assert!(!dir.path().join("Optimisation.html").exists());
     assert_eq!(std::fs::read(&notes).unwrap(), before, "the notes are untouched");
 }
+
+/// The text of a request's user message: its slide images come as parts of their own.
+fn request_text(body: &serde_json::Value) -> String {
+    body["messages"][0]["content"].as_array().unwrap().iter().find_map(|p| (p["type"] == "text").then(|| p["text"].as_str().unwrap().to_string())).expect("a text part")
+}
+
+/// A notebook and a dataset beside the notes (spec §6.4): the request carries them, the page carries the data for its
+/// widgets, and a changed dataset typesets again where a changed template alone does not.
+#[tokio::test]
+async fn the_notebook_and_data_beside_the_notes_reach_the_request_and_the_page() {
+    let (dir, notes) = lecture();
+    let live = dir.path().join("Live Coding");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("cases.csv"), "area,label\n100,benign\n300,malignant\n").unwrap();
+    std::fs::write(live.join("lab.ipynb"), serde_json::json!({"cells": [{"cell_type": "code", "source": "print(auc)", "outputs": [{"output_type": "stream", "text": "AUROC 0.959\n"}]}]}).to_string()).unwrap();
+    let budget = page::page_budget(&std::fs::read_to_string(&notes).unwrap()) as usize;
+    let fake = fake_sse::start(move |_| fake_sse::answer(&study_page(budget / 2))).await;
+    let chat = client(&fake.url, dir.path());
+    let cache = dir.path().join(".live_notes/lecture_notes_20260925.page.json");
+    let name = "Week 03 — Optimisation";
+
+    let first = make_page(&chat, "Machine Learning", &notes, &cache, name, TEMPLATE, &|_| {}).await.unwrap();
+    let text = request_text(&fake.state.bodies()[0]);
+    assert!(text.starts_with("Course materials") && text.contains("AUROC 0.959") && text.contains("w.data(\"cases\"): 2 rows"), "{text}");
+    let html = std::fs::read_to_string(&first.path).unwrap();
+    assert!(html.contains(r#"id="course-data">{"cases":{"columns":["area","label"],"rows":[[100.0,"benign"],[300.0,"malignant"]]}}</script>"#), "the page carries the data");
+
+    let again = make_page(&chat, "Machine Learning", &notes, &cache, name, TEMPLATE, &|_| {}).await.unwrap();
+    assert!(again.cached && fake.state.requests() == 1, "the same materials are a cache hit");
+    std::fs::write(live.join("cases.csv"), "area,label\n100,benign\n300,malignant\n250,benign\n").unwrap();
+    let changed = make_page(&chat, "Machine Learning", &notes, &cache, name, TEMPLATE, &|_| {}).await.unwrap();
+    assert!(!changed.cached && fake.state.requests() == 2, "a changed dataset typesets again");
+
+    // a lecture with neither sends the notes alone and carries an empty dataset block
+    let (bare, notes) = lecture();
+    let chat = client(&fake.url, bare.path());
+    let plain = make_page(&chat, "Machine Learning", &notes, &bare.path().join(".live_notes/p.json"), name, TEMPLATE, &|_| {}).await.unwrap();
+    let last = fake.state.bodies().pop().unwrap();
+    assert!(request_text(&last).starts_with("The complete notes"), "no materials section");
+    assert!(std::fs::read_to_string(&plain.path).unwrap().contains(r#"id="course-data">{}</script>"#));
+}

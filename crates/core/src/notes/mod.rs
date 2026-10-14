@@ -6,3 +6,4 @@ pub mod chat;
 pub mod embeds;
 pub mod polish;
 pub mod page;
+pub mod materials;

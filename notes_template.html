@@ -206,9 +206,12 @@ code { overflow-wrap: anywhere; }
 .flag { margin: 1.5rem 0; padding: 0.1rem 0 0.1rem 1.1rem; border-left: 3px solid var(--signal); }
 .flag::before { content: "Flagged in lecture"; display: block; margin-bottom: 0.15rem; color: var(--signal); font-size: 0.88rem; font-weight: 700; }
 .flag > :last-child { margin-bottom: 0; }
-.eli5 { margin: 1.4rem 0; padding: 0.1rem 0 0.1rem 1.1rem; border-left: 3px solid var(--teal); }
-.eli5::before { content: "In plain words"; display: block; margin-bottom: 0.15rem; color: var(--teal); font-size: 0.88rem; font-weight: 700; }
-.eli5 > :last-child { margin-bottom: 0; }
+.eli5, .everyday { margin: 1.4rem 0; padding: 0.1rem 0 0.1rem 1.1rem; border-left: 3px solid var(--teal); }
+.eli5::before, .everyday::before { display: block; margin-bottom: 0.15rem; color: var(--teal); font-size: 0.88rem; font-weight: 700; }
+.eli5::before { content: "Explained like I\2019m five"; }
+.everyday { margin-top: -0.6rem; border-left-color: var(--rule); }
+.everyday::before { content: "In everyday terms"; color: var(--graphite); }
+.eli5 > :last-child, .everyday > :last-child { margin-bottom: 0; }
 .example { margin: 2.2rem 0; padding-top: 1.1rem; border-top: 2px solid var(--ink); }
 .steps { list-style: none; padding: 0; counter-reset: step; }
 .steps > li { position: relative; margin: 0.6rem 0; padding-left: 2.3rem; counter-increment: step; }
@@ -447,6 +450,7 @@ dialog.sheet::backdrop { background: var(--scrim); }
 <div class="tip" id="tip" role="tooltip" hidden></div>
 
 <script type="application/json" id="slides">{{slides}}</script>
+<script type="application/json" id="course-data">{{data}}</script>
 <script>
 document.addEventListener("DOMContentLoaded", () => {
   const $ = (s, r = document) => r.querySelector(s);
@@ -554,6 +558,10 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls || "", textContent: text || "" });
   const redrawers = [];
+  // the datasets that sat beside the notes, as rows of objects; one case shared by every widget on the page
+  const courseData = JSON.parse($("#course-data").textContent || "{}");
+  const tables = {};
+  const shared = {};
   $$("figure.widget").forEach((fig) => {
     const script = $(":scope > script[type='text/widget']", fig);
     const code = script ? script.textContent : "";
@@ -615,6 +623,13 @@ document.addEventListener("DOMContentLoaded", () => {
     };
     w.redraw = render;
     w.rng = seeded;
+    w.shared = shared;
+    w.share = (key, value) => { shared[key] = value; redrawers.forEach((r) => r.render()); render(); };
+    w.data = (name) => {
+      const d = courseData[name];
+      if (!d) throw new Error(`there is no dataset called ${name}`);
+      return (tables[name] ||= d.rows.map((r) => Object.fromEntries(d.columns.map((c, i) => [c, r[i]]))));
+    };
     w.draw = (fn) => { drawFn = fn; };
     w.click = (fn) => {
       clickFn = fn;

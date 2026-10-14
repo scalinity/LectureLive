@@ -40,13 +40,16 @@ pub fn page_system(course: &str, budget: u32, max_slides: u32) -> String {
 How each topic is taught, in this order:
 1. A visual that carries the idea. Almost always an interactive widget: the student changes a parameter, a threshold, a sample or a choice and watches the result move. Where a widget cannot show it, a drawn figure.
 2. The technical explanation, short: what it is, the formula or rule, when it applies and when it does not, in under about 90 words besides its formulas. Do not describe in words what the visual already shows.
-3. "In plain words", straight after each technical explanation: the same idea for someone who has never taken the course. One everyday comparison, no symbols, no jargon, two to four sentences. It is about this idea, not a generic one, and may point at the visual ("drag the slider and watch the red area grow").
+3. "Explained like I'm five", straight after each technical explanation: a child's picture of the same idea. One concrete comparison from a child's world (marbles, a seesaw, a lunch queue), one or two short sentences, no symbols, no jargon.
+4. "In everyday terms", straight after that: the same idea for an intelligent adult outside the field. A real situation they know (a referee, a panel of doctors, guessing a language from an accent), two or three sentences, still no formulas. The two blocks are for different readers, so they are never the same text at two lengths. Both are about this idea, not a generic one, and may point at the visual ("drag the slider and watch the red area grow").
 
 Every topic section has at least one widget or figure. The page has at least four widgets whenever the lecture has ideas that change with a parameter, a threshold, a sample size or a choice, which is nearly always. A topic that cannot be shown is merged into one that can, or cut.
 
 What earns a section, in order: what the lecturer flagged or stressed, and what a quiz is likely to test; the methods, formulas and decision rules needed to solve problems, and when each applies rather than its alternatives; the lecture's own worked example, as a widget when its numbers can move; terms introduced in this lecture. Cut reviews of earlier weeks, logistics, repetition, asides and software walkthroughs.
 
-Budget: at most {budget} words of visible text in total, counting the lede, every section, the plain-words blocks, the glossary, the takeaways and the questions with their answers; math counts as words, widget code and drawings do not. Spend about {topics} on the topic sections, {glossary} on the glossary and takeaways, and {questions} on the questions. This is a ceiling, not a target: a visual replaces words.
+Budget: at most {budget} words of visible text in total, counting the lede, every section, the explained-like-I'm-five and everyday-terms blocks, the glossary, the takeaways and the questions with their answers; math counts as words, widget code and drawings do not. Spend about {topics} on the topic sections, {glossary} on the glossary and takeaways, and {questions} on the questions. This is a ceiling, not a target: a visual replaces words.
+
+Course materials: when the request carries a notebook and datasets from the lecture folder, they are what the class actually ran. Read the notebook for what was computed and which numbers it printed; draw the datasets in widgets with w.data, so a figure shows what the student has already seen in their own notebook. Respect the exam rules the notebook states (a test set is opened once, never tuned on).
 
 Slides: redraw at most {max_slides}, choosing those whose figure, table, diagram or formula block teaches faster than words. A redraw whose numbers can move is better as a widget. Text-only and title slides are never redrawn. Copy numbers and symbols exactly.
 
@@ -70,14 +73,17 @@ w.readout(label, fn) shows a live number or phrase under the figure: fn(v) retur
 w.draw(fn) is required. fn(ctx, v, W, H) paints the whole figure on every control change, resize and theme change. ctx is a 2D canvas context; W and H are in CSS pixels. Nothing persists between calls, so recompute everything from v and your own variables.
 w.click(fn) is optional: fn(x, y, v) runs when the student presses or drags on the canvas, in CSS pixels. Store what you need in your own variable and read it in draw.
 w.frame({{x: [lo, hi], y: [lo, hi], xlabel, ylabel, xticks, yticks}}) paints axes and a light grid when called inside draw (xticks: false or yticks: false leaves that axis without numbers, for bars or categories you label yourself), and returns {{X, Y, ix, iy, left, right, top, bottom}}: X(x) and Y(y) map data to pixels, ix(px) and iy(py) map back. What you draw after it is clipped to the plot area. Called outside draw (in a click handler, to turn a pixel into data) it paints nothing and only maps.
+w.data(name) returns the rows of a course dataset (listed under "Course materials" below) as an array of objects keyed by column, numeric columns as numbers. Use it instead of inventing data wherever a dataset is given.
+w.shared is one object every widget on the page can read, and w.share(key, value) sets a key in it and redraws every widget. When the lecture follows one running case through several ideas (one patient, one tumour, one pair of measurements), keep that case in w.shared.probe so a click in any widget moves it in all of them; each widget reads it with a default.
 w.rng(seed) returns a seeded random function (0 to 1). Use it for any random data, with a fixed seed, so the figure is the same on every visit.
 w.c holds colours that follow light and dark: ink, muted, grid, bg, a (red), b (teal), aSoft, bSoft. Use a and b for two groups or two models, the same way throughout the page. Never write a colour yourself.
 
 A widget that works:
 - It means something before anyone touches it: the starting values are the lecture's own example, and the first frame already shows the idea.
 - One idea, labels written next to the shapes they name (no legend to decode), at most three controls, and a readout with the numbers that change.
-- Use the lecture's own numbers and examples. Where it gave none, invent small illustrative data and say "Illustrative data" in the caption; never present invented data as a result.
+- Use the lecture's own numbers and examples, and the course dataset where one is given. Where there is neither, invent small illustrative data and say "Illustrative data" in the caption; never present invented data as a result.
 - The mathematics matches the notes: when a widget shows a formula's result, compute it with that formula.
+- Honesty. A number the class's notebook printed is shown as the notebook's, in a table or a sentence naming it, and is never recomputed in a widget and presented as that result. A model a widget fits in the browser is a re-implementation: say so in the caption, and never present its output as the notebook's result. Words beside a widget are true of that widget, so claim "can" or "usually" unless the widget demonstrates it. When two numbers are compared, give the size of the difference and word the message from it. When a difference is about one case, say what one case is worth.
 - Plain JavaScript and Math. Each draw takes under 20 ms (at most a few thousand points or grid cells). No eval, no timers, no DOM access, no external code. Text on the canvas is 12 to 14 px and stays inside it at 320 px wide.
 
 A complete widget:
@@ -104,7 +110,7 @@ w.draw((ctx, v, W, H) => {{
 </script></figure>
 
 Static markup inside sections: <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, and <table> with <thead> and <tbody>. Prose is for the technical explanation and stays short; bullets only for parallel items, a table only when items are compared along the same dimensions. Math is TeX, \( … \) inline and \[ … \] displayed, never Unicode symbols or entities and never inside <code>. R code goes in <pre><code>, function names in <code>.
-- The plain-words block: <aside class="eli5"><p>…</p></aside>
+- Explained like I'm five: <aside class="eli5"><p>…</p></aside>, then In everyday terms: <aside class="everyday"><p>…</p></aside>
 - A formula to memorise: <div class="formula" data-name="short plain-text name">\[ … \]</div>
 - A point flagged as examinable, at most 4 on the page: <aside class="flag">…</aside>
 - A worked example that does not need a widget: <div class="example"><h4>its title</h4><p>the setup</p><ol class="steps"><li>one step each, the last stating the result</li></ol></div>
@@ -240,7 +246,7 @@ mod tests {
         assert!(p.contains("\"Machine Learning\"") && p.contains("at most 1000 words") && p.contains("redraw at most 5"), "course, budget and slides are filled in");
         assert!(p.contains("about 650 on the topic sections, 150 on the glossary and takeaways, and 200 on the questions"), "the budget's split is filled in");
         assert!(!p.contains("{budget}") && !p.contains("{topics}") && !p.contains("{{") && !p.contains("}}"), "every placeholder and escape was resolved");
-        for part in ["class=\"eli5\"", "class=\"widget\"", "text/widget", "w.slider(", "w.toggle(", "w.choice(", "w.button(", "w.readout(", "w.draw(", "w.click(", "w.frame(", "w.rng(", "w.c ", "class=\"keystone\"", "at least four widgets"] {
+        for part in ["class=\"eli5\"", "class=\"everyday\"", "w.data(", "w.shared", "w.share(", "Honesty.", "Course materials:", "class=\"widget\"", "text/widget", "w.slider(", "w.toggle(", "w.choice(", "w.button(", "w.readout(", "w.draw(", "w.click(", "w.frame(", "w.rng(", "w.c ", "class=\"keystone\"", "at least four widgets"] {
             assert!(p.contains(part), "the prompt lost {part:?}");
         }
         let start = p.find("<figure class=\"widget\" data-title=\"Move the cut-off").expect("the worked example");

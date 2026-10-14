@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 use crate::fsutil::write_atomic;
 use crate::notes::chat::{ChatClient, ChatError, ChatRequest, Content, Image};
 use crate::notes::embeds::clean_output;
+use crate::notes::materials::Materials;
 use crate::notes::prompts::{page_system, page_user, revise_system, revise_user};
 use crate::pyjson::{dumps, round_int};
 use crate::session::notesfile::sha256_hex;
@@ -141,7 +142,7 @@ impl Fills {
         if !self.content.contains("<section class=\"part\">") {
             out.push("sections");
         }
-        for (class, name) in [("widget", "interactive figures"), ("eli5", "plain-words explanations"), ("glossary", "glossary"), ("takeaways", "takeaways"), ("quiz", "questions")] {
+        for (class, name) in [("widget", "interactive figures"), ("eli5", "explained-like-I'm-five blocks"), ("everyday", "everyday-terms blocks"), ("glossary", "glossary"), ("takeaways", "takeaways"), ("quiz", "questions")] {
             if !self.content.contains(&format!("class=\"{class}\"")) {
                 out.push(name);
             }
@@ -273,6 +274,7 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         ("summary", fills.summary.clone()),
         ("content", content.into_owned()),
         ("slides", dumps(&Value::Object(slides))),
+        ("data", Materials::gather(dir).data_json()),
         ("week", escape(week)),
         ("title", escape(title)),
         ("course", escape(course)),
@@ -311,16 +313,21 @@ pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Pa
     let budget = page_budget(&doc);
     let embeds: Vec<(String, String)> = SLIDE_EMBED.captures_iter(&doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
     let system = page_system(course, budget, max_slides(embeds.len()));
-    let key = sha256_hex(format!("{system}{doc}").as_bytes());
+    let dir = notes.parent().unwrap_or(Path::new("."));
+    // the notebook and datasets beside the notes: read fresh, and part of the key only when there are some
+    let materials = Materials::gather(dir);
+    let extra = if materials.is_empty() { String::new() } else { materials.digest() };
+    let key = sha256_hex(format!("{system}{doc}{extra}").as_bytes());
     let (fills, words, cached) = match load_cache(cache, &key) {
         Some((fills, words)) => (fills, words, true),
         None => {
             let words_in = notes_words(&doc);
             let numbers: Vec<String> = embeds.iter().map(|(n, _)| n.clone()).collect();
-            let dir = notes.parent().unwrap_or(Path::new("."));
-            let images = embeds.iter().map(|(_, p)| Image::read(&dir.join(p))).collect::<Result<Vec<_>>>()?;
+            let images= embeds.iter().map(|(_, p)| Image::read(&dir.join(p))).collect::<Result<Vec<_>>>()?;
             progress(format!("distilling {words_in} words into at most {budget}"));
-            let mut out = ask(chat, system.clone(), Content::Parts { text: page_user(&doc, words_in, &numbers, budget), images }).await?;
+            let user = page_user(&doc, words_in, &numbers, budget);
+            let text = if materials.is_empty() { user } else { format!("{}\n{user}", materials.prompt()) };
+            let mut out = ask(chat, system.clone(), Content::Parts { text, images }).await?;
             let mut words = visible_words(&out);
             if words as f64 > budget as f64 * 1.1 {
                 progress(format!("cutting the draft from {words} words to {budget}"));
@@ -396,9 +403,9 @@ mod tests {
             "<section class=\"part\">\n<h2>A</h2><p>a</p>\n</section>\n<section class=\"part\">\n<h2>B</h2><p>b</p>\n</section>\n<section class=\"part\">\n<h2>Glossary</h2><dl class=\"glossary\"><dt>t</dt><dd>d</dd></dl>\n</section>\n<section class=\"part check\">\n<h2>Check yourself</h2>\n<ol class=\"quiz\"><li><p class=\"q\">Q?</p><div class=\"answer\">A.</div></li></ol>\n</section>"
         );
         assert_eq!(f.slides, "{\"3\": \"slides/x<\\/y.png\", \"7\": \"slides/b.png\"}", "the CLI's JSON, safe inside a script element");
-        assert_eq!(f.missing(), vec!["interactive figures", "plain-words explanations", "takeaways"]);
-        let full = Fills { content: format!("{}<figure class=\"widget\"></figure><aside class=\"eli5\"></aside>", f.content), ..f };
-        assert_eq!(full.missing(), vec!["takeaways"], "a page with a widget and a plain-words block lacks neither");
+        assert_eq!(f.missing(), vec!["interactive figures", "explained-like-I'm-five blocks", "everyday-terms blocks", "takeaways"]);
+        let full = Fills { content: format!("{}<figure class=\"widget\"></figure><aside class=\"eli5\"></aside><aside class=\"everyday\"></aside>", f.content), ..f };
+        assert_eq!(full.missing(), vec!["takeaways"], "a page with a widget and both plain-language blocks lacks neither");
     }
 
     #[test]
@@ -417,7 +424,7 @@ mod tests {
     fn the_template_is_filled_in_one_pass() {
         let fills: HashMap<&str, String> = [("title", "T &amp; U".to_string()), ("content", "<p>{{title}} stays</p>".to_string())].into();
         assert_eq!(fill("<t>{{title}}</t>{{content}}{{unknown}}", &fills), "<t>T &amp; U</t><p>{{title}} stays</p>{{unknown}}");
-        assert!(TEMPLATE.contains("{{content}}") && TEMPLATE.contains("{{slides}}"), "the repository's template is embedded");
+        assert!(TEMPLATE.contains("{{content}}") && TEMPLATE.contains("{{slides}}") && TEMPLATE.contains("{{data}}"), "the repository's template is embedded");
     }
 
     #[test]
