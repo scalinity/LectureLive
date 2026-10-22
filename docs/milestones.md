@@ -1168,9 +1168,9 @@ All 50 frontend tests passed; type checking reported no errors or warnings. The 
 CLI and release app built. Tests cover successful and incomplete cleanup, source and archive
 changes, restricted paths, legacy-page adoption, archived-image rendering, re-rendering, reopening,
 capture-number reservation and undo after capture retirement. Installed CLI and app checksums
-match the builds, and strict app signature verification passed. The installed native app's visual
-image check remains unverified: Computer Use returns a stopped-session error across subsequent
-turns, including after its JavaScript connection is reset. No screenshots were saved.
+match the builds, and strict app signature verification passed. The installed native app reopened
+an archived lecture with no original captures and displayed its thumbnails and notes images.
+No screenshots were saved.
 
 The retrospective audit covered 48 week folders across four classes. It cleared 262 verified source
 files totaling 105,247,277 bytes and kept 125 without a verified finished archive. All 262 removed
@@ -1179,3 +1179,12 @@ Seven existing pages kept their teaching content and galleries, with only archiv
 The audit used the local conversion and archive code without paid model requests. Detailed paths
 and hashes stay in ignored artifacts. Both installed binaries include M7.2, M7.3 and M7.4; the older
 deferred installer is superseded and no longer waits to replace them.
+
+The native image check found that both Tauri's policy and SvelteKit's generated HTML policy blocked
+the archive's data images. Both image-source directives now allow `data:`; script and network
+directives are unchanged, and arbitrary Markdown data URLs remain rejected. The actual compressed
+HTML embedded in the release binary was checked, the app rebuilt and installed, and the same slide
+strip and notes pane visually verified with the original capture files absent. The archive reader
+and desktop adapter supplied all 108 images in that lecture. The frontend suite still passes 50
+tests and type checking reports no errors or warnings. The Computer Use stopped-session error
+cleared after its desktop host was quit and a subsequent CLI tool request reconnected.
