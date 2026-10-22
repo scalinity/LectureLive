@@ -141,6 +141,12 @@ reapplies the page design (`notes_template.html`) and costs nothing.
 Restarting the tool on the same day resumes: transcript lines and slides newer than
 the last snapshot are picked up, nothing is re-processed, and no new document is made.
 
+A successful polish and finished study page clear the separate capture files after verifying their
+embedded copies. Pending or unverified captures stay. LectureLive's notes, slide previews and later
+page builds use the HTML archive; Command-Z can also restore removed images from it. Keep the HTML
+for a portable copy with images: the unchanged Markdown's image links need LectureLive or the
+original capture files when viewed elsewhere.
+
 ## Cost
 
 Every paid call is appended to `spend.jsonl` next to `live_notes.py`: when, which course

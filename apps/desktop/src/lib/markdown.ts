@@ -8,6 +8,7 @@ export type SlideCtx = {
   notesDir: string;
   /** Absolute paths of the lecture's registered slides. */
   slides: Set<string>;
+  embedded?: Map<string, string>;
   toUrl: (abs: string) => string;
 };
 
@@ -48,7 +49,7 @@ export function render(md: string, ctx: SlideCtx): string {
         el.remove();
         continue;
       }
-      el.setAttribute("src", ctx.toUrl(abs));
+      el.setAttribute("src", ctx.embedded?.get(abs) ?? ctx.toUrl(abs));
       keep = "src";
     } else if (el.tagName === "A" && el.getAttribute("href")?.startsWith("#")) {
       keep = "href";

@@ -6,7 +6,8 @@
 
   let { toUrl }: { toUrl: (abs: string) => string } = $props();
 
-  const ctx: SlideCtx = $derived({ notesDir: session.folder?.notes_dir ?? "", slides: new Set(session.slides.map((s) => s.path)), toUrl });
+  const ctx: SlideCtx = $derived({ notesDir: session.folder?.notes_dir ?? "", slides: new Set(session.slides.map((s) => s.path)), embedded: new Map(session.slides.flatMap((s) => s.embedded ? [[s.path, s.embedded] as const] : [])), toUrl });
+  const imageVersion = $derived(ctx.slides.size + (ctx.embedded?.size ?? 0));
 
   // Rendered HTML by chunk: a chunk is parsed once, however often the list around it changes.
   const cache = new Map<string, string>();
@@ -25,8 +26,8 @@
     // The document as last read, then each block committed since; keys change when the document is read
     // again, and a chunk with an image also when a slide arrives, since only it can show the new slide.
     const base = `${session.revision - session.committed.length}:${session.document.length}`;
-    const parts = chunks(session.document).map((c, i) => ({ key: chunkKey(base, `d${i}`, c.md, ctx.slides.size), time: c.time, md: c.md }));
-    session.committed.forEach((block, b) => chunks(block).forEach((c, i) => parts.push({ key: chunkKey(base, `b${b}:${i}`, c.md, ctx.slides.size), time: c.time, md: c.md })));
+    const parts = chunks(session.document).map((c, i) => ({ key: chunkKey(base, `d${i}`, c.md, imageVersion), time: c.time, md: c.md }));
+    session.committed.forEach((block, b) => chunks(block).forEach((c, i) => parts.push({ key: chunkKey(base, `b${b}:${i}`, c.md, imageVersion), time: c.time, md: c.md })));
     return parts.filter((p) => p.md.trim() !== "").map((p) => ({ key: p.key, time: p.time, html: html(p.key, p.md) }));
   });
 
@@ -48,7 +49,7 @@
     const blocks = previewBlocks(session.previewShown);
     const op = session.preview?.op ?? 0;
     // Finished blocks are cached; only the last, still growing, is rendered again.
-    return blocks.map((md, i) => (i < blocks.length - 1 ? { key: `p${op}:${i}`, time: null, html: html(chunkKey(`p${op}`, `${i}`, md, ctx.slides.size), md) } : { key: `p${op}:last`, time: null, html: render(md, ctx) }));
+    return blocks.map((md, i) => (i < blocks.length - 1 ? { key: `p${op}:${i}`, time: null, html: html(chunkKey(`p${op}`, `${i}`, md, imageVersion), md) } : { key: `p${op}:last`, time: null, html: render(md, ctx) }));
   });
 </script>
 

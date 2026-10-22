@@ -72,7 +72,16 @@ pub fn open(files: &LectureFiles, title: &str, rebuild: bool) -> Result<(Sidecar
     }
     let edited = notesfile::accept_external_edit(files, &mut sc)?;
     report.external_edit = edited && report.how == How::Resumed;
-    for s in slide_files(files)? {
+    let mut captures = slide_files(files)?;
+    // Legacy folders and rebuilds can recover their capture records from the finished page too.
+    for (path, _) in crate::notes::archive::Archive::load(files.notes_dir()).0 {
+        if path.parent() != Some(files.slides.as_path()) { continue; }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(c) = SLIDE_NAME.captures(name) else { continue };
+        let (Ok(index), Ok(t)) = (c[1].parse::<u32>(), NaiveTime::parse_from_str(&c[2], "%H%M%S")) else { continue };
+        captures.push(SlideEntry { index, file: relative(files, &path), shown_at: local(files.date, t), auto: false, uncertain: false });
+    }
+    for s in captures {
         if !sc.slides.iter().any(|x| x.index == s.index) {
             sc.slides.push(s);
             report.slides_registered += 1;
@@ -174,7 +183,9 @@ pub fn slide_files(files: &LectureFiles) -> Result<Vec<SlideEntry>> {
 /// Removed slides reserve their number so undo cannot collide with a later capture.
 pub fn next_slide_index(files: &LectureFiles, sc: &Sidecar) -> Result<u32> {
     let on_disk = slide_files(files)?.iter().map(|s| s.index).max().unwrap_or(0);
-    sc.slides.iter().chain(&sc.removed_slides).map(|s| s.index).max().unwrap_or(0).max(sc.notes.slide_index).max(on_disk).checked_add(1).context("The slide numbers are exhausted")
+    let saved = sc.slides.iter().chain(&sc.removed_slides).map(|s| s.index).max().unwrap_or(0).max(sc.notes.slide_index).max(on_disk);
+    let archived = if saved == 0 { crate::notes::archive::Archive::load(files.notes_dir()).highest_index() } else { 0 };
+    saved.max(archived).checked_add(1).context("The slide numbers are exhausted")
 }
 
 /// Transcript lines and slide files as segments and slides. The leading segments for which `noted`

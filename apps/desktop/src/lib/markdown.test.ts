@@ -19,6 +19,14 @@ function inert(html: string) {
 }
 
 describe("rendered markdown", () => {
+  test("an archived registered image uses the saved HTML copy while arbitrary data URLs stay blocked", () => {
+    const uri = "data:image/jpeg;base64,/9j/2Q==";
+    const archived = { ...ctx, embedded: new Map([["/L/Week 1/slides/slide_01_100203.png", uri]]) };
+    const root = document.createElement("div");
+    root.innerHTML = render("![Slide 1](slides/slide_01_100203.png)\n![other](data:image/png;base64,aGVsbG8=)", archived);
+    expect(root.querySelectorAll("img")).toHaveLength(1);
+    expect(root.querySelector("img")?.getAttribute("src")).toBe(uri);
+  });
   test("hostile markdown renders inert", () => {
     const hostile = [
       "<script>alert(1)</script>",

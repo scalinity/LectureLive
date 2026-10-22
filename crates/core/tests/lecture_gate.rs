@@ -642,6 +642,50 @@ async fn a_polish_after_the_lecture_leaves_a_python_cli_folder_alone() {
     assert!(sse.state.bodies().is_empty(), "nothing is sent");
 }
 
+#[tokio::test]
+async fn a_failed_page_keeps_captures_and_a_successful_polish_page_retires_them() {
+    use lecturelive_core::session::slides::{self, SlideMeta};
+    let dir = tempfile::tempdir().unwrap();
+    let (f, _) = offline_folder(dir.path());
+    let store = Store::offline(Sidecar::load(&f.sidecar()).unwrap().unwrap(), f.sidecar());
+    let source = f.slides.join("capture.png");
+    support::slides::png(&source);
+    let slide = slides::register(&f, &store, &source, SlideMeta::manual(Local::now())).await.unwrap().unwrap();
+    let image = f.dir.join(&slide.file);
+    let failed = fake_sse::start(|body| {
+        let system = body["system"].as_str().unwrap_or_default();
+        if system.starts_with("You are the note-taker") || system.starts_with("You turn raw") { respond(body) }
+        else { Reply::Stream(vec![fake_sse::events(&[], None, false)]) }
+    }).await;
+    let lec = lecture_for(&f, &failed.url, &dir.path().join("spend.jsonl"));
+    let (tx, mut events) = mpsc::unbounded_channel();
+    lec.polish_after(&tx).await.unwrap();
+    drop(tx);
+    let mut page_failed = false;
+    while let Some(event) = events.recv().await {
+        page_failed |= matches!(event, Event::PageFailed(_));
+        assert!(!matches!(event, Event::CapturesArchived { .. }));
+    }
+    assert!(page_failed && image.exists());
+    let good = fake_sse::start(respond).await;
+    let lec = lecture_for(&f, &good.url, &dir.path().join("spend.jsonl"));
+    let (tx, mut events) = mpsc::unbounded_channel();
+    lec.polish_after(&tx).await.unwrap();
+    drop(tx);
+    let mut page_saved = false;
+    let mut cleared = false;
+    while let Some(event) = events.recv().await {
+        page_saved |= matches!(event, Event::Page { .. });
+        if let Event::CapturesArchived { files, .. } = event {
+            assert!(page_saved, "deletion follows the successful page event");
+            assert_eq!(files, 1);
+            cleared = true;
+        }
+    }
+    assert!(cleared && !image.exists());
+    assert!(lecturelive_core::notes::archive::Archive::load(&f.dir).uri(&image).is_some());
+}
+
 /// M7 Task 3 (plan §C invariants 3 and 6): the frontend's `Event` receiver is held but not read until
 /// each run has finished. Nothing waits for it; control and completion stay correct; every segment is
 /// in the log whatever notifications arrived. No test counts `Level`, `Open` or STT-status events,

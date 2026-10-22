@@ -17,6 +17,7 @@ use crate::fsutil::write_atomic;
 use crate::notes::chat::{ChatClient, ChatError, ChatRequest, Content, Image};
 use crate::notes::embeds::clean_output;
 use crate::notes::materials::Materials;
+use crate::notes::archive::{self, Archive, Capture, Manifest};
 use crate::notes::prompts::{page_system, page_user, revise_system, revise_user};
 use crate::pyjson::{dumps, round_int};
 use crate::session::notesfile::sha256_hex;
@@ -254,14 +255,38 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
     let dir = notes.parent().unwrap_or(Path::new("."));
     let stem = notes.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let date = STAMP.find(&stem).and_then(|m| NaiveDate::parse_from_str(m.as_str(), "%Y%m%d").ok()).map(|d| d.format("%-d %B %Y").to_string()).unwrap_or_default();
-    let paths: Vec<(String, String)> = match serde_json::from_str::<Value>(&fills.slides) {
+    let path = page_path(notes, lecture_name);
+    let archived = Archive::load(dir);
+    let mut paths: Vec<(String, String)> = match serde_json::from_str::<Value>(&fills.slides) {
         Ok(Value::Object(m)) => m.into_iter().filter_map(|(n, p)| p.as_str().map(|p| (n, p.to_string()))).collect(),
         _ => Vec::new(),
     };
+    // Reapplying a design must not discard the only surviving copies of earlier captures.
+    for (file, saved) in &archived.0 {
+        if saved.page == path && !saved.capture.slide.starts_with("removed:") && !paths.iter().any(|(n, _)| n == &saved.capture.slide) {
+            if let Ok(relative) = file.strip_prefix(dir) {
+                paths.push((saved.capture.slide.clone(), relative.to_string_lossy().into_owned()));
+            }
+        }
+    }
     let mut uris: HashMap<String, String> = HashMap::new();
-    for (_, p) in &paths {
+    let mut manifest = Manifest::new();
+    for (n, p) in &paths {
         if !uris.contains_key(p) {
-            uris.insert(p.clone(), slide_uri(&dir.join(p)).unwrap_or_else(|| p.clone()));
+            let file = dir.join(p);
+            let before = std::fs::read(&file).ok().map(|b| sha256_hex(&b));
+            let uri = slide_uri(&file).or_else(|| archived.uri(&file).map(str::to_string)).unwrap_or_else(|| p.clone());
+            let hash = match before {
+                Some(hash) => {
+                    if sha256_hex(&std::fs::read(&file)?) != hash { bail!("A capture changed while the page was being saved; its file was kept"); }
+                    Some(hash)
+                }
+                None => archived.0.get(&file).map(|s| s.capture.sha256.clone()),
+            };
+            if let Some(hash) = hash.filter(|_| archive::image(&uri).is_some()) {
+                manifest.insert(p.clone(), Capture { slide: n.clone(), sha256: hash, image_sha256: sha256_hex(uri.as_bytes()) });
+            }
+            uris.insert(p.clone(), uri);
         }
     }
     let slides: Map<String, Value> = paths.iter().map(|(n, p)| (n.clone(), json!(uris[p]))).collect();
@@ -281,8 +306,10 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         ("date", date),
     ]
     .into();
-    let path = page_path(notes, lecture_name);
-    write_atomic(&path, fill(template, &values).as_bytes()).with_context(|| format!("write {}", path.display()))?;
+    let (removed, images) = archive::removed_captures(dir, &path, &archived);
+    manifest.extend(removed);
+    let html = archive::with_removed(&archive::with_manifest(&fill(template, &values), &manifest)?, &images)?;
+    write_atomic(&path, html.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -323,7 +350,11 @@ pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Pa
         None => {
             let words_in = notes_words(&doc);
             let numbers: Vec<String> = embeds.iter().map(|(n, _)| n.clone()).collect();
-            let images= embeds.iter().map(|(_, p)| Image::read(&dir.join(p))).collect::<Result<Vec<_>>>()?;
+            let archived = Archive::load(dir);
+            let images = embeds.iter().map(|(_, p)| {
+                let path = dir.join(p);
+                Image::read(&path).or_else(|e| archived.uri(&path).and_then(archive::image).ok_or(e))
+            }).collect::<Result<Vec<_>>>()?;
             progress(format!("distilling {words_in} words into at most {budget}"));
             let user = page_user(&doc, words_in, &numbers, budget);
             let text = if materials.is_empty() { user } else { format!("{}\n{user}", materials.prompt()) };

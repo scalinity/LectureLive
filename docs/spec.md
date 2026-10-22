@@ -552,7 +552,7 @@ other without a request. Over a 2,000-word synthetic lecture one medium-effort r
 about nine minutes. The page is filled in one
 pass (generated text is never read as a placeholder) and written atomically. Slide
 screenshots are embedded as JPEG data URIs (quality 80, subscripts still legible), read
-fresh from `slides/` at each fill while the cache keeps only their paths: the page is one
+from `slides/` or from a finished page's capture archive while the cache keeps only their paths: the page is one
 self-contained file, because a browser handed only the page may not read the folder
 around it.
 
@@ -752,6 +752,25 @@ has already passed the old number, the image receives a new pending number so th
 includes it. Missing files or occupied destinations produce an error and keep the undo history.
 The strip follows `slide_removed`, `slide_restored`, and `slides_noted` (through an index); a snapshot's
 used slides lose the removal control.
+
+### 7.6 Clearing capture files after polish
+
+After a successful polish and a complete study page, the separate capture files represented in that
+page are deleted. A failed polish, failed page or incomplete page keeps them. Pending images absent
+from the page stay for the next snapshot. The page contains a small manifest mapping capture paths
+and source hashes to its existing embedded gallery images; cleanup checks both the source and the
+saved image before deleting a file. A changed file, unreadable file, external path or symlink stays.
+
+Removed captures are compressed into a separate hidden JSON section in the HTML, outside the study
+gallery, before their files are cleared. Their undo history remains in the sidecar. Command-Z can
+restore the saved JPEG as a new `.jpg` file, preserving capture time and origin, and returning it to
+the next snapshot. Capture numbers remain reserved even when a folder's images live only in HTML.
+
+LectureLive loads archived images for the notes, thumbnails and later page requests or free template
+rebuilds. Rendering a new page preserves its previous archived images. The Markdown text and its
+fingerprint stay unchanged; standalone Markdown viewers need the original files, while LectureLive
+and the self-contained HTML can show the archived copies. The CLI and app report files and bytes
+cleared. The app rehydrates image sources after cleanup.
 
 ## 8. Files, state, resume
 

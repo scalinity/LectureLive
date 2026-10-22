@@ -541,6 +541,8 @@ export class Session {
       this.removedSlides++;
     } else if (m.type === "slides_noted") {
       this.slides = this.slides.map((s) => (s.index <= m.through && !s.noted ? { ...s, noted: true } : s));
+    } else if (m.type === "slides_archived") {
+      return false; // rehydrate image sources from the saved HTML
     } else {
       const { type: _t, session: _s, seq: _q, ...slide } = m;
       this.slides = [...this.slides.filter((s) => s.index !== slide.index), slide].sort((a, b) => a.index - b.index);

@@ -209,6 +209,9 @@ pub struct SlideView {
     pub uncertain: bool,
     /// A snapshot has used it, so the notes embed its file and it can no longer be removed.
     pub noted: bool,
+    /// After cleanup, the image already saved in the self-contained study page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<String>,
 }
 
 /// The status stream (a Tauri event).
@@ -223,6 +226,7 @@ pub enum StatusMsg {
     SlideRestored(SlideView),
     /// A snapshot used the slides through this index.
     SlidesNoted { through: u32 },
+    SlidesArchived,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

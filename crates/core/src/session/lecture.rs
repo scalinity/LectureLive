@@ -120,6 +120,7 @@ pub enum Event {
     /// The person removed a slide no snapshot had used (spec §7.5).
     SlideRemoved { index: u32 },
     SlideRestored(SlideEntry),
+    CapturesArchived { files: usize, bytes: u64 },
     /// A snapshot took the slides through this index into the notes: they can no longer be removed.
     SlidesNoted { through: u32 },
     /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
@@ -345,9 +346,26 @@ impl Lecture {
         }
         let (sc, _) = folder::open(&self.files, &self.title, false).map_err(|e| format!("{e:#}"))?;
         if self.polish(&Store::offline(sc, self.files.sidecar()), events).await {
-            let _ = self.page(events).await;
+            self.page_after_polish(events).await;
         }
         Ok(())
+    }
+
+    /// Retire capture files only after both polish and its self-contained page succeeded.
+    async fn page_after_polish(&self, events: &UnboundedSender<Event>) {
+        if let Ok(page) = self.page(events).await {
+            if !page.missing.is_empty() {
+                let _ = events.send(Event::Warning("The study page is incomplete, so capture files were kept.".into()));
+                return;
+            }
+            match crate::notes::archive::clear(&page.path) {
+                Ok(cleaned) => {
+                    if cleaned.files > 0 { let _ = events.send(Event::CapturesArchived { files: cleaned.files, bytes: cleaned.bytes }); }
+                    if !cleaned.kept.is_empty() { let _ = events.send(Event::Warning(format!("{} capture files changed or were not safely embedded, so they were kept", cleaned.kept.len()))); }
+                }
+                Err(e) => { let _ = events.send(Event::Warning(format!("The study page is saved; capture cleanup could not finish: {e:#}"))); }
+            }
+        }
     }
 
     /// Spec §6.4: the study page from the notes as they are, without polishing again. One typeset runs at a time: a
@@ -412,7 +430,7 @@ async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceive
                     // Typesetting takes minutes and reads only the polished file: snapshots are not held up by it.
                     let (l, ev) = (lec.clone(), events.clone());
                     pages.lock().expect("the page list").push(tokio::spawn(async move {
-                        let _ = l.page(&ev).await;
+                        l.page_after_polish(&ev).await;
                     }));
                 }
             }

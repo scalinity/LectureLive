@@ -72,7 +72,7 @@
             <li>
               <span class="at"><span class="num">{s.at}</span><span class="badge" class:unsettled={s.uncertain} title={b.why}>{b.word}</span></span>
               <div class="shot">
-                <img src={toUrl(s.path)} alt="Slide {s.index}, {s.auto ? 'taken automatically' : 'taken by you'} at {s.at}" title="Slide {s.index}" loading="lazy" decoding="async" />
+                <img src={s.embedded ?? toUrl(s.path)} alt="Slide {s.index}, {s.auto ? 'taken automatically' : 'taken by you'} at {s.at}" title="Slide {s.index}" loading="lazy" decoding="async" />
                 {#if session.canRemove(s)}
                   <!-- A slide no snapshot has used: it can go before it reaches the notes. Its file is kept. -->
                   <button class="remove" type="button" onclick={() => session.removeSlide(s.index)} aria-label="Remove slide {s.index}" title="Remove slide {s.index}: ⌘Z undoes this; its file is kept in slides/removed">

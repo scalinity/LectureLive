@@ -248,7 +248,7 @@ impl Pump {
                     (true, false) => ", taken automatically",
                     _ => "",
                 };
-                self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path, at: shown_at.format("%H:%M:%S").to_string(), auto, uncertain, noted: false }));
+                self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path, at: shown_at.format("%H:%M:%S").to_string(), auto, uncertain, noted: false, embedded: None }));
                 self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}{how}, into the next snapshot"));
             }
             Event::SlideRemoved { index } => {
@@ -257,10 +257,14 @@ impl Pump {
             }
             Event::SlideRestored(s) => {
                 let path = self.slide_path(&s.file);
-                self.emit(Stream::Status, StatusMsg::SlideRestored(SlideView { index: s.index, file: s.file, path, at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain, noted: false }));
+                self.emit(Stream::Status, StatusMsg::SlideRestored(SlideView { index: s.index, file: s.file, path, at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain, noted: false, embedded: None }));
                 self.notice(NoticeKind::Slide, &format!("Slide {} restored", s.index), "back in the lecture, into the next snapshot");
             }
             Event::SlidesNoted { through } => self.emit(Stream::Status, StatusMsg::SlidesNoted { through }),
+            Event::CapturesArchived { files, bytes } => {
+                self.notice(NoticeKind::Done, "Captures cleared", &format!("{files} files, {:.1} MB; images are saved in the study page", bytes as f64 / 1_000_000.0));
+                self.emit(Stream::Status, StatusMsg::SlidesArchived);
+            }
             Event::Capture(s) => self.capture_state(s),
             Event::CaptureMode(mode) => self.mirror.status.capture_mode = mode,
             Event::CaptureMoved { note, .. } => self.notice(NoticeKind::Slide, "Found again", &note),
@@ -390,12 +394,19 @@ impl Pump {
     /// The whole view at this pump's sequence: the caller holds the pump while it reads the files, so
     /// nothing is sent between the reads and the watermark.
     pub fn state(&self, sc: Option<&Sidecar>, segments: &[Segment], document: String, files: Option<&LectureFiles>) -> SessionState {
+        let archive = if sc.is_some_and(|sc| files.is_some_and(|f| sc.slides.iter().any(|s| !f.dir.join(&s.file).exists()))) {
+            files.map(|f| lecturelive_core::notes::archive::Archive::load(f.notes_dir())).unwrap_or_default()
+        } else { Default::default() };
         let (revision, pending_segments, pending_slides, slides) = match sc {
             Some(sc) => (
                 sc.notes.revision,
                 (segments.len() as u64).saturating_sub(sc.notes.segment_cursor),
                 sc.slides.iter().filter(|s| s.index > sc.notes.slide_index).count(),
-                sc.slides.iter().map(|s| SlideView { index: s.index, file: s.file.clone(), path: files.map_or_else(|| s.file.clone(), |f| f.dir.join(&s.file).to_string_lossy().into_owned()), at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain, noted: s.index <= sc.notes.slide_index }).collect(),
+                sc.slides.iter().map(|s| {
+                    let path = files.map_or_else(|| s.file.clone(), |f| f.dir.join(&s.file).to_string_lossy().into_owned());
+                    let embedded = (!Path::new(&path).exists()).then(|| archive.uri(Path::new(&path)).map(str::to_string)).flatten();
+                    SlideView { index: s.index, file: s.file.clone(), path, at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain, noted: s.index <= sc.notes.slide_index, embedded }
+                }).collect(),
             ),
             None => (0, 0, 0, Vec::new()),
         };

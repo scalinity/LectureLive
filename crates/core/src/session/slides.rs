@@ -2,6 +2,7 @@
 //! dropped images are all moved into `slides/` under the CLI's name and recorded inside the sidecar's
 //! writer, so indexes never collide and no file is registered twice.
 use std::path::{Path, PathBuf};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -139,8 +140,10 @@ pub async fn undo_remove(files: &LectureFiles, store: &Store, snapshotting: Arc<
             bail!("The removed slide's file is not in the slides folder");
         }
         let from = files.slides.join(REMOVED_DIR).join(name);
-        let removed = files.slides.join(REMOVED_DIR).canonicalize().context("The removed slide's file is missing")?;
-        if removed.parent() != Some(folder.as_path()) || std::fs::symlink_metadata(&from).map(|m| !m.file_type().is_file()).unwrap_or(true) {
+        let archived = if !from.exists() { crate::notes::archive::Archive::load(files.notes_dir()).uri(&from).and_then(crate::notes::archive::image) } else { None };
+        let removed = files.slides.join(REMOVED_DIR).canonicalize();
+        let unsafe_file = std::fs::symlink_metadata(&from).is_ok_and(|m| !m.file_type().is_file());
+        if unsafe_file || removed.as_ref().is_ok_and(|p| p.parent() != Some(folder.as_path())) || (archived.is_none() && !from.is_file()) {
             bail!("The removed slide's file is missing or is not a regular image in slides/removed");
         }
         if slide.index <= sc.notes.slide_index || sc.slides.iter().any(|s| s.index == slide.index) {
@@ -148,9 +151,21 @@ pub async fn undo_remove(files: &LectureFiles, store: &Store, snapshotting: Arc<
             let ext = original.extension().and_then(|s| s.to_str()).unwrap_or("png");
             slide.file = relative(&files, &files.slides.join(format!("slide_{:02}_{}.{ext}", slide.index, slide.shown_at.format("%H%M%S"))));
         }
+        if let Some(image) = &archived {
+            let ext = if image.mime == "image/jpeg" { "jpg" } else { "png" };
+            slide.file = Path::new(&slide.file).with_extension(ext).to_string_lossy().into_owned();
+        }
         let dest = files.dir.join(&slide.file);
         if dest.exists() { bail!("The restored slide's destination already exists, so neither image was overwritten"); }
-        move_file(&from, &dest)?;
+        if let Some(image) = archived {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&image.base64)?;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest)?;
+            if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                let _ = std::fs::remove_file(&dest);
+                return Err(error.into());
+            }
+        } else { move_file(&from, &dest)?; }
         sc.removed_slides.pop();
         sc.slides.push(slide.clone());
         sc.slides.sort_by_key(|s| s.index);
@@ -411,6 +426,25 @@ mod tests {
         std::fs::remove_file(files.slides.join(REMOVED_DIR).join("slide_02_100002.png")).unwrap();
         assert!(undo_remove(&files, &store, idle()).await.is_err());
         assert_eq!(store.read().await.unwrap().removed_slides, vec![gone]);
+    }
+
+    #[tokio::test]
+    async fn undo_still_works_when_polish_retired_the_removed_capture_file() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        remove(&files, &store, 2, idle()).await.unwrap();
+        std::fs::write(&files.notes, "# Lecture").unwrap();
+        let fills = crate::notes::page::Fills { keystone: "k".into(), summary: "s".into(), content: "c".into(), slides: "{}".into() };
+        let page = crate::notes::page::render(&fills, "Test", &files.notes, "Week 01 — Test", crate::notes::page::TEMPLATE).unwrap();
+        assert_eq!(crate::notes::archive::clear(&page).unwrap().files, 1);
+        assert!(!files.slides.join(REMOVED_DIR).join("slide_02_100002.png").exists());
+        let html = std::fs::read_to_string(&page).unwrap();
+        assert_eq!(crate::notes::archive::script(&html, "slides").unwrap(), "{}", "a removed image stays out of the gallery");
+        let restored = undo_remove(&files, &store, idle()).await.unwrap();
+        assert_eq!((restored.index, restored.shown_at, restored.auto), (2, slides[1].shown_at, true));
+        assert!(restored.file.ends_with(".jpg"));
+        assert_eq!(crate::notes::chat::Image::read(&files.dir.join(restored.file)).unwrap().mime, "image/jpeg");
+        assert!(store.read().await.unwrap().removed_slides.is_empty());
     }
 
     #[tokio::test]

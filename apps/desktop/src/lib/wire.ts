@@ -49,7 +49,7 @@ export type Notice = { kind: NoticeKind; label: string; detail: string; at: stri
 
 /** `at` is when it was first on screen (HH:MM:SS); `auto` when the detector took it; `uncertain` when it was still changing. */
 /** `noted`: a snapshot has used it, so the notes embed its file and it can no longer be removed. */
-export type SlideView = { index: number; file: string; path: string; at: string; auto: boolean; uncertain: boolean; noted: boolean };
+export type SlideView = { index: number; file: string; path: string; at: string; auto: boolean; uncertain: boolean; noted: boolean; embedded?: string };
 
 export type ManualShortcut = { state: "inactive" } | { state: "ready" } | { state: "needs_permission" } | { state: "unavailable"; reason: string };
 export type CaptureMode = { automatic: boolean; selected: boolean; shortcut: ManualShortcut };
@@ -68,7 +68,7 @@ export type PreviewShot = { path: string; width: number; height: number };
 /** The course's saved region, and the parts of it left out as fractions of it. */
 export type SavedRegion = { region: Region; leave_out: Region[] };
 
-export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" | "slide_restored" } & SlideView) | { type: "slide_removed"; index: number } | { type: "slides_noted"; through: number };
+export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" | "slide_restored" } & SlideView) | { type: "slide_removed"; index: number } | { type: "slides_noted"; through: number } | { type: "slides_archived" };
 
 export type OpenView = { utterance: number; stable: string; tentative: string };
 

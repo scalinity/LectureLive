@@ -1152,3 +1152,30 @@ standard Edit menu verified actual Command-Z image restoration and native text u
 image remained removed, followed by restoration after leaving the typing field. No screenshots
 were saved. The CLI is installed; the replacement app includes M7.2 and M7.3 and waits for the
 existing app to quit before installation.
+
+## M7.4 — Clear captures after the finished study page
+
+A successful polish clears separate capture files only after its complete HTML page has been saved
+and each source hash and embedded image have been checked. Failed or incomplete work, pending
+captures absent from the page, changed files and unsafe paths keep their files. The manifest points
+into the existing gallery; removed images have a compressed, hidden archive outside that gallery
+so Command-Z can still restore them. Notes, thumbnails, later page requests and free design rebuilds
+can read the HTML archive. Markdown text and fingerprints stay unchanged; an external Markdown
+viewer needs the original image files, while the HTML remains self-contained. Keep the HTML.
+
+Verification (2026-10-22): the serial workspace suite passed 782 tests with 33 opt-in checks ignored.
+All 50 frontend tests passed; type checking reported no errors or warnings. The frontend, release
+CLI and release app built. Tests cover successful and incomplete cleanup, source and archive
+changes, restricted paths, legacy-page adoption, archived-image rendering, re-rendering, reopening,
+capture-number reservation and undo after capture retirement. Installed CLI and app checksums
+match the builds, and strict app signature verification passed. The installed native app's visual
+image check remains unverified: Computer Use returns a stopped-session error across subsequent
+turns, including after its JavaScript connection is reset. No screenshots were saved.
+
+The retrospective audit covered 48 week folders across four classes. It cleared 262 verified source
+files totaling 105,247,277 bytes and kept 125 without a verified finished archive. All 262 removed
+files have verified HTML copies; 84 notes, transcript, state and recording files were unchanged.
+Seven existing pages kept their teaching content and galleries, with only archive metadata added.
+The audit used the local conversion and archive code without paid model requests. Detailed paths
+and hashes stay in ignored artifacts. Both installed binaries include M7.2, M7.3 and M7.4; the older
+deferred installer is superseded and no longer waits to replace them.

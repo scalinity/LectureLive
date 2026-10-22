@@ -56,6 +56,9 @@ async fn the_fixture_lecture_distils_within_its_budget_and_rerenders_from_cache_
     assert!(!html.contains("{{"), "every placeholder filled");
     assert!(html.contains("<title>Optimisation — Machine Learning</title>"));
     assert!(html.contains("data:image/jpeg;base64,"), "the slides are embedded");
+    let cleared = lecturelive_core::notes::archive::clear(&first.path).unwrap();
+    assert_eq!(cleared.files, 3);
+    assert_eq!(std::fs::read_dir(dir.path().join("slides")).unwrap().count(), 0);
 
     let again = make_page(&chat, "Machine Learning", &notes, &cache, name, TEMPLATE, &|_| {}).await.unwrap();
     assert!(again.cached);
@@ -70,6 +73,8 @@ async fn the_fixture_lecture_distils_within_its_budget_and_rerenders_from_cache_
     std::fs::write(&notes, std::fs::read_to_string(&notes).unwrap() + "\n- One more point.\n").unwrap();
     make_page(&chat, "Machine Learning", &notes, &cache, name, TEMPLATE, &|_| {}).await.unwrap();
     assert_eq!(fake.state.requests(), 4, "changed notes typeset again");
+    let bodies = fake.state.bodies();
+    assert_eq!(bodies[2]["messages"][0]["content"][1]["source"]["media_type"], "image/jpeg", "a new request reads the image from the finished HTML");
 }
 
 #[tokio::test]

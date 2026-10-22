@@ -345,6 +345,7 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
         }
         Event::SlideRemoved { index } => n("slide", &format!("slide {index} removed"), "kept in slides/removed, and left out of the next snapshot".into()),
         Event::SlideRestored(s) => n("slide", &format!("slide {} restored", s.index), "into the next snapshot".into()),
+        Event::CapturesArchived { files, bytes } => n("done", "captures cleared", format!("{files} files, {:.1} MB; images are saved in the study page", *bytes as f64 / 1_000_000.0)),
         Event::Capture(s) => {
             let (kind, label, detail) = capture::state_words(s, words);
             n(kind, label, detail)

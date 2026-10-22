@@ -7,3 +7,4 @@ pub mod embeds;
 pub mod polish;
 pub mod page;
 pub mod materials;
+pub mod archive;
