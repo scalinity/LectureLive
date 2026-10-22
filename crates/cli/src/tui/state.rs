@@ -539,6 +539,7 @@ impl View {
                 effect.hydrate = true;
             }
             Event::Slide { index, file, auto, uncertain, shown_at } => self.slide(*index, file, *auto, *uncertain, *shown_at),
+            Event::SlideRestored(s) => self.slide(s.index, &s.file, s.auto, s.uncertain, s.shown_at),
             Event::SlideRemoved { index } => {
                 self.slides.retain(|s| s.index != *index);
                 self.removed.insert(*index);
@@ -785,7 +786,7 @@ impl View {
     /// A slide registration upserts by index (plan §F): a duplicate index refreshes what is shown.
     fn slide(&mut self, index: u32, file: &str, auto: bool, uncertain: bool, shown_at: DateTime<Local>) {
         let line = SlideLine { index, file: plain::clean(file), shown_at, auto, uncertain };
-        self.removed.remove(&index); // the newest slide's number is free again once it was removed
+        self.removed.remove(&index); // a restored slide may use its original number
         match self.slides.iter_mut().find(|s| s.index == index) {
             Some(s) => *s = line,
             None => match self.slides.iter().position(|s| s.index > index) {

@@ -68,7 +68,7 @@ export type PreviewShot = { path: string; width: number; height: number };
 /** The course's saved region, and the parts of it left out as fractions of it. */
 export type SavedRegion = { region: Region; leave_out: Region[] };
 
-export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" } & SlideView) | { type: "slide_removed"; index: number } | { type: "slides_noted"; through: number };
+export type StatusMsg = ({ type: "status" } & Status) | ({ type: "notice" } & Notice) | ({ type: "slide" | "slide_restored" } & SlideView) | { type: "slide_removed"; index: number } | { type: "slides_noted"; through: number };
 
 export type OpenView = { utterance: number; stable: string; tentative: string };
 
@@ -86,6 +86,7 @@ export type SessionState = {
   preview: PreviewView | null;
   op: number;
   slides: SlideView[];
+  removed_slides: number;
   pending_segments: number;
   pending_slides: number;
 };

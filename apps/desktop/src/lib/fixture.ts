@@ -1,14 +1,14 @@
 // A scripted backend: the store's tests, the frame-time bench and the browser preview drive the real
 // store through it, with the adapter's session and sequence rules.
 import type { DropEvent, Transport } from "./transport";
-import type { Envelope, NotesMsg, SessionState, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
+import type { Envelope, NotesMsg, SessionState, SlideView, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 
 export function idleStatus(): Status {
   return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, paused: false, input_gone: null, capture_mode: { automatic: true, selected: false, shortcut: { state: "inactive" } }, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
 }
 
 export function emptyState(session: string): SessionState {
-  return { session, seq: 0, status: idleStatus(), notices: [], segments: [], open: null, revision: 0, document: "", preview: null, op: 1, slides: [], pending_segments: 0, pending_slides: 0 };
+  return { session, seq: 0, status: idleStatus(), notices: [], segments: [], open: null, revision: 0, document: "", preview: null, op: 1, slides: [], removed_slides: 0, pending_segments: 0, pending_slides: 0 };
 }
 
 type Handler<T> = (m: Envelope<T>) => void;
@@ -229,14 +229,25 @@ export function demoWithNotes(): FixtureTransport {
     t.emitStatus({ type: "status", ...t.state_.status });
   };
   t.assetUrl = () => "/demo-slide.svg";
-  // The backend's answer to a removal: the slide goes, and the notice line says where its file is kept.
+  const removed: SlideView[] = [];
+  // The backend's answer to a removal, including its undo history.
   t.effects.remove_slide = (args) => {
     const index = Number(args?.index);
     const slide = t.state_.slides.find((s) => s.index === index);
     if (!slide || slide.noted) return;
+    removed.push(slide);
+    t.state_.removed_slides = removed.length;
     t.state_.slides = t.state_.slides.filter((s) => s.index !== index);
     t.emitStatus({ type: "slide_removed", index });
-    t.emitStatus({ type: "notice", kind: "slide", label: `Slide ${index} removed`, detail: "kept in slides/removed, and left out of the next snapshot", at: new Date().toTimeString().slice(0, 8) });
+    t.emitStatus({ type: "notice", kind: "slide", label: `Slide ${index} removed`, detail: "⌘Z undoes this; kept in slides/removed, and left out of the next snapshot", at: new Date().toTimeString().slice(0, 8) });
+  };
+  t.effects.undo_remove_slide = () => {
+    const slide = removed.pop();
+    if (!slide) return;
+    t.state_.removed_slides = removed.length;
+    t.state_.slides = [...t.state_.slides, slide].sort((a, b) => a.index - b.index);
+    t.emitStatus({ type: "slide_restored", ...slide });
+    t.emitStatus({ type: "notice", kind: "slide", label: `Slide ${slide.index} restored`, detail: "back in the lecture, into the next snapshot", at: new Date().toTimeString().slice(0, 8) });
   };
   t.answers = { capture_windows: DEMO_WINDOWS, capture_preview: { path: "/demo-slide.svg", width: 1600, height: 900 }, capture_saved_region: { region: { x: 0.06, y: 0.1, w: 0.88, h: 0.8 }, leave_out: [{ x: 0.8, y: 0, w: 0.2, h: 0.22 }] }, capture_select: null, capture_now: null, import_slides: null, key_status: { stored: true, env_available: true }, inputs: [{ name: "MacBook Pro Microphone", uid: "BuiltInMicrophoneDevice" }, { name: "BlackHole 2ch", uid: "BlackHole2ch_UID" }], loopback_status: { present: true, blackhole_present: true }, spend_summary: { total: 3.8412, estimated: 0.4071, calls: 57, months: [{ key: "2026-08", label: "August 2026", total: 1.2033, courses: [["Machine Learning", 0.9021], ["Statistics", 0.3012]] }, { key: "2026-09", label: "September 2026", total: 2.6379, courses: [["Machine Learning", 1.9112], ["Statistics", 0.6021], ["Biology", 0.1246]] }], recent: [{ day: "2026-09-25", label: "25 Sep", course: "Machine Learning", lecture: "Week 06 — Optimisation", total: 0.4402, kinds: [["page", 0.2727], ["notes", 0.1021], ["transcribe", 0.0533], ["polish", 0.0121]] }, { day: "2026-09-24", label: "24 Sep", course: "Statistics", lecture: "Week 05 — Hypothesis tests", total: 0.3104, kinds: [["notes", 0.1902], ["transcribe", 0.1202]] }, { day: "2026-09-22", label: "22 Sep", course: "Biology", lecture: "Week 02", total: 0.004, kinds: [["notes", 0.004]] }] } };
   (globalThis as { __fixture?: FixtureTransport }).__fixture = t; // the preview's checks drive states through it

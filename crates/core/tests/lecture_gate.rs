@@ -118,6 +118,14 @@ async fn a_whole_lecture_runs_headless_from_first_word_to_study_page() {
     segments_seen(&mut ev, 2).await;
     support::slides::png(&f.slides.join("Screenshot dropped in.png"));
     until(&mut ev, "the slide", |e| matches!(e, Event::Slide { index: 1, .. })).await;
+    // A fast removal followed immediately by Command-Z stays ordered in the live command loop.
+    let (removed, removed_reply) = tokio::sync::oneshot::channel();
+    let (restored, restored_reply) = tokio::sync::oneshot::channel();
+    cmd.send(Command::RemoveSlide { index: 1, reply: Some(removed) }).unwrap();
+    cmd.send(Command::UndoRemoveSlide { reply: restored }).unwrap();
+    tokio::time::timeout(ms(5_000), removed_reply).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(ms(5_000), restored_reply).await.unwrap().unwrap().unwrap();
+    until(&mut ev, "the restored slide", |e| matches!(e, Event::SlideRestored(s) if s.index == 1)).await;
     cmd.send(Command::Op(Op::Snapshot(String::new()))).unwrap();
     until(&mut ev, "the first snapshot", |e| matches!(e, Event::Committed { slides: 1, .. })).await;
     segments_seen(&mut ev, 1).await;
@@ -294,6 +302,15 @@ async fn a_removed_slide_is_left_out_of_the_next_snapshot_and_a_used_one_cannot_
     let again = slides::remove(&f, &store, 2, Arc::new(AtomicBool::new(false))).await.unwrap_err();
     assert!(format!("{again}").contains("already in the notes"), "{again}");
     assert!(f.slides.join("slide_02_100002.png").exists(), "the notes still show it");
+    let restored = slides::undo_remove(&f, &store, Arc::new(AtomicBool::new(false))).await.unwrap();
+    assert_eq!(restored.index, 3, "the restored image is pending beyond the committed snapshot");
+    let (ev_tx, _) = mpsc::unbounded_channel();
+    lec.snapshot(&store, "", &ev_tx).await.unwrap();
+    let sent = sse.state.bodies();
+    assert!(user_text(&sent[1]).contains("slide_03_100001.png"));
+    let notes = std::fs::read_to_string(&f.notes).unwrap();
+    assert!(notes.contains("![Slide 3](slides/slide_03_100001.png)"), "the next notes include the restored image");
+    assert_eq!(Sidecar::load(&f.sidecar()).unwrap().unwrap().notes.slide_index, 3);
 }
 
 /// A polish starts a page in the background and a Study page pressed meanwhile used to start a second full typeset: now the

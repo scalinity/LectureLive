@@ -62,6 +62,7 @@ pub fn run() {
             app::set_auto_capture,
             app::import_slides,
             app::remove_slide,
+            app::undo_remove_slide,
             app::open_screen_settings,
             app::microphone,
             app::open_microphone_settings,

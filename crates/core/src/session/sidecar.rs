@@ -34,6 +34,9 @@ pub struct Sidecar {
     /// Registered slides, in registration order (spec §7.3, §8).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slides: Vec<SlideEntry>,
+    /// Removed slides in deletion order, kept for undo with their original capture metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_slides: Vec<SlideEntry>,
     /// The stretches the person paused the lecture (spec §9.6): nothing was recorded in them, so the hole between
     /// the recordings either side is theirs, and the audit counts it as explained.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -42,7 +45,7 @@ pub struct Sidecar {
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new(), pauses: Vec::new() }
+        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new(), removed_slides: Vec::new(), pauses: Vec::new() }
     }
 }
 

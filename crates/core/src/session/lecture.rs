@@ -84,6 +84,7 @@ pub enum Command {
     /// Remove a slide no snapshot has used (spec §7.5). `reply` answers the caller that waits for the result (the
     /// desktop's command); without one, a refusal is told as a `Warning`, which is how a typed `remove` hears it.
     RemoveSlide { index: u32, reply: Option<oneshot::Sender<Result<(), String>>> },
+    UndoRemoveSlide { reply: oneshot::Sender<Result<(), String>> },
 }
 
 /// Slide capture for a lecture (spec §7): where windows come from, and the course's saved selection.
@@ -118,6 +119,7 @@ pub enum Event {
     Thinking(String),
     /// The person removed a slide no snapshot had used (spec §7.5).
     SlideRemoved { index: u32 },
+    SlideRestored(SlideEntry),
     /// A snapshot took the slides through this index into the notes: they can no longer be removed.
     SlidesNoted { through: u32 },
     /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
@@ -615,20 +617,27 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                 },
                 Some(Command::RemoveSlide { index, reply }) => match &state_store {
                     Some(s) => {
-                        let (lec, s, events, snapshotting) = (lec.clone(), s.clone(), events.clone(), snapshotting.clone());
-                        tokio::spawn(async move {
-                            match slides::remove(&lec.files, &s, index, snapshotting).await {
-                                Ok(_) => {
-                                    let _ = events.send(Event::SlideRemoved { index });
-                                    if let Some(r) = reply {
-                                        let _ = r.send(Ok(()));
-                                    }
+                        match slides::remove(&lec.files, s, index, snapshotting.clone()).await {
+                            Ok(_) => {
+                                let _ = events.send(Event::SlideRemoved { index });
+                                if let Some(r) = reply {
+                                    let _ = r.send(Ok(()));
                                 }
-                                Err(e) => refused(reply, &events, format!("{e:#}")),
                             }
-                        });
+                            Err(e) => refused(reply, &events, format!("{e:#}")),
+                        }
                     }
                     None => refused(reply, &events, "The lecture is stopping.".into()),
+                },
+                Some(Command::UndoRemoveSlide { reply }) => match &state_store {
+                    Some(s) => match slides::undo_remove(&lec.files, s, snapshotting.clone()).await {
+                        Ok(slide) => {
+                            let _ = events.send(Event::SlideRestored(slide));
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(e) => refused(Some(reply), &events, format!("{e:#}")),
+                    },
+                    None => refused(Some(reply), &events, "The lecture is stopping.".into()),
                 },
                 None => commands_open = false, // input closed: the lecture runs until it is stopped or its audio ends
             },

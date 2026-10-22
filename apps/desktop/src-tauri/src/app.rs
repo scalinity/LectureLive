@@ -161,6 +161,7 @@ fn stopping_refusal(c: &Command) -> Option<&'static str> {
     match c {
         Command::Op(_) => Some("The lecture is stopping; the last snapshot takes what is left."),
         Command::Pause | Command::Resume => Some("The lecture is stopping; it can no longer be paused or resumed."),
+        Command::RemoveSlide { .. } | Command::UndoRemoveSlide { .. } => Some("The lecture is stopping; wait until it has saved before changing slides."),
         _ => None,
     }
 }
@@ -754,6 +755,27 @@ pub async fn remove_slide(index: u32, app: State<'_, App>) -> Res<()> {
     let (tx, rx) = oneshot::channel();
     app.send(Command::RemoveSlide { index, reply: Some(tx) })?;
     rx.await.map_err(|_| "The lecture has ended.".to_string())?
+}
+
+/// Command-Z restores the last removed image, including after class without starting recording.
+#[tauri::command]
+pub async fn undo_remove_slide(app: State<'_, App>) -> Res<()> {
+    if app.commands().is_some() {
+        let (tx, rx) = oneshot::channel();
+        app.send(Command::UndoRemoveSlide { reply: tx })?;
+        return rx.await.map_err(|_| "The lecture has ended.".to_string())?;
+    }
+    let mut pump = app.pump.lock().await;
+    if !matches!(pump.phase(), Phase::Idle | Phase::Ended) {
+        return Err("Wait until the lecture has saved before restoring a slide.".into());
+    }
+    let folder = app.folder().ok_or("Choose a lecture folder first.")?;
+    let _lock = FolderLock::acquire(&folder.files.dir).map_err(chain)?;
+    let sc = Sidecar::load(&folder.files.sidecar()).map_err(chain)?.ok_or("This lecture has no saved slide history.")?;
+    let store = lecturelive_core::session::coordinator::Store::offline(sc, folder.files.sidecar());
+    let slide = lecturelive_core::session::slides::undo_remove(&folder.files, &store, Arc::new(AtomicBool::new(false))).await.map_err(chain)?;
+    pump.apply(Event::SlideRestored(slide));
+    Ok(())
 }
 
 /// ⌘⇧2: as the Capture button; a refusal becomes a notice, since no button was pressed to show it.

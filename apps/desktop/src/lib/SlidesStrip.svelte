@@ -75,7 +75,7 @@
                 <img src={toUrl(s.path)} alt="Slide {s.index}, {s.auto ? 'taken automatically' : 'taken by you'} at {s.at}" title="Slide {s.index}" loading="lazy" decoding="async" />
                 {#if session.canRemove(s)}
                   <!-- A slide no snapshot has used: it can go before it reaches the notes. Its file is kept. -->
-                  <button class="remove" type="button" onclick={() => session.removeSlide(s.index)} aria-label="Remove slide {s.index}" title="Remove slide {s.index}: the next snapshot leaves it out, and its file is kept in slides/removed">
+                  <button class="remove" type="button" onclick={() => session.removeSlide(s.index)} aria-label="Remove slide {s.index}" title="Remove slide {s.index}: ⌘Z undoes this; its file is kept in slides/removed">
                     <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" /></svg>
                   </button>
                 {/if}

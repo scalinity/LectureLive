@@ -134,6 +134,7 @@ reapplies the page design (`notes_template.html`) and costs nothing.
                                    folder holds more than one day's notes)
   lecture_transcript_YYYYMMDD.txt  [HH:MM:SS] text, one line per utterance
   slides/slide_NN_HHMMSS.png       captured slides, ≤1600 px
+  slides/removed/                 removed images, recoverable in the app with Command-Z
   .live_notes/                     resume state, polish backups, typeset page parts
 ```
 

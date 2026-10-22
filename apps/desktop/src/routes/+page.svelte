@@ -11,6 +11,7 @@
   import KeyDialog from "$lib/KeyDialog.svelte";
   import Notes from "$lib/Notes.svelte";
   import SlidesStrip from "$lib/SlidesStrip.svelte";
+  import SlideUndo from "$lib/SlideUndo.svelte";
   import WindowPicker from "$lib/WindowPicker.svelte";
   import SpendView from "$lib/SpendView.svelte";
   import StatusStrip from "$lib/StatusStrip.svelte";
@@ -82,6 +83,7 @@
   const started = boot();
 </script>
 
+<SlideUndo />
 <div class="window">
   <StatusStrip onSpend={() => spendView.show()} onKey={() => keyDialog.show()} />
   <main class="panes">

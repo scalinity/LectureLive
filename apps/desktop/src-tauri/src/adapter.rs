@@ -253,7 +253,12 @@ impl Pump {
             }
             Event::SlideRemoved { index } => {
                 self.emit(Stream::Status, StatusMsg::SlideRemoved { index });
-                self.notice(NoticeKind::Slide, &format!("Slide {index} removed"), "kept in slides/removed, and left out of the next snapshot");
+                self.notice(NoticeKind::Slide, &format!("Slide {index} removed"), "⌘Z undoes this; kept in slides/removed, and left out of the next snapshot");
+            }
+            Event::SlideRestored(s) => {
+                let path = self.slide_path(&s.file);
+                self.emit(Stream::Status, StatusMsg::SlideRestored(SlideView { index: s.index, file: s.file, path, at: s.shown_at.format("%H:%M:%S").to_string(), auto: s.auto, uncertain: s.uncertain, noted: false }));
+                self.notice(NoticeKind::Slide, &format!("Slide {} restored", s.index), "back in the lecture, into the next snapshot");
             }
             Event::SlidesNoted { through } => self.emit(Stream::Status, StatusMsg::SlidesNoted { through }),
             Event::Capture(s) => self.capture_state(s),
@@ -406,6 +411,7 @@ impl Pump {
             preview: self.mirror.preview.clone(),
             op: self.mirror.op,
             slides,
+            removed_slides: sc.map_or(0, |sc| sc.removed_slides.len()),
             pending_segments,
             pending_slides,
         }
@@ -579,6 +585,23 @@ mod tests {
         let state = p.state(Some(&sc), &[], String::new(), None);
         assert_eq!(state.slides.iter().map(|s| (s.index, s.noted)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false)], "a snapshot used the first two");
         assert_eq!(state.pending_slides, 1);
+    }
+
+    #[test]
+    fn restored_images_keep_their_metadata_and_reloaded_pages_know_the_undo_count() {
+        use lecturelive_core::session::sidecar::SlideEntry;
+        let (mut p, sink) = pump();
+        let slide = SlideEntry { index: 2, file: "slides/slide_02_100002.png".into(), shown_at: Local::now(), auto: true, uncertain: true };
+        p.apply(Event::SlideRestored(slide.clone()));
+        let messages = sink.on(Stream::Status);
+        let restored = messages.iter().find(|m| m["type"] == "slide_restored").unwrap();
+        assert_eq!(restored["index"], 2);
+        assert_eq!(restored["auto"], true);
+        assert_eq!(restored["uncertain"], true);
+        assert_eq!(restored["noted"], false);
+        let mut sc = Sidecar::default();
+        sc.removed_slides.push(slide);
+        assert_eq!(p.state(Some(&sc), &[], String::new(), None).removed_slides, 1);
     }
 
     #[test]

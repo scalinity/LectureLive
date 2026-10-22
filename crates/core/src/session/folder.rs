@@ -171,10 +171,10 @@ pub fn slide_files(files: &LectureFiles) -> Result<Vec<SlideEntry>> {
     Ok(out)
 }
 
-/// The next slide index: one past the highest registered or on disk (spec §8).
+/// Removed slides reserve their number so undo cannot collide with a later capture.
 pub fn next_slide_index(files: &LectureFiles, sc: &Sidecar) -> Result<u32> {
     let on_disk = slide_files(files)?.iter().map(|s| s.index).max().unwrap_or(0);
-    Ok(sc.slides.iter().map(|s| s.index).max().unwrap_or(0).max(on_disk) + 1)
+    sc.slides.iter().chain(&sc.removed_slides).map(|s| s.index).max().unwrap_or(0).max(sc.notes.slide_index).max(on_disk).checked_add(1).context("The slide numbers are exhausted")
 }
 
 /// Transcript lines and slide files as segments and slides. The leading segments for which `noted`

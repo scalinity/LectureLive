@@ -84,7 +84,7 @@ pub async fn register(files: &LectureFiles, store: &Store, path: &Path, meta: Sl
 }
 
 /// Where a removed slide's file goes inside `slides/`: out of the folder's slide files, so opening the lecture
-/// again does not register it back, and kept, so the person can take it back by hand.
+/// again does not register it back, and kept for undo.
 pub const REMOVED_DIR: &str = "removed";
 
 /// Takes a slide that no snapshot has used out of the lecture (spec §7.5), inside the sidecar's writer: its record
@@ -112,11 +112,50 @@ pub async fn remove(files: &LectureFiles, store: &Store, index: u32, snapshottin
                 }
                 let dir = files.slides.join(REMOVED_DIR);
                 std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-                move_file(&from, &dir.join(name))?;
+                if dir.canonicalize()?.parent() != Some(files.slides.canonicalize()?.as_path()) {
+                    bail!("The removed folder is not inside the slides folder");
+                }
+                let dest = dir.join(name);
+                if dest.exists() { bail!("Slide {index}'s removed file already exists, so neither image was overwritten"); }
+                move_file(&from, &dest)?;
+                sc.removed_slides.push(sc.slides[at].clone());
             }
             Ok(sc.slides.remove(at))
         })
         .await
+}
+
+/// Restores the most recent removal inside the same writer as capture and snapshots. If a snapshot
+/// has passed its old number, give it a new pending number so the next snapshot can include it.
+pub async fn undo_remove(files: &LectureFiles, store: &Store, snapshotting: Arc<AtomicBool>) -> Result<SlideEntry> {
+    let files = files.clone();
+    store.update(move |sc| {
+        let mut slide = sc.removed_slides.last().cloned().context("There is no removed slide to restore")?;
+        if snapshotting.load(Ordering::SeqCst) { bail!("A snapshot is running: undo the removal once it is done"); }
+        let original = files.dir.join(&slide.file);
+        let name = original.file_name().context("The removed slide has no filename")?;
+        let folder = files.slides.canonicalize()?;
+        if original.parent().and_then(|p| p.canonicalize().ok()).as_ref() != Some(&folder) {
+            bail!("The removed slide's file is not in the slides folder");
+        }
+        let from = files.slides.join(REMOVED_DIR).join(name);
+        let removed = files.slides.join(REMOVED_DIR).canonicalize().context("The removed slide's file is missing")?;
+        if removed.parent() != Some(folder.as_path()) || std::fs::symlink_metadata(&from).map(|m| !m.file_type().is_file()).unwrap_or(true) {
+            bail!("The removed slide's file is missing or is not a regular image in slides/removed");
+        }
+        if slide.index <= sc.notes.slide_index || sc.slides.iter().any(|s| s.index == slide.index) {
+            slide.index = next_slide_index(&files, sc)?;
+            let ext = original.extension().and_then(|s| s.to_str()).unwrap_or("png");
+            slide.file = relative(&files, &files.slides.join(format!("slide_{:02}_{}.{ext}", slide.index, slide.shown_at.format("%H%M%S"))));
+        }
+        let dest = files.dir.join(&slide.file);
+        if dest.exists() { bail!("The restored slide's destination already exists, so neither image was overwritten"); }
+        move_file(&from, &dest)?;
+        sc.removed_slides.pop();
+        sc.slides.push(slide.clone());
+        sc.slides.sort_by_key(|s| s.index);
+        Ok(slide)
+    }).await
 }
 
 /// Images dropped on the app (spec §7.3): each is copied to a temp name in `slides/`, so the original
@@ -316,13 +355,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_next_slide_after_the_newest_was_removed_takes_its_number_again() {
+    async fn the_next_slide_reserves_a_removed_slides_number_for_undo() {
         let (_d, files, store) = setup();
         three(&files, &store).await;
         remove(&files, &store, 3, idle()).await.unwrap();
         let tmp = files.slides.join(".capture-4.png.tmp");
         png(&tmp);
         let s = register(&files, &store, &tmp, SlideMeta::manual(Local.with_ymd_and_hms(2026, 9, 25, 10, 5, 0).unwrap())).await.unwrap().unwrap();
-        assert_eq!(s.index, 3, "nothing in the notes can name a slide that was never in a snapshot");
+        assert_eq!(s.index, 4, "undo must not collide with a new capture");
+        assert_eq!(undo_remove(&files, &store, idle()).await.unwrap().index, 3);
+    }
+
+    #[tokio::test]
+    async fn undo_restores_multiple_removals_in_reverse_order_with_metadata_and_bytes() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        let bytes = std::fs::read(files.dir.join(&slides[1].file)).unwrap();
+        remove(&files, &store, 2, idle()).await.unwrap();
+        remove(&files, &store, 1, idle()).await.unwrap();
+        assert_eq!(undo_remove(&files, &store, idle()).await.unwrap(), slides[0]);
+        assert_eq!(undo_remove(&files, &store, idle()).await.unwrap(), slides[1]);
+        assert_eq!(std::fs::read(files.dir.join(&slides[1].file)).unwrap(), bytes);
+        assert_eq!(store.read().await.unwrap().slides, slides);
+        assert!(store.read().await.unwrap().removed_slides.is_empty());
+        assert!(undo_remove(&files, &store, idle()).await.unwrap_err().to_string().contains("no removed slide"));
+    }
+
+    #[tokio::test]
+    async fn undo_survives_reopening_and_a_later_snapshot_makes_the_restored_image_pending() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        remove(&files, &store, 2, idle()).await.unwrap();
+        store.update(|sc| Ok(sc.notes.slide_index = 3)).await.unwrap();
+        let (sc, _) = crate::session::folder::open(&files, "Lecture", false).unwrap();
+        assert_eq!(sc.removed_slides, vec![slides[1].clone()]);
+        let reopened = Store::offline(sc, files.sidecar());
+        let restored = undo_remove(&files, &reopened, idle()).await.unwrap();
+        assert_eq!(restored.index, 4);
+        assert_eq!((restored.shown_at, restored.auto, restored.uncertain), (slides[1].shown_at, true, false));
+        assert!(restored.file.ends_with("slide_04_100002.png"));
+        assert!(files.dir.join(&restored.file).is_file());
+        let sc = reopened.read().await.unwrap();
+        assert_eq!(sc.notes.slide_index, 3);
+        assert!(sc.removed_slides.is_empty());
+        assert_eq!(sc.slides.iter().filter(|s| s.index > sc.notes.slide_index).cloned().collect::<Vec<_>>(), vec![restored]);
+    }
+
+    #[tokio::test]
+    async fn undo_refuses_a_snapshot_or_missing_file_without_losing_history() {
+        let (_d, files, store) = setup();
+        three(&files, &store).await;
+        let gone = remove(&files, &store, 2, idle()).await.unwrap();
+        let busy = Arc::new(AtomicBool::new(true));
+        assert!(undo_remove(&files, &store, busy).await.unwrap_err().to_string().contains("snapshot is running"));
+        std::fs::remove_file(files.slides.join(REMOVED_DIR).join("slide_02_100002.png")).unwrap();
+        assert!(undo_remove(&files, &store, idle()).await.is_err());
+        assert_eq!(store.read().await.unwrap().removed_slides, vec![gone]);
+    }
+
+    #[tokio::test]
+    async fn undo_overwrites_neither_an_existing_destination_nor_a_link_outside_removed() {
+        let (_d, files, store) = setup();
+        let slides = three(&files, &store).await;
+        remove(&files, &store, 2, idle()).await.unwrap();
+        let dest = files.dir.join(&slides[1].file);
+        std::fs::write(&dest, b"another image").unwrap();
+        assert!(undo_remove(&files, &store, idle()).await.unwrap_err().to_string().contains("already exists"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"another image");
+        std::fs::remove_file(&dest).unwrap();
+        let from = files.slides.join(REMOVED_DIR).join("slide_02_100002.png");
+        std::fs::remove_file(&from).unwrap();
+        std::os::unix::fs::symlink(files.dir.join(&slides[0].file), &from).unwrap();
+        assert!(undo_remove(&files, &store, idle()).await.is_err());
+        assert!(files.dir.join(&slides[0].file).exists());
+        assert_eq!(store.read().await.unwrap().removed_slides.len(), 1);
     }
 }

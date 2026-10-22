@@ -1131,3 +1131,24 @@ solo-key check is BLOCKED: computer use rejects modifier-only key input with
 Physical right Option delivery and the packaged app's own permission grant remain unverified.
 The existing app is recording, so its replacement is staged for the one-time installer to apply
 only after that process exits; it is not restarted during the lecture.
+
+## M7.3 — Undo image deletion
+
+The app's Command-Z restores the most recently removed slide; repeated presses restore earlier
+removals one at a time. Inputs and editable text keep native text undo, and open dialogs keep their
+own keyboard behavior. The removal notice and tooltip show the shortcut. Removed entries persist
+in the sidecar with capture time, automatic/manual origin and uncertainty, so undo survives reload
+and is available after class without starting recording. Removed slide numbers stay reserved to
+avoid capture collisions. An image restored after a snapshot passed its old number receives a new
+pending number and reaches the next notes snapshot. Snapshot/polish activity, missing files and
+occupied destinations leave history recoverable and report the reason.
+
+Verification (2026-10-22): the serial workspace suite passed 776 tests with 33 opt-in checks ignored.
+All 48 frontend tests passed, type checking reported no errors or warnings, and the frontend,
+release CLI and signed app built. Tests cover reverse-order restoration, byte and metadata
+preservation, reload, capture-number reservation, snapshot gating, missing images, collisions and
+the next snapshot including a restored image. A titleless native WKWebView preview with the
+standard Edit menu verified actual Command-Z image restoration and native text undo while an
+image remained removed, followed by restoration after leaving the typing field. No screenshots
+were saved. The CLI is installed; the replacement app includes M7.2 and M7.3 and waits for the
+existing app to quit before installation.

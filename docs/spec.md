@@ -736,16 +736,22 @@ so that a duplicate or an empty capture never reaches the model or the notes. In
 pointer shows a quiet × at its top-right corner; with the pointer on the ×, it turns red and the slide it would
 remove is outlined. It is also reached with the keyboard. There is no confirmation: the slide's file moves to
 `slides/removed/`, where the folder's slide scan does not look, so it is not registered again when the folder is
-opened and the person can take it back by hand. The notice line says so. The CLI reaches it with
+opened. In the app, Command-Z restores the most recently removed image; repeated presses undo
+earlier removals one at a time. Typing fields keep their normal text undo, and dialogs keep their
+own keyboard behavior. The notice and removal tooltip show the shortcut. The CLI reaches removal with
 `remove N` (or `remove slide N`) as the whole line; no reply is waited for, so a refusal comes back as a
 warning in the event stream and the plain CLI prints a removal as `slide N removed`.
 
 The strip offers the control only for a slide that is removable, and the core decides again when asked, inside
 the sidecar's writer: a slide a snapshot has used stays (the notes embed its file), and nothing is removed while a
-snapshot or polish runs, because its batch may already hold the slide. A removed slide's number is not kept: the
-next slide after the newest one takes it again, since nothing in the notes can name a slide that was never in a
-snapshot. Two messages keep the strip true: `slide_removed` when a slide goes, and `slides_noted` (through an
-index) when a snapshot commits, after which those slides lose the control.
+snapshot or polish runs, because its batch may already hold the slide. Undo also waits for a snapshot
+or polish to finish. The sidecar keeps removed slides in deletion order with their original metadata,
+so undo survives a reload and works after class without starting recording. Their numbers stay reserved.
+Restoration puts the original file and metadata back in registration order. If a committed snapshot
+has already passed the old number, the image receives a new pending number so the next snapshot
+includes it. Missing files or occupied destinations produce an error and keep the undo history.
+The strip follows `slide_removed`, `slide_restored`, and `slides_noted` (through an index); a snapshot's
+used slides lose the removal control.
 
 ## 8. Files, state, resume
 

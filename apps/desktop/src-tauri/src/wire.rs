@@ -220,6 +220,7 @@ pub enum StatusMsg {
     Slide(SlideView),
     /// A slide no snapshot had used was removed.
     SlideRemoved { index: u32 },
+    SlideRestored(SlideView),
     /// A snapshot used the slides through this index.
     SlidesNoted { through: u32 },
 }
@@ -253,6 +254,7 @@ pub struct SessionState {
     /// The notes operation the next deltas belong to.
     pub op: u64,
     pub slides: Vec<SlideView>,
+    pub removed_slides: usize,
     pub pending_segments: u64,
     pub pending_slides: usize,
 }

@@ -38,6 +38,8 @@ export class Session {
   /** The preview as last shown: whole words only, re-shown at most every 100 ms. */
   previewShown = $state("");
   slides = $state.raw<SlideView[]>([]);
+  removedSlides = $state(0);
+  private removingSlides = $state(0);
   /** The live preview; not reactive, since only `previewShown` is drawn. */
   preview: { op: number; text: string } | null = null;
   previewParses = 0;
@@ -306,7 +308,17 @@ export class Session {
 
   /** Takes a slide no snapshot has used out of the lecture; its file is kept in `slides/removed`. */
   async removeSlide(index: number) {
-    await this.act("remove_slide", { index });
+    this.removingSlides++;
+    try { await this.act("remove_slide", { index }); }
+    finally { this.removingSlides--; }
+  }
+
+  get canUndoRemoval(): boolean {
+    return ["running", "idle", "ended"].includes(this.status.phase) && !this.busyOp && (this.removedSlides > 0 || this.removingSlides > 0);
+  }
+
+  async undoRemoval() {
+    await this.act("undo_remove_slide");
   }
 
   async importSlides(paths: string[]) {
@@ -446,6 +458,7 @@ export class Session {
     this.document = st.document;
     this.committed = [];
     this.slides = st.slides;
+    this.removedSlides = st.removed_slides;
     this.preview = st.preview ? { ...st.preview } : null;
     this.previewShown = this.preview ? wholeWords(this.preview.text) : "";
     this.previewDirty = false;
@@ -525,11 +538,13 @@ export class Session {
       this.notices = [...this.notices, notice].slice(-NOTICES);
     } else if (m.type === "slide_removed") {
       this.slides = this.slides.filter((s) => s.index !== m.index);
+      this.removedSlides++;
     } else if (m.type === "slides_noted") {
       this.slides = this.slides.map((s) => (s.index <= m.through && !s.noted ? { ...s, noted: true } : s));
     } else {
       const { type: _t, session: _s, seq: _q, ...slide } = m;
-      this.slides = [...this.slides, slide];
+      this.slides = [...this.slides.filter((s) => s.index !== slide.index), slide].sort((a, b) => a.index - b.index);
+      if (m.type === "slide_restored") this.removedSlides = Math.max(0, this.removedSlides - 1);
     }
     return true;
   }
