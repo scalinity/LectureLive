@@ -1,7 +1,7 @@
 //! The desktop adapter (spec §3.6): maps a running lecture's events to the frontend's three streams,
 //! stamps each message with the session and one rising sequence, and mirrors what a reload needs.
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Local;
@@ -13,7 +13,7 @@ use lecturelive_core::session::lecture::Event;
 use lecturelive_core::session::notesfile::sha256_hex;
 use lecturelive_core::session::segments::{Segment, SegmentSource};
 use lecturelive_core::session::sidecar::{NotesState, Sidecar};
-use lecturelive_core::session::spend::{money, Spend};
+use lecturelive_core::session::spend::{self, money};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -66,7 +66,8 @@ pub struct Pump {
     session: String,
     seq: u64,
     sink: Arc<dyn Sink>,
-    spend: Option<Spend>,
+    ledger: Option<PathBuf>,
+    spend_failed: bool,
     silence: Option<SilenceWatch>,
     kind: SourceKind,
     mirror: Mirror,
@@ -89,10 +90,12 @@ fn stt_words(s: &SttStatus) -> (String, bool) {
 }
 
 impl Pump {
-    pub fn new(session: String, sink: Arc<dyn Sink>, spend: Option<Spend>, kind: SourceKind) -> Self {
+    pub fn new(session: String, sink: Arc<dyn Sink>, ledger: Option<PathBuf>, kind: SourceKind) -> Self {
         let mirror = Mirror { op: 1, status: Status { stt: "not started".into(), ..Status::default() }, ..Mirror::default() };
         let silence = (kind != SourceKind::Input).then(|| SilenceWatch::new(-60.0, 10));
-        Self { session, seq: 0, sink, spend, silence, kind, mirror, sent: None }
+        let mut pump = Self { session, seq: 0, sink, ledger, spend_failed: false, silence, kind, mirror, sent: None };
+        pump.refresh_spend();
+        pump
     }
 
     pub fn phase(&self) -> Phase {
@@ -145,13 +148,28 @@ impl Pump {
 
     /// Sends the status when it differs from what the frontend last received.
     fn flush_status(&mut self) {
-        if let Some(spend) = &self.spend {
-            self.mirror.status.spend_usd = spend.lecture_total();
-        }
         if self.sent.as_ref() != Some(&self.mirror.status) {
             let s = self.mirror.status.clone();
             self.sent = Some(s.clone());
             self.emit(Stream::Status, StatusMsg::Status(s));
+        }
+    }
+
+    /// The header follows the persistent day's ledger, even before a lecture or after polish.
+    pub fn refresh_spend(&mut self) {
+        let Some(path) = &self.ledger else { return };
+        match spend::daily_total(path, Local::now().date_naive()) {
+            Ok(total) => {
+                self.spend_failed = false;
+                self.mirror.status.spend_usd = total;
+                self.flush_status();
+            }
+            Err(e) => {
+                if !self.spend_failed {
+                    self.notice(NoticeKind::Warn, "Spend unavailable", &format!("The daily total could not be refreshed: {e:#}"));
+                }
+                self.spend_failed = true;
+            }
         }
     }
 
@@ -467,6 +485,52 @@ mod tests {
     fn pump_with(kind: SourceKind) -> (Pump, Arc<Recorded>) {
         let sink = Arc::new(Recorded::default());
         (Pump::new("s1".into(), sink.clone(), None, kind), sink)
+    }
+
+    #[test]
+    fn daily_spend_is_loaded_before_recording_and_survives_folder_and_process_changes() {
+        use spend::{Spend, SpendKind};
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("spend.jsonl");
+        let today = Local::now().date_naive();
+        let first = Spend::open(&ledger, "Statistics", "Week 1", today).unwrap();
+        first.add(SpendKind::Notes, 0.25, true, None).unwrap();
+        let sink = Arc::new(Recorded::default());
+        let mut p = Pump::new("first".into(), sink.clone(), Some(ledger.clone()), SourceKind::Input);
+        assert_eq!(p.state(None, &[], String::new(), None).status.spend_usd, 0.25);
+        p.set_status(|s| s.phase = Phase::Running);
+        p.lecture_ended();
+        assert_eq!(p.mirror().status.spend_usd, 0.25);
+        // A second lecture or after-class request writes while no lecture is attached to the pump.
+        let second = Spend::open(&ledger, "Medicine", "Week 2", today).unwrap();
+        second.add(SpendKind::Page, 0.50, true, None).unwrap();
+        p.refresh_spend();
+        assert_eq!(p.mirror().status.spend_usd, 0.75);
+        let before = std::fs::read(&ledger).unwrap();
+        drop(p);
+        let reopened = Pump::new("reopened".into(), sink, Some(ledger.clone()), SourceKind::Loopback);
+        assert_eq!(reopened.state(None, &[], String::new(), None).status.spend_usd, 0.75);
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+    }
+
+    #[test]
+    fn a_failed_daily_read_keeps_the_last_total_and_warns_once_until_it_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("spend.jsonl");
+        let entry = spend::line(Local::now().naive_local(), "Test", "Week 1", spend::SpendKind::Notes, 0.25, true, None);
+        std::fs::write(&ledger, &entry).unwrap();
+        let (sink, path) = (Arc::new(Recorded::default()), ledger.clone());
+        let mut p = Pump::new("test".into(), sink, Some(path), SourceKind::Input);
+        std::fs::remove_file(&ledger).unwrap();
+        std::fs::create_dir(&ledger).unwrap();
+        p.refresh_spend();
+        p.refresh_spend();
+        assert_eq!(p.mirror().status.spend_usd, 0.25);
+        assert_eq!(p.mirror().notices.iter().filter(|n| n.label == "Spend unavailable").count(), 1);
+        std::fs::remove_dir(&ledger).unwrap();
+        std::fs::write(&ledger, entry).unwrap();
+        p.refresh_spend();
+        assert!(!p.spend_failed);
     }
 
     /// M4 minor M4: a SourceEnded that arrives after the second stop does not bring back "Stop waiting".

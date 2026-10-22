@@ -72,7 +72,7 @@
       <span class:bad={!session.status.stt_ok}>{session.status.stt}</span>
       <span class="num" class:bad={session.status.gaps > 0}>{session.status.gaps} {session.status.gaps === 1 ? "gap" : "gaps"}</span>
     {/if}
-    <button class="quiet num" onclick={onSpend} title="What LectureLive has cost">{money(session.status.spend_usd)} today</button>
+    <button class="quiet num" onclick={onSpend} title="Today's spend across all lectures">{money(session.status.spend_usd)} today</button>
     <button class="quiet" onclick={toggleLarge} aria-pressed={large} title="Larger type">Aa</button>
     <button class="quiet" onclick={onKey}>Key</button>
   </div>

@@ -1188,3 +1188,21 @@ strip and notes pane visually verified with the original capture files absent. T
 and desktop adapter supplied all 108 images in that lecture. The frontend suite still passes 50
 tests and type checking reports no errors or warnings. The Computer Use stopped-session error
 cleared after its desktop host was quit and a subsequent CLI tool request reconnected.
+
+## M7.5 — Persistent daily spend in the app header
+
+The app's header reads the persistent ledger for the local calendar day across every course and
+lecture. It loads before a folder or recording is chosen, remains accurate when the folder or
+lecture changes, and refreshes once a second while idle as well as during a lecture. After-class
+polish and study-page requests therefore appear too, and midnight selects the new day's total.
+The CLI's lecture-specific totals and the ledger format stay unchanged. A failed refresh keeps the
+last known amount and reports a warning once until reading succeeds again.
+
+Verification (2026-10-22): all nine core spend tests passed, including cross-lecture aggregation,
+reopening, previous/next-day boundaries and byte preservation. The desktop suite passed 39 tests
+with one opt-in check ignored, including header initialization, lecture transitions, a second
+writer, reopening and read failure/recovery. All 50 frontend tests passed; type checking reported
+no errors or warnings. The release app built, its strict signature verified and the installed
+binary matched the build. In the installed app, the header matched the saved daily total before
+choosing a folder, after opening an existing lecture, and after a full process exit and reopen.
+The ledger's checksum remained unchanged. No paid request or saved screenshot was needed.

@@ -102,7 +102,7 @@ pub struct Status {
     pub gaps: usize,
     /// RFC 3339.
     pub started_at: Option<String>,
-    /// This lecture's spend today.
+    /// Today's recorded spend across all courses and lectures.
     pub spend_usd: f64,
     /// Ten silent seconds on loopback.
     pub silence: bool,

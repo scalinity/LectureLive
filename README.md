@@ -155,6 +155,9 @@ Claude calls report tokens, not a price, so their cost is worked out from the to
 Opus 5.5's published rates; transcription responses carry no cost either, so those are
 worked out from the audio length at the published $0.10 per hour (both `estimated`). The recording footer shows today's total for the lecture,
 and `lecture spend` summarises by month, course and lecture.
+The desktop app's header shows the day's total across all lectures from the persistent ledger,
+including before recording starts and after reopening the app. It refreshes while the app is open
+and begins the next day's total at local midnight.
 
 Transcription is the smallest share, about $0.20 for a two-hour lecture. Each snapshot
 is one Claude call carrying the notes so far, the new transcript and the new slide

@@ -156,7 +156,7 @@ transcript are then shown from the files. A `Pump` turns each lecture event into
 of three streams:
 
 - **status**, a Tauri event: the whole status (phase, folder, source, input level once a second, STT
-  state, the notes operation running, open transcript gaps, start time, this lecture's spend today,
+  state, the notes operation running, open transcript gaps, start time, today's spend across lectures,
   the loopback silence warning), sent whenever any part of it changes; notices, the CLI's event lines
   in its words and marks; registered slides.
 - **transcript**, a Tauri `Channel`: `open {utterance, stable, tentative}` for what is being said;
@@ -855,8 +855,10 @@ read, and the next line starts on a line of its own.
 - **Status strip** (top): the phase in one word (Ready, Starting, Listening, Stopping, Stopped) with
   what it means while it lasts; a static red dot while recording; course › lecture; the source with a
   level meter (−60 to 0 dBFS, once a second, red while ten silent seconds on loopback last); elapsed
-  time; STT state; open transcript gaps; this lecture's spend today from the ledger (§8), which opens
-  the spend view; a large-type toggle; the API key.
+  time; STT state; open transcript gaps; today's spend across all courses and lectures from the
+  persistent ledger (§8), which opens the spend view; a large-type toggle; the API key. The daily
+  total loads before a lecture starts, survives folder changes and app restarts, and refreshes once
+  a second even while idle. The date follows the local calendar day and rolls over at midnight.
 - **Command line** (bottom), in the CLI's grammar: an empty ⏎ takes a snapshot, a hint then ⏎ a hinted
   snapshot, `polish` ⏎ a polish. Snapshot; Cancel, only while a snapshot or polish runs; Polish; Study
   page (typesets first when the page is missing or stale, §6.4, then opens it in the default browser; while a page is

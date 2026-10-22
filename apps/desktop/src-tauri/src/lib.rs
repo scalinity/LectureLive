@@ -16,6 +16,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, e| if e.state == ShortcutState::Pressed { app::shortcut(app) }).build())
         .setup(move |a| {
             a.manage(app::App::new(a.handle().clone()));
+            app::watch_spend(a.handle().clone());
             #[cfg(unix)]
             watch_signals(a.handle().clone());
             if !check.is_empty() {

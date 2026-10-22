@@ -76,6 +76,12 @@ pub fn read(path: &Path) -> Result<Vec<SpendEntry>> {
     Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
 }
 
+/// The day's recorded spend across all courses and lectures, including estimated charges.
+pub fn daily_total(path: &Path, day: NaiveDate) -> Result<f64> {
+    let day = day.format("%Y-%m-%d").to_string();
+    Ok(read(path)?.iter().filter(|e| e.at.get(..10) == Some(day.as_str())).map(|e| e.usd).sum())
+}
+
 /// Appends and syncs; after a line cut short, the new one starts on a line of its own.
 fn append(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
@@ -398,6 +404,27 @@ mod tests {
         assert_eq!(spend.lecture_total(), 0.25);
         spend.add_at(at(25, 10, 0, 0), SpendKind::Page, 0.125, true, None).unwrap();
         assert_eq!((spend.lecture_total(), spend.kind_total(SpendKind::Page), spend.kind_total(SpendKind::Notes)), (0.375, 0.125, 0.0));
+    }
+
+    #[test]
+    fn daily_spend_survives_reopening_and_combines_lectures_without_changing_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.jsonl");
+        let today = at(25, 0, 0, 0).date();
+        assert_eq!(daily_total(&path, today).unwrap(), 0.0);
+        let first = Spend::open(&path, "Statistics", "Week 1", today).unwrap();
+        first.add_at(at(24, 23, 59, 59), SpendKind::Notes, 4.0, true, None).unwrap();
+        first.add_at(at(25, 9, 0, 0), SpendKind::Notes, 0.25, true, None).unwrap();
+        drop(first);
+        let second = Spend::open(&path, "Medicine", "Week 2", today).unwrap();
+        second.add_at(at(25, 15, 0, 0), SpendKind::Transcribe, 0.10, false, Some(1800.0)).unwrap();
+        second.add_at(at(26, 0, 0, 0), SpendKind::Page, 0.50, true, None).unwrap();
+        drop(second);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(daily_total(&path, today).unwrap(), 0.35);
+        assert_eq!(daily_total(&path, at(26, 0, 0, 0).date()).unwrap(), 0.50);
+        assert_eq!(daily_total(&path, at(27, 0, 0, 0).date()).unwrap(), 0.0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// Live evidence (M7.1): a packaged app launched by the system may not read the Python CLI's ledger, which lives in the

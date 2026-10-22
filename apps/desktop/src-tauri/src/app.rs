@@ -115,8 +115,15 @@ pub struct App {
 impl App {
     pub fn new(app: AppHandle) -> Self {
         let sink = Arc::new(TauriSink { app, channels: StdMutex::new(None) });
+        let ledger = data_dir().and_then(|dir| {
+            let path = dir.join("spend.jsonl");
+            spend::take_over(&path, Path::new(CLI_LEDGER)).map_err(chain)?;
+            Ok(path)
+        });
+        let mut pump = Pump::new(String::new(), sink.clone(), ledger.as_ref().ok().cloned(), SourceKind::Input);
+        if let Err(e) = ledger { pump.notice(NoticeKind::Warn, "Spend unavailable", &e); }
         Self {
-            pump: Arc::new(Mutex::new(Pump::new(String::new(), sink.clone(), None, SourceKind::Input))),
+            pump: Arc::new(Mutex::new(pump)),
             sink,
             folder: StdMutex::new(None),
             running: StdMutex::new(None),
@@ -153,6 +160,16 @@ impl App {
         }
         self.commands().ok_or("No lecture is running.")?.send(c).map_err(|_| "The lecture has ended.".to_string())
     }
+}
+
+/// Refresh while idle too: after-class requests, another ledger writer and midnight change the day.
+pub fn watch_spend(handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            handle.state::<App>().pump.lock().await.refresh_spend();
+        }
+    });
 }
 
 /// What to say when this command arrives after the lecture began stopping, which takes no new operation and no
@@ -219,7 +236,8 @@ async fn sidecar(commands: Option<&mpsc::UnboundedSender<Command>>, files: &Lect
 /// everything read; the document is read until its hash is the sidecar's revision.
 #[tauri::command]
 pub async fn get_session_state(app: State<'_, App>) -> Res<SessionState> {
-    let pump = app.pump.lock().await;
+    let mut pump = app.pump.lock().await;
+    pump.refresh_spend();
     let Some(folder) = app.folder() else { return Ok(pump.state(None, &[], String::new(), None)) };
     let files = &folder.files;
     let commands = app.commands();
@@ -262,7 +280,7 @@ pub async fn select_folder(dir: String, app: State<'_, App>, handle: AppHandle) 
     let capture = ready_view(&selections_path()?, &folder.course);
     *app.folder.lock().expect("the folder lock") = Some(folder);
     let mut pump = app.pump.lock().await;
-    *pump = Pump::new(uuid::Uuid::new_v4().to_string(), app.sink.clone(), None, SourceKind::Input);
+    *pump = Pump::new(uuid::Uuid::new_v4().to_string(), app.sink.clone(), Some(data_dir()?.join("spend.jsonl")), SourceKind::Input);
     let v = view.clone();
     pump.set_status(move |s| {
         s.folder = Some(v);
@@ -342,7 +360,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let session = uuid::Uuid::new_v4().to_string();
     {
         let mut pump = app.pump.lock().await;
-        *pump = Pump::new(session.clone(), app.sink.clone(), Some(spend.clone()), kind);
+        *pump = Pump::new(session.clone(), app.sink.clone(), Some(app_ledger), kind);
         let (view, name) = (folder_view(&folder), source_name.clone());
         let capture_view = ready_view(&selections_path()?, &folder.course);
         pump.set_status(move |s| {
