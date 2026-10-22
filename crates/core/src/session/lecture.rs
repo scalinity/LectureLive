@@ -18,7 +18,7 @@ use crate::audio::source::Source;
 use crate::capture::detect::Thresholds;
 use crate::capture::select::Selection;
 use crate::capture::window::WindowSource;
-use crate::capture::worker::{self, CaptureCmd, CaptureEvent, CaptureHandle, CaptureState, WorkerConfig};
+use crate::capture::worker::{self, CaptureCmd, CaptureEvent, CaptureHandle, CaptureMode, CaptureState, WorkerConfig};
 use crate::notes::chat::{self, ChatClient, ChatRequest, Content, Image};
 use crate::notes::embeds::{clean_output, repair};
 use crate::notes::page::{self, PageOutcome};
@@ -74,6 +74,9 @@ pub enum Command {
     State(oneshot::Sender<Result<Sidecar, String>>),
     /// Capture the watched region now, as a manual slide (spec §7.3): the button and the shortcut.
     CaptureNow(oneshot::Sender<Result<(), String>>),
+    CaptureManual,
+    /// Hold automatic screenshots without pausing audio or transcription.
+    SetAutoCapture(bool),
     /// Watch this window through this region: the person's answer to the picker or to an ask.
     Bind { window: u32, selection: Selection },
     /// Images dropped on the app (spec §7.3).
@@ -119,6 +122,7 @@ pub enum Event {
     SlidesNoted { through: u32 },
     /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
     Capture(CaptureState),
+    CaptureMode(CaptureMode),
     /// The watched window changed size and its slide is watched through the region for that size: saved by
     /// the adapter for the course, and said.
     CaptureMoved { selection: Selection, note: String },
@@ -581,6 +585,14 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                     if let Some(tx) = &pause_tx { let _ = tx.send(PauseLog::End(Local::now())); }
                     let _ = events.send(Event::Paused(false));
                 },
+                Some(Command::SetAutoCapture(enabled)) => match &capture {
+                    Some(c) => c.send(CaptureCmd::SetAutoCapture(enabled)),
+                    None => { let _ = events.send(Event::Warning("Capture is unavailable or the lecture is stopping.".into())); }
+                },
+                Some(Command::CaptureManual) => match &capture {
+                    Some(c) => c.send(CaptureCmd::Manual),
+                    None => { let _ = events.send(Event::Warning("Capture is unavailable or the lecture is stopping.".into())); }
+                },
                 Some(Command::CaptureNow(reply)) => match &capture {
                     Some(c) => c.send(CaptureCmd::Now(reply)),
                     None if stopping.load(Ordering::Relaxed) => { let _ = reply.send(Err("The lecture is stopping.".into())); }
@@ -702,6 +714,8 @@ fn slide_event(s: &SlideEntry) -> Event {
 async fn capture_task(lec: Arc<Lecture>, store: Store, mut rx: UnboundedReceiver<CaptureEvent>, events: UnboundedSender<Event>) {
     while let Some(e) = rx.recv().await {
         match e {
+            CaptureEvent::Mode(mode) => { let _ = events.send(Event::CaptureMode(mode)); }
+            CaptureEvent::Warning(reason) => { let _ = events.send(Event::Warning(reason)); }
             CaptureEvent::Relocated { selection, note } => {
                 let _ = events.send(Event::CaptureMoved { selection, note });
             }

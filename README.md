@@ -1,5 +1,15 @@
 # LectureLive
 
+The Rust CLI (`lecturelive lecture`) and Mac app support switching between automatic and manual
+screenshots during a lecture. Use **Pause auto-capture** in the app, or type `auto off` and Enter in
+the CLI. Recording and transcription continue. Tap **right Option alone** to save the already selected
+window region; the screenshot is taken when the key is released, including while RStudio or Zoom has
+focus. Use **Resume auto-capture**, or `auto on`, when returning to slides. The Capture button,
+terminal UI's Ctrl-S and typed `capture` are manual alternatives. The global right Option shortcut
+needs macOS **Input Monitoring** permission; if requested, grant it to LectureLive or the terminal
+app, then enter manual mode again or reopen that app. A normal lecture **Pause** also stops audio
+and transcription; it is a separate control.
+
 Live lecture transcription with slide capture and LLM-written notes, for a single
 person on a Mac. Audio goes to Grok Voice Transcribe, the running transcript and
 slide screenshots go to Claude (Opus 5.5, high effort) on demand, and the result is one Markdown notes

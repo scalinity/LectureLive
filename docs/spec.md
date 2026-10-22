@@ -689,6 +689,26 @@ both.
 
 ### 7.3 Manual and imported
 
+Automatic screenshots can be paused independently of the lecture: **Pause auto-capture** in the app,
+or `auto off` as the whole command line in the app or CLI. Audio, transcription, snapshots and notes
+continue. The selected window and region stay selected; no periodic window images are sampled while
+auto-capture is off. The capture status says **Auto-capture paused**, independently of the recording
+status and any window or permission problem. **Resume auto-capture**, or `auto on`, resumes detection
+from the current image. Unfinished change candidates are discarded at either mode change, retaining
+the last saved image as the comparison. Changes during the pause are not replayed, and the last manual
+shot is not automatically duplicated. A newly started lecture begins with auto-capture on; a full
+lecture Pause/Resume retains the selected auto-capture mode.
+
+While auto-capture is off, a solo tap of the physical **right Option** key saves one image of the selected
+region when the key is released, even while another app has focus. Left Option, held-key repeats and
+Option key combinations do not trigger it. The listener is shared by the CLI and app, observes input
+without consuming or changing it, and is released when automatic capture resumes or the lecture stops.
+The Capture button, terminal UI's Ctrl-S and typed `capture` remain available. A selected region can be
+captured before the first automatic image succeeds. Each manual request saves one image, even when
+unchanged. The window and its known-size region are checked on demand; an unknown layout or missing
+window asks for a selection instead of capturing a different window. Mode changes are shown after the
+capture worker acknowledges them.
+
 The Capture button, the global shortcut ⌘⇧2 (registered only while a lecture runs), images dropped
 on the window, and screenshots taken with macOS (⌘⇧4, from its screenshot folder, and only while the lecture
 is recording: not before it starts, in a pause or once it is stopping) all go through the
@@ -701,8 +721,13 @@ auto and whether it was uncertain.
 ### 7.4 Permissions
 
 Screen Recording (TCC), verified in the packaged app; a binary run from a terminal uses the
-terminal's grant. Without it the strip says so and offers System Settings. The Capture button works
-once a real capture of the watched window has succeeded.
+terminal's grant. Without it the strip says so and offers System Settings.
+
+The right Option listener requests **Input Monitoring** when manual mode first needs it. Missing
+permission is shown with the host's settings guidance while recording and other manual capture controls
+continue. After granting permission, enter manual mode again (or reopen the app or terminal) to retry.
+The shortcut is advertised as ready only after its native listener starts successfully. Fixture window
+sources never request keyboard permission.
 
 ### 7.5 Removing a slide
 

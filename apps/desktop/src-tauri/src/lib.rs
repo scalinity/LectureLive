@@ -58,6 +58,8 @@ pub fn run() {
             app::check_deck,
             app::check_record,
             app::capture_now,
+            app::capture_manual,
+            app::set_auto_capture,
             app::import_slides,
             app::remove_slide,
             app::open_screen_settings,

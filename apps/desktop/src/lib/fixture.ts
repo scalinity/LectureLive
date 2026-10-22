@@ -4,7 +4,7 @@ import type { DropEvent, Transport } from "./transport";
 import type { Envelope, NotesMsg, SessionState, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 
 export function idleStatus(): Status {
-  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, paused: false, input_gone: null, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
+  return { phase: "idle", folder: null, source: null, level_dbfs: null, stt: "not started", stt_ok: false, busy: null, gaps: 0, started_at: null, spend_usd: 0, silence: false, paused: false, input_gone: null, capture_mode: { automatic: true, selected: false, shortcut: { state: "inactive" } }, capture: { state: "unbound", window: null, detail: null, candidates: [], captured: false } };
 }
 
 export function emptyState(session: string): SessionState {
@@ -222,6 +222,12 @@ export function demoWithNotes(): FixtureTransport {
     { index: 3, file: "slides/slide_03_100633.png", path: `${DEMO_DIR}/slides/slide_03_100633.png`, at: "10:06:33", auto: true, uncertain: true, noted: false },
   ];
   t.state_.status.capture = { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true };
+  t.state_.status.capture_mode = { automatic: true, selected: true, shortcut: { state: "inactive" } };
+  t.effects.set_auto_capture = (args) => {
+    const automatic = Boolean(args?.enabled);
+    t.state_.status = { ...t.state_.status, capture_mode: { ...t.state_.status.capture_mode, automatic, shortcut: { state: automatic ? "inactive" : "ready" } } };
+    t.emitStatus({ type: "status", ...t.state_.status });
+  };
   t.assetUrl = () => "/demo-slide.svg";
   // The backend's answer to a removal: the slide goes, and the notice line says where its file is kept.
   t.effects.remove_slide = (args) => {

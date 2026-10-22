@@ -348,6 +348,7 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
             let (kind, label, detail) = capture::state_words(s, words);
             n(kind, label, detail)
         }
+        Event::CaptureMode(mode) => n("slide", "capture mode", capture::mode_words(mode, words).join(" ")),
         Event::CaptureMoved { note, .. } => {
             let (kind, label, detail) = capture::moved_words(note);
             n(kind, label, detail)
@@ -543,6 +544,12 @@ pub(crate) fn parse_command(line: &str) -> LectureCommand {
         LectureCommand::Pause
     } else if text.eq_ignore_ascii_case("resume") {
         LectureCommand::Resume
+    } else if text.eq_ignore_ascii_case("auto off") {
+        LectureCommand::SetAutoCapture(false)
+    } else if text.eq_ignore_ascii_case("auto on") {
+        LectureCommand::SetAutoCapture(true)
+    } else if text.eq_ignore_ascii_case("capture") {
+        LectureCommand::CaptureManual
     } else if let Some(index) = remove_index(text) {
         // No reply is waited for: a refusal comes back as a warning in the event stream, which both frontends show.
         LectureCommand::RemoveSlide { index, reply: None }
@@ -613,6 +620,7 @@ pub(crate) fn print_prepared(out: &mut impl Write, d: Display, ready: &start::Pr
     };
     writeln!(out, "{}", d.paint.paint(&format!("  listening on {input_name}{waiting}"), &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     writeln!(out, "{}", d.paint.paint("  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    writeln!(out, "{}", d.paint.paint("  auto off ⏎ manual slides   auto on ⏎ automatic slides   capture ⏎ one slide", &["dim"])).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
     writeln!(out).unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
 }
 
@@ -985,6 +993,29 @@ mod goldens {
         assert_eq!(kind("pause the discussion of variance"), "snapshot \"pause the discussion of variance\"", "only the whole line is the command");
     }
 
+    #[test]
+    fn manual_capture_commands_are_exact_full_lines() {
+        for line in ["auto off", "  AUTO OFF  "] {
+            assert!(matches!(parse_command(line), LectureCommand::SetAutoCapture(false)));
+        }
+        for line in ["auto on", " AuTo On "] {
+            assert!(matches!(parse_command(line), LectureCommand::SetAutoCapture(true)));
+        }
+        assert!(matches!(parse_command(" CAPTURE "), LectureCommand::CaptureManual));
+        for line in ["capture the slide", "auto off for now", "auto on please", "auto  off", "capture!"] {
+            assert_eq!(match parse_command(line) { LectureCommand::Op(op) => op, other => panic!("{other:?}") }, Op::Snapshot(line.into()));
+        }
+    }
+
+    #[test]
+    fn manual_mode_reports_permission_and_keeps_the_capture_fallback() {
+        use lecturelive_core::capture::worker::{CaptureMode, ManualShortcut};
+        let output = plain(&Event::CaptureMode(CaptureMode { automatic: false, selected: true, shortcut: ManualShortcut::NeedsPermission }));
+        assert!(output.contains("Manual capture; audio and transcription continue."), "{output}");
+        assert!(output.contains("Input Monitoring for Terminal"), "{output}");
+        assert!(output.contains("Type capture or press Ctrl-S"), "{output}");
+    }
+
     /// `remove N` (spec §7.5): the whole line, any case, with or without the word slide; a number that is not one, or
     /// words after it, is still a hint for the snapshot.
     #[test]
@@ -1096,7 +1127,7 @@ mod goldens {
         String::from_utf8(out).unwrap()
     }
 
-    const HEADER: &str = "\n  Machine Learning  ›  Week 03 — Optimisation\n  listening on BlackHole 2ch\n  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop\n\n";
+    const HEADER: &str = "\n  Machine Learning  ›  Week 03 — Optimisation\n  listening on BlackHole 2ch\n  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop\n  auto off ⏎ manual slides   auto on ⏎ automatic slides   capture ⏎ one slide\n\n";
 
     #[test]
     fn print_prepared_for_a_created_folder() {
@@ -1154,7 +1185,7 @@ mod goldens {
     fn print_prepared_paints_the_header() {
         let mut out = Vec::new();
         print_prepared(&mut out, pipe(TRUE), &prepared(InitReport::default()), &files(), "Machine Learning", "Week 03 — Optimisation", "BlackHole 2ch");
-        assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[1mMachine Learning\u{1b}[0m  \u{1b}[2m›\u{1b}[0m  Week 03 — Optimisation\n\u{1b}[2m  listening on BlackHole 2ch\u{1b}[0m\n\u{1b}[2m  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop\u{1b}[0m\n\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "\n  \u{1b}[1mMachine Learning\u{1b}[0m  \u{1b}[2m›\u{1b}[0m  Week 03 — Optimisation\n\u{1b}[2m  listening on BlackHole 2ch\u{1b}[0m\n\u{1b}[2m  ⏎ snapshot   a hint ⏎   polish ⏎   pause ⏎   resume ⏎   ^C stop\u{1b}[0m\n\u{1b}[2m  auto off ⏎ manual slides   auto on ⏎ automatic slides   capture ⏎ one slide\u{1b}[0m\n\n");
     }
 
     fn ended(report: StopReport, spend: &Spend) -> String {

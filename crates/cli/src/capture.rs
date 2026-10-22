@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use lecturelive_core::capture::detect::{Thresholds, SAMPLE_INTERVAL};
 use lecturelive_core::capture::select::{Selection, Selections};
 use lecturelive_core::capture::window::SystemWindows;
-use lecturelive_core::capture::worker::CaptureState;
+use lecturelive_core::capture::worker::{CaptureMode, CaptureState, ManualShortcut};
 use lecturelive_core::session::lecture::{CaptureSetup, Event};
 
 /// The saved selections' file, as the desktop names it (spec §7.1): in the app's data folder.
@@ -184,6 +184,25 @@ pub(crate) fn state_words(s: &CaptureState, w: &Words) -> (&'static str, &'stati
 /// ring and the notice line, always after the save has been kept.
 pub(crate) fn moved_words(note: &str) -> (&'static str, &'static str, String) {
     ("slide", "found again", note.to_string())
+}
+
+/// Acknowledged capture mode, separate from the lecture's recording pause and window health.
+pub(crate) fn mode_words(mode: &CaptureMode, words: &Words) -> Vec<String> {
+    if mode.automatic {
+        return vec!["Automatic capture on; type auto off to capture slides by hand.".into()];
+    }
+    let mut lines = vec!["Manual capture; audio and transcription continue.".into()];
+    if !mode.selected {
+        lines.push("Choose a window once in the LectureLive app before capturing.".into());
+    }
+    lines.push(match &mode.shortcut {
+        ManualShortcut::Ready => "Right Option ready: tap and release it alone to capture.".into(),
+        ManualShortcut::NeedsPermission => format!("Right Option needs Input Monitoring for {}: System Settings → Privacy & Security → Input Monitoring, then quit and reopen {}.", words.host, words.host),
+        ManualShortcut::Unavailable { reason } => format!("Right Option unavailable: {reason}"),
+        ManualShortcut::Inactive => "Right Option is inactive.".into(),
+    });
+    lines.push("Type capture or press Ctrl-S to capture; auto on resumes automatic capture.".into());
+    lines
 }
 
 /// Whether a capture state needs the person: healthy watching does not; everything else does —

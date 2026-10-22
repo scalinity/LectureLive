@@ -1,6 +1,7 @@
 //! What the adapter sends the frontend (spec §3.6). `src/lib/wire.ts` mirrors these types exactly.
 use lecturelive_core::capture::detect::Region;
 use lecturelive_core::capture::window::WindowInfo;
+use lecturelive_core::capture::worker::CaptureMode;
 use lecturelive_core::session::segments::{Segment, SegmentSource};
 use serde::Serialize;
 
@@ -111,6 +112,8 @@ pub struct Status {
     pub input_gone: Option<String>,
     /// Slide capture: the watched window and its state (spec §7).
     pub capture: CaptureView,
+    /// Acknowledged automatic/manual capture mode, separate from window health and lecture pause.
+    pub capture_mode: CaptureMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -153,7 +156,7 @@ pub struct CaptureView {
     pub detail: Option<String>,
     /// The windows the person may mean, while asking.
     pub candidates: Vec<WindowView>,
-    /// A real capture has succeeded this lecture: the Capture button works (spec §7.4).
+    /// A real capture has succeeded this lecture; mode.selected allows manual capture before it.
     pub captured: bool,
 }
 

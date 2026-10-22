@@ -149,6 +149,8 @@ enum Act {
     /// `remove N` and Enter (spec §7.5): one pending slide taken out of the lecture. Core answers a refusal as a
     /// warning event, so no reply is waited for here; the hint empties once the command is out.
     RemoveSlide(u32),
+    SetAutoCapture(bool),
+    CaptureManual,
 }
 
 /// What a Ctrl-S comes back as, off the reactor: the oneshot's answer to a capture-now, or the
@@ -405,9 +407,15 @@ impl Ui {
         if self.view.phase != Stage::Listening {
             return capture::Action::Refused(capture::Refusal::None);
         }
-        match &self.capture {
+        let action = match &self.capture {
             Some(ctx) => capture::action(ctx.current.as_ref(), ctx.saved.as_ref()),
             None => capture::action(None, None),
+        };
+        if !self.view.paused && self.view.capture_mode.as_ref().is_some_and(|m| !m.automatic && m.selected) && matches!(action, capture::Action::Refused(_)) {
+            // A selected region is usable before the first automatic frame reports Watching.
+            capture::Action::Now
+        } else {
+            action
         }
     }
 
@@ -496,6 +504,8 @@ impl Ui {
         match plain::parse_command(self.hint.value()) {
             Command::Pause => Act::Pause { typed: true },
             Command::Resume => Act::Resume { typed: true },
+            Command::SetAutoCapture(enabled) => Act::SetAutoCapture(enabled),
+            Command::CaptureManual => Act::CaptureManual,
             Command::RemoveSlide { index, .. } => Act::RemoveSlide(index),
             _ => Act::Op(plain::parse_line(self.hint.value())),
         }
@@ -555,6 +565,18 @@ impl Ui {
             }
             Act::RemoveSlide(index) => {
                 if commands.send(Command::RemoveSlide { index, reply: None }).is_ok() {
+                    self.hint.clear();
+                    self.notice = None;
+                } else {
+                    self.notice = Some(ENDED.into());
+                }
+            }
+            Act::SetAutoCapture(_) | Act::CaptureManual => {
+                let command = match act {
+                    Act::SetAutoCapture(enabled) => Command::SetAutoCapture(enabled),
+                    _ => Command::CaptureManual,
+                };
+                if commands.send(command).is_ok() {
                     self.hint.clear();
                     self.notice = None;
                 } else {
@@ -799,7 +821,7 @@ where
                     }
                     Act::Redraw => dirty = true,
                     Act::Nothing => {}
-                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. } | Act::Pause { .. } | Act::Resume { .. } | Act::RemoveSlide(_)) => {
+                    act @ (Act::Op(_) | Act::Cancel | Act::CaptureNow | Act::CaptureWatch { .. } | Act::Pause { .. } | Act::Resume { .. } | Act::RemoveSlide(_) | Act::SetAutoCapture(_) | Act::CaptureManual) => {
                         ui.send(act, &io.commands, &io.capture_tx);
                         dirty = true;
                     }
@@ -1184,7 +1206,7 @@ mod tests {
     /// A key as the reactor takes it: the Ui decides, and the one command a key may carry is sent.
     fn press(ui: &mut Ui, k: KeyEvent, now: Instant, tx: &UnboundedSender<Command>) -> Act {
         let act = ui.key(k, now);
-        if matches!(act, Act::Op(_) | Act::Cancel | Act::Pause { .. } | Act::Resume { .. } | Act::RemoveSlide(_)) {
+        if matches!(act, Act::Op(_) | Act::Cancel | Act::Pause { .. } | Act::Resume { .. } | Act::RemoveSlide(_) | Act::SetAutoCapture(_) | Act::CaptureManual) {
             let (replies, _) = tokio::sync::mpsc::channel(1);
             ui.send(act, tx, &replies);
             return Act::Redraw;
@@ -1723,6 +1745,46 @@ mod tests {
         let mut ui = ui();
         ui.capture = Some(crate::capture::Context { path: dir.path().join("capture.json"), course: identity().course, saved: Some(saved_selection()), current: None });
         ui
+    }
+
+    #[test]
+    fn typed_manual_controls_wait_for_acknowledgement_and_do_not_pause() {
+        use lecturelive_core::capture::worker::{CaptureMode, ManualShortcut};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, _answers) = tokio::sync::mpsc::channel(4);
+        let mut ui = drawn_ui();
+        let now = Instant::now();
+        for (i, text) in ["AUTO OFF", "capture", "auto on"].iter().enumerate() {
+            ui.hint.paste(text).unwrap();
+            let act = ui.enter(now + Duration::from_secs(i as u64));
+            ui.send(act, &tx, &replies);
+            assert_eq!(ui.hint.value(), "");
+            assert!(ui.view.capture_mode.is_none(), "a sent command is not acknowledgement");
+            assert!(!ui.view.paused);
+            assert!(!ui.view.work.mine(), "capture controls do not queue notes");
+        }
+        assert!(matches!(rx.try_recv(), Ok(Command::SetAutoCapture(false))));
+        assert!(matches!(rx.try_recv(), Ok(Command::CaptureManual)));
+        assert!(matches!(rx.try_recv(), Ok(Command::SetAutoCapture(true))));
+        assert!(rx.try_recv().is_err());
+        let mode = CaptureMode { automatic: false, selected: true, shortcut: ManualShortcut::NeedsPermission };
+        ui.event(&Event::CaptureMode(mode.clone()), now);
+        assert_eq!(ui.view.capture_mode, Some(mode));
+        assert!(!ui.view.paused);
+    }
+
+    #[test]
+    fn ctrl_s_uses_a_manual_selection_before_the_first_frame() {
+        use lecturelive_core::capture::worker::{CaptureMode, ManualShortcut};
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = capture_ui(&dir);
+        let now = Instant::now();
+        assert!(ui.view.capture.is_none());
+        ui.event(&Event::CaptureMode(CaptureMode { automatic: false, selected: true, shortcut: ManualShortcut::NeedsPermission }), now);
+        assert_eq!(ui.capture_key(now), Act::CaptureNow, "Ctrl-S is independent of right Option permission");
+        assert!(ui.view.slides.is_empty(), "a request is not a saved slide");
+        ui.event(&Event::Paused(true), now);
+        assert!(matches!(ui.capture_action(), capture::Action::Refused(_)), "lecture pause remains distinct");
     }
 
     /// A relocation as the adapter hands it on: saved for the course, or not.

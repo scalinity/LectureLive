@@ -696,10 +696,13 @@ fn help_lines(g: &Glyphs, inner: usize) -> Vec<Line<'static>> {
     let tabs = format!("Tab {}", g.backtab);
     let pausing = format!("pause or resume (typed: pause{0}, resume{0})", g.enter);
     let remove = format!("remove 3{}", g.enter);
+    let auto_off = format!("auto off{}", g.enter);
+    let auto_on = format!("auto on{}", g.enter);
+    let capture = format!("capture{}", g.enter);
     let groups: [(&str, Vec<(&str, &str)>); 5] = [
         ("Notes", vec![(g.enter, "a snapshot now"), (hint.as_str(), "a snapshot that focuses on the hint"), (g.polish, "polish the notes; a snapshot comes first"), ("^X", "cancel your notes requests or the study page")]),
         ("Reading", vec![(g.updown, "a row in the focused pane"), ("PgUp PgDn", "a page"), (tabs.as_str(), "the next or previous pane"), ("Esc", "back to live"), ("^T", "the focused pane fills the body; again to go back")]),
-        ("Slides", vec![("^S", "capture the watched window's slide now"), ("^S", "watch the window offered, if its region is saved"), (remove.as_str(), "take a slide out; only one no snapshot used")]),
+        ("Slides", vec![("^S", "capture the watched window's slide now"), ("^S", "watch the window offered, if its region is saved"), (capture.as_str(), "capture the selected window once"), (auto_off.as_str(), "manual slides; audio and transcription continue"), (auto_on.as_str(), "resume automatic slide capture"), ("Right Option", "manual mode: tap and release alone; needs Input Monitoring"), (remove.as_str(), "take a slide out; only one no snapshot used")]),
         ("App", vec![("^P", pausing.as_str()), ("^O", "activity: this session's notices"), ("^H F1", "this help"), ("^L", "redraw the screen"), ("^Z", "nothing: suspending would stop the recording")]),
         (
             "Stopping",
@@ -2369,7 +2372,7 @@ mod tests {
     #[test]
     fn the_help_overlay() {
         let theme = Theme::new(TRUE, true);
-        let (t, drawn) = looked(140, 42, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
+        let (t, drawn) = looked(140, 58, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
         let l = lines(t.backend().buffer());
         let top = l.iter().position(|r| r.contains("┌─ Help ")).unwrap();
         let bottom = l.iter().rposition(|r| r.contains('┘')).unwrap();
@@ -2387,7 +2390,7 @@ mod tests {
         assert!(prose.contains("Spend is this lecture's cost today; speech-to-text is added when a recording closes."), "{prose}");
         assert!(text.contains("^S"), "Task 11's capture key is documented");
         assert!(prose.contains("capture the watched window's slide now") && prose.contains("watch the window offered, if its region is saved"), "{prose}");
-        assert_eq!(drawn.help_max, 0, "it all fits at 140×42");
+        assert_eq!(drawn.help_max, 0, "it all fits at 140×58");
         assert!(l[bottom].contains("Esc closes"));
         // small: it scrolls, and the border says there is more
         let (t, drawn) = looked(60, 16, &view(Stage::Listening), &Look { overlay: Overlay::Help, ..Look::default() }, &theme);
@@ -2580,6 +2583,23 @@ mod tests {
         assert!(scrolled_look.slides.apply(panes::Move::Up(6), &many, drawn.slides.unwrap()));
         many.reduce(&Event::Slide { index: 31, file: "slides/slide_31_104400.png".into(), auto: true, uncertain: false, shown_at: fixed() }, fixed());
         golden("slides_scrolled_80x25", &looked(80, 25, &many, &scrolled_look, &theme).0);
+    }
+
+    #[test]
+    fn goldens_for_manual_capture() {
+        use lecturelive_core::capture::worker::{CaptureMode, ManualShortcut};
+        let theme = Theme::new(TRUE, true);
+        for (name, shortcut) in [("ready", ManualShortcut::Ready), ("permission", ManualShortcut::NeedsPermission)] {
+            let mut v = capturing(CaptureState::Watching { window: "Zoom Meeting".into() });
+            v.reduce(&Event::CaptureMode(CaptureMode { automatic: false, selected: true, shortcut }), fixed());
+            for (w, h) in [(140, 40), (80, 25)] {
+                let look = Look { focus: Some(Pane::Slides), ..Look::default() };
+                let (terminal, _) = looked(w, h, &v, &look, &theme);
+                let text = lines(terminal.backend().buffer()).join("\n");
+                assert!(text.contains("Listening"), "manual capture keeps the recording state");
+                golden(&format!("capture_manual_{name}_{w}x{h}"), &terminal);
+            }
+        }
     }
 
     /// The slides tab carries the attention mark while capture needs the person, in words that

@@ -2,6 +2,7 @@
   // The slides strip (spec §9.1, §7): which window is watched and what it needs, then every slide in
   // time order with when it was first on screen and how it was taken. Newest at the end, followed
   // while the reader is there, as the panes are.
+  import CaptureControls from "./CaptureControls.svelte";
   import { session } from "./session.svelte";
   import type { SlideView } from "./wire";
 
@@ -33,51 +34,37 @@
 </script>
 
 <aside class="strip" aria-label="Slides">
-  <div class="binding" class:live={c.state === "watching"} class:bad={c.state === "denied" || c.state === "failing"}>
+  <div class="binding" class:live={c.state === "watching" && session.captureMode.automatic} class:bad={c.state === "denied" || c.state === "failing"}>
     {#if c.state === "watching"}
-      <p class="state">Watching</p>
+      <p class="state">{session.captureMode.automatic ? "Watching" : "Manual capture"}</p>
       <p class="window">{c.window}</p>
-      <div class="actions">
-        <button class="outline" onclick={() => session.captureNow()} disabled={!session.canCapture} title={session.canCapture ? "Capture the slide now (⌘⇧2)" : "Available once the window has been captured"}>Capture</button>
-        <span class="keys" aria-hidden="true">⌘⇧2</span>
-        <button class="quiet" onclick={onChoose}>Choose…</button>
-      </div>
     {:else if c.state === "ready"}
       <p class="window">{c.window}</p>
-      <p class="note">Chosen for this course. Watching starts with the lecture.</p>
-      <div class="actions"><button class="quiet" onclick={onChoose}>Choose…</button></div>
+      <p class="note">Chosen for this course. Capture starts with the lecture.</p>
     {:else if c.state === "paused"}
-      <p class="state">Paused</p>
+      <p class="state">Window unavailable</p>
       <p class="window">{c.window}</p>
       <p class="note">{sentence(c.detail)}.</p>
-      <div class="actions"><button class="quiet" onclick={onChoose}>Choose…</button></div>
     {:else if c.state === "asking"}
       <p class="ask">{sentence(c.detail)}. {single ? "Watch it?" : "Choose the window to watch."}</p>
-      <div class="actions">
-        {#if single && running}<button class="primary" onclick={() => session.captureWatch(single.id)}>Watch it</button>{/if}
-        <button class="quiet" onclick={onChoose}>Choose…</button>
-      </div>
+      {#if single && running}<div class="actions"><button class="primary" onclick={() => session.captureWatch(single.id)}>Watch it</button></div>{/if}
     {:else if c.state === "denied"}
       <p class="ask">Screen Recording is off for LectureLive.</p>
-      <div class="actions">
-        <button class="outline" onclick={() => session.openScreenSettings()}>Open Settings</button>
-        <button class="quiet" onclick={onChoose}>Choose…</button>
-      </div>
+      <div class="actions"><button class="outline" onclick={() => session.openScreenSettings()}>Open Settings</button></div>
       <p class="note">Allow LectureLive there, then quit and reopen LectureLive.</p>
     {:else if c.state === "failing"}
       <p class="ask">{c.window} could not be captured: {c.detail}.</p>
-      <div class="actions"><button class="quiet" onclick={onChoose}>Choose…</button></div>
     {:else}
       <p class="window">No window chosen</p>
       <p class="note">Choose Zoom's window and the part that shows the slide.</p>
-      <div class="actions"><button class="outline" onclick={onChoose} disabled={!session.folder} title={session.folder ? "" : "Open a lecture folder first"}>Choose window</button></div>
     {/if}
+    <CaptureControls {onChoose} />
   </div>
 
   <div class="body">
     <div class="list" use:follow {onscroll}>
       {#if session.slides.length === 0}
-        <p class="empty">Screenshots you take during the lecture become slides.{#if c.state !== "unbound"}{" "}Zoom's slides are added as they change.{/if}</p>
+        <p class="empty">Screenshots you take during the lecture become slides.{#if c.state !== "unbound" && session.captureMode.automatic}{" "}Zoom's slides are added as they change.{/if}</p>
       {:else}
         <ol>
           {#each session.slides as s (s.index)}
@@ -185,22 +172,6 @@
   .outline {
     background: transparent;
     color: var(--teal);
-  }
-
-  .quiet {
-    border: 0;
-    padding: calc(0.3rem + 1.5px) 0;
-    background: transparent;
-    color: var(--graphite);
-  }
-
-  .quiet:hover {
-    color: var(--ink);
-  }
-
-  .keys {
-    color: var(--graphite);
-    font-variant-numeric: tabular-nums;
   }
 
   .body {

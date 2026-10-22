@@ -3,7 +3,7 @@
 import { flushSync } from "svelte";
 import { idleStatus } from "./fixture";
 import type { Transport } from "./transport";
-import type { CaptureView, Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, PreviewShot, Region, SavedRegion, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
+import type { CaptureMode, CaptureView, Envelope, FolderView, InputView, LoopbackView, Notice, NotesMsg, PreviewShot, Region, SavedRegion, SegmentView, SlideView, SpendSummary, Status, StatusMsg, TranscriptMsg, WindowView } from "./wire";
 import { nextWords, type Word } from "./words";
 
 type Stream = "status" | "transcript" | "notes";
@@ -98,10 +98,29 @@ export class Session {
     return this.status.capture;
   }
 
-  /** Capture works once a real capture has succeeded, while the lecture runs and the window is watched (spec §7.4). */
+  /** Only the worker's event changes this mode; a command returning is not an acknowledgement. */
+  get captureMode(): CaptureMode {
+    return this.status.capture_mode;
+  }
+
+  /** A saved selected region permits manual capture before any automatic frame has succeeded. */
   get canCapture(): boolean {
-    const c = this.status.capture;
-    return this.status.phase === "running" && c.captured && c.state === "watching";
+    return this.status.phase === "running" && this.captureMode.selected;
+  }
+
+  get canSetAutoCapture(): boolean {
+    return this.status.phase === "running";
+  }
+
+  get captureGuidance(): string | null {
+    if (this.captureMode.automatic) return null;
+    const shortcut = this.captureMode.shortcut;
+    switch (shortcut.state) {
+      case "ready": return "Auto-capture is paused. Release right Option by itself to capture a slide. Capture and ⌘⇧2 also work.";
+      case "needs_permission": return "Auto-capture is paused. Right Option needs Input Monitoring: allow LectureLive in System Settings → Privacy & Security → Input Monitoring, then quit and reopen LectureLive. Use Capture or type capture meanwhile.";
+      case "unavailable": return `Auto-capture is paused. Right Option is unavailable: ${shortcut.reason}. Use Capture or type capture.`;
+      case "inactive": return "Auto-capture is paused. Use Capture or type capture to take a slide.";
+    }
   }
 
   /** A snapshot or a polish is running: the one thing Cancel stops. */
@@ -214,6 +233,9 @@ export class Session {
     if (word === "polish") return this.polish();
     if (word === "pause") return this.pause();
     if (word === "resume") return this.resume();
+    if (word === "auto off") return this.setAutoCapture(false);
+    if (word === "auto on") return this.setAutoCapture(true);
+    if (word === "capture") return this.captureManual();
     await this.act("snapshot", { hint: h });
   }
 
@@ -262,6 +284,14 @@ export class Session {
 
   loopback(): Promise<LoopbackView | undefined> {
     return this.act<LoopbackView>("loopback_status");
+  }
+
+  async setAutoCapture(enabled: boolean) {
+    await this.act("set_auto_capture", { enabled });
+  }
+
+  async captureManual() {
+    await this.act("capture_manual");
   }
 
   /** The Capture button: the watched region now, as a manual slide. */

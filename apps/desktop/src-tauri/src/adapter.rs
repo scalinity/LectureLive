@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::Local;
 use lecturelive_core::audio::level::{dbfs, SilenceWatch};
-use lecturelive_core::capture::worker::CaptureState;
+use lecturelive_core::capture::worker::{CaptureMode, CaptureState};
 use lecturelive_core::session::coordinator::{Notification, SttStatus};
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::lecture::Event;
@@ -118,6 +118,7 @@ impl Pump {
         s.level_dbfs = None;
         s.input_gone = None;
         s.paused = false;
+        s.capture_mode = CaptureMode::default();
         if s.capture.window.is_some() {
             s.capture = CaptureView { state: CaptureWord::Ready, window: s.capture.window.take(), ..CaptureView::default() };
         } else {
@@ -256,6 +257,7 @@ impl Pump {
             }
             Event::SlidesNoted { through } => self.emit(Stream::Status, StatusMsg::SlidesNoted { through }),
             Event::Capture(s) => self.capture_state(s),
+            Event::CaptureMode(mode) => self.mirror.status.capture_mode = mode,
             Event::CaptureMoved { note, .. } => self.notice(NoticeKind::Slide, "Found again", &note),
             Event::Paused(paused) => self.paused(paused),
             Event::Warning(m) => self.notice(NoticeKind::Warn, "Warning", &m),
@@ -509,6 +511,27 @@ mod tests {
         p.lecture_ended();
         assert_eq!(p.mirror().status.phase, Phase::Ended);
         assert_eq!((p.mirror().status.capture.state, p.mirror().status.capture.window.as_deref()), (CaptureWord::Ready, Some("Zoom Meeting")));
+    }
+
+    #[test]
+    fn capture_mode_is_acknowledged_serialized_and_reset_separately_from_lecture_pause() {
+        use lecturelive_core::capture::worker::ManualShortcut;
+        let (mut p, sink) = pump();
+        assert_eq!(p.mirror().status.capture_mode, CaptureMode::default());
+        let mode = CaptureMode { automatic: false, selected: true, shortcut: ManualShortcut::NeedsPermission };
+        p.apply(Event::CaptureMode(mode.clone()));
+        assert_eq!(p.mirror().status.capture_mode, mode);
+        assert!(!p.mirror().status.paused);
+        assert!(!p.mirror().status.capture.captured, "a saved region needs no successful automatic frame");
+        let messages = sink.on(Stream::Status);
+        let status = messages.last().unwrap();
+        assert_eq!(status["capture_mode"]["automatic"], false);
+        assert_eq!(status["capture_mode"]["selected"], true);
+        assert_eq!(status["capture_mode"]["shortcut"]["state"], "needs_permission");
+        p.apply(Event::Paused(true));
+        assert_eq!(p.mirror().status.capture_mode, mode, "lecture pause leaves capture mode alone");
+        p.lecture_ended();
+        assert_eq!(p.mirror().status.capture_mode, CaptureMode::default());
     }
 
     fn seg(id: u64, text: &str, source: SegmentSource) -> Segment {

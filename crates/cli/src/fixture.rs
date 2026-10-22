@@ -282,6 +282,8 @@ fn log_command(files: &LectureFiles, c: &Command) {
         Command::Resume => "resume".into(),
         Command::Quit => "quit".into(),
         Command::CaptureNow(_) => "capture-now".into(),
+        Command::CaptureManual => "capture-manual".into(),
+        Command::SetAutoCapture(enabled) => format!("auto-{}", if *enabled { "on" } else { "off" }),
         Command::Bind { window, selection } => format!("bind\t{window}\t{}", selection_id(selection)),
         other => format!("{other:?}"),
     };
@@ -728,6 +730,18 @@ pub(crate) async fn run(scenario: Scenario, files: &LectureFiles, mut commands: 
                                 let _ = events.send(Event::Slide { index: next_slide, file: format!("slides/captured-{next_slide}_{}.png", Local::now().format("%H%M%S")), auto: false, uncertain: false, shown_at: Local::now() });
                             } else {
                                 let _ = reply.send(Err("no window is being watched: choose it once in the LectureLive app".into()));
+                            }
+                        }
+                        Command::SetAutoCapture(automatic) => {
+                            use lecturelive_core::capture::worker::{CaptureMode, ManualShortcut};
+                            let _ = events.send(Event::CaptureMode(CaptureMode { automatic, selected: cap, shortcut: if automatic { ManualShortcut::Inactive } else { ManualShortcut::Unavailable { reason: "scripted session".into() } } }));
+                        }
+                        Command::CaptureManual => {
+                            if watching {
+                                next_slide += 1;
+                                let _ = events.send(Event::Slide { index: next_slide, file: format!("slides/captured-{next_slide}.png"), auto: false, uncertain: false, shown_at: Local::now() });
+                            } else {
+                                let _ = events.send(Event::Warning("no window is being watched: choose it once in the LectureLive app".into()));
                             }
                         }
                         // The person's Ctrl-S on a safe offering: watched from this moment.

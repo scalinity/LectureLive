@@ -2,9 +2,12 @@
   // The command line (spec §9.1): the CLI's grammar in one field. Empty ⏎ is a snapshot, a hint then
   // ⏎ a hinted snapshot, `polish` ⏎ a polish, `pause` and `resume` ⏎ a break (spec §9.6). Stop goes Stop → Stop waiting;
   // quitting is the third.
+  import CaptureControls from "./CaptureControls.svelte";
   import FolderPicker from "./FolderPicker.svelte";
   import { session } from "./session.svelte";
   import type { NoticeKind } from "./wire";
+
+  let { onChoose }: { onChoose: () => void } = $props();
 
   let hint = $state("");
   let history = $state(false);
@@ -83,10 +86,11 @@
   {/if}
 
   {#if live}
+    <div class="capture-fallback"><CaptureControls {onChoose} showWindow /></div>
     <form class="prompt" onsubmit={submit}>
       <label class="field">
         <span class="diamond" aria-hidden="true">◆</span>
-        <input bind:value={hint} placeholder="a hint, or ⏎ for a snapshot" aria-label="Hint for the next snapshot" disabled={!session.canSnapshot} />
+        <input bind:value={hint} placeholder="a hint, or ⏎ for a snapshot" aria-label="Snapshot hint or command" aria-describedby="capture-commands" disabled={!session.canSnapshot} />
       </label>
       <!-- One filled action per state: while paused it is Resume. -->
       <button class={session.paused ? "outline" : "primary"} class:breathing={snapshotting} type="submit" disabled={!session.canSnapshot || session.busyOp} aria-busy={snapshotting}>{snapshotting ? "Snapshotting" : "Snapshot"}</button>
@@ -98,6 +102,7 @@
         <button class={session.stopLabel === "Stop" ? "stop" : "stop waiting"} type="button" onclick={() => session.stop()}>{session.stopLabel}</button>
       {/if}
     </form>
+    <p id="capture-commands" class="commands">Slide commands: auto off, auto on, capture. Recording continues when auto-capture is paused.</p>
   {:else}
     <div class="idle">
       <FolderPicker />
@@ -114,6 +119,14 @@
 </footer>
 
 <style>
+  .capture-fallback { display: none; }
+  .commands { margin: 0.4rem 0 0; color: var(--graphite); font-size: var(--step--1); }
+  @media (max-width: 1100px) {
+    .capture-fallback { display: block; margin-bottom: 0.8rem; }
+    .prompt { flex-wrap: wrap; }
+    .field { flex-basis: 20rem; }
+  }
+
   .command {
     background: var(--plate);
     border-top: 1px solid var(--rule);

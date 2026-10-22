@@ -1088,7 +1088,14 @@ pub(crate) fn slides(buf: &mut Buffer, body: Rect, v: &View, scroll: &SlidesScro
         return None;
     }
     let mut y = body.y;
-    let block = v.capture.as_ref().map(|s| capture_block(s, words, action, body.width as usize, ink, signal)).unwrap_or_default();
+    let mut block = v.capture.as_ref().map(|s| capture_block(s, words, action, body.width as usize, ink, signal)).unwrap_or_default();
+    if let Some(mode) = &v.capture_mode {
+        for line in capture::mode_words(mode, words) {
+            for range in wrap(&line, (body.width as usize).max(1)) {
+                block.push(vec![(line[range].to_string(), DIM)]);
+            }
+        }
+    }
     for row in &block {
         if y >= body.bottom() {
             return None;
@@ -1948,6 +1955,26 @@ mod tests {
         let area = b.area;
         slides(&mut b, area, v, s, action, &words(), &NOTE_INK, SIGNAL);
         (b.clone(), (0..height).map(|y| row_text(&b, y)).collect())
+    }
+
+    #[test]
+    fn manual_mode_is_quiet_and_explains_the_native_shortcut() {
+        use lecturelive_core::capture::worker::{CaptureMode, ManualShortcut};
+        for shortcut in [ManualShortcut::Ready, ManualShortcut::NeedsPermission, ManualShortcut::Unavailable { reason: "listener stopped\x1b[31m".into() }] {
+            let mut v = view(0);
+            v.reduce(&Event::CaptureMode(CaptureMode { automatic: false, selected: true, shortcut: shortcut.clone() }), at(0));
+            let (b, rows) = draw_slides(&v, &SlidesScroll::default(), &capture::Action::Now, 60, 16);
+            let text = rows.join(" ");
+            assert!(text.contains("Manual capture; audio and transcription continue."), "{text}");
+            assert!(text.contains("Type capture or press Ctrl-S"), "{text}");
+            assert!(!text.contains('\x1b'));
+            match shortcut {
+                ManualShortcut::Ready => assert!(text.contains("Right Option ready")),
+                ManualShortcut::NeedsPermission => assert!(text.contains("Input Monitoring for Terminal")),
+                _ => assert!(text.contains("Right Option unavailable: listener stopped")),
+            }
+            assert!(b[(0, 0)].modifier.contains(Modifier::DIM), "mode is quiet, not a recording-pause signal");
+        }
     }
 
     /// A lecture with `n` slides of mixed provenance, watching a window.

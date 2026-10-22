@@ -20,6 +20,7 @@ use crate::capture::detect::{crop, thumb, thumb_for, Detector, Region, Threshold
 use crate::capture::layout;
 use crate::capture::locate::locate;
 use crate::capture::scene::{classify, features, Gate, Scene};
+use crate::capture::shortcut::Listener;
 use crate::capture::select::{revalidate, Revalidation, Selection};
 use crate::capture::window::{fit_within, is_blank, CaptureError, WindowInfo, WindowSource, MAX_PX};
 
@@ -84,9 +85,34 @@ pub struct Captured {
     pub uncertain: bool,
 }
 
+/// The person's capture mode, independent of window health and the lecture's audio pause.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaptureMode {
+    pub automatic: bool,
+    pub selected: bool,
+    pub shortcut: ManualShortcut,
+}
+
+impl Default for CaptureMode {
+    fn default() -> Self {
+        Self { automatic: true, selected: false, shortcut: ManualShortcut::Inactive }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ManualShortcut {
+    Inactive,
+    Ready,
+    NeedsPermission,
+    Unavailable { reason: String },
+}
+
 #[derive(Debug)]
 pub enum CaptureEvent {
     State(CaptureState),
+    Mode(CaptureMode),
+    Warning(String),
     /// The same window's slide is watched through another region (its size changed): to save, and to say.
     Relocated { selection: Selection, note: String },
     Captured(Captured),
@@ -95,6 +121,11 @@ pub enum CaptureEvent {
 pub enum CaptureCmd {
     /// Capture the bound region now, as a manual slide (the button, the shortcut).
     Now(oneshot::Sender<Result<(), String>>),
+    /// A typed capture; errors are returned through the event stream.
+    Manual,
+    /// A solo right Option tap from this listener generation.
+    Shortcut(u64),
+    SetAutoCapture(bool),
     /// The person chose this window and region.
     Bind { window: u32, selection: Selection },
     /// The lecture is paused (spec §9.6): nothing is sampled until it is not. A manual capture still works.
@@ -113,14 +144,23 @@ impl CaptureHandle {
     }
 }
 
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        // The listener also has a sender, so disconnect alone cannot stop the worker.
+        let _ = self.tx.send(CaptureCmd::Stop);
+    }
+}
+
 pub fn spawn(source: Box<dyn WindowSource>, selection: Option<Selection>, cfg: WorkerConfig, events: UnboundedSender<CaptureEvent>) -> CaptureHandle {
     let (tx, rx) = std_mpsc::channel();
+    let worker_tx = tx.clone();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
             let recorder = cfg.record.as_ref().and_then(|d| Recorder::new(d.clone()).ok());
-            let mut w = Worker { detector: Detector::new(cfg.thresholds), gate: Gate::new(), source, cfg, events, bound: None, waiting: None, sent: None, failures: 0, tried: None, new_size: None, settling: 0, held: false, since_audit: AUDIT_EVERY, suspect: 0, recorder };
+            let mut w = Worker { detector: Detector::new(cfg.thresholds), gate: Gate::new(), source, cfg, events, bound: None, waiting: None, sent: None, failures: 0, tried: None, new_size: None, settling: 0, held: false, since_audit: AUDIT_EVERY, suspect: 0, recorder, mode: CaptureMode::default(), sent_mode: None, listener: None, generation: 0, tx: worker_tx, manual_selection: None };
             w.start(selection);
+            w.publish_mode();
             w.run(rx);
         })
         .expect("start the capture thread");
@@ -153,6 +193,14 @@ struct Worker {
     since_audit: u32,
     suspect: u32,
     recorder: Option<Recorder>,
+    mode: CaptureMode,
+    sent_mode: Option<CaptureMode>,
+    listener: Option<Listener>,
+    generation: u64,
+    tx: std_mpsc::Sender<CaptureCmd>,
+    /// Regions chosen or verified at exact sizes. Startup's tolerant identity match must not
+    /// turn a size never checked into a known manual crop before the automatic layout audit.
+    manual_selection: Option<Selection>,
 }
 
 impl Worker {
@@ -163,8 +211,17 @@ impl Worker {
                 Ok(CaptureCmd::Now(reply)) => {
                     let _ = reply.send(self.capture_now());
                 }
+                Ok(CaptureCmd::Manual) => self.manual(),
+                Ok(CaptureCmd::Shortcut(generation)) => {
+                    if !self.mode.automatic && generation == self.generation { self.manual(); }
+                }
+                Ok(CaptureCmd::SetAutoCapture(enabled)) => {
+                    self.set_auto_capture(enabled);
+                    next = Instant::now();
+                }
                 Ok(CaptureCmd::Bind { window, selection }) => {
                     self.bind(window, selection);
+                    self.publish_mode();
                     next = Instant::now();
                 }
                 Ok(CaptureCmd::Hold(held)) => {
@@ -184,8 +241,52 @@ impl Worker {
         }
     }
 
+    fn publish_mode(&mut self) {
+        self.mode.selected = self.bound.is_some() || self.waiting.is_some();
+        if self.sent_mode.as_ref() != Some(&self.mode) {
+            self.sent_mode = Some(self.mode.clone());
+            let _ = self.events.send(CaptureEvent::Mode(self.mode.clone()));
+        }
+    }
+
+    fn set_auto_capture(&mut self, enabled: bool) {
+        if self.mode.automatic != enabled {
+            self.mode.automatic = enabled;
+            self.generation = self.generation.wrapping_add(1);
+            // Keep only the last saved frame. A candidate and its timestamp cannot cross a pause.
+            let kept = self.detector.kept().cloned();
+            self.detector = Detector::new(self.cfg.thresholds);
+            if let Some(kept) = kept { self.detector.keep(kept); }
+            self.gate = Gate::new();
+            self.settling = 0;
+            self.failures = 0;
+            (self.since_audit, self.suspect) = (AUDIT_EVERY, 0);
+        }
+        if enabled {
+            self.listener = None;
+            self.mode.shortcut = ManualShortcut::Inactive;
+        } else if self.listener.is_none() {
+            if self.source.global_shortcuts() {
+                self.mode.shortcut = match Listener::start(self.tx.clone(), self.generation) {
+                    Ok(listener) => { self.listener = Some(listener); ManualShortcut::Ready }
+                    Err(state) => state,
+                };
+            } else {
+                self.mode.shortcut = ManualShortcut::Unavailable { reason: "Global shortcuts are unavailable for this window source".into() };
+            }
+        }
+        self.publish_mode();
+    }
+
+    fn manual(&mut self) {
+        if let Err(reason) = self.capture_now() {
+            let _ = self.events.send(CaptureEvent::Warning(reason));
+        }
+    }
+
     /// Spec §7.1: the saved selection is revalidated when the lecture starts; only an exact match binds.
     fn start(&mut self, selection: Option<Selection>) {
+        self.manual_selection = selection.clone();
         let Some(sel) = selection else { return self.set(CaptureState::Unbound) };
         match self.source.windows() {
             Ok(ws) => match revalidate(&sel, &ws) {
@@ -205,6 +306,7 @@ impl Worker {
     }
 
     fn bind(&mut self, window: u32, selection: Selection) {
+        self.manual_selection = Some(selection.clone());
         let seen = |s: &Selection| (s.region, s.leave_out.clone());
         let before = self.bound.as_ref().map(|(_, s)| seen(s)).or(self.waiting.as_ref().map(seen));
         if before != Some(seen(&selection)) {
@@ -266,10 +368,12 @@ impl Worker {
         self.new_size = None;
         self.failures = 0;
         (self.since_audit, self.suspect) = (AUDIT_EVERY, 0);
-        let _ = self.events.send(CaptureEvent::Relocated { selection: at, note: format!("{label} opened again; watching it as before") });
+        let checked = self.manual_selection.clone().unwrap_or(at);
+        let _ = self.events.send(CaptureEvent::Relocated { selection: checked, note: format!("{label} opened again; watching it as before") });
     }
 
     fn tick(&mut self) {
+        if !self.mode.automatic { return; }
         if self.held {
             if let Some((_, sel)) = &self.bound {
                 let window = sel.descriptor.label();
@@ -323,6 +427,7 @@ impl Worker {
                 // against where the shared content is, and moved when it is not looking at it.
                 if let Some(better) = self.audit(&img, &sel.region) {
                     let found = sel.with_size(w.width, w.height, better);
+                    self.remember_manual_region(&found);
                     self.rebind(id, found, format!("{window} is {} × {}; the slide was not where the region looked, and is watched where its edges are", w.width, w.height));
                     return;
                 }
@@ -429,6 +534,7 @@ impl Worker {
                     let aspect = (sel.region.w * sel.descriptor.width as f64) / (sel.region.h * sel.descriptor.height as f64);
                     if let Some(region) = locate(&img, &kept, aspect, &sel.leave_out) {
                         let found = sel.with_size(w.width, w.height, region);
+                        self.remember_manual_region(&found);
                         return Some(self.rebind(id, found, format!("{window} is {} × {} now; the slide was found again there", w.width, w.height)));
                     }
                 }
@@ -436,12 +542,16 @@ impl Worker {
                 // slide's own edges say where it is, whichever slide it is.
                 if let Some(region) = Self::edges(&img) {
                     let found = sel.with_size(w.width, w.height, region);
+                    self.remember_manual_region(&found);
                     return Some(self.rebind(id, found, format!("{window} is {} × {} now; the slide was found by its edges there", w.width, w.height)));
                 }
             }
         }
         if let Some(known) = known {
-            return Some(self.rebind(id, known, format!("{window} is {} × {} now; watching the same region", w.width, w.height)));
+            // Identity tolerance permits an automatic trial, not a newly checked exact crop.
+            // Align the detector as for a resize, but leave the trial out of saved preferences.
+            self.use_region(id, &known);
+            return Some(known);
         }
         // No window to "Watch it": the old region is what could not be checked at this size.
         let reason = format!("it is {} × {} now and the slide was not found in it; check the region", w.width, w.height);
@@ -449,10 +559,26 @@ impl Worker {
         None
     }
 
+    /// Add only a region actually verified by the image search/audit. The automatic selection
+    /// may contain tolerance-only sizes, which must not enter this catalog along with it.
+    fn remember_manual_region(&mut self, sel: &Selection) {
+        self.manual_selection = Some(match &self.manual_selection {
+            Some(known) => known.with_size(sel.descriptor.width, sel.descriptor.height, sel.region),
+            None => sel.clone(),
+        });
+    }
+
     /// The same window through another region, and the app is told (it saves the region and says so). The
     /// slide on screen becomes the kept frame when it is the kept slide; a slide that changed as the window did,
     /// or the first one, is left to the detector, so it is taken.
     fn rebind(&mut self, id: u32, sel: Selection, note: String) -> Selection {
+        self.use_region(id, &sel);
+        let checked = self.manual_selection.clone().unwrap_or_else(|| sel.clone());
+        let _ = self.events.send(CaptureEvent::Relocated { selection: checked, note });
+        sel
+    }
+
+    fn use_region(&mut self, id: u32, sel: &Selection) {
         if let Ok((_, t)) = self.frame(id, &sel) {
             if self.detector.shows_kept(&t) {
                 self.detector.keep(t);
@@ -462,8 +588,6 @@ impl Worker {
         self.bound = Some((id, sel.clone()));
         self.tried = None;
         (self.since_audit, self.suspect) = (AUDIT_EVERY, 0); // the new region is checked on the next sample
-        let _ = self.events.send(CaptureEvent::Relocated { selection: sel.clone(), note });
-        sel
     }
 
     /// One capture and its detector input; a blank window or a black region is a failed capture.
@@ -477,13 +601,67 @@ impl Worker {
     }
 
     fn capture_now(&mut self) -> Result<(), String> {
-        let Some((id, sel)) = self.bound.clone() else { return Err("No window is being watched: choose one in the slides strip.".into()) };
-        let (img, t) = self.frame(id, &sel).map_err(|e| match e {
-            CaptureError::Denied => e.to_string(),
-            CaptureError::Failed(m) => format!("{} could not be captured: {m}", sel.descriptor.label()),
+        let sel = self.manual_selection.clone()
+            .ok_or("No window is selected: choose one in LectureLive.")?;
+        let windows = self.source.windows().map_err(|e| {
+            match &e {
+                CaptureError::Denied => self.set(CaptureState::Denied),
+                CaptureError::Failed(reason) => self.set(CaptureState::Failing { window: sel.descriptor.label(), reason: reason.clone() }),
+            }
+            e.to_string()
         })?;
+        let chosen = self.bound.as_ref().and_then(|(id, _)| windows.iter().find(|w| w.id == *id && sel.descriptor.same_app(w) && sel.descriptor.title == w.title)).cloned();
+        let w = match chosen {
+            Some(w) => w,
+            None => match revalidate(&sel, &windows) {
+                Revalidation::Match(w) => w,
+                Revalidation::Ask { reason, candidates } => {
+                    self.set(CaptureState::Asking { window: sel.descriptor.label(), reason: reason.clone(), candidates });
+                    return Err(format!("{reason}; choose the window in LectureLive."));
+                }
+            }
+        };
+        let known_size = |w: &WindowInfo| (sel.descriptor.width, sel.descriptor.height) == (w.width, w.height)
+            || sel.sizes.iter().any(|s| (s.width, s.height) == (w.width, w.height));
+        let Some(at_size) = known_size(&w).then(|| sel.at_size(w.width, w.height)).flatten() else {
+            let reason = format!("the window is {} × {} now; choose its region in LectureLive", w.width, w.height);
+            self.set(CaptureState::Asking { window: sel.descriptor.label(), reason: reason.clone(), candidates: vec![] });
+            return Err(reason);
+        };
+        if self.bound.as_ref() != Some(&(w.id, at_size.clone())) {
+            self.follow(&w, &sel);
+        }
+        let (id, at_size) = self.bound.clone().ok_or("No window is selected.")?;
+        let mut frame = self.frame(id, &at_size);
+        if frame.is_err() && !w.on_screen {
+            let others: Vec<WindowInfo> = windows.iter().filter(|o| o.id != id && o.on_screen && sel.descriptor.same_app(o) && sel.descriptor.title == o.title).cloned().collect();
+            match others.as_slice() {
+                [only] if known_size(only) => {
+                    self.follow(only, &sel);
+                    let (_, replacement) = self.bound.clone().expect("follow binds a known size");
+                    frame = self.frame(only.id, &replacement);
+                }
+                [] => {}
+                _ => {
+                    let reason = "the old window cannot be captured; choose the replacement window and its region in LectureLive".to_string();
+                    self.set(CaptureState::Asking { window: sel.descriptor.label(), reason: reason.clone(), candidates: others });
+                    return Err(reason);
+                }
+            }
+        }
+        let (img, t) = frame.map_err(|e| match e {
+            CaptureError::Denied => { self.set(CaptureState::Denied); e.to_string() }
+            CaptureError::Failed(m) => {
+                self.set(CaptureState::Failing { window: sel.descriptor.label(), reason: m.clone() });
+                format!("{} could not be captured: {m}", sel.descriptor.label())
+            }
+        })?;
+        let (_, at_size) = self.bound.as_ref().ok_or("No window is selected.")?;
+        let region = at_size.region;
+        self.save(&img, &region, Local::now(), false, false)?;
         self.detector.keep(t); // auto capture does not take this slide again
-        self.save(&img, &sel.region, Local::now(), false, false)
+        if !self.held { self.set(CaptureState::Watching { window: sel.descriptor.label() }); }
+        Ok(())
     }
 
     /// The region at full size, at most 1600 px, as a PNG temp file in `slides/` (spec §7.2, §7.3).

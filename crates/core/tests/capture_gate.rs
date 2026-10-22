@@ -50,6 +50,8 @@ async fn watch(rx: &mut mpsc::UnboundedReceiver<CaptureEvent>, ms: u64) -> (Vec<
     let end = tokio::time::Instant::now() + Duration::from_millis(ms);
     while let Ok(Some(e)) = tokio::time::timeout_at(end, rx.recv()).await {
         match e {
+            CaptureEvent::Mode(_) => {}
+            CaptureEvent::Warning(reason) => panic!("unexpected capture warning: {reason}"),
             CaptureEvent::State(s) => states.push(s),
             CaptureEvent::Relocated { .. } => {} // said by the app; the slides are what these tests count
             CaptureEvent::Captured(c) => {
@@ -68,6 +70,8 @@ async fn until_moved(rx: &mut mpsc::UnboundedReceiver<CaptureEvent>, ms: u64) ->
     let mut end = tokio::time::Instant::now() + Duration::from_millis(ms);
     while let Ok(Some(e)) = tokio::time::timeout_at(end, rx.recv()).await {
         match e {
+            CaptureEvent::Mode(_) => {}
+            CaptureEvent::Warning(reason) => panic!("unexpected capture warning: {reason}"),
             CaptureEvent::State(s) => states.push(s),
             CaptureEvent::Captured(c) => shots.push((c.auto, c.uncertain)),
             CaptureEvent::Relocated { .. } if !moved => {
@@ -569,7 +573,7 @@ async fn denial_is_said_and_manual_capture_says_why_it_cannot() {
     assert_eq!(states.last(), Some(&CaptureState::Denied));
     let (tx, reply) = tokio::sync::oneshot::channel();
     h.send(CaptureCmd::Now(tx));
-    assert!(reply.await.unwrap().unwrap_err().contains("No window is being watched"));
+    assert!(reply.await.unwrap().unwrap_err().contains("Screen Recording"));
 }
 
 #[tokio::test]
@@ -644,6 +648,14 @@ async fn auto_slides_and_the_watcher_share_one_registration() {
     until(&mut ev, "the first auto slide", |e| matches!(e, Event::Slide { index: 1, auto: true, .. })).await;
     fake.show(42, slide(2));
     until(&mut ev, "the build", |e| matches!(e, Event::Slide { index: 2, auto: true, .. })).await;
+    cmd.send(Command::SetAutoCapture(false)).unwrap();
+    until(&mut ev, "manual capture mode", |e| matches!(e, Event::CaptureMode(m) if !m.automatic && m.selected)).await;
+    let before_audio = stt.state.frames.load(std::sync::atomic::Ordering::SeqCst);
+    let before_images = fake.0.lock().unwrap().captures;
+    fake.show(42, slide(3));
+    stt.state.wait_frames(before_audio + 5).await;
+    until(&mut ev, "transcription while automatic screenshots are paused", |e| matches!(e, Event::Session(lecturelive_core::session::coordinator::Notification::Segment(_)))).await;
+    assert_eq!(fake.0.lock().unwrap().captures, before_images, "manual mode takes no periodic window images while audio reaches STT");
     let (tx, reply) = tokio::sync::oneshot::channel();
     cmd.send(Command::CaptureNow(tx)).unwrap();
     reply.await.unwrap().unwrap();
@@ -652,11 +664,14 @@ async fn auto_slides_and_the_watcher_share_one_registration() {
     support::slides::png(&outside);
     cmd.send(Command::Import(vec![outside.clone()])).unwrap();
     until(&mut ev, "the dropped image", |e| matches!(e, Event::Slide { index: 4, auto: false, .. })).await;
+    cmd.send(Command::SetAutoCapture(true)).unwrap();
+    until(&mut ev, "automatic capture resumed", |e| matches!(e, Event::CaptureMode(m) if m.automatic)).await;
     tokio::time::sleep(ms(200)).await; // the watcher lists slides/ several times
     cmd.send(Command::Stop).unwrap();
     tokio::time::timeout(Duration::from_secs(10), run).await.expect("the lecture ends within 10 s of the stop").unwrap().unwrap();
 
     let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert!(sc.pauses.is_empty(), "pausing automatic screenshots does not pause the lecture");
     assert_eq!(sc.slides.iter().map(|s| (s.index, s.auto)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false), (4, false)]);
     let names: Vec<String> = std::fs::read_dir(&f.slides).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(names.len(), 4, "{names:?}");
@@ -666,4 +681,237 @@ async fn auto_slides_and_the_watcher_share_one_registration() {
         assert_eq!(notes.matches(&format!("![Slide {n}](slides/slide_{n:02}_")).count(), 1, "{notes}");
     }
     assert_eq!(embeds_in(&notes).len(), 4);
+}
+
+async fn mode_until(rx: &mut mpsc::UnboundedReceiver<CaptureEvent>, automatic: bool, selected: bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let e = tokio::time::timeout_at(deadline, rx.recv()).await.expect("capture mode acknowledgement").expect("worker alive");
+        if matches!(e, CaptureEvent::Mode(m) if m.automatic == automatic && m.selected == selected) { return; }
+    }
+}
+
+async fn manual_now(h: &worker::CaptureHandle) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    h.send(CaptureCmd::Now(tx));
+    tokio::time::timeout(Duration::from_secs(3), rx).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn manual_mode_preserves_the_region_and_each_press_saves_one_even_before_the_first_auto_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let sel = selection(&fake, 42);
+    let (h, mut rx) = start(&fake, None, dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, false).await;
+    h.send(CaptureCmd::Bind { window: 42, selection: sel.clone() });
+    mode_until(&mut rx, false, true).await;
+    assert_eq!(fake.0.lock().unwrap().captures, 0, "a bound selection needs no auto frame to capture by hand");
+    for n in 1..5 { fake.show(42, slide(n)); tokio::time::sleep(ms(25)).await; }
+    assert_eq!(fake.0.lock().unwrap().captures, 0, "no periodic sampling while code changes");
+    manual_now(&h).await.unwrap();
+    manual_now(&h).await.unwrap();
+    let end = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut shots = Vec::new();
+    while shots.len() < 2 {
+        if let CaptureEvent::Captured(c) = tokio::time::timeout_at(end, rx.recv()).await.unwrap().unwrap() { shots.push(c); }
+    }
+    assert_eq!(fake.0.lock().unwrap().captures, 2);
+    let (_, _, width, height) = sel.region.pixels(640, 360).unwrap();
+    for c in shots {
+        assert!(!c.auto && !c.uncertain);
+        assert_eq!(image::ImageReader::open(c.path).unwrap().with_guessed_format().unwrap().into_dimensions().unwrap(), (width, height), "the selected section, not a foreground window");
+    }
+    h.send(CaptureCmd::SetAutoCapture(true));
+    mode_until(&mut rx, true, true).await;
+    assert!(watch(&mut rx, 150).await.1.is_empty(), "resuming does not duplicate the last manual image");
+    fake.show(42, slide(5));
+    assert_eq!(watch(&mut rx, 250).await.1, vec![(true, false)], "slide changes are detected normally again");
+}
+
+#[tokio::test]
+async fn manual_mode_and_the_full_lecture_hold_are_independent_and_stopping_closes_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    let n = fake.0.lock().unwrap().captures;
+    h.send(CaptureCmd::Hold(true));
+    h.send(CaptureCmd::Hold(false));
+    h.send(CaptureCmd::SetAutoCapture(false)); // repeated command is harmless
+    tokio::time::sleep(ms(80)).await;
+    assert_eq!(fake.0.lock().unwrap().captures, n);
+    h.send(CaptureCmd::Hold(true));
+    h.send(CaptureCmd::SetAutoCapture(true));
+    mode_until(&mut rx, true, true).await;
+    assert!(watch(&mut rx, 80).await.1.is_empty(), "auto on does not release the lecture hold");
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    manual_now(&h).await.unwrap();
+    assert_eq!(watch(&mut rx, 80).await.1, vec![(false, false)], "a deliberate capture still works in a full lecture pause");
+    drop(h);
+    tokio::time::timeout(Duration::from_secs(1), async { while rx.recv().await.is_some() {} }).await.expect("dropping the handle stops the worker despite its internal command sender");
+}
+
+#[tokio::test]
+async fn a_manual_shot_revalidates_the_selected_window_and_refuses_an_unknown_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let sel = selection(&fake, 42);
+    let (h, mut rx) = start(&fake, Some(sel), dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    fake.close(42);
+    assert!(manual_now(&h).await.is_err(), "do not capture another app when the selected window closes");
+    fake.add(77, "Zoom Meeting", 1600, 900, slide(2));
+    manual_now(&h).await.unwrap();
+    assert_eq!(watch(&mut rx, 50).await.1, vec![(false, false)], "the uniquely matching saved window can be followed on demand");
+    fake.resize(77, 1608, 900); // close enough for identity, but never checked as a crop
+    let n = fake.0.lock().unwrap().captures;
+    assert!(manual_now(&h).await.unwrap_err().contains("choose its region"));
+    assert_eq!(fake.0.lock().unwrap().captures, n, "a 2% identity tolerance must not approve an unknown manual layout");
+    fake.resize(77, 1000, 700);
+    let n = fake.0.lock().unwrap().captures;
+    assert!(manual_now(&h).await.unwrap_err().contains("choose its region"));
+    assert_eq!(fake.0.lock().unwrap().captures, n, "no capture through a region for an unknown layout");
+    fake.resize(77, 1600, 900);
+    fake.0.lock().unwrap().fail_next = 1;
+    assert!(manual_now(&h).await.is_err());
+    manual_now(&h).await.unwrap();
+    assert_eq!(watch(&mut rx, 50).await.1, vec![(false, false)], "a failed request does not save a slide or disable later manual requests");
+}
+
+#[tokio::test]
+async fn manual_capture_does_not_approve_a_tolerant_startup_size_as_a_known_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let saved = selection(&fake, 42);
+    fake.resize(42, 1608, 900);
+    let (h, mut rx) = start(&fake, Some(saved), dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    let n = fake.0.lock().unwrap().captures;
+    assert!(manual_now(&h).await.unwrap_err().contains("choose its region"));
+    assert_eq!(fake.0.lock().unwrap().captures, n);
+}
+
+#[tokio::test]
+async fn a_manual_capture_follows_the_unique_replacement_when_the_old_id_lingers_off_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    fake.on_screen(42, false);
+    fake.add(77, "Zoom Meeting", 1600, 900, slide(2));
+    manual_now(&h).await.unwrap();
+    assert_eq!(watch(&mut rx, 50).await.1, vec![(false, false)]);
+    fake.show(77, slide(3));
+    manual_now(&h).await.unwrap();
+    assert_eq!(watch(&mut rx, 50).await.1, vec![(false, false)], "the replacement remains selected for later presses");
+}
+
+#[tokio::test]
+async fn a_change_candidate_from_before_manual_mode_does_not_supply_the_resumed_slides_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let cfg = WorkerConfig { slides: dir.path().into(), interval: ms(10), thresholds: Thresholds { hold: 20, ..Thresholds::default() }, record: None };
+    let h = worker::spawn(Box::new(fake.clone()), Some(selection(&fake, 42)), cfg, tx);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(tokio::time::timeout_at(deadline, rx.recv()).await.unwrap(), Some(CaptureEvent::Captured(_))) { break; }
+    }
+    let n = fake.0.lock().unwrap().captures;
+    fake.show(42, slide(2));
+    while fake.0.lock().unwrap().captures < n + 3 { tokio::time::sleep(ms(1)).await; }
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    fake.show(42, slide(3));
+    tokio::time::sleep(ms(50)).await;
+    let resumed = Local::now();
+    h.send(CaptureCmd::SetAutoCapture(true));
+    mode_until(&mut rx, true, true).await;
+    loop {
+        if let Some(CaptureEvent::Captured(c)) = tokio::time::timeout_at(deadline, rx.recv()).await.unwrap() {
+            assert!(c.shown_at >= resumed, "a stale candidate must not date the new slide before resuming");
+            assert!(c.auto && !c.uncertain);
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unverified_auto_resize_does_not_become_a_known_manual_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let (h, mut rx) = start(&fake, Some(selection(&fake, 42)), dir.path());
+    watch(&mut rx, 150).await;
+    fake.0.lock().unwrap().fail_next = 10_000; // region search and audit cannot verify the new layout
+    fake.resize(42, 1608, 900);
+    let (_, _, moved) = until_moved(&mut rx, 150).await;
+    assert!(!moved, "a tentative near-size crop is not published or persisted as a verified region");
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    fake.0.lock().unwrap().fail_next = 0;
+    let n = fake.0.lock().unwrap().captures;
+    assert!(manual_now(&h).await.unwrap_err().contains("choose its region"));
+    assert_eq!(fake.0.lock().unwrap().captures, n, "the unchecked fallback was not promoted to an exact manual crop");
+}
+
+#[tokio::test]
+async fn a_tolerance_only_replacement_keeps_the_checked_catalog_for_the_next_lecture() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let saved = selection(&fake, 42);
+    let (h, mut rx) = start(&fake, Some(saved.clone()), dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    fake.close(42);
+    fake.add(77, "Zoom Meeting", 1608, 900, slide(2));
+    fake.0.lock().unwrap().fail_next = 10_000;
+    h.send(CaptureCmd::SetAutoCapture(true));
+    mode_until(&mut rx, true, true).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(CaptureEvent::Relocated { selection, .. }) = tokio::time::timeout_at(deadline, rx.recv()).await.unwrap() {
+            assert_eq!(selection, saved, "the adapter must never persist tentative replacement dimensions as a known crop");
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_verified_resize_does_not_persist_an_unchecked_startup_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeWindows::default();
+    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
+    let saved = selection(&fake, 42);
+    fake.resize(42, 1608, 900); // identity match at startup, no region checked at this size
+    let (h, mut rx) = start(&fake, Some(saved), dir.path());
+    h.send(CaptureCmd::SetAutoCapture(false));
+    mode_until(&mut rx, false, true).await;
+    fake.resize(42, 1280, 800);
+    fake.show(42, zoom_window(1280, 800, (160, 120, 960, 540), 2));
+    h.send(CaptureCmd::SetAutoCapture(true));
+    mode_until(&mut rx, true, true).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(CaptureEvent::Relocated { selection, .. }) = tokio::time::timeout_at(deadline, rx.recv()).await.unwrap() {
+            assert_eq!((selection.descriptor.width, selection.descriptor.height), (1280, 800));
+            assert!(selection.sizes.iter().any(|s| (s.width, s.height) == (1600, 900)));
+            assert!(!selection.sizes.iter().any(|s| (s.width, s.height) == (1608, 900)), "unchecked automatic dimensions must not enter the saved catalog along with a verified region");
+            break;
+        }
+    }
 }

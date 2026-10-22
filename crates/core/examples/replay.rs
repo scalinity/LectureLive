@@ -107,6 +107,8 @@ fn main() {
             quiet = false;
             let now = cur.load(Ordering::SeqCst);
             match e {
+                CaptureEvent::Mode(mode) => println!("{}  mode     {:?}", at(now), mode),
+                CaptureEvent::Warning(reason) => eprintln!("capture: {reason}"),
                 CaptureEvent::State(s) => println!("{}  state    {:?}", at(now), s),
                 CaptureEvent::Relocated { selection, note } => {
                     moves += 1;

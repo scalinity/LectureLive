@@ -116,6 +116,8 @@ impl std::error::Error for CaptureError {}
 
 /// Where the capture worker finds and captures windows: the system, or a fake in tests.
 pub trait WindowSource: Send {
+    /// Only live system windows need global keyboard input; fixture sources never request it.
+    fn global_shortcuts(&self) -> bool { false }
     fn windows(&mut self) -> Result<Vec<WindowInfo>, CaptureError>;
     fn capture(&mut self, id: u32) -> Result<RgbaImage, CaptureError>;
 }
@@ -136,6 +138,7 @@ fn bundle_id(pid: i32) -> Option<String> {
 }
 
 impl WindowSource for SystemWindows {
+    fn global_shortcuts(&self) -> bool { true }
     fn windows(&mut self) -> Result<Vec<WindowInfo>, CaptureError> {
         ensure_screen_access().map_err(|_| CaptureError::Denied)?;
         let raw = unsafe { CGWindowListCopyWindowInfo(ALL_WINDOWS, 0) };

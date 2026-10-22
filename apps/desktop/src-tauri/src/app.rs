@@ -505,9 +505,31 @@ pub async fn stop(app: State<'_, App>) -> Res<u32> {
     Ok(level)
 }
 
+/// Exact capture commands in the prompt; all other text remains a snapshot hint.
+fn prompt_command(hint: String) -> Command {
+    match hint.trim().to_ascii_lowercase().as_str() {
+        "auto off" => Command::SetAutoCapture(false),
+        "auto on" => Command::SetAutoCapture(true),
+        "capture" => Command::CaptureManual,
+        _ => Command::Op(Op::Snapshot(hint)),
+    }
+}
+
 #[tauri::command]
 pub fn snapshot(hint: String, app: State<'_, App>) -> Res<()> {
-    app.send(Command::Op(Op::Snapshot(hint)))
+    app.send(prompt_command(hint))
+}
+
+/// Ask the worker to change capture mode; its event acknowledges the result.
+#[tauri::command]
+pub fn set_auto_capture(enabled: bool, app: State<'_, App>) -> Res<()> {
+    app.send(Command::SetAutoCapture(enabled))
+}
+
+/// The typed `capture` command does not wait for a screenshot; warnings arrive on the event stream.
+#[tauri::command]
+pub fn capture_manual(app: State<'_, App>) -> Res<()> {
+    app.send(Command::CaptureManual)
 }
 
 /// Pause the lecture (spec §9.6): nothing is recorded or transcribed, and automatic slide capture waits, until resume.
@@ -936,6 +958,8 @@ pub async fn check_record(minutes: u64, app: State<'_, App>) -> Res<Value> {
                 states.push(serde_json::json!({ "at": Local::now().to_rfc3339(), "state": s.words().0, "detail": s.words().1 }));
                 app.pump.lock().await.apply(Event::Capture(s));
             }
+            CaptureEvent::Mode(mode) => app.pump.lock().await.apply(Event::CaptureMode(mode)),
+            CaptureEvent::Warning(message) => app.pump.lock().await.apply(Event::Warning(message)),
             CaptureEvent::Relocated { note, .. } => states.push(serde_json::json!({ "at": Local::now().to_rfc3339(), "state": "Found again", "detail": note })),
             CaptureEvent::Captured(c) => {
                 kept.push(serde_json::json!({ "at": Local::now().to_rfc3339(), "shown_at": c.shown_at.to_rfc3339(), "uncertain": c.uncertain }));
@@ -1031,6 +1055,16 @@ pub async fn save_for_quit(app: &App, until: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_capture_commands_are_case_insensitive_and_match_the_whole_line() {
+        assert!(matches!(prompt_command(" AUTO OFF ".into()), Command::SetAutoCapture(false)));
+        assert!(matches!(prompt_command("Auto On".into()), Command::SetAutoCapture(true)));
+        assert!(matches!(prompt_command("CAPTURE".into()), Command::CaptureManual));
+        for hint in ["auto off later", "capture this slide", "auto  on", ""] {
+            assert!(matches!(prompt_command(hint.into()), Command::Op(Op::Snapshot(h)) if h == hint));
+        }
+    }
 
     /// Spec §9.6: a stopping lecture takes no new operation and no pause or resume, and says so; a stop, a cancel, a
     /// quit and a state read still go through.

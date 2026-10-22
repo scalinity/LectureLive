@@ -313,11 +313,57 @@ describe("session store", () => {
     expect(s.canSnapshot).toBe(false);
   });
 
+  test("manual capture works before the first auto frame and mode changes only on acknowledgement", async () => {
+    const st = emptyState("manual");
+    st.status = { ...st.status, phase: "running", capture: { ...st.status.capture, window: "Zoom Meeting", state: "ready" }, capture_mode: { automatic: true, selected: true, shortcut: { state: "inactive" } } };
+    const { t, s, ready, frame } = setup(st);
+    await ready;
+    expect(s.canCapture).toBe(true);
+    await s.setAutoCapture(false);
+    expect(s.captureMode.automatic).toBe(true);
+    await s.captureNow();
+    t.emitStatus({ type: "status", ...st.status, capture_mode: { automatic: false, selected: true, shortcut: { state: "ready" } } });
+    frame();
+    expect(s.captureMode.automatic).toBe(false);
+    expect(s.paused).toBe(false);
+    expect(s.canCapture).toBe(true);
+    expect(s.captureGuidance).toContain("Release right Option by itself");
+    expect(t.calls).toEqual([["set_auto_capture", { enabled: false }], ["capture_now", undefined]]);
+  });
+
+  test("exact capture commands route separately and all other text remains a snapshot hint", async () => {
+    const { t, s, ready } = setup();
+    await ready;
+    await s.snapshot(" AUTO OFF ");
+    await s.snapshot("Auto On");
+    await s.snapshot(" CAPTURE ");
+    await s.snapshot("capture the update rule");
+    await s.snapshot("auto off later");
+    await s.snapshot("auto  on");
+    expect(t.calls).toEqual([["set_auto_capture", { enabled: false }], ["set_auto_capture", { enabled: true }], ["capture_manual", undefined], ["snapshot", { hint: "capture the update rule" }], ["snapshot", { hint: "auto off later" }], ["snapshot", { hint: "auto  on" }]]);
+  });
+
+  test("manual guidance preserves the button fallback when the native shortcut needs permission or fails", async () => {
+    const { t, s, ready, frame } = setup();
+    await ready;
+    for (const shortcut of [{ state: "needs_permission" } as const, { state: "unavailable", reason: "listener stopped" } as const]) {
+      t.emitStatus({ type: "status", ...t.state_.status, phase: "running", capture_mode: { automatic: false, selected: true, shortcut } });
+      frame();
+      expect(s.canCapture).toBe(true);
+      expect(s.captureGuidance).toContain("Use Capture or type capture");
+      if (shortcut.state === "needs_permission") expect(s.captureGuidance).toContain("Input Monitoring");
+      else expect(s.captureGuidance).toContain(shortcut.reason);
+    }
+    t.emitStatus({ type: "status", ...t.state_.status, phase: "running", capture_mode: { automatic: false, selected: false, shortcut: { state: "inactive" } } });
+    frame();
+    expect(s.canCapture).toBe(false);
+  });
+
   test("slides keep their badges, capture status arrives whole, and a drop imports its paths", async () => {
     const { t, s, ready, frame } = setup();
     await ready;
     t.emitStatus({ type: "slide", index: 1, file: "slides/slide_01_100251.png", path: "/l/slides/slide_01_100251.png", at: "10:02:51", auto: true, uncertain: false, noted: false });
-    t.emitStatus({ type: "status", ...emptyState("s1").status, phase: "running", capture: { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true } });
+    t.emitStatus({ type: "status", ...emptyState("s1").status, phase: "running", capture: { state: "watching", window: "Zoom Meeting", detail: null, candidates: [], captured: true }, capture_mode: { automatic: true, selected: true, shortcut: { state: "inactive" } } });
     frame();
     expect(s.slides[0].auto).toBe(true);
     expect(s.canCapture).toBe(true);

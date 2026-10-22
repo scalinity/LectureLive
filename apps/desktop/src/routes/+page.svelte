@@ -89,7 +89,7 @@
     <Notes toUrl={(p) => current.assetUrl(p)} />
     <SlidesStrip toUrl={(p) => current.assetUrl(p)} onChoose={() => picker.show(session.capture.state === "asking" ? session.capture.detail : null)} />
   </main>
-  <CommandLine />
+  <CommandLine onChoose={() => picker.show(session.capture.state === "asking" ? session.capture.detail : null)} />
 </div>
 <KeyDialog bind:this={keyDialog} />
 <SpendView bind:this={spendView} />

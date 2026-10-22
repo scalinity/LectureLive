@@ -39,6 +39,8 @@ export type Status = {
   /** The single input that went, while it is away: the fallback offer. */
   input_gone: string | null;
   capture: CaptureView;
+  /** Worker-acknowledged mode, separate from window health and lecture pause. */
+  capture_mode: CaptureMode;
 };
 
 export type NoticeKind = "notes" | "slide" | "page" | "done" | "warn";
@@ -48,6 +50,9 @@ export type Notice = { kind: NoticeKind; label: string; detail: string; at: stri
 /** `at` is when it was first on screen (HH:MM:SS); `auto` when the detector took it; `uncertain` when it was still changing. */
 /** `noted`: a snapshot has used it, so the notes embed its file and it can no longer be removed. */
 export type SlideView = { index: number; file: string; path: string; at: string; auto: boolean; uncertain: boolean; noted: boolean };
+
+export type ManualShortcut = { state: "inactive" } | { state: "ready" } | { state: "needs_permission" } | { state: "unavailable"; reason: string };
+export type CaptureMode = { automatic: boolean; selected: boolean; shortcut: ManualShortcut };
 
 export type CaptureWord = "unbound" | "ready" | "watching" | "paused" | "asking" | "denied" | "failing";
 

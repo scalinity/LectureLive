@@ -160,6 +160,33 @@ fn pause_and_resume_are_stdin_commands_in_plain() {
 }
 
 #[test]
+fn manual_capture_controls_reach_plain_without_pausing_the_lecture() {
+    use rustix::process::{kill_process, Pid, Signal};
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let dir = tmp.path().join("Week 01 — Fixture");
+    let (child, mut stdin) = running_plain(&home, &dir);
+    stdin.write_all(b"AUTO OFF\ncapture\nauto on\ncapture the formula\n").unwrap();
+    let log = dir.join("fixture-commands.log");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while std::fs::read_to_string(&log).map_or(0, |s| s.lines().count()) < 5 {
+        assert!(Instant::now() < deadline, "manual commands never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    kill_process(Pid::from_child(&child), Signal::TERM).unwrap();
+    let (_, stdout, stderr) = ended(child, Duration::from_secs(20));
+    let lines: Vec<_> = std::fs::read_to_string(log).unwrap().lines().map(str::to_string).collect();
+    assert_eq!(&lines[..5], ["snapshot\t", "auto-off", "capture-manual", "auto-on", "snapshot\tcapture the formula"]);
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("Manual capture; audio and transcription continue."), "{stdout}");
+    assert!(stdout.contains("Automatic capture on"), "{stdout}");
+    assert!(stdout.contains("no window is being watched"), "a failed typed capture returns a warning: {stdout}");
+    assert!(!stdout.contains("nothing is recorded or transcribed until you resume"), "capture mode never pauses the lecture");
+    assert!(empty(&home));
+}
+
+#[test]
 fn tui_is_refused_when_stdin_is_a_pipe() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("never");

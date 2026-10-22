@@ -1093,3 +1093,41 @@ Spec: §7.1, §7.2, §8, §9.6, §10. A real class on 6 October 2026 ran the app
 *Not yet run on a live meeting:* the new build (the class above was recorded by the old one); full screen on and off, V04, and a deck paged through quickly. Dark decks are the open question for the scene measures: a dark slide with next to no sharp edges reads as a notice, and the manual capture covers it.
 
 **Next:** run class mode on the new build at the next class (`LECTURELIVE_BIN`), then V04 again; V08 is the person's, with the login password. M8 (Automatic Zoom capture) is unchanged.
+
+## M7.2 — Manual screenshots during live coding
+
+Automatic capture has a separate per-lecture switch, shared by the CLI and app. `auto off` holds
+periodic window sampling while recording and transcription continue; `auto on` resumes detection
+from the current image with no old candidate or paused-interval backlog. The selected region stays
+selected. In manual mode, a solo physical right Option release captures it from any app. Key
+combinations and left Option are unaffected. Capture, Ctrl-S and typed `capture` are alternatives.
+The global listener uses Input Monitoring; window fixtures never request it. Mode status is the
+worker's acknowledgement and is separate from window health and full lecture Pause.
+
+Verification (2026-10-22): `cargo test --workspace -- --test-threads=1` passed 771 tests, with
+33 opt-in checks ignored; the focused capture gate passed 33 tests and the pure shortcut checks
+passed 4. Desktop `npm run check` reported no errors or warnings, all 43 frontend tests passed,
+and the frontend and signed release app built. The release CLI was installed and its checksum
+matched the build. A titleless native WebKit preview verified the new controls in light and dark
+appearances and at 1,000 px, including pause and resume through the compact control row.
+
+Independent source review found and resolved unchecked near-size crops, tentative sizes escaping
+into saved regions, Option-plus-mouse gestures, and an off-screen old window masking its replacement.
+The final independent review found no remaining actionable issue. The requested native Claude
+implementation and review workers were rejected before execution because the provider-reported
+model identity did not match; cross-vendor review remains BLOCKED. Scoped Codex workers completed
+the frontend work and an independent Codex review checked core.
+
+The default parallel workspace run exposed a pre-existing synthetic transcript fixture race in
+`frontend_boundary::every_segment_is_in_the_log_whatever_the_frontend_read`: its source sends
+100 ms audio frames every 2 ms without awaiting connection, can overrun the 50-frame startup hold,
+and disables recovery. The failing diagnostic received 297 of 300 frames, reported the unresolved
+`SttOffline` gap 0..4800 samples, and began at word w1. The relevant fixture and STT source are
+unchanged; the focused test and serial suite pass. No unrelated transcript code was changed.
+
+Native listener startup passed with the shell host's existing Input Monitoring grant. The live
+solo-key check is BLOCKED: computer use rejects modifier-only key input with
+`keyPressIncludedNoNonModifierKeys`, and the external-input test timed out without taps.
+Physical right Option delivery and the packaged app's own permission grant remain unverified.
+The existing app is recording, so its replacement is staged for the one-time installer to apply
+only after that process exits; it is not restarted during the lecture.

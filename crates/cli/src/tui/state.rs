@@ -16,7 +16,7 @@ use std::time::Instant;
 use chrono::{DateTime, Local};
 use lecturelive_core::audio::level::{dbfs, SilenceWatch};
 use lecturelive_core::capture::window::WindowInfo;
-use lecturelive_core::capture::worker::CaptureState;
+use lecturelive_core::capture::worker::{CaptureMode, CaptureState, ManualShortcut};
 use lecturelive_core::session::coordinator::{Notification, SttStatus};
 use lecturelive_core::session::lecture::Event;
 use lecturelive_core::session::segments::{Segment, SegmentSource};
@@ -423,6 +423,8 @@ pub(crate) struct View {
     pub(crate) stt: Option<SttStatus>,
     /// The capture worker's state, as core typed it (Task 11 renders it).
     pub(crate) capture: Option<CaptureState>,
+    /// Mode changes only on the worker's acknowledgement, independently of window health.
+    pub(crate) capture_mode: Option<CaptureMode>,
 
     // Canonical, reconciled state (plan §F): durable ids, canonical files.
     /// Transcript gaps waiting for recovery, by identity; [`View::gaps`] is their count.
@@ -491,6 +493,7 @@ impl View {
             input_gone: None,
             stt: None,
             capture: None,
+            capture_mode: None,
             waiting: BTreeSet::new(),
             resolved: BTreeSet::new(),
             closed: Vec::new(),
@@ -542,6 +545,13 @@ impl View {
             }
             Event::SlidesNoted { through } => self.slides_noted = self.slides_noted.max(*through),
             Event::Capture(s) => self.capture = Some(capture_cleaned(s)),
+            Event::CaptureMode(mode) => {
+                let mut mode = mode.clone();
+                if let ManualShortcut::Unavailable { reason } = &mut mode.shortcut {
+                    *reason = plain::clean(reason);
+                }
+                self.capture_mode = Some(mode);
+            }
             // Nothing is recorded while paused, so nothing is silent; the watch starts afresh on the resume.
             Event::Paused(p) => {
                 self.paused = *p;
