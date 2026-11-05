@@ -16,6 +16,9 @@ const MOTION: f32 = 0.0004;
 /// Samples averaged for the motion; fewer than this are taken as moving, so a camera is never taken for a page
 /// while it is still being looked at for the first time.
 const LOOKS: usize = 3;
+/// One sample's mean change at a cut to another picture. Measured on a classroom camera (M7.6): its frames minutes
+/// apart, people moving, differed by 0.001–0.057; a cut from a slide to it, or between slides, by 0.16–0.50.
+const CUT: f32 = 0.08;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Features {
@@ -116,6 +119,9 @@ pub fn photographic(f: &Features) -> bool {
 pub struct Gate {
     before: Option<GrayImage>,
     deltas: VecDeque<f32>,
+    /// A camera seen moving: it stays a camera while the picture stays photographic, so a room that holds still
+    /// between someone's movements is not taken for a slide each time it does (M7.6 class: 22 captures).
+    camera: bool,
 }
 
 fn mean_abs_diff(a: &GrayImage, b: &GrayImage) -> f32 {
@@ -128,18 +134,22 @@ impl Gate {
     }
 
     pub fn look(&mut self, g: &GrayImage) -> Scene {
-        match self.before.as_ref().filter(|b| b.dimensions() == g.dimensions()) {
-            Some(b) => {
-                self.deltas.push_back(mean_abs_diff(b, g));
+        match self.before.as_ref().filter(|b| b.dimensions() == g.dimensions()).map(|b| mean_abs_diff(b, g)) {
+            // Another picture entirely: its motion is measured afresh, as a first look's is.
+            Some(d) if d < CUT => {
+                self.deltas.push_back(d);
                 while self.deltas.len() > LOOKS {
                     self.deltas.pop_front();
                 }
             }
-            None => self.deltas.clear(),
+            _ => self.deltas.clear(),
         }
         self.before = Some(g.clone());
-        let moving = self.deltas.len() < LOOKS || self.deltas.iter().sum::<f32>() / LOOKS as f32 >= MOTION;
-        classify(&features(g), moving)
+        let measured = self.deltas.len() == LOOKS && self.deltas.iter().sum::<f32>() / LOOKS as f32 >= MOTION;
+        let moving = self.deltas.len() < LOOKS || measured;
+        let f = features(g);
+        self.camera = photographic(&f) && (self.camera && !self.deltas.is_empty() || measured);
+        if self.camera { Scene::Camera } else { classify(&f, moving) }
     }
 }
 
@@ -226,6 +236,27 @@ mod tests {
         let mut gate = Gate::new();
         let seen: Vec<Scene> = (0..6).map(|k| gate.look(&camera(k))).collect();
         assert!(seen.iter().all(|s| *s == Scene::Camera), "{seen:?}");
+    }
+
+    #[test]
+    fn a_camera_that_holds_still_after_moving_stays_a_camera_until_a_page_or_a_cut() {
+        let mut gate = Gate::new();
+        for k in 0..4 {
+            assert_eq!(gate.look(&camera(k)), Scene::Camera);
+        }
+        let still = camera(9);
+        assert!((0..8).all(|_| gate.look(&still) == Scene::Camera), "a room holding still between movements");
+        assert_eq!(gate.look(&page()), Scene::Slide, "the share is back");
+        assert_eq!(gate.look(&still), Scene::Camera, "first looks are not known to be still");
+        let mut gate = Gate::new();
+        for k in 0..4 {
+            gate.look(&camera(k));
+        }
+        // A cut to a still photograph on a slide: another picture entirely.
+        let photo = GrayImage::from_fn(W, H, |x, y| Luma([(230 - x * 120 / W - y * 60 / H + (x * 7 + y * 13) % 21) as u8]));
+        assert!(photographic(&features(&photo)));
+        let seen: Vec<Scene> = (0..6).map(|_| gate.look(&photo)).collect();
+        assert_eq!(seen[5], Scene::Slide, "{seen:?}");
     }
 
     #[test]
