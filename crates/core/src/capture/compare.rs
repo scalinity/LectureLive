@@ -274,7 +274,7 @@ pub fn order(r: &Relation) -> Order {
 }
 
 /// Share of the frame whose level differs by more than ink does.
-fn changed(a: &Look, b: &Look) -> f32 {
+pub fn changed(a: &Look, b: &Look) -> f32 {
     a.gray.as_raw().iter().zip(b.gray.as_raw()).filter(|(x, y)| x.abs_diff(**y) as i16 > INK).count() as f32 / (W * H) as f32
 }
 

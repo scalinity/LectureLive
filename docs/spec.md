@@ -805,8 +805,13 @@ hand, 131 of 236 captures were discarded for these reasons. Each is told from th
   Another slide, a new title, text a panel covers and a flat frame are not.
 - **Photographs.** A photograph's detail (§7.2's measures) is not ink. A photograph is the same only as a picture
   matching it pixel for pixel (at most 0.25 % of pixels changed by more than 32 levels), and is never an earlier state.
-- **Camera.** A camera is a run of two or more photographic captures in a row, each the same view as the one before
-  (fewer than 30 % of pixels changed). A single photographic capture between slides is a slide with a photograph on it.
+- **Camera.** A camera is a run of three or more photographic captures in a row, each the same view as the one before
+  (fewer than 30 % of pixels changed), in which little moves: the typical change between neighbours is at most 2 % of the
+  frame (a classroom camera's captures changed by 0.2–13 %, typically 0.5 %). These stay:
+  - a photographic capture between slides, which is a slide with a photograph on it;
+  - two in a row;
+  - a series of photographs that change throughout;
+  - copies of one photograph, which are one slide shown again: the same-picture pass keeps one.
 
 The judge settles camera runs first. Then come groups of the same picture, each keeping its first showing or a capture
 that must stay. Then come earlier states, from the most ink down, each judged against a capture kept within 10 minutes,

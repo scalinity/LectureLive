@@ -20,6 +20,11 @@ use crate::session::slides::{self, REMOVED_DIR};
 
 /// An earlier state is looked for among captures this close in time: a build is revealed over a few minutes.
 const BUILD_MINUTES: i64 = 10;
+/// A camera is a run of at least this many photographs of one view...
+const CAMERA_RUN: usize = 3;
+/// ...in which little moves: the typical change from one to the next is at most this share of the frame. A classroom
+/// camera's captures changed by 0.2–13 %, typically 0.5 % (M7.6 class); slides of different photographs change throughout.
+const CAMERA_STILL: f32 = 0.02;
 
 /// Why a capture is not needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +105,9 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
     let look = |i: usize| caps[i].look.as_deref();
     let mut why: Vec<Option<Redundant>> = vec![None; n];
 
-    // A camera: a run of photographs of one view. A single photograph between slides is a slide that has one.
+    // A camera: a run of photographs of one fixed view in which someone moves. A photograph between slides is a slide
+    // that has one, copies of one photograph are one slide shown again (the same-picture pass keeps one), and a series
+    // of different photographs changes throughout.
     let photo = |i: usize| look(i).is_some_and(Look::photographic);
     let mut in_run = vec![false; n];
     let mut i = 0;
@@ -110,7 +117,11 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
             while j < n && photo(j) && compare::same_view(look(j - 1).unwrap(), look(j).unwrap()) {
                 j += 1;
             }
-            if j - i >= 2 {
+            let identical = (i + 1..j).all(|k| compare::order_photographs(look(i).unwrap(), look(k).unwrap()) == Order::Same);
+            let mut steps: Vec<f32> = (i + 1..j).map(|k| compare::changed(look(k - 1).unwrap(), look(k).unwrap())).collect();
+            steps.sort_by(f32::total_cmp);
+            let fixed = steps.get(steps.len() / 2).is_some_and(|&c| c <= CAMERA_STILL);
+            if j - i >= CAMERA_RUN && !identical && fixed {
                 for k in i..j {
                     in_run[k] = true;
                     if caps[k].candidate {
@@ -455,8 +466,14 @@ mod tests {
         judge(caps, &mut Relations::default()).into_iter().map(|v| (v.index, v.why)).collect()
     }
 
+    /// A fixed camera's view with someone standing in a different place.
     fn room(shift: u32) -> GrayImage {
-        GrayImage::from_fn(W, H, |x, y| Luma([(60 + x * 90 / W + y * 70 / H + (x * 7 + y * 13) % 11 + if (100..130).contains(&x) && y > 40 { shift } else { 0 }).min(255) as u8]))
+        GrayImage::from_fn(W, H, |x, y| Luma([(60 + x * 90 / W + y * 70 / H + (x * 7 + y * 13) % 11 + if (100..110).contains(&x) && (60..90).contains(&y) { shift } else { 0 }).min(255) as u8]))
+    }
+
+    /// Different photographs of one kind: alike overall, different throughout.
+    fn scan(k: u32) -> GrayImage {
+        GrayImage::from_fn(W, H, |x, y| Luma([(60 + x * 90 / W + y * 70 / H + (x * (7 + 2 * k) + y * 13) % 41) as u8]))
     }
 
     mod sweeps {
@@ -610,6 +627,18 @@ mod tests {
     fn a_camera_run_goes_and_a_lone_photograph_between_slides_stays() {
         let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, room(0)), cap(3, 2, slide(3, 3)), cap(4, 50, room(0)), cap(5, 51, room(40)), cap(6, 52, room(10))];
         assert_eq!(judged(&caps), [(4, Redundant::Camera), (5, Redundant::Camera), (6, Redundant::Camera)]);
+    }
+
+    #[test]
+    fn copies_of_one_photograph_keep_one_and_a_series_of_photographs_stays() {
+        // F003: a photograph slide taken again is one slide, not a camera.
+        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, room(0)), cap(3, 30, room(0))];
+        assert_eq!(judged(&caps), [(3, Redundant::SameAs(2))]);
+        let two = [cap(1, 0, room(0)), cap(2, 1, room(40))];
+        assert!(judged(&two).is_empty(), "two photographs are not enough to call a camera");
+        let series = [cap(1, 0, scan(0)), cap(2, 1, scan(1)), cap(3, 2, scan(2)), cap(4, 3, scan(3))];
+        assert!(series.iter().all(|c| c.look.as_ref().unwrap().photographic()));
+        assert!(judged(&series).is_empty(), "photographs that change throughout are slides");
     }
 
     #[test]
