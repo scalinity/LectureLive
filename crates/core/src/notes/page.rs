@@ -231,6 +231,13 @@ pub fn slide_uri(path: &Path) -> Option<String> {
     Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data)))
 }
 
+/// The parts spec §6.4 promises that the page typeset into this cache lacks, whatever notes and prompt it was made from;
+/// None when there is no readable cache.
+pub fn cached_parts_missing(path: &Path) -> Option<Vec<&'static str>> {
+    let v: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some(Fills::from_json(&v["fills"])?.missing())
+}
+
 pub fn load_cache(path: &Path, key: &str) -> Option<(Fills, usize)> {
     let v: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     if v["source"].as_str() != Some(key) {

@@ -126,8 +126,8 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String]) -> Result<()> {
             }
         }
         let page = lecturelive_core::notes::page::page_path(&files.notes, &name);
-        if !(page.exists() && tidy::holds_notes(&page, &files.notes)) {
-            println!("  no finished study page yet: its captures and recordings stay until a polish makes one");
+        if let Err(why) = tidy::finished(&files, &page) {
+            println!("  the study page is not finished ({why}): its captures and recordings stay until a complete page is made");
         } else if notes_changed {
             println!("  the notes changed, so {} is stale: `lecture page` typesets it again, then clears what it replaces", page.file_name().unwrap_or_default().to_string_lossy());
         } else if apply {
