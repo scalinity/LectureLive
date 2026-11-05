@@ -799,17 +799,13 @@ hand, 131 of 236 captures were discarded for these reasons. Each is told from th
 
   PowerPoint's slideshow toolbar corner (the bottom-left 17 % × 6 %) counts in neither picture.
 - **Zoom's control bar.** Where the region takes in Zoom's controls, a slide that changed while the pointer was over the
-  window is captured with the bar over its bottom. A band that looks like the bar is found from the bottom up: one dark
-  level (at most 40), 5–22 of the 144 rows, with marks in it, over a slide of another level. A slide's own dark footer
-  can look the same, so the band counts as Zoom's bar only once the lecture shows the same band (differing in at most
-  3 % of its pixels) over different slides, as Zoom draws one bar over whatever is shared. A footer that says different
-  things on different slides, and a banner a build reveals over one slide, stay content.
-  - A capture's own confirmed bar is not ink.
-  - What a capture shows under the other's bar counts as lost, since the bar hides it.
-  - So a barred twin is an earlier state of its clean capture and goes, while a capture whose rows a bar covers in the
-    finished slide stays unless the hidden part is within the 0.25 %.
-  - Of copies of one picture, one without the bar stays.
-  - Without the confirmation, both twins stay.
+  window is captured with the bar over its bottom. From saved pictures the bar cannot be told reliably from a slide's own
+  dark footer: a band of one dark level (at most 40), 5–22 of the 144 rows, with marks in it, over a slide of another
+  level, looks like either. So such a band's content is never skipped; it counts as the slide's.
+  - When the more complete of two captures adds nothing above such a band, all it adds is the band (the bar's icons, or a
+    footer). The other is then no earlier state of it, and both stay.
+  - Of copies of one picture, one without such a band stays.
+  - A barred twin and its clean capture therefore both stay, for the person to remove.
 - **Earlier state.** A is an earlier state of B when B holds all of A's ink but at most 0.25 % of the frame, and A holds
   less of B's.
 - **Same picture.** Each holds the other's ink to within 0.25 %, and neither has 0.05 % more.

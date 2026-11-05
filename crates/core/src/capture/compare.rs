@@ -43,8 +43,7 @@ pub struct Look {
     /// Tiles with any edge in them: a flat fill shows nothing, whatever its level.
     busy: [bool; TILES],
     /// The first row of a band that looks like Zoom's control bar. Only a look: a slide's own dark footer can look the
-    /// same, so the band is Zoom's only once the lecture shows it over different slides (`same_band`), and comparisons
-    /// take it into account only when told so (`relate_with`).
+    /// same, so the band's content is never skipped; it only keeps a pair whose difference lies all in it (`adds_above_band`).
     pub bar: Option<u32>,
     tiles: [f32; TILES],
     /// Pixels of ink, outside the toolbar's corner.
@@ -188,19 +187,16 @@ fn zoom_bar(g: &GrayImage) -> Option<u32> {
 /// same level there, or, as a fade does, ink of its own (against its own page) in the same direction and at least as strong.
 /// Showing something matters: a flat dark frame has dark text's level everywhere, and white text on a dark divider is
 /// "lighter" than its page as every pixel of a white slide is; neither shows the text.
-fn uncovered(a: &Look, a_bar: Option<u32>, b: &Look, b_bar: Option<u32>) -> u32 {
+fn uncovered(a: &Look, b: &Look, rows: u32) -> u32 {
     let mut n = 0;
-    each_uncovered(a, a_bar, b, b_bar, |_| n += 1);
+    each_uncovered(a, b, rows, |_| n += 1);
     n
 }
 
-/// `a_bar` and `b_bar` are where Zoom's bar starts in each picture, when the lecture shows it to be the bar.
-fn each_uncovered(a: &Look, a_bar: Option<u32>, b: &Look, b_bar: Option<u32>, mut hit: impl FnMut(usize)) {
+/// Over the first `rows` rows.
+fn each_uncovered(a: &Look, b: &Look, rows: u32, mut hit: impl FnMut(usize)) {
     let (pa, pb) = (a.gray.as_raw(), b.gray.as_raw());
-    // `a`'s own bar is not the slide, so its icons are never ink to hold. `b`'s bar holds nothing: what `a` shows under
-    // it, `b` hides.
-    let below = a_bar.unwrap_or(H);
-    for y in 0..below {
+    for y in 0..rows.min(H) {
         for x in 0..W {
             if toolbar(x, y) {
                 continue;
@@ -208,10 +204,6 @@ fn each_uncovered(a: &Look, a_bar: Option<u32>, b: &Look, b_bar: Option<u32>, mu
             let (i, t) = ((y * W + x) as usize, tile_of(x, y));
             let ia = a.ink_at(x, y);
             if ia == 0 {
-                continue;
-            }
-            if b_bar.is_some_and(|top| y >= top) {
-                hit(i);
                 continue;
             }
             // Holding needs an edge right there: a fill at the ink's own level, a box laid over strokes, shows none of it.
@@ -253,51 +245,26 @@ pub fn map(a: &Look, b: &Look) -> String {
 
 fn marks(a: &Look, b: &Look) -> Vec<bool> {
     let mut m = vec![false; (W * H) as usize];
-    each_uncovered(a, None, b, None, |i| m[i] = true);
+    each_uncovered(a, b, H, |i| m[i] = true);
     m
 }
 
-/// What `b` is to `a`, every pixel being the slide's.
+/// What `b` is to `a`, every pixel being the slide's, a band that looks like Zoom's bar included.
 pub fn relate(a: &Look, b: &Look) -> Relation {
-    relate_with(a, None, b, None)
-}
-
-/// What `b` is to `a`, given where Zoom's bar is drawn over each, when the lecture shows it to be the bar.
-pub fn relate_with(a: &Look, a_bar: Option<u32>, b: &Look, b_bar: Option<u32>) -> Relation {
     let px = (W * H) as f32;
-    Relation { lost: uncovered(a, a_bar, b, b_bar) as f32 / px, added: uncovered(b, b_bar, a, a_bar) as f32 / px }
+    Relation { lost: uncovered(a, b, H) as f32 / px, added: uncovered(b, a, H) as f32 / px }
 }
 
-/// Whether two pictures carry the same bottom band, the way Zoom draws one bar over whatever is shared: it starts at the
-/// same row in both and differs in at most 3 % of its pixels (a participant count, a chat badge).
-pub fn same_band(a: &Look, b: &Look) -> bool {
-    let (Some(ta), Some(tb)) = (a.bar, b.bar) else { return false };
-    if ta.abs_diff(tb) > 1 {
-        return false;
-    }
-    let from = (ta.max(tb) * W) as usize;
-    let band = &a.gray.as_raw()[from..];
-    let differ = band.iter().zip(&b.gray.as_raw()[from..]).filter(|(x, y)| x.abs_diff(**y) as i16 > INK).count();
-    differ as f32 <= 0.03 * band.len() as f32
-}
-
-/// Whether two pictures show the same thing above their bands: at most 1 % of those pixels differ.
-pub fn same_above(a: &Look, b: &Look) -> bool {
-    let to = (a.bar.into_iter().chain(b.bar).min().unwrap_or(H) * W) as usize;
-    let differ = a.gray.as_raw()[..to].iter().zip(&b.gray.as_raw()[..to]).filter(|(x, y)| x.abs_diff(**y) as i16 > INK).count();
-    differ as f32 <= 0.01 * to.max(1) as f32
+/// Share of the frame where `b` has ink above its band that looks like Zoom's bar and `a` does not hold it: what `b` adds
+/// besides that band. When it is next to nothing, all `b` adds is the band, Zoom's icons or a slide's own footer alike,
+/// and `a` is not taken for an earlier state of it.
+pub fn adds_above_band(a: &Look, b: &Look) -> f32 {
+    uncovered(b, a, b.bar.unwrap_or(H)) as f32 / (W * H) as f32
 }
 
 /// Whether the two can be the same picture at all: a cheap look at the tile means before `relate`.
 pub fn near(a: &Look, b: &Look) -> bool {
-    near_with(a, None, b, None)
-}
-
-/// `near`, leaving out the tiles that reach into Zoom's bar in either picture.
-pub fn near_with(a: &Look, a_bar: Option<u32>, b: &Look, b_bar: Option<u32>) -> bool {
-    let below = a_bar.into_iter().chain(b_bar).min().unwrap_or(H);
-    let rows = (below / TILE) as usize * (W / TILE) as usize;
-    rows > 0 && a.tiles[..rows].iter().zip(&b.tiles[..rows]).map(|(x, y)| (x - y).abs()).sum::<f32>() / rows as f32 <= NEAR
+    a.tiles.iter().zip(&b.tiles).map(|(x, y)| (x - y).abs()).sum::<f32>() / TILES as f32 <= NEAR
 }
 
 pub fn order(r: &Relation) -> Order {
@@ -368,11 +335,7 @@ pub(crate) mod tests {
         order(&relate(&Look::of(a.clone()), &Look::of(b.clone())))
     }
 
-    /// `rel`, with each picture's bar taken to be Zoom's, as the lecture would show it.
-    fn rel_barred(a: &GrayImage, b: &GrayImage) -> Order {
-        let (la, lb) = (Look::of(a.clone()), Look::of(b.clone()));
-        order(&relate_with(&la, la.bar, &lb, lb.bar))
-    }
+
 
     #[test]
     fn each_step_of_a_build_is_an_earlier_state_of_the_next_and_of_the_last() {
@@ -442,10 +405,10 @@ pub(crate) mod tests {
         bar(&mut s, 136, 20, 90, 3, 90); // the slide's own footer, under where the bar comes
         let barred = with_bar(&s);
         assert!(Look::of(barred.clone()).bar.is_some() && Look::of(s.clone()).bar.is_none());
-        assert_eq!(rel_barred(&barred, &s), Order::Earlier, "the clean capture holds the barred one, footer and all");
+        assert_eq!(rel(&s, &barred), Order::Apart, "the band is content: it covers the footer and adds its own");
+        assert!(adds_above_band(&Look::of(s.clone()), &Look::of(barred.clone())) <= NOISE, "and adds nothing above itself");
         let blank_bottom = slide(0, 3);
-        assert_eq!(rel_barred(&blank_bottom, &with_bar(&blank_bottom)), Order::Same, "with nothing under it, the bar hides nothing");
-        assert_eq!(rel(&s, &barred), Order::Apart, "taken as slide content, the band covers the footer and adds its own");
+        assert!(adds_above_band(&Look::of(blank_bottom.clone()), &Look::of(with_bar(&blank_bottom))) <= NOISE);
         let dark = GrayImage::from_fn(W, H, |x, y| Luma([if (40..48).contains(&y) && x > 20 && x < 200 { 230 } else { 34 }]));
         assert!(Look::of(with_bar(&dark)).bar.is_some(), "over a dark slide too");
         let black = GrayImage::from_fn(W, H, |x, y| Luma([if (40..48).contains(&y) && x > 20 && x < 200 { 230 } else if y >= 130 && x % 40 < 5 { 200 } else { 22 }]));
@@ -461,7 +424,7 @@ pub(crate) mod tests {
         bar(&mut earlier, 134, 30, 160, 5, 40);
         let mut later = earlier.clone();
         bar(&mut later, 76, 26, 200, 5, 50);
-        assert_eq!(rel_barred(&earlier, &with_bar(&later)), Order::Apart);
+        assert_eq!(rel(&earlier, &with_bar(&later)), Order::Apart);
         assert_eq!(rel(&earlier, &later), Order::Earlier, "without the bar it is an earlier state");
     }
 
