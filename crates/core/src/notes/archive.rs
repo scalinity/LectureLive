@@ -78,6 +78,17 @@ fn parts(html: &str) -> Result<(Manifest, BTreeMap<String, String>)> {
 
 pub fn manifest_json(manifest: &Manifest) -> Result<String> { Ok(serde_json::to_string(manifest)?.replace("</", "<\\/")) }
 
+/// The page with what it records of itself (spec §7.6): whether it was typeset with every part §6.4 promises. Written in
+/// the same atomic write as the page, so it describes the page on disk and not a cache saved before it.
+pub fn with_status(html: &str, complete: bool) -> Result<String> {
+    with_script(html, "page-status", &serde_json::json!({ "complete": complete }).to_string())
+}
+
+/// Whether the page records that it is complete; None when it records nothing, as pages typeset before M7.6 do.
+pub fn complete(html: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(&script(html, "page-status")?).ok()?["complete"].as_bool()
+}
+
 pub fn with_manifest(html: &str, manifest: &Manifest) -> Result<String> {
     with_script(html, "capture-files", &manifest_json(manifest)?)
 }

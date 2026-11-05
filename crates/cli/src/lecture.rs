@@ -144,6 +144,15 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -
             }
         }
         let page = lecturelive_core::notes::page::page_path(&files.notes, &name);
+        // A page from before pages recorded their completeness is rendered again from its own saved parts, with no
+        // request, so what it records describes it.
+        if apply && !notes_changed && page.exists() && tidy::finished(&files, &page).is_err_and(|why| why.contains("does not record")) {
+            let course = course_from_path(dir).unwrap_or_else(|| "Lecture".into());
+            if let Some(done) = lecturelive_core::notes::page::rerender_saved(&files.page_cache(), &course, &files.notes, &name) {
+                done?;
+                println!("  {} rendered again from its saved parts, with no request", page.file_name().unwrap_or_default().to_string_lossy());
+            }
+        }
         if let Err(why) = tidy::finished(&files, &page) {
             println!("  the study page is not finished ({why}): its captures and recordings stay until a complete page is made");
         } else if notes_changed {

@@ -856,9 +856,11 @@ the CLI say why ("Slide 199 removed: an earlier state of slide 200"). The sweep 
 `lecture tidy` makes no request and needs no key. It reports each day's redundant captures and their size, kept
 captures that are an earlier state of one taken out by hand, and what a finished page would let go.
 
-- A page counts as finished when its saved parts (`.live_notes/<stem>.page.json`) are all there, the same rule as after
-  a polish, and it holds every slide the notes embed. A page typeset before a part was asked for is not finished, and
-  keeps its files until it is typeset again.
+- A page counts as finished when the page itself records that it was typeset with every part, the same rule as after a
+  polish, and it holds every slide the notes embed. The record is a `page-status` script written in the page's own
+  atomic write, so it describes the page on disk and not the cache saved before it. A page from before pages recorded
+  this is first rendered again from its saved parts (no request). A page typeset before a part was asked for then
+  records itself incomplete, and keeps its files until it is typeset again.
 - `--apply` does it.
 - `--swap A=B` puts slide B, taken out by hand, back in place of slide A, an earlier state of it, with B's embed taking
   A's place in the notes.

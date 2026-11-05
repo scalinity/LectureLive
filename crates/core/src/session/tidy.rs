@@ -457,19 +457,16 @@ pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, li
     Ok(out)
 }
 
-/// Whether a study page already on disk is finished, so `lecture tidy` may let go of what it replaces (spec §7.6):
-/// typeset with every part §6.4 promises, the same rule as after a polish, and holding every slide the notes embed. Says
-/// why not otherwise.
+/// Whether a study page already on disk is finished, so `lecture tidy` may let go of what it replaces (spec §7.6): the
+/// page records, in the HTML itself, that it was typeset with every part §6.4 promises (the same rule as after a
+/// polish), and it holds every slide the notes embed. Says why not otherwise.
 pub fn finished(files: &LectureFiles, page: &Path) -> Result<(), String> {
-    if !page.exists() {
-        return Err("no study page yet".into());
+    let (Ok(html), Ok(doc)) = (std::fs::read_to_string(page), std::fs::read_to_string(&files.notes)) else { return Err("no study page yet".into()) };
+    match crate::notes::archive::complete(&html) {
+        None => return Err("it does not record whether it is complete".into()),
+        Some(false) => return Err("it lacks parts a study page has".into()),
+        Some(true) => {}
     }
-    match crate::notes::page::cached_parts_missing(&files.page_cache()) {
-        None => return Err("its typeset parts are not saved, so whether it is complete is not known".into()),
-        Some(missing) if !missing.is_empty() => return Err(format!("it lacks {}", missing.join(", "))),
-        Some(_) => {}
-    }
-    let (Ok(html), Ok(doc)) = (std::fs::read_to_string(page), std::fs::read_to_string(&files.notes)) else { return Err("it or the notes cannot be read".into()) };
     let Some(gallery) = crate::notes::archive::script(&html, "slides").and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok()) else { return Err("it has no slide gallery".into()) };
     let held = crate::notes::embeds::embeds_in(&doc).iter().filter_map(|e| e.strip_prefix("![Slide ")?.split(']').next().map(str::to_string)).all(|n| gallery.get(&n).is_some_and(|u| u.starts_with("data:image/")));
     if held { Ok(()) } else { Err("it lacks slides the notes embed".into()) }
@@ -509,24 +506,27 @@ mod tests {
         use super::super::*;
 
         #[test]
-        fn only_a_complete_page_holding_the_notes_slides_is_finished() {
-            // F004: a page lacking a part, or one whose parts are unknown, lets nothing go.
+        fn only_a_page_recording_it_is_complete_and_holding_the_notes_slides_is_finished() {
+            // F004: what the saved HTML records, not a cache that may be newer than it.
             let dir = tempfile::tempdir().unwrap();
             let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap());
             std::fs::create_dir_all(files.state_dir()).unwrap();
             std::fs::write(&files.notes, "# T\n\nNo slides.\n").unwrap();
             let page = dir.path().join("Page.html");
-            std::fs::write(&page, "<script type=\"application/json\" id=\"slides\">{}</script>").unwrap();
-            assert!(finished(&files, &page).unwrap_err().contains("not saved"), "no saved parts, even with no slides to hold");
-            let parts = |content: &str| serde_json::json!({"source": "k", "fills": {"keystone": "k", "summary": "s", "content": content, "slides": "{}"}, "words": 1, "budget": 1}).to_string();
-            std::fs::write(files.page_cache(), parts("<section class=\"part\">x</section>")).unwrap();
-            assert!(finished(&files, &page).unwrap_err().contains("lacks"), "parts missing");
+            let html = |status: &str| format!("<html><body><script type=\"application/json\" id=\"slides\">{{}}</script>{status}</body></html>");
+            std::fs::write(&page, html("")).unwrap();
+            // A complete cache beside it changes nothing: the page itself says nothing.
             let all = ["widget", "eli5", "everyday", "glossary", "takeaways", "quiz"].iter().map(|c| format!("<p class=\"{c}\"></p>")).collect::<String>();
-            std::fs::write(files.page_cache(), parts(&format!("<section class=\"part\">{all}</section>"))).unwrap();
+            std::fs::write(files.page_cache(), serde_json::json!({"source": "k", "fills": {"keystone": "k", "summary": "s", "content": format!("<section class=\"part\">{all}</section>"), "slides": "{}"}, "words": 1, "budget": 1}).to_string()).unwrap();
+            assert!(finished(&files, &page).unwrap_err().contains("does not record"), "even with no slides to hold");
+            std::fs::write(&page, crate::notes::archive::with_status(&html(""), false).unwrap()).unwrap();
+            assert!(finished(&files, &page).unwrap_err().contains("lacks parts"));
+            std::fs::write(&page, crate::notes::archive::with_status(&html(""), true).unwrap()).unwrap();
             assert_eq!(finished(&files, &page), Ok(()));
             std::fs::write(&files.notes, "# T\n\n![Slide 3](slides/slide_03_100000.png)\n").unwrap();
             assert!(finished(&files, &page).unwrap_err().contains("slides the notes embed"));
         }
+
         use crate::capture::compare::tests::slide;
         use crate::session::slides::{register, undo_remove, SlideMeta};
         use chrono::TimeZone;

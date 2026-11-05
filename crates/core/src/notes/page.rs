@@ -231,11 +231,12 @@ pub fn slide_uri(path: &Path) -> Option<String> {
     Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data)))
 }
 
-/// The parts spec §6.4 promises that the page typeset into this cache lacks, whatever notes and prompt it was made from;
-/// None when there is no readable cache.
-pub fn cached_parts_missing(path: &Path) -> Option<Vec<&'static str>> {
-    let v: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    Some(Fills::from_json(&v["fills"])?.missing())
+/// Renders the page again from the parts last typeset into `cache`, whatever notes and prompt they were made from, with
+/// no request: the page's content stays as it was typeset, under the current template. None when there is no readable
+/// cache.
+pub fn rerender_saved(cache: &Path, course: &str, notes: &Path, lecture_name: &str) -> Option<Result<PathBuf>> {
+    let v: Value = serde_json::from_slice(&std::fs::read(cache).ok()?).ok()?;
+    Some(render(&Fills::from_json(&v["fills"])?, course, notes, lecture_name, TEMPLATE))
 }
 
 pub fn load_cache(path: &Path, key: &str) -> Option<(Fills, usize)> {
@@ -316,7 +317,7 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         ("date", date),
     ]
     .into();
-    let html = archive::with_manifest(&fill(template, &values), &manifest)?;
+    let html = archive::with_status(&archive::with_manifest(&fill(template, &values), &manifest)?, fills.missing().is_empty())?;
     write_atomic(&path, html.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
