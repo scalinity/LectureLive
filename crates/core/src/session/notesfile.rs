@@ -197,19 +197,21 @@ pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on:
     Ok(backup)
 }
 
-/// How the notes refer to one slide's file (spec §7.7): every link or image destination that resolves to it (decoded,
-/// from the notes' folder, `.` and `..` resolved), every mention of its file name, and own-line copies of its embed
-/// outside code. A slide may leave the lecture only when nothing refers to it, or when its one reference is that embed.
+/// How the notes refer to one slide's file (spec §7.7). Links can be written in more ways than are worth parsing
+/// (inline, by reference, in HTML with or without quotes, encoded, with a fragment or a query, through `./`), and every
+/// one that names the file contains its name: so the notes are decoded (percent escapes until none are left, and HTML
+/// character references) and the file's stem is counted wherever it stands. A count too high only keeps a slide. A slide
+/// may leave the lecture only when it is not named at all, or named once, by its own embed on a line of its own outside
+/// code.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct References {
-    pub destinations: usize,
-    pub names: usize,
+    /// Where the decoded notes name the file's stem.
+    pub mentions: usize,
+    /// Own-line copies of its embed outside code.
     pub own_line_embeds: usize,
 }
 
-static DESTINATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)|(?i:src|href)\s*=\s*["']([^"']+)["']"#).expect("a valid pattern"));
-
-fn decoded(text: &str) -> String {
+fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -228,33 +230,29 @@ fn decoded(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A path with `.` and `..` taken out, without touching the disk.
-fn plain(path: &std::path::Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
+static CHARACTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").expect("a valid pattern"));
+
+/// The notes as a reader of their links sees them: HTML character references and percent escapes undone, again and
+/// again until nothing changes (a name escaped twice is still a name).
+fn decoded_notes(doc: &str) -> String {
+    let mut text = doc.to_string();
+    for _ in 0..4 {
+        let entities = CHARACTER.replace_all(&text, |c: &regex::Captures| {
+            let n = c.get(1).map_or_else(|| c[2].parse::<u32>().ok(), |h| u32::from_str_radix(h.as_str(), 16).ok());
+            n.and_then(char::from_u32).map_or(c[0].to_string(), |ch| ch.to_string())
+        });
+        let next = percent_decoded(&entities.replace("&amp;", "&"));
+        if next == text {
+            break;
         }
+        text = next;
     }
-    out
+    text
 }
 
-pub fn references(doc: &str, notes_dir: &std::path::Path, file: &std::path::Path, embed: &str) -> References {
-    let target = plain(file);
-    let destinations = DESTINATION
-        .captures_iter(doc)
-        .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| decoded(m.as_str())))
-        .filter(|d| {
-            let d = d.strip_prefix("file://").unwrap_or(d);
-            plain(&notes_dir.join(d)) == target
-        })
-        .count();
-    let names = file.file_name().map_or(0, |n| doc.matches(&*n.to_string_lossy()).count());
+pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References {
+    let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mentions = if stem.is_empty() { 1 } else { decoded_notes(doc).matches(stem.as_str()).count() };
     let mut fenced = false;
     let mut own_line_embeds = 0;
     for line in doc.lines() {
@@ -265,7 +263,7 @@ pub fn references(doc: &str, notes_dir: &std::path::Path, file: &std::path::Path
             own_line_embeds += 1;
         }
     }
-    References { destinations, names, own_line_embeds }
+    References { mentions, own_line_embeds }
 }
 
 /// Takes slides' embeds out of the notes, or puts another slide's embed in one's place (spec §7.7): each change is
@@ -388,17 +386,27 @@ mod tests {
     }
 
     #[test]
-    fn references_are_counted_by_where_they_lead_however_they_are_written() {
-        let dir = std::path::Path::new("/lec");
-        let file = dir.join("slides/slide_04_100000.png");
+    fn a_slide_is_referred_to_wherever_its_name_stands_however_the_link_is_written() {
+        // F013, F015, F016: inline, by reference, unquoted, encoded once or twice, with a fragment or a query.
+        let file = std::path::Path::new("/lec/slides/slide_04_100000.png");
         let embed = "![Slide 4](slides/slide_04_100000.png)";
-        let refs = |doc: &str| references(doc, dir, &file, embed);
-        assert_eq!(refs("# T\n"), References::default());
-        assert_eq!(refs(&format!("# T\n\n{embed}\n")), References { destinations: 1, names: 1, own_line_embeds: 1 });
-        assert_eq!(refs("![detail](slides/%73lide_04_100000.png)").destinations, 1, "decoded");
-        assert_eq!(refs(&format!("{embed}\n\nSee [detail](slides/./slide_04_100000.png).")).destinations, 2, "resolved");
-        assert_eq!(refs("<img src=\"slides/../slides/slide_04_100000.png\">").destinations, 1);
-        assert_eq!(refs("![x](slides/slide_05_100000.png)"), References::default());
+        let mentions = |doc: &str| references(doc, file, embed).mentions;
+        assert_eq!(references("# T\n", file, embed), References::default());
+        assert_eq!(references(&format!("# T\n\n{embed}\n"), file, embed), References { mentions: 1, own_line_embeds: 1 });
+        for doc in [
+            "![detail](slides/%73lide_04_100000.png)",
+            "![detail][s]\n\n[s]: slides/%73lide_04_100000.png",
+            "<img src=slides/%73lide_04_100000.png>",
+            "![d](slides/removed/%73lide_04_100000.png#detail)",
+            "![d](slides/%73lide_04_100000.png?v=2)",
+            "![d](slides/%2573lide_04_100000.png)",
+            "<img src=\"slides/&#115;lide_04_100000.png\">",
+            "See [it](slides/./slide_04_100000.png).",
+        ] {
+            assert_eq!(mentions(doc), 1, "{doc}");
+        }
+        assert_eq!(mentions(&format!("{embed}\n\nSee [it](slides/./slide_04_100000.png).")), 2);
+        assert_eq!(mentions("![x](slides/slide_05_100000.png)"), 0);
     }
 
     #[test]

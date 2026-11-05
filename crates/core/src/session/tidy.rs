@@ -345,7 +345,8 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
 /// in the notes refers to goes as it is. A slide whose one reference is its own embed, standing once on its own line
 /// outside code, goes with that embed, taken out first. Any other reference, however it is written (a different label,
 /// an encoded or roundabout path, the file named in text), keeps the slide, so no link in the notes is left naming a
-/// moved file. Returns what went.
+/// moved file. A reference is counted wherever the decoded notes name the file (`notesfile::references`). Returns what
+/// went.
 fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<Vec<SlideEntry>> {
     // No notes yet refer to nothing; notes that cannot be read keep every slide.
     let doc = match std::fs::read_to_string(&files.notes) {
@@ -356,9 +357,9 @@ fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<V
     let mut stay: HashSet<u32> = HashSet::new();
     for s in indices.iter().filter_map(|&i| sc.slides.iter().find(|s| s.index == i)) {
         let embed = embed_line(s, &files.dir, files.notes_dir());
-        match notesfile::references(&doc, files.notes_dir(), &files.dir.join(&s.file), &embed) {
-            notesfile::References { destinations: 0, names: 0, .. } => {}
-            notesfile::References { destinations: 1, names: 1, own_line_embeds: 1 } => with_embed.push(s.clone()),
+        match notesfile::references(&doc, &files.dir.join(&s.file), &embed) {
+            notesfile::References { mentions: 0, .. } => {}
+            notesfile::References { mentions: 1, own_line_embeds: 1 } => with_embed.push(s.clone()),
             _ => {
                 stay.insert(s.index);
             }
@@ -463,10 +464,7 @@ pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, li
     }
     // A removed image the notes still refer to, however written, stays.
     let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
-    let removed = archive::clear_removed(&files.dir, |p| {
-        let r = notesfile::references(&doc, files.notes_dir(), p, "");
-        r.destinations > 0 || r.names > 0
-    });
+    let removed = archive::clear_removed(&files.dir, |p| notesfile::references(&doc, p, "").mentions > 0);
     out.images.files += removed.files;
     out.images.bytes += removed.bytes;
     out.images.kept.extend(removed.kept);
@@ -661,6 +659,22 @@ mod tests {
             std::fs::write(&f.files.notes, [0xff, 0xfe, 0x00]).unwrap();
             assert!(drop_slides(&f.files, &f.store, &[3]).await.is_err());
             assert!(f.files.dir.join(&steps[2].file).exists() && f.store.read().await.unwrap().slides.iter().any(|s| s.index == 3));
+        }
+
+        #[tokio::test]
+        async fn a_removed_image_the_notes_still_name_survives_the_finished_page() {
+            // F015/F016 at retirement: a reference-style link with an encoded name and a fragment, into slides/removed.
+            let f = folder();
+            let steps = build(&f, 1).await;
+            let files = f.files.clone();
+            f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
+            let name = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().replacen("slide_", "%73lide_", 1);
+            std::fs::write(&f.files.notes, format!("# T\n\n![detail][s]\n\n[s]: slides/removed/{name}#detail\n")).unwrap();
+            let page = f.files.dir.join("Page.html");
+            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+            let r = retire(&f.files, &page, Some(&f.store), false).await.unwrap();
+            assert_eq!((r.images.files, r.images.kept.len()), (0, 1));
+            assert!(f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap()).exists());
         }
 
         #[tokio::test]
