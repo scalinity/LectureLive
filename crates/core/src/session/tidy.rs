@@ -61,9 +61,32 @@ pub struct Verdict {
     pub why: Redundant,
 }
 
-/// Relations already measured, by the two slides' numbers (a slide's number never names another image).
+/// Relations already measured, by the two slides' numbers (a slide's number never names another image) and whether
+/// each was then known to have Zoom's bar over it.
 #[derive(Default)]
-pub struct Relations(HashMap<(u32, u32), Relation>);
+pub struct Relations {
+    measured: HashMap<(u32, u32, bool, bool), Relation>,
+    /// Where Zoom's bar starts over each capture the lecture shows it on (`zooms_bar`).
+    bars: HashMap<u32, u32>,
+}
+
+/// The captures Zoom's control bar is drawn over: a band that looks like the bar counts only once the same band is seen
+/// over different slides, as Zoom draws one bar over whatever is shared. A slide's own dark footer differs from slide to
+/// slide, and a banner a build reveals sits over the same slide, so neither is taken for the bar, and their content is
+/// compared as any other.
+fn zooms_bar(caps: &[&Capture]) -> HashMap<u32, u32> {
+    let banded: Vec<(&Capture, &Look)> = caps.iter().filter_map(|c| Some((*c, c.look.as_deref().filter(|l| l.bar.is_some())?))).collect();
+    let mut out = HashMap::new();
+    for (p, (a, la)) in banded.iter().enumerate() {
+        for (b, lb) in &banded[p + 1..] {
+            if compare::same_band(la, lb) && !compare::same_above(la, lb) {
+                out.insert(a.index, la.bar.unwrap());
+                out.insert(b.index, lb.bar.unwrap());
+            }
+        }
+    }
+    out
+}
 
 impl Relations {
     fn get(&mut self, a: &Capture, b: &Capture) -> Option<Relation> {
@@ -71,7 +94,13 @@ impl Relations {
         if a.index > b.index {
             return self.get(b, a).map(|r| Relation { lost: r.added, added: r.lost });
         }
-        Some(*self.0.entry((a.index, b.index)).or_insert_with(|| compare::relate(la, lb)))
+        let (ba, bb) = (self.bars.get(&a.index).copied(), self.bars.get(&b.index).copied());
+        Some(*self.measured.entry((a.index, b.index, ba.is_some(), bb.is_some())).or_insert_with(|| compare::relate_with(la, ba, lb, bb)))
+    }
+
+    fn near(&self, a: &Capture, b: &Capture) -> bool {
+        let (Some(la), Some(lb)) = (a.look.as_deref(), b.look.as_deref()) else { return false };
+        compare::near_with(la, self.bars.get(&a.index).copied(), lb, self.bars.get(&b.index).copied())
     }
 
     /// What `b` is to `a`. A photograph's detail is not ink, so it is never the earlier state of anything and is only
@@ -130,6 +159,7 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
     let n = caps.len();
     let look = |i: usize| caps[i].look.as_deref();
     let mut why: Vec<Option<Redundant>> = vec![None; n];
+    memo.bars = zooms_bar(&caps);
 
     // The same picture, however long apart: each group keeps one, the first shown unless one must stay.
     let pool: Vec<usize> = (0..n).filter(|&i| look(i).is_some()).collect();
@@ -144,7 +174,7 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
     }
     for (p, &a) in pool.iter().enumerate() {
         for &b in &pool[p + 1..] {
-            if compare::near(look(a).unwrap(), look(b).unwrap()) && memo.order(caps[a], caps[b]) == Order::Same {
+            if memo.near(caps[a], caps[b]) && memo.order(caps[a], caps[b]) == Order::Same {
                 let (ra, rb) = (root(&mut group, a), root(&mut group, b));
                 group[ra.max(rb)] = ra.min(rb);
             }
@@ -158,7 +188,7 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
     let mut keeper_of: HashMap<usize, usize> = HashMap::new();
     for members in groups.values() {
         // The first showing, unless one must stay, or the first had Zoom's control bar over it and another did not.
-        let keep = members.iter().copied().find(|&i| !caps[i].candidate).or_else(|| members.iter().copied().find(|&i| look(i).is_some_and(|l| l.bar.is_none()))).unwrap_or(members[0]);
+        let keep = members.iter().copied().find(|&i| !caps[i].candidate).or_else(|| members.iter().copied().find(|&i| !memo.bars.contains_key(&caps[i].index))).unwrap_or(members[0]);
         for &m in members {
             // A group is only where to look: the measure is not transitive, so each goes only if it matches the very
             // capture that stays, and otherwise stands on its own.
@@ -693,12 +723,51 @@ mod tests {
     }
 
     #[test]
-    fn the_same_slide_without_zooms_bar_is_kept_whichever_came_first() {
+    fn the_same_slide_without_zooms_bar_is_kept_once_the_lecture_shows_the_bar() {
         use crate::capture::compare::tests::with_bar;
-        let caps = [cap(1, 0, with_bar(&slide(0, 3))), cap(2, 1, slide(0, 3))];
+        let elsewhere = cap(9, 30, with_bar(&slide(3, 1))); // the bar over another slide: it is Zoom's
+        let caps = [cap(1, 0, with_bar(&slide(0, 3))), cap(2, 1, slide(0, 3)), elsewhere];
         assert_eq!(judged(&caps), [(1, Redundant::SameAs(2))]);
-        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, with_bar(&slide(0, 3)))];
+        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, with_bar(&slide(0, 3))), cap(9, 30, with_bar(&slide(3, 1)))];
         assert_eq!(judged(&caps), [(2, Redundant::SameAs(1))]);
+    }
+
+    #[test]
+    fn a_band_seen_once_is_the_slides_own_and_both_twins_stay() {
+        use crate::capture::compare::tests::with_bar;
+        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, with_bar(&slide(0, 3)))];
+        assert!(judged(&caps).is_empty(), "with no evidence it is Zoom's, the band is content and nothing is lost");
+    }
+
+    #[test]
+    fn what_zooms_bar_hides_in_the_finished_slide_keeps_the_capture_that_shows_it() {
+        // F008: a footer only the earlier capture shows, under the bar of one with an extra bullet.
+        use crate::capture::compare::tests::with_bar;
+        let mut earlier = slide(0, 2);
+        bar(&mut earlier, 134, 30, 160, 5, 40);
+        let mut later = earlier.clone();
+        bar(&mut later, 76, 26, 200, 5, 50);
+        let caps = [cap(1, 0, earlier), cap(2, 1, with_bar(&later)), cap(9, 30, with_bar(&slide(3, 1)))];
+        assert!(judged(&caps).iter().all(|(i, _)| *i != 1), "{:?}", judged(&caps));
+        let mut kept = caps;
+        kept[1].candidate = false; // a barred keeper that must stay changes nothing for what it hides
+        assert!(judged(&kept).iter().all(|(i, _)| *i != 1));
+    }
+
+    #[test]
+    fn slides_with_their_own_dark_footers_saying_different_things_both_stay() {
+        // F009: a footer band like Zoom's, different on each slide, is the slides' content.
+        let footed = |caption: u32| {
+            let mut g = slide(0, 3);
+            bar(&mut g, 130, 0, W, 14, 22);
+            for k in 0..6 {
+                bar(&mut g, 134, 20 + k * (20 + caption), 12, 4, 200);
+            }
+            g
+        };
+        let caps = [cap(1, 0, footed(0)), cap(2, 1, footed(9))];
+        assert!(caps.iter().all(|c| c.look.as_ref().unwrap().bar.is_some()), "both look barred");
+        assert!(judged(&caps).is_empty(), "{:?}", judged(&caps));
     }
 
     #[test]
