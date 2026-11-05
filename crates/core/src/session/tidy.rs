@@ -151,9 +151,13 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
         // The first showing, unless one must stay, or the first had Zoom's control bar over it and another did not.
         let keep = members.iter().copied().find(|&i| !caps[i].candidate).or_else(|| members.iter().copied().find(|&i| look(i).is_some_and(|l| l.bar.is_none()))).unwrap_or(members[0]);
         for &m in members {
-            keeper_of.insert(m, keep);
-            if m != keep && caps[m].candidate {
+            // A group is only where to look: the measure is not transitive, so each goes only if it matches the very
+            // capture that stays, and otherwise stands on its own.
+            if m != keep && caps[m].candidate && memo.order(caps[m], caps[keep]) == Order::Same {
+                keeper_of.insert(m, keep);
                 why[m] = Some(Redundant::SameAs(caps[keep].index));
+            } else {
+                keeper_of.insert(m, m);
             }
         }
     }
@@ -180,10 +184,10 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
             if let Some(k) = best {
                 let to = Redundant::EarlierStateOf(caps[k].index);
                 why[s] = Some(to);
-                for (&m, &keep) in &keeper_of {
-                    if keep == s && m != s && caps[m].candidate {
-                        why[m] = Some(to);
-                    }
+                // What stood in for this capture follows it only if the new keeper holds it as well.
+                let followers: Vec<usize> = keeper_of.iter().filter(|&(&m, &keep)| keep == s && m != s).map(|(&m, _)| m).collect();
+                for m in followers {
+                    why[m] = matches!(memo.order(caps[m], caps[k]), Order::Earlier | Order::Same).then_some(to);
                 }
                 continue;
             }
@@ -573,6 +577,24 @@ mod tests {
         caps[0].candidate = false;
         caps[2].candidate = false; // a manual capture: the group keeps it, not the first showing
         assert_eq!(judged(&caps), [(2, Redundant::SameAs(3))]);
+    }
+
+    #[test]
+    fn a_chain_of_near_copies_never_removes_one_its_keeper_does_not_match() {
+        // F002: A ≈ B and B ≈ C within the tolerance, A and C twice as far apart.
+        let marked = |marks: &[(u32, u32)]| {
+            let mut g = slide(0, 2);
+            for &(y, x) in marks {
+                bar(&mut g, y, x, 20, 6, 20);
+            }
+            g
+        };
+        let (p1, p2, q1, q2) = ((90, 30), (90, 120), (110, 30), (110, 120));
+        let caps = [cap(1, 0, marked(&[p1, p2])), cap(2, 1, marked(&[p2, q1])), cap(3, 2, marked(&[q1, q2]))];
+        let mut memo = Relations::default();
+        let (a, b, c) = (&caps[0], &caps[1], &caps[2]);
+        assert_eq!((memo.order(a, b), memo.order(b, c), memo.order(a, c)), (Order::Same, Order::Same, Order::Apart), "the shape under test");
+        assert_eq!(judged(&caps), [(2, Redundant::SameAs(1))]);
     }
 
     #[test]
