@@ -182,8 +182,8 @@ fn zoom_bar(g: &GrayImage) -> Option<u32> {
     (above[above.len() / 2].abs_diff(level) > 8).then_some(top - 2)
 }
 
-/// Pixels where `a` has ink that `b` does not hold. `b` holds it where its own tile shows something and it has the same
-/// level there, or, as a fade does, ink of its own (against its own page) in the same direction and at least as strong.
+/// Pixels where `a` has ink that `b` does not hold. `b` holds it where it has an edge at that pixel too and either the
+/// same level there, or, as a fade does, ink of its own (against its own page) in the same direction and at least as strong.
 /// Showing something matters: a flat dark frame has dark text's level everywhere, and white text on a dark divider is
 /// "lighter" than its page as every pixel of a white slide is; neither shows the text.
 fn uncovered(a: &Look, b: &Look) -> u32 {
@@ -203,7 +203,15 @@ fn each_uncovered(a: &Look, b: &Look, mut hit: impl FnMut(usize)) {
             }
             let (i, t) = ((y * W + x) as usize, tile_of(x, y));
             let ia = a.ink_at(x, y);
-            if ia == 0 || (b.busy[t] && (pb[i] as i16 - pa[i] as i16).abs() <= SLACK) {
+            if ia == 0 {
+                continue;
+            }
+            // Holding needs an edge right there: a fill at the ink's own level, a box laid over strokes, shows none of it.
+            if !b.edge[i] {
+                hit(i);
+                continue;
+            }
+            if b.busy[t] && (pb[i] as i16 - pa[i] as i16).abs() <= SLACK {
                 continue;
             }
             let (ib, own) = (pb[i] as i16 - a.page[t] as i16, pb[i] as i16 - b.page[t] as i16);
@@ -426,6 +434,18 @@ pub(crate) mod tests {
         let mut boxed = s.clone();
         bar(&mut boxed, 40, 16, 224, 60, 40); // a dark panel laid over the bullets
         assert_eq!(rel(&s, &boxed), Order::Apart);
+    }
+
+    #[test]
+    fn thin_strokes_painted_over_at_their_own_level_are_lost() {
+        // F001: a narrow block at the strokes' level leaves the tile busy but shows none of them.
+        let mut a = slide(0, 1);
+        for k in 0..17 {
+            bar(&mut a, 100, 60 + 6 * k, 1, 6, 30);
+        }
+        let mut b = slide(0, 1);
+        bar(&mut b, 99, 58, 104, 8, 30);
+        assert_eq!(rel(&a, &b), Order::Apart);
     }
 
     #[test]
