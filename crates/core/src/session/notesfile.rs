@@ -198,11 +198,14 @@ pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on:
 }
 
 /// How the notes refer to one slide's file (spec §7.7). Links can be written in more ways than are worth parsing
-/// (inline, by reference, in HTML with or without quotes, encoded, with a fragment or a query, through `./`), and every
-/// one that names the file contains its name: so the notes are decoded (percent escapes until none are left, and HTML
-/// character references) and the file's stem is counted wherever it stands. A count too high only keeps a slide. A slide
-/// may leave the lecture only when it is not named at all, or named once, by its own embed on a line of its own outside
-/// code.
+/// (inline, by reference, in HTML with or without quotes, encoded, escaped, with a fragment or a query, through `./`, in
+/// another case on a disk that ignores case), so the notes are searched for what every one of them keeps. A slide's file
+/// is named `slide_NN_HHMMSS`, and its six capture-time digits survive all of these: digits have no Markdown escape, no
+/// named HTML reference and no case, and percent and numeric escapes are undone first. The notes write times with colons,
+/// so the digits stand together only in a file name; two captures in one second only count each other, which keeps
+/// both. A file named otherwise is searched for by its stem, case folded and with backslash escapes taken out. A count
+/// too high only keeps a slide. A slide may leave the lecture only when it is not named at all, or named once, by its
+/// own embed on a line of its own outside code.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct References {
     /// Where the decoded notes name the file's stem.
@@ -250,9 +253,16 @@ fn decoded_notes(doc: &str) -> String {
     text
 }
 
+static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
+
 pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References {
     let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mentions = if stem.is_empty() { 1 } else { decoded_notes(doc).matches(stem.as_str()).count() };
+    let text = decoded_notes(doc);
+    let mentions = match SLIDE_STEM.captures(&stem) {
+        Some(c) => text.matches(&c[1]).count(),
+        None if stem.is_empty() => 1,
+        None => text.replace('\\', "").to_ascii_lowercase().matches(&stem.to_ascii_lowercase()).count(),
+    };
     let mut fenced = false;
     let mut own_line_embeds = 0;
     for line in doc.lines() {
@@ -402,11 +412,19 @@ mod tests {
             "![d](slides/%2573lide_04_100000.png)",
             "<img src=\"slides/&#115;lide_04_100000.png\">",
             "See [it](slides/./slide_04_100000.png).",
+            "![detail](slides/slide\\_04\\_100000.png)",
+            "<img src=\"slides/slide&lowbar;04&lowbar;100000.png\">",
+            "![detail](slides/removed/SLIDE_04_100000.png)",
         ] {
             assert_eq!(mentions(doc), 1, "{doc}");
         }
+        assert_eq!(mentions(&format!("{embed}\n\n![d](slides/slide\\_04\\_100000.png)")), 2, "an escaped second reference");
+        assert_eq!(mentions("<!-- 10:00:00 -->\n\n## At 10:00:00"), 0, "times in the notes are written with colons");
+        let other = std::path::Path::new("/lec/slides/Board Photo.png");
+        assert_eq!(references("![b](slides/board\\ photo.png)", other, "").mentions, 1, "a name of another shape, folded");
         assert_eq!(mentions(&format!("{embed}\n\nSee [it](slides/./slide_04_100000.png).")), 2);
-        assert_eq!(mentions("![x](slides/slide_05_100000.png)"), 0);
+        assert_eq!(mentions("![x](slides/slide_05_100001.png)"), 0);
+        assert_eq!(mentions("![x](slides/slide_05_100000.png)"), 1, "a capture in the same second counts: it only keeps");
     }
 
     #[test]

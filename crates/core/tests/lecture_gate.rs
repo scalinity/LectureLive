@@ -655,7 +655,8 @@ async fn a_failed_page_keeps_captures_and_a_successful_polish_page_retires_them(
     // A slide taken out of the lecture, and the lecture's recording: both go once the page is finished (spec §7.6).
     let out = f.slides.join("out.png");
     support::slides::png(&out);
-    let out = slides::register(&f, &store, &out, SlideMeta::manual(Local::now())).await.unwrap().unwrap();
+    // A minute apart: slides captured in the same second name each other's time, which only ever keeps an image.
+    let out = slides::register(&f, &store, &out, SlideMeta::manual(Local::now() + chrono::Duration::minutes(1))).await.unwrap().unwrap();
     slides::remove(&f, &store, out.index, Arc::new(std::sync::atomic::AtomicBool::new(false))).await.unwrap();
     let wav = f.dir.join("recordings/session_1.wav");
     std::fs::create_dir_all(wav.parent().unwrap()).unwrap();

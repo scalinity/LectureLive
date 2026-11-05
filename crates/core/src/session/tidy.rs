@@ -669,7 +669,8 @@ mod tests {
             let files = f.files.clone();
             f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
             let name = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().replacen("slide_", "%73lide_", 1);
-            std::fs::write(&f.files.notes, format!("# T\n\n![detail][s]\n\n[s]: slides/removed/{name}#detail\n")).unwrap();
+            let shouted = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().to_uppercase().replace('_', "\\_");
+            std::fs::write(&f.files.notes, format!("# T\n\n![detail][s]\n\n[s]: slides/removed/{name}#detail\n\n<img src=\"slides/removed/{shouted}\">\n")).unwrap();
             let page = f.files.dir.join("Page.html");
             std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
             let r = retire(&f.files, &page, Some(&f.store), false).await.unwrap();
