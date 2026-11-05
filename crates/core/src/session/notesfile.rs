@@ -278,6 +278,9 @@ pub fn has_alias(slides: &std::path::Path, file: &std::path::Path) -> bool {
     false
 }
 
+/// Styles and scripts in the notes: a style spells a name with its own escapes and a script can build one, so no search
+/// of the text finds what they refer to. Notes that hold either keep every capture.
+static STYLE_OR_SCRIPT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)<\s*(?:style|script|link)\b|\bstyle\s*=").expect("a valid pattern"));
 
 static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
 
@@ -289,6 +292,7 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
         None if stem.is_empty() => 1,
         None => text.replace('\\', "").to_ascii_lowercase().matches(&stem.to_ascii_lowercase()).count(),
     };
+    let mentions = if STYLE_OR_SCRIPT.is_match(doc) { mentions.max(2) } else { mentions };
     let mut fenced = false;
     let mut own_line_embeds = 0;
     for line in doc.lines() {
@@ -457,6 +461,18 @@ mod tests {
         assert_eq!(mentions(&format!("{embed}\n\nSee [it](slides/./slide_04_100000.png).")), 2);
         assert_eq!(mentions("![x](slides/slide_05_100001.png)"), 0);
         assert_eq!(mentions("![x](slides/slide_05_100000.png)"), 1, "a capture in the same second counts: it only keeps");
+    }
+
+    #[test]
+    fn notes_with_styles_or_scripts_keep_every_capture() {
+        // F023: CSS reads `\31 ` as `1`, so a style can name the file without its digits standing together.
+        let file = std::path::Path::new("/lec/slides/removed/slide_04_100000.png");
+        let embed = "![Slide 4](slides/slide_04_100000.png)";
+        let figure = "<div style=\"background-image:url('slides/removed/slide_04_\\31 00000.png')\"></div>";
+        for doc in [figure.to_string(), format!("{embed}\n\n{figure}"), "<STYLE>p{}</STYLE>".into(), "<script>x()</script>".into(), "<link rel=stylesheet href=a.css>".into()] {
+            assert_eq!(references(&doc, file, embed).mentions, 2, "{doc}");
+        }
+        assert_eq!(references(&format!("# T\n\n{embed}\n\nIn this style, $\\beta = 1$.\n"), file, embed).mentions, 1, "prose and maths keep the common path");
     }
 
     #[test]
