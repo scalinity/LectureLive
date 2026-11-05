@@ -148,7 +148,8 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
     }
     let mut keeper_of: HashMap<usize, usize> = HashMap::new();
     for members in groups.values() {
-        let keep = members.iter().copied().find(|&i| !caps[i].candidate).unwrap_or(members[0]);
+        // The first showing, unless one must stay, or the first had Zoom's control bar over it and another did not.
+        let keep = members.iter().copied().find(|&i| !caps[i].candidate).or_else(|| members.iter().copied().find(|&i| look(i).is_some_and(|l| l.bar.is_none()))).unwrap_or(members[0]);
         for &m in members {
             keeper_of.insert(m, keep);
             if m != keep && caps[m].candidate {
@@ -572,6 +573,15 @@ mod tests {
         caps[0].candidate = false;
         caps[2].candidate = false; // a manual capture: the group keeps it, not the first showing
         assert_eq!(judged(&caps), [(2, Redundant::SameAs(3))]);
+    }
+
+    #[test]
+    fn the_same_slide_without_zooms_bar_is_kept_whichever_came_first() {
+        use crate::capture::compare::tests::with_bar;
+        let caps = [cap(1, 0, with_bar(&slide(0, 3))), cap(2, 1, slide(0, 3))];
+        assert_eq!(judged(&caps), [(1, Redundant::SameAs(2))]);
+        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, with_bar(&slide(0, 3)))];
+        assert_eq!(judged(&caps), [(2, Redundant::SameAs(1))]);
     }
 
     #[test]

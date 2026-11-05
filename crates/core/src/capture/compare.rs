@@ -14,6 +14,11 @@ use crate::capture::scene::{self, Features};
 const INK: i16 = 32;
 /// Ink is still held when the other picture has it this much fainter: anti-aliasing and re-encoding differ.
 const SLACK: i16 = 32;
+/// Zoom's control bar, drawn over the bottom of the share while the pointer is over the window: a band of one dark
+/// level across the bottom with its icons and labels in it, and a step in level above it (M7.6 class: rows 130–143 of
+/// 144 at level 22, over light and dark slides alike).
+const BAR_LEVEL: u8 = 40;
+const BAR_ROWS: std::ops::RangeInclusive<u32> = 5..=22;
 /// PowerPoint's slideshow toolbar, drawn at the bottom-left while the presenter moves the mouse, as fractions of the
 /// slide. Neither picture's ink counts there.
 const TOOLBAR_W: f32 = 0.17;
@@ -37,6 +42,8 @@ pub struct Look {
     edge: Vec<bool>,
     /// Tiles with any edge in them: a flat fill shows nothing, whatever its level.
     busy: [bool; TILES],
+    /// The first row of Zoom's control bar, when it is drawn over this picture.
+    pub bar: Option<u32>,
     tiles: [f32; TILES],
     /// Pixels of ink, outside the toolbar's corner.
     pub ink: u32,
@@ -109,8 +116,10 @@ impl Look {
                 (hi - lo) as i16 > INK
             })
             .collect();
-        let mut look = Self { gray: gray.clone(), page, edge, busy, tiles, ink: 0, features: scene::features(&gray) };
-        look.ink = (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| !toolbar(x, y) && look.ink_at(x, y) != 0).count() as u32;
+        let bar = zoom_bar(&gray);
+        let mut look = Self { gray: gray.clone(), page, edge, busy, bar, tiles, ink: 0, features: scene::features(&gray) };
+        let below = bar.unwrap_or(H);
+        look.ink = (0..below).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| !toolbar(x, y) && look.ink_at(x, y) != 0).count() as u32;
         look
     }
 
@@ -142,6 +151,37 @@ impl Look {
     }
 }
 
+/// Where Zoom's control bar starts, if it is drawn: from the bottom up, rows of one dark level (each mostly that level,
+/// its icons and labels the rest), between 5 and 22 rows of them, some with marks, over a slide of another level. A dark
+/// slide's own bottom is its background's level, however much footer text it holds; a light one is not dark. The rows
+/// the bar's edge blends into are the bar's too.
+fn zoom_bar(g: &GrayImage) -> Option<u32> {
+    let row = |y: u32| {
+        let mut r: Vec<u8> = (0..W).map(|x| g.get_pixel(x, y).0[0]).collect();
+        r.sort_unstable();
+        let level = r[W as usize / 2];
+        (level, r.iter().filter(|v| v.abs_diff(level) <= 6).count() as f32 / W as f32)
+    };
+    let (level, _) = row(H - 1);
+    if level > BAR_LEVEL {
+        return None;
+    }
+    let mut top = H - 1;
+    while top > 0 {
+        let (l, even) = row(top - 1);
+        if l.abs_diff(level) > 4 || even < 0.7 {
+            break;
+        }
+        top -= 1;
+    }
+    if !BAR_ROWS.contains(&(H - top)) || !(top..H).any(|y| row(y).1 < 0.95) || top < 8 {
+        return None;
+    }
+    let mut above: Vec<u8> = (top - 8..top - 2).map(|y| row(y).0).collect();
+    above.sort_unstable();
+    (above[above.len() / 2].abs_diff(level) > 8).then_some(top - 2)
+}
+
 /// Pixels where `a` has ink that `b` does not hold. `b` holds it where its own tile shows something and it has the same
 /// level there, or, as a fade does, ink of its own (against its own page) in the same direction and at least as strong.
 /// Showing something matters: a flat dark frame has dark text's level everywhere, and white text on a dark divider is
@@ -154,7 +194,9 @@ fn uncovered(a: &Look, b: &Look) -> u32 {
 
 fn each_uncovered(a: &Look, b: &Look, mut hit: impl FnMut(usize)) {
     let (pa, pb) = (a.gray.as_raw(), b.gray.as_raw());
-    for y in 0..H {
+    // Under Zoom's bar in either picture, neither shows the slide.
+    let below = a.bar.into_iter().chain(b.bar).min().unwrap_or(H);
+    for y in 0..below {
         for x in 0..W {
             if toolbar(x, y) {
                 continue;
@@ -206,7 +248,10 @@ pub fn relate(a: &Look, b: &Look) -> Relation {
 
 /// Whether the two can be the same picture at all: a cheap look at the tile means before `relate`.
 pub fn near(a: &Look, b: &Look) -> bool {
-    a.tiles.iter().zip(&b.tiles).map(|(x, y)| (x - y).abs()).sum::<f32>() / TILES as f32 <= NEAR
+    // Tiles reaching into Zoom's bar in either picture are not the slide.
+    let below = a.bar.into_iter().chain(b.bar).min().unwrap_or(H);
+    let rows = (below / TILE) as usize * (W / TILE) as usize;
+    rows > 0 && a.tiles[..rows].iter().zip(&b.tiles[..rows]).map(|(x, y)| (x - y).abs()).sum::<f32>() / rows as f32 <= NEAR
 }
 
 pub fn order(r: &Relation) -> Order {
@@ -327,6 +372,32 @@ pub(crate) mod tests {
         }
         assert_eq!(rel(&with, &s), Order::Same);
         assert_eq!(rel(&s, &with), Order::Same);
+    }
+
+    /// Zoom's control bar over the bottom of `g`: its dark level with icons and labels in it.
+    pub(crate) fn with_bar(g: &GrayImage) -> GrayImage {
+        let mut g = g.clone();
+        bar(&mut g, 130, 0, W, 14, 22);
+        for x in [8, 60, 110, 140, 170, 200] {
+            bar(&mut g, 133, x, 6, 4, 200);
+        }
+        g
+    }
+
+    #[test]
+    fn zooms_bar_over_the_footer_is_the_same_slide_and_is_found_on_light_and_dark_slides() {
+        let mut s = slide(0, 3);
+        bar(&mut s, 136, 20, 90, 3, 90); // the slide's own footer, under where the bar comes
+        let barred = with_bar(&s);
+        assert!(Look::of(barred.clone()).bar.is_some() && Look::of(s.clone()).bar.is_none());
+        assert_eq!(rel(&s, &barred), Order::Same);
+        assert_eq!(rel(&barred, &s), Order::Same);
+        let dark = GrayImage::from_fn(W, H, |x, y| Luma([if (40..48).contains(&y) && x > 20 && x < 200 { 230 } else { 34 }]));
+        assert!(Look::of(with_bar(&dark)).bar.is_some(), "over a dark slide too");
+        let black = GrayImage::from_fn(W, H, |x, y| Luma([if (40..48).contains(&y) && x > 20 && x < 200 { 230 } else if y >= 130 && x % 40 < 5 { 200 } else { 22 }]));
+        assert!(Look::of(black).bar.is_none(), "a dark slide's own bottom is its background");
+        let footed = GrayImage::from_fn(W, H, |x, y| Luma([if (100..124).contains(&y) && x % 9 < 4 { 200 } else if (131..134).contains(&y) && (20..100).contains(&x) && x % 3 == 0 { 180 } else { 34 }]));
+        assert!(Look::of(footed).bar.is_none(), "nor is its footer");
     }
 
     #[test]

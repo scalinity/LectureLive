@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     if let Some((a, b)) = why {
         let (la, lb) = (by_index[&a].look.as_deref().unwrap(), by_index[&b].look.as_deref().unwrap());
         let r = compare::relate(la, lb);
-        println!("{a} against {b}: lost {:.4} added {:.4}; {a}: soft {:.2} dominant {:.2} photographic {}; {b}: soft {:.2} dominant {:.2} photographic {}", r.lost, r.added, la.features.soft, la.features.dominant, la.photographic(), lb.features.soft, lb.features.dominant, lb.photographic());
+        println!("{a} against {b}: lost {:.4} added {:.4}; {a}: soft {:.2} dominant {:.2} photographic {} bar {:?}; {b}: soft {:.2} dominant {:.2} photographic {} bar {:?}", r.lost, r.added, la.features.soft, la.features.dominant, la.photographic(), la.bar, lb.features.soft, lb.features.dominant, lb.photographic(), lb.bar);
         print!("{}", compare::map(la, lb));
         return Ok(());
     }
