@@ -341,16 +341,19 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
         .await
 }
 
-/// Takes these registered slides out, inside the sidecar's writer: the notes' embeds of those a snapshot used first (an
-/// embed must never name a file that has moved), only where each stands once on its own line outside code, and a slide
-/// whose embed could not be taken out stays. Returns what went.
+/// Takes these registered slides out, inside the sidecar's writer. A slide the notes mention (its file named anywhere in
+/// them, a snapshot's embed or one typed by hand) goes only with its embed, taken out first, and only where that stands
+/// once on its own line outside code; otherwise it stays, so no link in the notes is left naming a moved file. A slide the
+/// notes do not mention goes as it is. Returns what went.
 fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<Vec<SlideEntry>> {
-    let noted: Vec<SlideEntry> = indices.iter().filter(|&&i| i <= sc.notes.slide_index).filter_map(|&i| sc.slides.iter().find(|s| s.index == i).cloned()).collect();
+    let doc = std::fs::read_to_string(&files.notes).unwrap_or_default();
+    let named = |s: &SlideEntry| Path::new(&s.file).file_name().is_some_and(|n| doc.contains(&*n.to_string_lossy()));
+    let mentioned: Vec<SlideEntry> = indices.iter().filter_map(|&i| sc.slides.iter().find(|s| s.index == i).cloned()).filter(named).collect();
     let mut stay: HashSet<u32> = HashSet::new();
-    if !noted.is_empty() {
-        let changes: Vec<(String, Option<String>)> = noted.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
+    if !mentioned.is_empty() {
+        let changes: Vec<(String, Option<String>)> = mentioned.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
         let made = notesfile::change_embeds(files, sc, &changes, Local::now())?;
-        stay = noted.iter().enumerate().filter(|(k, _)| !made.contains(k)).map(|(_, s)| s.index).collect();
+        stay = mentioned.iter().enumerate().filter(|(k, _)| !made.contains(k)).map(|(_, s)| s.index).collect();
     }
     Ok(indices.iter().filter(|i| !stay.contains(i)).filter_map(|&i| slides::remove_in(files, sc, i).ok()).collect())
 }
@@ -604,8 +607,23 @@ mod tests {
             let files = f.files.clone();
             f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 3; Ok(()) }).await.unwrap();
             let gone = drop_slides(&f.files, &f.store, &[1, 2, 9]).await.unwrap();
-            assert_eq!(gone.iter().map(|s| s.index).collect::<Vec<_>>(), [1], "2 is used but its embed is not in the notes, 9 is not a slide");
+            assert_eq!(gone.iter().map(|s| s.index).collect::<Vec<_>>(), [1, 2], "2 is not in the notes, 9 is not a slide");
             assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\n{}\n", line(&steps[2])));
+        }
+
+        #[tokio::test]
+        async fn a_pending_slide_the_notes_embed_by_hand_goes_with_its_embed_or_not_at_all() {
+            // F012: what the notes reference, not the snapshot cursor, decides.
+            let f = folder();
+            let steps = build(&f, 3).await;
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            let name = |s: &SlideEntry| Path::new(&s.file).file_name().unwrap().to_string_lossy().into_owned();
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\nSee {} too.\n", line(&steps[1]), name(&steps[2]))).unwrap();
+            let files = f.files.clone();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; Ok(()) }).await.unwrap();
+            let gone = drop_slides(&f.files, &f.store, &[2, 3]).await.unwrap();
+            assert_eq!(gone.iter().map(|s| s.index).collect::<Vec<_>>(), [2], "3 is named inline, so it stays");
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\nSee {} too.\n", name(&steps[2])));
         }
 
         #[tokio::test]

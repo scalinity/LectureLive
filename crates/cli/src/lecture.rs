@@ -113,21 +113,20 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -
         let store = Store::offline(sc.clone(), files.sidecar());
         let mut notes_changed = false;
         if apply {
+            let revision = sc.notes.revision;
             for (a, b) in &swaps {
                 tidy::swap(&files, &store, *a, *b).await?;
-                notes_changed = true;
                 println!("  slide {b} put back in place of slide {a}");
             }
             if !drops.is_empty() {
                 for s in tidy::drop_slides(&files, &store, &drops).await? {
-                    notes_changed |= s.index <= sc.notes.slide_index;
                     println!("  slide {} removed, as asked", s.index);
                 }
             }
             for (s, why) in tidy::sweep(&files, &store, tidy::Scope::All, None).await? {
-                notes_changed |= s.index <= sc.notes.slide_index;
                 println!("  slide {} removed: {why}", s.index);
             }
+            notes_changed = store.read().await?.notes.revision != revision;
         } else {
             let mut bytes = 0;
             let going = tidy::plan(&files, &sc, tidy::Scope::All).await;
