@@ -14,12 +14,14 @@ use lecturelive_core::audio::{input, loopback};
 use lecturelive_core::notes::chat::{self, ChatClient, ChatConfig};
 use lecturelive_core::notes::prompts;
 use lecturelive_core::session::audit;
-use lecturelive_core::session::coordinator::{SessionConfig, StopReport};
+use lecturelive_core::session::coordinator::{SessionConfig, StopReport, Store};
 use lecturelive_core::session::files::{course_from_path, LectureFiles};
 use lecturelive_core::session::launch::{self, Retention};
 use lecturelive_core::session::lecture::{self, Lecture, SlideWatch};
 use lecturelive_core::session::lock::FolderLock;
+use lecturelive_core::session::sidecar::Sidecar;
 use lecturelive_core::session::spend::{self, Spend};
+use lecturelive_core::session::tidy;
 use lecturelive_core::session::start;
 use lecturelive_core::stt::{rest, stream};
 
@@ -77,6 +79,66 @@ fn audit_cmd(dir: &Path) -> Result<()> {
         0 => Ok(()),
         code => std::process::exit(code),
     }
+}
+
+/// `lecture tidy` (spec §7.7): each day's redundant captures, and with `--apply` takes them out, the notes' embeds of
+/// them first, then clears what a finished study page replaces (§7.6). No request is made, so no key is needed.
+async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String]) -> Result<()> {
+    let days: Vec<(String, chrono::NaiveDate)> = std::fs::read_dir(dir.join(".live_notes"))
+        .map(|e| e.flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".v2.json").map(str::to_string)).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|stem| Some((stem.clone(), chrono::NaiveDate::parse_from_str(stem.strip_prefix("lecture_notes_")?, "%Y%m%d").ok()?)))
+        .collect();
+    anyhow::ensure!(!days.is_empty(), "no LectureLive lecture state in {} (.live_notes/*.v2.json); a folder from the Python tool gets its page with `lecture page --notes <file>`", dir.display());
+    let swaps: Vec<(u32, u32)> = swaps.iter().map(|s| s.split_once('=').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))).with_context(|| format!("--swap wants A=B, slide numbers: {s:?}"))).collect::<Result<_>>()?;
+    // Only a change needs the folder to itself: what a dry run reads, a lecture open in the app does not touch.
+    let _lock = if apply { Some(FolderLock::acquire(dir)?) } else { None };
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mb = |b: u64| b as f64 / 1_000_000.0;
+    for (stem, date) in days {
+        let files = LectureFiles::standard(dir, date);
+        println!("{stem}");
+        anyhow::ensure!(!files.journal().exists(), "a snapshot's commit was interrupted in {stem}; open the lecture once to finish it, then tidy");
+        let sc = Sidecar::load(&files.sidecar())?.with_context(|| format!("no sidecar for {stem}"))?;
+        let store = Store::offline(sc.clone(), files.sidecar());
+        let mut notes_changed = false;
+        if apply {
+            for (a, b) in &swaps {
+                tidy::swap(&files, &store, *a, *b).await?;
+                notes_changed = true;
+                println!("  slide {b} put back in place of slide {a}");
+            }
+            for (s, why) in tidy::sweep(&files, &store, tidy::Scope::All, None).await? {
+                notes_changed |= s.index <= sc.notes.slide_index;
+                println!("  slide {} removed: {why}", s.index);
+            }
+        } else {
+            let mut bytes = 0;
+            let going = tidy::plan(&files, &sc, tidy::Scope::All).await;
+            for v in &going {
+                bytes += sc.slides.iter().find(|s| s.index == v.index).and_then(|s| std::fs::metadata(files.dir.join(&s.file)).ok()).map_or(0, |m| m.len());
+                println!("  slide {} would go: {}", v.index, v.why);
+            }
+            println!("  {:.1} MB of redundant captures", mb(bytes));
+            for (a, b) in tidy::mistakes(&files, &sc).into_iter().filter(|(a, _)| !going.iter().any(|v| v.index == *a)) {
+                println!("  slide {a}, kept, is an earlier state of slide {b}, taken out by hand: --swap {a}={b} puts {b} back in its place");
+            }
+        }
+        let page = lecturelive_core::notes::page::page_path(&files.notes, &name);
+        if !(page.exists() && tidy::holds_notes(&page, &files.notes)) {
+            println!("  no finished study page yet: its captures and recordings stay until a polish makes one");
+        } else if notes_changed {
+            println!("  the notes changed, so {} is stale: `lecture page` typesets it again, then clears what it replaces", page.file_name().unwrap_or_default().to_string_lossy());
+        } else if apply {
+            let r = tidy::retire(&files, &page, Some(&store), false).await?;
+            println!("  finished page: {} images ({:.1} MB) and {} recordings ({:.1} MB) cleared", r.images.files, mb(r.images.bytes), r.recordings, mb(r.recording_bytes));
+        } else {
+            let wavs: u64 = lecturelive_core::session::launch::prunable(&sc, lecturelive_core::session::launch::Retention::KeepDays(0), chrono::Local::now()).iter().filter_map(|id| sc.recordings.iter().find(|r| r.id == *id)).filter_map(|r| std::fs::metadata(files.dir.join(&r.file)).ok()).map(|m| m.len()).sum();
+            println!("  finished page: --apply clears its removed images and {:.1} MB of recordings", mb(wavs));
+        }
+    }
+    Ok(())
 }
 
 /// The lecture folder as an absolute path, `.` components dropped, without touching the filesystem: the course is
@@ -192,6 +254,9 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     if a.command.as_deref() == Some("audit") {
         return audit_cmd(&dir);
     }
+    if a.command.as_deref() == Some("tidy") {
+        return tidy_cmd(&dir, a.apply, &a.swap).await;
+    }
     // Grok transcribes; Claude writes the notes, the polish and the page.
     let (key, claude_key) = match fixture {
         Some(_) => (String::new(), String::new()), // nothing is sent
@@ -239,7 +304,11 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
                 }
             }
         });
-        let _ = lec.page(&ev_tx).await;
+        if let Ok(page) = lec.page(&ev_tx).await {
+            // A finished page is what the lecture keeps: what it holds, what was taken out and the recordings go.
+            let store = Sidecar::load(&files.sidecar()).ok().flatten().map(|sc| Store::offline(sc, files.sidecar()));
+            lec.retire(&page, store.as_ref(), false, &ev_tx).await;
+        }
         drop(ev_tx);
         printer.await?;
         return Ok(());

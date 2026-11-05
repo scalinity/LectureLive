@@ -58,9 +58,17 @@ pub(crate) enum Cmd {
 #[derive(clap::Args)]
 pub(crate) struct LectureArgs {
     /// page: typeset the study page from the notes; spend: what the tool has cost; audit: whether the folder's
-    /// audio is whole (exit 1 when anything is unexplained, 2 while something waits). Leave out to record.
-    #[arg(value_parser = ["page", "spend", "audit"])]
+    /// audio is whole (exit 1 when anything is unexplained, 2 while something waits); tidy: which captures are
+    /// redundant (build steps, slides shown again, a camera) and, with --apply, take them out and clear what a
+    /// finished study page replaces. Leave out to record.
+    #[arg(value_parser = ["page", "spend", "audit", "tidy"])]
     pub(crate) command: Option<String>,
+    /// tidy: do it (without this, tidy says what it would do)
+    #[arg(long)]
+    pub(crate) apply: bool,
+    /// tidy --apply: put slide B, taken out by hand, back in place of slide A, an earlier state of it (repeatable)
+    #[arg(long, value_name = "A=B", requires = "apply")]
+    pub(crate) swap: Vec<String>,
     /// The lecture folder (default: the current directory)
     #[arg(long)]
     pub(crate) dir: Option<PathBuf>,
