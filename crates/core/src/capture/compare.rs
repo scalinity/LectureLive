@@ -194,8 +194,9 @@ fn uncovered(a: &Look, b: &Look) -> u32 {
 
 fn each_uncovered(a: &Look, b: &Look, mut hit: impl FnMut(usize)) {
     let (pa, pb) = (a.gray.as_raw(), b.gray.as_raw());
-    // Under Zoom's bar in either picture, neither shows the slide.
-    let below = a.bar.into_iter().chain(b.bar).min().unwrap_or(H);
+    // `a`'s own bar is not the slide, so its icons are never ink to hold. `b`'s bar holds nothing: what `a` shows under
+    // it, `b` hides.
+    let below = a.bar.unwrap_or(H);
     for y in 0..below {
         for x in 0..W {
             if toolbar(x, y) {
@@ -398,14 +399,26 @@ pub(crate) mod tests {
         bar(&mut s, 136, 20, 90, 3, 90); // the slide's own footer, under where the bar comes
         let barred = with_bar(&s);
         assert!(Look::of(barred.clone()).bar.is_some() && Look::of(s.clone()).bar.is_none());
-        assert_eq!(rel(&s, &barred), Order::Same);
-        assert_eq!(rel(&barred, &s), Order::Same);
+        assert_eq!(rel(&barred, &s), Order::Earlier, "the clean capture holds the barred one, footer and all");
+        let blank_bottom = slide(0, 3);
+        assert_eq!(rel(&blank_bottom, &with_bar(&blank_bottom)), Order::Same, "with nothing under it, the bar hides nothing");
         let dark = GrayImage::from_fn(W, H, |x, y| Luma([if (40..48).contains(&y) && x > 20 && x < 200 { 230 } else { 34 }]));
         assert!(Look::of(with_bar(&dark)).bar.is_some(), "over a dark slide too");
         let black = GrayImage::from_fn(W, H, |x, y| Luma([if (40..48).contains(&y) && x > 20 && x < 200 { 230 } else if y >= 130 && x % 40 < 5 { 200 } else { 22 }]));
         assert!(Look::of(black).bar.is_none(), "a dark slide's own bottom is its background");
         let footed = GrayImage::from_fn(W, H, |x, y| Luma([if (100..124).contains(&y) && x % 9 < 4 { 200 } else if (131..134).contains(&y) && (20..100).contains(&x) && x % 3 == 0 { 180 } else { 34 }]));
         assert!(Look::of(footed).bar.is_none(), "nor is its footer");
+    }
+
+    #[test]
+    fn what_zooms_bar_hides_in_the_later_capture_is_not_held_by_it() {
+        // The finished slide came with the bar over a row only the earlier capture shows.
+        let mut earlier = slide(0, 2);
+        bar(&mut earlier, 134, 30, 160, 5, 40);
+        let mut later = earlier.clone();
+        bar(&mut later, 76, 26, 200, 5, 50);
+        assert_eq!(rel(&earlier, &with_bar(&later)), Order::Apart);
+        assert_eq!(rel(&earlier, &later), Order::Earlier, "without the bar it is an earlier state");
     }
 
     #[test]
