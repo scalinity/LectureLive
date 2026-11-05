@@ -237,6 +237,10 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     // stdout is a terminal — an independent fact that decides whether untrusted text is cleaned.
     let out = plain::Display::stdout();
     let p = out.paint;
+    // Tidying reads no ledger and needs no key: it goes before the ledger is taken over, so a dry run writes nothing.
+    if a.command.as_deref() == Some("tidy") {
+        return tidy_cmd(&lecture_dir(a.dir.clone())?, a.apply, &a.swap).await;
+    }
     let app_ledger = if fixture.is_some() {
         // A name in the scripted lecture's own folder, never written: the scripted session spends nothing.
         lecture_dir(a.dir.clone())?.join("fixture-spend.jsonl")
@@ -253,9 +257,6 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let dir = lecture_dir(a.dir)?;
     if a.command.as_deref() == Some("audit") {
         return audit_cmd(&dir);
-    }
-    if a.command.as_deref() == Some("tidy") {
-        return tidy_cmd(&dir, a.apply, &a.swap).await;
     }
     // Grok transcribes; Claude writes the notes, the polish and the page.
     let (key, claude_key) = match fixture {
