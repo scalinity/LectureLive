@@ -236,14 +236,45 @@ fn percent_decoded(text: &str) -> String {
 /// A numeric character reference, with or without its semicolon, as HTML reads it.
 static CHARACTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?").expect("a valid pattern"));
 
-/// The named references that spell what an escape is made of (`&`, `%`, `#`, `;`, `\\`) or what a browser drops from a
-/// URL (a tab, a line break). Digits and letters have none.
-const NAMED: [(&str, &str); 10] = [("&amp;", "&"), ("&AMP;", "&"), ("&amp", "&"), ("&AMP", "&"), ("&percnt;", "%"), ("&num;", "#"), ("&semi;", ";"), ("&bsol;", "\\"), ("&Tab;", "\t"), ("&NewLine;", "\n")];
+/// Every named character reference HTML defines whose text is ASCII: 54 of the WHATWG table's 2,231. No named reference
+/// spells a digit, and the only letters any spells are `fj`, so the rest cannot build a capture's digits, an escape, or
+/// `javascript:`. The eight without a semicolon are the ones HTML also reads bare.
+const ASCII_NAMED: [(&str, &str); 54] = [
+    ("AMP", "&"), ("AMP;", "&"), ("DiacriticalGrave;", "`"), ("GT", ">"), ("GT;", ">"), ("Hat;", "^"), ("LT", "<"),
+    ("LT;", "<"), ("NewLine;", "\n"), ("QUOT", "\""), ("QUOT;", "\""), ("Tab;", "\t"), ("UnderBar;", "_"),
+    ("VerticalLine;", "|"), ("amp", "&"), ("amp;", "&"), ("apos;", "'"), ("ast;", "*"), ("bsol;", "\\"),
+    ("colon;", ":"), ("comma;", ","), ("commat;", "@"), ("dollar;", "$"), ("equals;", "="), ("excl;", "!"),
+    ("fjlig;", "fj"), ("grave;", "`"), ("gt", ">"), ("gt;", ">"), ("lbrace;", "{"), ("lbrack;", "["), ("lcub;", "{"),
+    ("lowbar;", "_"), ("lpar;", "("), ("lsqb;", "["), ("lt", "<"), ("lt;", "<"), ("midast;", "*"), ("num;", "#"),
+    ("percnt;", "%"), ("period;", "."), ("plus;", "+"), ("quest;", "?"), ("quot", "\""), ("quot;", "\""),
+    ("rbrace;", "}"), ("rbrack;", "]"), ("rcub;", "}"), ("rpar;", ")"), ("rsqb;", "]"), ("semi;", ";"), ("sol;", "/"),
+    ("verbar;", "|"), ("vert;", "|"),
+];
+
+/// A named character reference: a name, with its semicolon if it has one.
+static NAMED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"&([A-Za-z][A-Za-z0-9]*;?)").expect("a valid pattern"));
+
+/// Undoes the ASCII named references, reading a bare one as HTML does: the longest name without a semicolon that the
+/// reference starts with.
+fn named_decoded(text: &str) -> String {
+    let ascii = |name: &str| ASCII_NAMED.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+    NAMED
+        .replace_all(text, |c: &regex::Captures| {
+            let name = &c[1];
+            if let Some(v) = ascii(name) {
+                return v.to_string();
+            }
+            let bare = ASCII_NAMED.iter().filter(|(n, _)| !n.ends_with(';') && name.starts_with(n)).max_by_key(|(n, _)| n.len());
+            bare.map_or_else(|| c[0].to_string(), |(n, v)| format!("{v}{}", &name[n.len()..]))
+        })
+        .into_owned()
+}
 
 /// The notes as a reader of their links sees them. Every step between a link's text and the file it opens is applied
 /// together, again and again until nothing changes, so the steps undo in whatever order they were stacked: HTML reads its
-/// character references, Markdown drops a backslash, a browser drops tabs and line breaks from a URL and undoes its
-/// percent escapes. Each pass only shortens the text, so it settles; `None` when a name is escaped more deeply than
+/// character references (numeric ones by their code point: those HTML remaps, 0x80 to 0x9F and a few others, become no
+/// ASCII either way), Markdown drops a backslash, a browser drops tabs and line breaks from a URL and undoes its percent
+/// escapes. Each pass only shortens the text, so it settles; `None` when a name is escaped more deeply than
 /// [`DEPTH`] passes undo.
 fn decoded_notes(doc: &str) -> Option<String> {
     let mut text = doc.to_string();
@@ -252,7 +283,7 @@ fn decoded_notes(doc: &str) -> Option<String> {
             let n = c.get(1).map_or_else(|| c[2].parse::<u32>().ok(), |h| u32::from_str_radix(h.as_str(), 16).ok());
             n.and_then(char::from_u32).map_or(c[0].to_string(), |ch| ch.to_string())
         });
-        let named = NAMED.iter().fold(numeric.into_owned(), |t, (from, to)| t.replace(from, to));
+        let named = named_decoded(&numeric);
         let bare: String = named.chars().filter(|c| !matches!(c, '\\' | '\t' | '\n' | '\r')).collect();
         let next = percent_decoded(&bare);
         if next == text {
@@ -300,11 +331,9 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
     let decoded = decoded_notes(doc);
     let opaque = decoded.as_deref().is_none_or(|t| STYLE_OR_SCRIPT.is_match(doc) || STYLE_OR_SCRIPT.is_match(t));
     let text = decoded.unwrap_or_default();
-    let mentions = match SLIDE_STEM.captures(&stem) {
-        Some(c) => text.matches(&c[1]).count(),
-        None if stem.is_empty() => 1,
-        None => text.to_ascii_lowercase().matches(&stem.to_ascii_lowercase()).count(),
-    };
+    // Every capture is named slide_NN_HHMMSS; a file named otherwise could be spelled in ways the digits are not, so it
+    // stays.
+    let mentions = SLIDE_STEM.captures(&stem).map_or(2, |c| text.matches(&c[1]).count());
     let mentions = if opaque { mentions.max(2) } else { mentions };
     let mut fenced = false;
     let mut own_line_embeds = 0;
@@ -479,11 +508,17 @@ mod tests {
         let deep = format!("<img src=\"slides/slide_04_1%{}300000.png\">", "25".repeat(40));
         assert_eq!(mentions(&deep), 2, "escaped more deeply than the passes follow, every capture stays");
         assert_eq!(mentions("<!-- 10:00:00 -->\n\n## At 10:00:00"), 0, "times in the notes are written with colons");
-        let other = std::path::Path::new("/lec/slides/Board Photo.png");
-        assert_eq!(references("![b](slides/board\\ photo.png)", other, "").mentions, 1, "a name of another shape, folded");
+        let other = std::path::Path::new("/lec/slides/removed/board_photo.png");
+        assert_eq!(references("<img src=\"slides/removed/board&lowbar;photo.png\">", other, "").mentions, 2, "a name of another shape always stays");
+        assert_eq!(references("# T\n", other, "").mentions, 2, "even with nothing naming it");
         assert_eq!(mentions(&format!("{embed}\n\nSee [it](slides/./slide_04_100000.png).")), 2);
         assert_eq!(mentions("![x](slides/slide_05_100001.png)"), 0);
         assert_eq!(mentions("![x](slides/slide_05_100000.png)"), 1, "a capture in the same second counts: it only keeps");
+    }
+
+    #[test]
+    fn named_references_read_as_html_reads_them() {
+        assert_eq!(named_decoded("a&ampb &lt;x&gt; &colon; &lowbar;&UnderBar; &fjlig; &nbsp; &unknown; &percnt"), "a&b <x> : __ fj &nbsp; &unknown; &percnt");
     }
 
     #[test]
@@ -506,6 +541,9 @@ mod tests {
             format!("{embed}\n\n{handler}"),
             link.into(),
             "<a href=\"jav&Tab;ascript:go()\">it</a>".into(),
+            // F026: HTML reads every named reference, `&colon;` among them.
+            "<a href=\"javascript&colon;void(location='slides/removed/slide_04_'+'100'+'000.png')\">it</a>".into(),
+            "<a href=\"javascript&#58void(0)\">it</a>".into(),
         ] {
             assert_eq!(references(&doc, file, embed).mentions, 2, "{doc}");
         }
