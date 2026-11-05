@@ -41,6 +41,7 @@ Run it inside the folder that holds that lecture's files:
 cd ~/path/to/<course>/Weeks/<week>
 lecture                 # record; resumes if today's notes are already here
 lecture page            # typeset today's study page from the notes, without recording
+lecture tidy            # which slides are redundant; --apply takes them out (no request)
 lecture spend           # what the tool has cost, by month, course and lecture
 ```
 
@@ -62,6 +63,14 @@ recording light and elapsed time, a trace of the input's loudness, what is queue
 next snapshot, and what this lecture has cost so far. When the input has been exactly
 silent for 15 seconds the trace reads **no signal**, which with BlackHole means Zoom's
 audio is no longer reaching it (usually Zoom's speaker setting).
+
+Slides look after themselves: when a build slide finishes revealing, the captures of its
+earlier steps (and of a fade caught part way) are taken out as the finished slide lands, a
+slide shown again is taken out as the same picture, and a classroom camera left on screen
+after the share is not taken for slides. Each removal says why and Command-Z puts it back;
+what you put back stays. Nothing is sent anywhere to decide this. After class, before the
+polish, the same check runs over the slides the notes already hold, and takes their embeds
+out of the notes with them.
 
 Take a screenshot of a slide with the normal macOS shortcut while it runs; the file is
 moved into `slides/` and placed in the timeline at the moment it was captured, so the
@@ -134,18 +143,26 @@ reapplies the page design (`notes_template.html`) and costs nothing.
                                    folder holds more than one day's notes)
   lecture_transcript_YYYYMMDD.txt  [HH:MM:SS] text, one line per utterance
   slides/slide_NN_HHMMSS.png       captured slides, ≤1600 px
-  slides/removed/                 removed images, recoverable in the app with Command-Z
+  slides/removed/                 removed images, recoverable in the app with Command-Z until
+                                   the study page is finished
   .live_notes/                     resume state, polish backups, typeset page parts
 ```
 
 Restarting the tool on the same day resumes: transcript lines and slides newer than
 the last snapshot are picked up, nothing is re-processed, and no new document is made.
 
-A successful polish and finished study page clear the separate capture files after verifying their
-embedded copies. Pending or unverified captures stay. LectureLive's notes, slide previews and later
-page builds use the HTML archive; Command-Z can also restore removed images from it. Keep the HTML
-for a portable copy with images: the unchanged Markdown's image links need LectureLive or the
-original capture files when viewed elsewhere.
+A finished study page is what the lecture keeps, with the notes and transcript: after a polish
+or `lecture page`, the capture files are deleted once their embedded copies are verified, the
+removed images and their folder go (Command-Z has nothing left to restore), and the recordings
+are deleted unless a stretch of audio still waits for transcription. Pending or unverified
+captures stay. LectureLive's notes, slide previews and later page builds use the HTML archive.
+Keep the HTML for a portable copy with images: the unchanged Markdown's image links need
+LectureLive or the original capture files when viewed elsewhere.
+
+`lecture tidy` says which slides of a lecture are redundant and how much they take; `--apply`
+takes them out (the notes' embeds first, with a backup) and, for a finished page, clears what
+it replaces. `--swap A=B` puts slide B, removed by hand, back in place of slide A when A is an
+earlier state of it.
 
 ## Cost
 

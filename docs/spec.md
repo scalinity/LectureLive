@@ -298,7 +298,7 @@ suffix) with `hound`: 32,000 B/s, 115.2 MB/h. The recorder calls `flush()` (head
 update) and `fsync` once per second, and `finalize()` on stop with the error surfaced.
 After a crash the header is repaired from the file length on next launch. A recording
 is kept while any gap overlapping it is unresolved; otherwise retention follows a
-setting.
+setting, and a finished study page deletes it (§7.6).
 
 ## 5. Speech-to-text streaming
 
@@ -649,7 +649,10 @@ with each count of samples multiplied by the rate, so each stays the same in sec
   screen sharing". A frame that is gentle all over with no level most of it shares (soft at least
   0.25, dominant under 0.40) and that is moving (the mean change from the sample before, over the
   last 3 samples, at least 0.0004) is a camera; the same picture held still is a slide with a
-  photograph on it. Nothing is taken from a camera or a notice and the strip says what is showing
+  photograph on it. A camera once seen moving stays a camera while its frames stay gentle all over,
+  though the room holds still between someone's movements, until a page or a cut to another picture
+  (one sample's mean change of at least 0.08, after which the motion is measured afresh): a classroom
+  camera's frames minutes apart changed by at most 0.057, cuts by 0.16 to 0.50. Nothing is taken from a camera or a notice and the strip says what is showing
   ("Zoom Meeting, waiting for a slide (a camera is showing)"); the first page that follows is
   the lecture's first slide. A manual capture is the person's call and is not judged.
 - **Candidate**: at least one changed tile outside the mask. Its image and first-observed time are kept.
@@ -664,7 +667,8 @@ with each count of samples multiplied by the rate, so each stays the same in sec
   frames (no unmasked tile past the change threshold), which was on screen within the last minute
   (180 samples), is that slide shown again: it becomes the kept frame and is not registered. A step back
   and forward would otherwise register one slide once for every look, and each registered slide is sent to
-  the model and embedded in the notes. A slide returned to after a longer time registers again.
+  the model and embedded in the notes. A slide returned to after a longer time registers again, and
+  tidying takes it out as the same picture (§7.7).
 - **The control bar**: Zoom draws its control bar over the bottom of the share when the pointer moves over the
   window, and takes it off a few seconds later. A change is the bar's, and starts nothing, when every changed
   tile lies in the bottom 2 tile rows, the changed tiles span at least 12 of the 16 columns, and their mean
@@ -742,6 +746,9 @@ own keyboard behavior. The notice and removal tooltip show the shortcut. The CLI
 `remove N` (or `remove slide N`) as the whole line; no reply is waited for, so a refusal comes back as a
 warning in the event stream and the plain CLI prints a removal as `slide N removed`.
 
+Tidying (§7.7) takes redundant captures out through this same path, each with its reason; a slide that
+undo restores is pinned, so tidying never takes it out again.
+
 The strip offers the control only for a slide that is removable, and the core decides again when asked, inside
 the sidecar's writer: a slide a snapshot has used stays (the notes embed its file), and nothing is removed while a
 snapshot or polish runs, because its batch may already hold the slide. Undo also waits for a snapshot
@@ -753,24 +760,93 @@ includes it. Missing files or occupied destinations produce an error and keep th
 The strip follows `slide_removed`, `slide_restored`, and `slides_noted` (through an index); a snapshot's
 used slides lose the removal control.
 
-### 7.6 Clearing capture files after polish
+### 7.6 Clearing after the finished page
 
-After a successful polish and a complete study page, the separate capture files represented in that
-page are deleted. A failed polish, failed page or incomplete page keeps them. Pending images absent
-from the page stay for the next snapshot. The page contains a small manifest mapping capture paths
-and source hashes to its existing embedded gallery images; cleanup checks both the source and the
-saved image before deleting a file. A changed file, unreadable file, external path or symlink stays.
+Once the study page is complete (every part §6.4 asks for), it is what the lecture keeps, with the notes and the
+transcript. A failed or incomplete page keeps everything, and pending images absent from the page stay for the next
+snapshot. Otherwise:
 
-Removed captures are compressed into a separate hidden JSON section in the HTML, outside the study
-gallery, before their files are cleared. Their undo history remains in the sidecar. Command-Z can
-restore the saved JPEG as a new `.jpg` file, preserving capture time and origin, and returning it to
-the next snapshot. Capture numbers remain reserved even when a folder's images live only in HTML.
+- **Captures the page holds** are deleted, each after a check. The page contains a small manifest mapping capture paths
+  and source hashes to its embedded gallery images, and cleanup checks both the source and the saved image before
+  deleting a file. A changed file, unreadable file, external path or symlink stays.
+- **Images of slides taken out of the lecture** (`slides/removed/`) are deleted with their folder, and so is any copy of
+  them an earlier page kept. Undo has nothing left to restore: their records leave the sidecar, and their numbers stay
+  reserved (`reserved_index`).
+- **Recordings**, outside a session: each closed recording with no unresolved gap is deleted as retention deletes one
+  (§4.4) and marked deleted in the sidecar, and the emptied `recordings/` goes. `lecture audit` reports it as deleted.
 
-LectureLive loads archived images for the notes, thumbnails and later page requests or free template
-rebuilds. Rendering a new page preserves its previous archived images. The Markdown text and its
-fingerprint stay unchanged; standalone Markdown viewers need the original files, while LectureLive
-and the self-contained HTML can show the archived copies. The CLI and app report files and bytes
-cleared. The app rehydrates image sources after cleanup.
+This runs after a polish's page and after `lecture page`; the app's Open study page typesets without clearing. The CLI
+and app report the images, recordings and bytes cleared, and the app rehydrates image sources afterwards.
+
+LectureLive loads archived images for the notes, thumbnails and later page requests or free template rebuilds.
+Rendering a new page preserves its previous archived images while the notes still embed them, so a slide taken out of
+the notes leaves the gallery, and opening the folder never registers a removed slide again from an older page. The
+Markdown text and its fingerprint stay unchanged; standalone Markdown viewers need the original files, while LectureLive
+and the self-contained HTML can show the archived copies.
+
+### 7.7 Redundant captures
+
+A build slide is captured once per reveal, and a fade can be caught part way. A slide shown again after the detector's
+minute (§7.2) is taken again, and a camera left on screen after a share can be taken for a slide. On a class pruned by
+hand, 131 of 236 captures were discarded for these reasons. Each is told from the pictures alone, with no request
+(`capture::compare`, `session::tidy`), on the detector's 256×144 grayscale of the saved image:
+
+- **Ink** is an edge (something within one pixel differs by more than 32 levels) that stands more than 32 levels off its
+  16×16 tile's page level (the tile's median).
+- **Holding ink.** Capture B holds A's ink at a pixel in either of two ways:
+  - B's tile shows something and B has the same level there within 32;
+  - B has ink of its own there in the same direction and at least as strong, as a fade does.
+
+  PowerPoint's slideshow toolbar corner (the bottom-left 17 % × 6 %) counts in neither picture.
+- **Earlier state.** A is an earlier state of B when B holds all of A's ink but at most 0.25 % of the frame, and A holds
+  less of B's.
+- **Same picture.** Each holds the other's ink to within 0.25 %, and neither has 0.05 % more.
+- **What is and is not an earlier state.** A build step and a frame of a fade are earlier states of the finished slide.
+  Another slide, a new title, text a panel covers and a flat frame are not.
+- **Photographs.** A photograph's detail (§7.2's measures) is not ink. A photograph is the same only as a picture
+  matching it pixel for pixel (at most 0.25 % of pixels changed by more than 32 levels), and is never an earlier state.
+- **Camera.** A camera is a run of two or more photographic captures in a row, each the same view as the one before
+  (fewer than 30 % of pixels changed). A single photographic capture between slides is a slide with a photograph on it.
+
+The judge settles camera runs first. Then come groups of the same picture, each keeping its first showing or a capture
+that must stay. Then come earlier states, from the most ink down, each judged against a capture kept within 10 minutes,
+preferring the one that holds it most closely. So nothing is removed together with the capture it defers to.
+
+Calibrated on the class pruned by hand (M7.6):
+
+- 119 of the 131 discards were reproduced and every camera frame was found.
+- True build steps lost 0–0.12 % of their ink, and distinct slides at least 0.67 %.
+- A panel drawn over the end of a title rule, and re-encoding twins, lost 0.30–0.44 %. They stay for the person.
+
+Some captures are never removed:
+
+- Captures taken by hand, though another capture can still defer to them.
+- A slide undo puts back: it is pinned (`pinned_slides`).
+- A capture whose image cannot be read: it is never judged.
+
+Removals go through the person's own removal (§7.5), so each joins the undo history and keeps its number. The strip and
+the CLI say why ("Slide 199 removed: an earlier state of slide 200"). The sweep runs at three points:
+
+1. **After every automatic capture registers**, over the pending captures: a finished slide takes its build steps with it
+   as it lands. This sweep gives way to a running snapshot, and every removal is looked at again inside the sidecar's
+   writer.
+2. **At the start of every snapshot** (manual, polish's own, and the last one at stop), over the pending captures, before
+   the batch is taken.
+3. **After the lecture, before its polish** (§6.3), over every capture. A capture the notes already embed goes with its
+   embed. The line comes out of the notes first, backed up and written as a polish writes them
+   (`.live_notes/<stem>_HHMMSS.md`), and only where it stands once, on its own line, outside code; otherwise the capture
+   stays.
+
+`lecture tidy` makes no request and needs no key. It reports each day's redundant captures and their size, kept
+captures that are an earlier state of one taken out by hand, and what a finished page would let go.
+
+- `--apply` does it.
+- `--swap A=B` puts slide B, taken out by hand, back in place of slide A, an earlier state of it, with B's embed taking
+  A's place in the notes.
+- Editing the notes leaves an existing page stale; `lecture page` typesets it again.
+
+What only the person can judge stays the person's to remove: an earlier module's slides shown in review, a closing
+slide.
 
 ## 8. Files, state, resume
 
@@ -780,16 +856,16 @@ cleared. The app rehydrates image sources after cleanup.
   <lecture title>.html                the study page, named after the lecture (§6.4)
   lecture_transcript_YYYYMMDD.txt     [HH:MM:SS] text, append-only, in commit order;
                                       --- started|resumed HH:MM:SS --- at each session
-  slides/slide_NN_HHMMSS.png|jpg      slides/removed/ holds the ones taken out before a snapshot used them (§7.5)
+  slides/slide_NN_HHMMSS.png|jpg      slides/removed/ holds the ones taken out, until the study page is finished (§7.5–§7.7)
   recordings/session_YYYYMMDD_HHMMSS.wav
   .live_notes/<stem>.v2.json          sidecar: version, lecture date, recordings + anchors, gaps,
                                       open utterances, notes {revision, len, sha256,
                                       segment_cursor, slide_index}, slides [{index, file, shown_at, auto, uncertain}],
-                                      pauses [{from, to}]
+                                      removed_slides, pinned_slides, reserved_index, pauses [{from, to}]
   .live_notes/<stem>.segments.jsonl   segment log: id, recording, samples, wall times, text, words,
                                       source (live | recovered | imported)
   .live_notes/<stem>.journal.json     pending commit, present only mid-commit
-  .live_notes/<stem>_HHMMSS.md        polish backups
+  .live_notes/<stem>_HHMMSS.md        backups before a polish or a tidy rewrites the notes
   .live_notes/<stem>.page.json        typeset study page parts, keyed by prompt and notes (§6.4)
   .live_notes/lock                    exclusive advisory lock (GUI and CLI)
 ```
@@ -968,7 +1044,7 @@ sends core commands. Every number it shows is either the projection or the canon
   back, one plain line says `The terminal could not be taken over (…); continuing in plain mode.`,
   and the same lecture — one `prepare`, one folder lock, one engine — continues through the plain
   adapter. An **explicit** `--tui` treats the same failure as that ordinary error and starts nothing.
-- `lecture page`, `lecture spend` and `lecture audit` are always conventional. `record`, `inputs`,
+- `lecture page`, `lecture spend`, `lecture audit` and `lecture tidy` are always conventional. `record`, `inputs`,
   `outputs`, `loopback` and `canary` are unaffected.
 
 #### 9.5.2 Layout
