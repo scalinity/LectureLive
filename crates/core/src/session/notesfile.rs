@@ -217,35 +217,44 @@ pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, changes: &[(String,
     }
     let mut out: Vec<Option<String>> = lines.iter().map(|l| Some(l.to_string())).collect();
     let mut made = Vec::new();
+    let mut removed = Vec::new();
     for (k, (embed, replacement)) in changes.iter().enumerate() {
         let own: Vec<usize> = (0..lines.len()).filter(|&i| !code[i] && lines[i].trim() == embed).collect();
         let anywhere = lines.iter().map(|l| l.matches(embed.as_str()).count()).sum::<usize>();
         if own.len() == 1 && anywhere == 1 {
             out[own[0]] = replacement.clone();
+            if replacement.is_none() {
+                removed.push(own[0]);
+            }
             made.push(k);
         }
     }
     if made.is_empty() {
         return Ok(made);
     }
-    // A slide's line out leaves its blank lines either side: one is kept. A "Slides not placed" heading left with
-    // nothing under it goes too.
-    let mut kept: Vec<String> = Vec::new();
-    for l in out.into_iter().flatten() {
-        if l.trim().is_empty() && kept.last().is_some_and(|p| p.trim().is_empty()) {
-            continue;
-        }
-        kept.push(l);
-    }
-    if let Some(h) = kept.iter().position(|l| l.trim() == crate::notes::embeds::NOT_PLACED) {
-        let rest_empty = kept[h + 1..].iter().take_while(|l| !l.starts_with('#')).all(|l| l.trim().is_empty());
-        if rest_empty {
-            kept.remove(h);
-            while h < kept.len() && kept[h].trim().is_empty() && (h == 0 || kept[h - 1].trim().is_empty() || h + 1 == kept.len()) {
-                kept.remove(h);
+    // Only what the change touched is tidied, outside code: the blank lines a removed embed leaves side by side become
+    // one, and a "Slides not placed" heading whose section it emptied goes with that section's blank lines.
+    let blank = |out: &[Option<String>], i: usize| out[i].as_deref().is_some_and(|l| l.trim().is_empty());
+    removed.sort_unstable();
+    for &r in &removed {
+        let prev = (0..r).rev().find(|&i| out[i].is_some());
+        let next = (r + 1..out.len()).find(|&i| out[i].is_some());
+        if let (Some(p), Some(n)) = (prev, next) {
+            if !code[p] && !code[n] && blank(&out, p) && blank(&out, n) {
+                out[n] = None;
             }
         }
     }
+    for h in (0..lines.len()).filter(|&i| !code[i] && lines[i].trim() == crate::notes::embeds::NOT_PLACED) {
+        let end = (h + 1..lines.len()).find(|&i| !code[i] && lines[i].starts_with('#')).unwrap_or(lines.len());
+        let emptied = removed.iter().any(|&r| r > h && r < end) && (h + 1..end).all(|i| out[i].is_none() || blank(&out, i));
+        if emptied {
+            for line in out.iter_mut().take(end).skip(h) {
+                *line = None;
+            }
+        }
+    }
+    let kept: Vec<String> = out.into_iter().flatten().collect();
     replace(files, sc, &kept.join("\n"), &sha256_hex(doc.as_bytes()), at)?;
     Ok(made)
 }
@@ -294,6 +303,17 @@ mod tests {
         let made = change_embeds(&files, &mut sc, &[("![Slide 1](slides/a.png)".into(), Some("![Slide 5](slides/e.png)".into())), ("![Slide 2](slides/b.png)".into(), None)], chrono::Local::now()).unwrap();
         assert_eq!(made, [0, 1]);
         assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), "# T\n\n![Slide 5](slides/e.png)\n");
+    }
+
+    #[test]
+    fn only_the_lines_around_the_removed_embed_change() {
+        // F007: blank lines and a "not placed" heading elsewhere, inside code, are the notes' own.
+        let (_dir, files, mut sc) = folder();
+        let code = "```markdown\nfirst\n\n\nsecond\n### Slides not placed\n## Next\n```";
+        let doc = format!("# T\n\nText.\n\n\nMore.\n\n{code}\n\n![Slide 1](slides/a.png)\n\nAfter.\n");
+        std::fs::write(&files.notes, &doc).unwrap();
+        change_embeds(&files, &mut sc, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap();
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), format!("# T\n\nText.\n\n\nMore.\n\n{code}\n\nAfter.\n"));
     }
 
     #[test]
