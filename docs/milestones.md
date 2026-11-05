@@ -1206,3 +1206,74 @@ no errors or warnings. The release app built, its strict signature verified and 
 binary matched the build. In the installed app, the header matched the saved daily total before
 choosing a folder, after opening an existing lecture, and after a full process exit and reopen.
 The ledger's checksum remained unchanged. No paid request or saved screenshot was needed.
+
+## M7.6 — Redundant captures and clearing after the finished page
+
+A build slide was captured once per reveal, a fade could be caught part way, a slide shown again after the detector's
+minute was taken again, and a classroom camera left on screen after the share was taken for slides each time the room
+held still. On Biostatistics Week 12, 131 of 236 captures were discarded by hand during class, and the 22 camera
+captures left in reached the notes. Captures are now judged from the pictures alone, with no request (spec §7.7):
+
+- **Earlier states and repeats.** A capture another holds all the ink of (an edge off its tile's page level, held where
+  the other has an edge too, at the same level or stronger in the same direction) is an earlier state of it. Two that
+  each hold the other within 0.25 % of the frame are the same picture. A photograph compares only by identity.
+- **Order.** Same-picture groups keep their first showing, and each member goes only if it matches that keeper
+  directly. Earlier states are settled from the most ink down, each against a kept capture within 10 minutes, so nothing
+  is removed together with the capture it defers to.
+- **Where it runs.** After every automatic capture, at the start of every snapshot and after the lecture before polish.
+  Removals go through the person's removal path, with the reason in the notice; undo pins what it puts back. A slide
+  the notes name anywhere (counted on the decoded notes) goes only with its own embed, taken out first and backed up.
+- **Camera.** The scene gate stays on camera once it has seen one move, until a page or a cut (classroom camera
+  captures changed by at most 0.057, cuts by 0.16–0.50). Camera-like runs among saved captures are only reported:
+  grain cannot tell them from a photograph slide whose caption changes (1.2–9 % against 3.2 %), so
+  `lecture tidy --drop A-B` takes them out on the person's word.
+- **Zoom's control bar.** Where the region takes in Zoom's controls, a slide that changed under the bar is captured with
+  it. A band like the bar is never skipped: it cannot be told from a slide's own dark footer. When all the more complete
+  capture adds is that band, both stay.
+- **After the finished page.** The page records in its own atomic write whether it was typeset with every part. Once it
+  is complete, its verified captures, the removed images (none the notes still name) and, outside a session, the
+  recordings with no unresolved gap are deleted. Removed images are no longer kept in the page, their numbers stay
+  reserved, and a removed slide never comes back from an older page. `lecture page` clears the same way.
+- **`lecture tidy`.** It makes no request and needs no key. A dry run writes nothing, and `--apply` does the work. A page
+  from before the status record is rendered again from its saved parts, with no request, and is refused if any image
+  cannot be read again. `--swap A=B` puts a complete slide removed by hand back in place of its kept partial, embed
+  included.
+
+*Calibration* (`examples/tidy_score`, against the Week 12 removals, local copies only):
+
+- 118 of the 131 discards were reproduced.
+- The 23-frame camera run was reported.
+- The kept captures removed are all earlier states or repeats, among them the two complete versions discarded by
+  mistake (94/95, 191/192).
+- True build steps lost 0–0.12 % of their ink, and distinct slides at least 0.67 %. Near misses (a panel over a title
+  rule, re-encoding twins) lost 0.30–0.44 % and are left for the person.
+- Dry runs over the other classes, with every borderline pair checked by eye: Applied GenAI W10's 20 redundant captures
+  are pixel-identical re-shows, and Biostat W08's 17 are build steps.
+- Checking those pairs is how the Zoom-bar twins were found.
+
+*Review.* An independent Codex (GPT-6.1 Sol, xhigh) read-only review of the branch, then four follow-ups on each fix
+range, found 16 issues, all fixed with regressions. Among them:
+
+- overpainted strokes counted as held;
+- a non-transitive same-picture group;
+- photograph copies all removed as a camera;
+- completeness read from a cache saved before the page;
+- stale cached relations;
+- a dry run touching the ledger;
+- notes cleanup outside the embed;
+- the Zoom-bar heuristic hiding a slide's footer, twice;
+- an old page's only image overwritten by a re-render;
+- `--drop` ignoring hand-typed embeds;
+- references written with other syntaxes (encoded, by reference, unquoted, with a fragment or a query).
+
+The NativePeers resume path refused to continue the reviewer (`PERMISSION_CAPABILITY_UNKNOWN`: unscoped tools on
+resume), so each follow-up ran in a fresh read-only worker given the previous report.
+
+*Verification* (2026-11-05):
+
+- The serial workspace suite passed 827 tests with 33 opt-in checks ignored.
+- One test failed: `the_failures_scenario_walks_the_table_and_keeps_it_inspectable`. It fails only on dates whose
+  digits make the terminal's cell diff skip a character of the expected text, and is unrelated to this milestone.
+- Desktop type checking reported no errors, and the 50 frontend tests passed.
+- On a copy of Biostat W09, `lecture tidy --apply` re-rendered the page with no request. The gallery kept all 20 images,
+  the page recorded itself complete, its 5 MB hidden archive of removed images went, and the recording was deleted.
