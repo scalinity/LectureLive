@@ -357,6 +357,10 @@ fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<V
     let mut stay: HashSet<u32> = HashSet::new();
     for s in indices.iter().filter_map(|&i| sc.slides.iter().find(|s| s.index == i)) {
         let embed = embed_line(s, &files.dir, files.notes_dir());
+        if notesfile::has_alias(&files.slides, &files.dir.join(&s.file)) {
+            stay.insert(s.index);
+            continue;
+        }
         match notesfile::references(&doc, &files.dir.join(&s.file), &embed) {
             notesfile::References { mentions: 0, .. } => {}
             notesfile::References { mentions: 1, own_line_embeds: 1 } => with_embed.push(s.clone()),
@@ -464,7 +468,7 @@ pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, li
     }
     // A removed image the notes still refer to, however written, stays.
     let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
-    let removed = archive::clear_removed(&files.dir, |p| notesfile::references(&doc, p, "").mentions > 0);
+    let removed = archive::clear_removed(&files.dir, |p| notesfile::references(&doc, p, "").mentions > 0 || notesfile::has_alias(&files.slides, p));
     out.images.files += removed.files;
     out.images.bytes += removed.bytes;
     out.images.kept.extend(removed.kept);
@@ -676,6 +680,24 @@ mod tests {
             let r = retire(&f.files, &page, Some(&f.store), false).await.unwrap();
             assert_eq!((r.images.files, r.images.kept.len()), (0, 1));
             assert!(f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap()).exists());
+        }
+
+        #[tokio::test]
+        async fn an_image_a_link_leads_to_under_another_name_stays() {
+            // F021: slides/detail.png -> removed/slide_NN_HHMMSS.png, the notes naming only the link.
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let files = f.files.clone();
+            f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
+            let target = f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap());
+            std::os::unix::fs::symlink(&target, f.files.slides.join("detail.png")).unwrap();
+            std::os::unix::fs::symlink(f.files.dir.join(&steps[1].file), f.files.slides.join("other.png")).unwrap();
+            std::fs::write(&f.files.notes, "# T\n\n![detail](slides/detail.png)\n\n![other](slides/other.png)\n").unwrap();
+            assert!(drop_slides(&f.files, &f.store, &[2]).await.unwrap().is_empty(), "a registered slide with a link to it stays");
+            let page = f.files.dir.join("Page.html");
+            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+            retire(&f.files, &page, Some(&f.store), false).await.unwrap();
+            assert!(target.exists() && f.files.slides.join("detail.png").canonicalize().is_ok(), "the link still leads to it");
         }
 
         #[tokio::test]

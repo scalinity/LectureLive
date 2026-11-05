@@ -256,6 +256,21 @@ fn decoded_notes(doc: &str) -> String {
     text.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect()
 }
 
+/// Whether a link in the slides' folders (`slides/`, `slides/removed/`) leads to `file` under another name: the notes
+/// may name the link. A link that cannot be read counts, since it might.
+pub fn has_alias(slides: &std::path::Path, file: &std::path::Path) -> bool {
+    let Ok(target) = file.canonicalize() else { return true };
+    for dir in [slides.to_path_buf(), slides.join("removed")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            if entry.file_type().map_or(true, |t| t.is_symlink()) && entry.path().canonicalize().map_or(true, |p| p == target) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
 
 pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References {
