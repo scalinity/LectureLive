@@ -197,6 +197,77 @@ pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on:
     Ok(backup)
 }
 
+/// How the notes refer to one slide's file (spec §7.7): every link or image destination that resolves to it (decoded,
+/// from the notes' folder, `.` and `..` resolved), every mention of its file name, and own-line copies of its embed
+/// outside code. A slide may leave the lecture only when nothing refers to it, or when its one reference is that embed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct References {
+    pub destinations: usize,
+    pub names: usize,
+    pub own_line_embeds: usize,
+}
+
+static DESTINATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)|(?i:src|href)\s*=\s*["']([^"']+)["']"#).expect("a valid pattern"));
+
+fn decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A path with `.` and `..` taken out, without touching the disk.
+fn plain(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+pub fn references(doc: &str, notes_dir: &std::path::Path, file: &std::path::Path, embed: &str) -> References {
+    let target = plain(file);
+    let destinations = DESTINATION
+        .captures_iter(doc)
+        .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| decoded(m.as_str())))
+        .filter(|d| {
+            let d = d.strip_prefix("file://").unwrap_or(d);
+            plain(&notes_dir.join(d)) == target
+        })
+        .count();
+    let names = file.file_name().map_or(0, |n| doc.matches(&*n.to_string_lossy()).count());
+    let mut fenced = false;
+    let mut own_line_embeds = 0;
+    for line in doc.lines() {
+        let t = line.trim();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fenced = !fenced;
+        } else if !fenced && t == embed {
+            own_line_embeds += 1;
+        }
+    }
+    References { destinations, names, own_line_embeds }
+}
+
 /// Takes slides' embeds out of the notes, or puts another slide's embed in one's place (spec §7.7): each change is
 /// `(embed, replacement)`, the embed as it is written on its own line. An embed is changed only where it stands once,
 /// on its own line and outside code; any other copy (inline, repeated, or the line edited by hand) leaves that one as
@@ -314,6 +385,20 @@ mod tests {
         std::fs::write(&files.notes, &doc).unwrap();
         change_embeds(&files, &mut sc, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap();
         assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), format!("# T\n\nText.\n\n\nMore.\n\n{code}\n\nAfter.\n"));
+    }
+
+    #[test]
+    fn references_are_counted_by_where_they_lead_however_they_are_written() {
+        let dir = std::path::Path::new("/lec");
+        let file = dir.join("slides/slide_04_100000.png");
+        let embed = "![Slide 4](slides/slide_04_100000.png)";
+        let refs = |doc: &str| references(doc, dir, &file, embed);
+        assert_eq!(refs("# T\n"), References::default());
+        assert_eq!(refs(&format!("# T\n\n{embed}\n")), References { destinations: 1, names: 1, own_line_embeds: 1 });
+        assert_eq!(refs("![detail](slides/%73lide_04_100000.png)").destinations, 1, "decoded");
+        assert_eq!(refs(&format!("{embed}\n\nSee [detail](slides/./slide_04_100000.png).")).destinations, 2, "resolved");
+        assert_eq!(refs("<img src=\"slides/../slides/slide_04_100000.png\">").destinations, 1);
+        assert_eq!(refs("![x](slides/slide_05_100000.png)"), References::default());
     }
 
     #[test]

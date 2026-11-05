@@ -853,7 +853,11 @@ the CLI say why ("Slide 199 removed: an earlier state of slide 200"). The sweep 
 3. **After the lecture, before its polish** (§6.3), over every capture. A capture the notes already embed goes with its
    embed. The line comes out of the notes first, backed up and written as a polish writes them
    (`.live_notes/<stem>_HHMMSS.md`), and only where it stands once, on its own line, outside code; otherwise the capture
-   stays.
+   stays. The same rule holds for every removal: a capture nothing in the notes refers to goes as it is, one whose only
+   reference is its own embed goes with it, and any other reference keeps it, however it is written (references are
+   counted by where they lead, decoded and resolved from the notes' folder, and the file named in text counts). Notes
+   that cannot be read keep every capture. Clearing removed images after a finished page also keeps any the notes still
+   refer to.
 
 `lecture tidy` makes no request and needs no key. It reports each day's redundant captures and their size, kept
 captures that are an earlier state of one taken out by hand, and what a finished page would let go.

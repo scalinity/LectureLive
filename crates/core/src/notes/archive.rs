@@ -109,14 +109,15 @@ pub fn without_removed(html: &str) -> Option<String> {
 }
 
 /// Deletes the images of slides taken out of the lecture (`slides/removed/`) and the emptied folder: regular image
-/// files directly inside it only. Returns the files and bytes deleted, and what was left.
-pub fn clear_removed(dir: &Path) -> Cleanup {
+/// files directly inside it only, and none that `keep` says is still referred to. Returns the files and bytes deleted,
+/// and what was left.
+pub fn clear_removed(dir: &Path, keep: impl Fn(&Path) -> bool) -> Cleanup {
     let mut out = Cleanup::default();
     let folder = dir.join("slides/removed");
     let Ok(entries) = std::fs::read_dir(&folder) else { return out };
     for entry in entries.flatten() {
         let Ok(relative) = entry.path().strip_prefix(dir).map(|p| p.to_string_lossy().into_owned()) else { continue };
-        let Some(path) = capture_path(dir, &relative) else {
+        let Some(path) = capture_path(dir, &relative).filter(|p| !keep(p)) else {
             out.kept.push(relative);
             continue;
         };

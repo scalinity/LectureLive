@@ -463,7 +463,7 @@ mod tests {
         let html = std::fs::read_to_string(&page).unwrap();
         assert_eq!(crate::notes::archive::script(&html, "slides").unwrap(), "{}", "a removed image stays out of the gallery");
         assert!(crate::notes::archive::script(&html, "removed-captures").is_none(), "and the page keeps no copy of it");
-        let cleared = crate::notes::archive::clear_removed(&files.dir);
+        let cleared = crate::notes::archive::clear_removed(&files.dir, |_| false);
         assert_eq!((cleared.files, cleared.kept.len()), (1, 0));
         assert!(!files.slides.join(REMOVED_DIR).exists(), "the emptied folder goes too");
         let files2 = files.clone();
