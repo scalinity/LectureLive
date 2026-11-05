@@ -96,13 +96,19 @@ pub fn classify(f: &Features, moving: bool) -> Scene {
     // slide had a mean of 170.
     if f.mean < 70.0 && f.dominant >= 0.75 && f.hard < 0.05 {
         Scene::Placeholder
-    // A photograph's gradients and grain, and no single level most of it shares. Recorded: the lectern camera
-    // (soft 0.41–0.48, dominant 0.15–0.17); no slide had soft above 0.15 or dominant below 0.48.
-    } else if f.soft >= 0.25 && f.dominant < 0.40 && moving {
+    // A camera is a photograph that moves.
+    } else if photographic(f) && moving {
         Scene::Camera
     } else {
         Scene::Slide
     }
+}
+
+/// A photograph's gradients and grain, and no single level most of it shares. Recorded: the lectern camera (soft
+/// 0.41–0.48, dominant 0.15–0.17) and a classroom camera (0.48–0.55, 0.13–0.14); no slide had soft above 0.15 or
+/// dominant below 0.48.
+pub fn photographic(f: &Features) -> bool {
+    f.soft >= 0.25 && f.dominant < 0.40
 }
 
 /// Looks at each sample in turn: the measures, and whether the picture is moving.

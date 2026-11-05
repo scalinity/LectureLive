@@ -1,3 +1,4 @@
+pub mod compare;
 pub mod detect;
 pub mod layout;
 pub mod locate;
