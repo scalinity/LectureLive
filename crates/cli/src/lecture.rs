@@ -83,7 +83,7 @@ fn audit_cmd(dir: &Path) -> Result<()> {
 
 /// `lecture tidy` (spec §7.7): each day's redundant captures, and with `--apply` takes them out, the notes' embeds of
 /// them first, then clears what a finished study page replaces (§7.6). No request is made, so no key is needed.
-async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String]) -> Result<()> {
+async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -> Result<()> {
     let days: Vec<(String, chrono::NaiveDate)> = std::fs::read_dir(dir.join(".live_notes"))
         .map(|e| e.flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".v2.json").map(str::to_string)).collect::<Vec<_>>())
         .unwrap_or_default()
@@ -91,6 +91,15 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String]) -> Result<()> {
         .filter_map(|stem| Some((stem.clone(), chrono::NaiveDate::parse_from_str(stem.strip_prefix("lecture_notes_")?, "%Y%m%d").ok()?)))
         .collect();
     anyhow::ensure!(!days.is_empty(), "no LectureLive lecture state in {} (.live_notes/*.v2.json); a folder from the Python tool gets its page with `lecture page --notes <file>`", dir.display());
+    let drops: Vec<u32> = drops
+        .iter()
+        .map(|d| match d.split_once('-') {
+            Some((a, b)) => Some((a.trim().parse::<u32>().ok()?..=b.trim().parse::<u32>().ok()?).collect::<Vec<_>>()),
+            None => Some(vec![d.trim().parse().ok()?]),
+        })
+        .collect::<Option<Vec<_>>>()
+        .with_context(|| format!("--drop wants slide numbers, N or A-B: {drops:?}"))?
+        .concat();
     let swaps: Vec<(u32, u32)> = swaps.iter().map(|s| s.split_once('=').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))).with_context(|| format!("--swap wants A=B, slide numbers: {s:?}"))).collect::<Result<_>>()?;
     // Only a change needs the folder to itself: what a dry run reads, a lecture open in the app does not touch.
     let _lock = if apply { Some(FolderLock::acquire(dir)?) } else { None };
@@ -109,6 +118,12 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String]) -> Result<()> {
                 notes_changed = true;
                 println!("  slide {b} put back in place of slide {a}");
             }
+            if !drops.is_empty() {
+                for s in tidy::drop_slides(&files, &store, &drops).await? {
+                    notes_changed |= s.index <= sc.notes.slide_index;
+                    println!("  slide {} removed, as asked", s.index);
+                }
+            }
             for (s, why) in tidy::sweep(&files, &store, tidy::Scope::All, None).await? {
                 notes_changed |= s.index <= sc.notes.slide_index;
                 println!("  slide {} removed: {why}", s.index);
@@ -121,6 +136,9 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String]) -> Result<()> {
                 println!("  slide {} would go: {}", v.index, v.why);
             }
             println!("  {:.1} MB of redundant captures", mb(bytes));
+            for (first, last) in tidy::camera_report(&files, &sc).await {
+                println!("  slides {first}-{last} look like a camera left on screen (a fixed view in which someone moves); tidy never removes them on its own: --drop {first}-{last} takes them out");
+            }
             for (a, b) in tidy::mistakes(&files, &sc).into_iter().filter(|(a, _)| !going.iter().any(|v| v.index == *a)) {
                 println!("  slide {a}, kept, is an earlier state of slide {b}, taken out by hand: --swap {a}={b} puts {b} back in its place");
             }
@@ -239,7 +257,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let p = out.paint;
     // Tidying reads no ledger and needs no key: it goes before the ledger is taken over, so a dry run writes nothing.
     if a.command.as_deref() == Some("tidy") {
-        return tidy_cmd(&lecture_dir(a.dir.clone())?, a.apply, &a.swap).await;
+        return tidy_cmd(&lecture_dir(a.dir.clone())?, a.apply, &a.swap, &a.drop_slides).await;
     }
     let app_ledger = if fixture.is_some() {
         // A name in the scripted lecture's own folder, never written: the scripted session spends nothing.

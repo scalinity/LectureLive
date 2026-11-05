@@ -33,8 +33,6 @@ pub enum Redundant {
     EarlierStateOf(u32),
     /// The same picture as this slide, taken again.
     SameAs(u32),
-    /// A camera, not a slide.
-    Camera,
 }
 
 impl fmt::Display for Redundant {
@@ -42,7 +40,6 @@ impl fmt::Display for Redundant {
         match self {
             Redundant::EarlierStateOf(n) => write!(f, "an earlier state of slide {n}"),
             Redundant::SameAs(n) => write!(f, "the same as slide {n}"),
-            Redundant::Camera => write!(f, "a camera, not a slide"),
         }
     }
 }
@@ -97,20 +94,16 @@ impl Relations {
     }
 }
 
-/// Which candidates are redundant, in index order. A capture is only ever removed in favour of one that stays.
-pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
+/// Runs that look like a camera left on screen: at least three photographs of one fixed view in which little moves,
+/// not all the same picture. Only reported: from saved pictures alone such a run cannot be told from a photograph slide
+/// whose caption or highlight changes, so it goes only on the person's word (`lecture tidy --drop`). The scene gate
+/// keeps a camera from being captured in the first place (spec §7.2). Each run is its first and last slide number.
+pub fn camera_runs(caps: &[Capture]) -> Vec<(u32, u32)> {
     let mut caps: Vec<&Capture> = caps.iter().collect();
     caps.sort_by_key(|c| c.index);
-    let n = caps.len();
     let look = |i: usize| caps[i].look.as_deref();
-    let mut why: Vec<Option<Redundant>> = vec![None; n];
-
-    // A camera: a run of photographs of one fixed view in which someone moves. A photograph between slides is a slide
-    // that has one, copies of one photograph are one slide shown again (the same-picture pass keeps one), and a series
-    // of different photographs changes throughout.
     let photo = |i: usize| look(i).is_some_and(Look::photographic);
-    let mut in_run = vec![false; n];
-    let mut i = 0;
+    let (n, mut out, mut i) = (caps.len(), Vec::new(), 0);
     while i < n {
         let mut j = i + 1;
         if photo(i) {
@@ -122,19 +115,24 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
             steps.sort_by(f32::total_cmp);
             let fixed = steps.get(steps.len() / 2).is_some_and(|&c| c <= CAMERA_STILL);
             if j - i >= CAMERA_RUN && !identical && fixed {
-                for k in i..j {
-                    in_run[k] = true;
-                    if caps[k].candidate {
-                        why[k] = Some(Redundant::Camera);
-                    }
-                }
+                out.push((caps[i].index, caps[j - 1].index));
             }
         }
         i = j;
     }
+    out
+}
+
+/// Which candidates are redundant, in index order. A capture is only ever removed in favour of one that stays.
+pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
+    let mut caps: Vec<&Capture> = caps.iter().collect();
+    caps.sort_by_key(|c| c.index);
+    let n = caps.len();
+    let look = |i: usize| caps[i].look.as_deref();
+    let mut why: Vec<Option<Redundant>> = vec![None; n];
 
     // The same picture, however long apart: each group keeps one, the first shown unless one must stay.
-    let pool: Vec<usize> = (0..n).filter(|&i| !in_run[i] && look(i).is_some()).collect();
+    let pool: Vec<usize> = (0..n).filter(|&i| look(i).is_some()).collect();
     let mut group: Vec<usize> = (0..n).collect();
     fn root(group: &mut [usize], i: usize) -> usize {
         let mut r = i;
@@ -293,6 +291,14 @@ pub async fn plan(files: &LectureFiles, sc: &Sidecar, scope: Scope) -> Vec<Verdi
     judge(&caps, &mut t.memo)
 }
 
+/// Runs among the lecture's captures that look like a camera (`camera_runs`), for `lecture tidy` to report.
+pub async fn camera_report(files: &LectureFiles, sc: &Sidecar) -> Vec<(u32, u32)> {
+    let t = tidier(files);
+    let mut t = t.lock().await;
+    t.refresh(files, &sc.slides).await;
+    camera_runs(&t.captures(files, sc, Scope::All))
+}
+
 /// Takes the redundant captures `scope` covers out of the lecture (spec §7.7), through the same removal as the
 /// person's, so undo restores them; says which went and why. `guard` is a running lecture's snapshot flag: a sweep
 /// from capture gives way to a snapshot, which sweeps for itself before it takes its batch.
@@ -323,26 +329,34 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
                 .filter(|v| registered(sc, v.index) && !sc.pinned_slides.contains(&v.index) && (scope == Scope::All || v.index > sc.notes.slide_index))
                 .filter(|v| match v.why {
                     Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k),
-                    Redundant::Camera => true,
                 })
                 .collect();
-            // The notes first: an embed must never name a file that has moved.
-            let noted: Vec<SlideEntry> = still.iter().filter(|v| v.index <= sc.notes.slide_index).filter_map(|v| sc.slides.iter().find(|s| s.index == v.index).cloned()).collect();
-            let mut stay: HashSet<u32> = HashSet::new();
-            if !noted.is_empty() {
-                let changes: Vec<(String, Option<String>)> = noted.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
-                let made = notesfile::change_embeds(&files, sc, &changes, Local::now())?;
-                stay = noted.iter().enumerate().filter(|(k, _)| !made.contains(k)).map(|(_, s)| s.index).collect();
-            }
-            let mut out = Vec::new();
-            for v in still.into_iter().filter(|v| !stay.contains(&v.index)) {
-                if let Ok(entry) = slides::remove_in(&files, sc, v.index) {
-                    out.push((entry, v.why));
-                }
-            }
-            Ok(out)
+            let gone = take_out(&files, sc, &still.iter().map(|v| v.index).collect::<Vec<_>>())?;
+            Ok(gone.into_iter().map(|e| { let why = still.iter().find(|v| v.index == e.index).expect("taken out from the verdicts").why; (e, why) }).collect::<Vec<_>>())
         })
         .await
+}
+
+/// Takes these registered slides out, inside the sidecar's writer: the notes' embeds of those a snapshot used first (an
+/// embed must never name a file that has moved), only where each stands once on its own line outside code, and a slide
+/// whose embed could not be taken out stays. Returns what went.
+fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<Vec<SlideEntry>> {
+    let noted: Vec<SlideEntry> = indices.iter().filter(|&&i| i <= sc.notes.slide_index).filter_map(|&i| sc.slides.iter().find(|s| s.index == i).cloned()).collect();
+    let mut stay: HashSet<u32> = HashSet::new();
+    if !noted.is_empty() {
+        let changes: Vec<(String, Option<String>)> = noted.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
+        let made = notesfile::change_embeds(files, sc, &changes, Local::now())?;
+        stay = noted.iter().enumerate().filter(|(k, _)| !made.contains(k)).map(|(_, s)| s.index).collect();
+    }
+    Ok(indices.iter().filter(|i| !stay.contains(i)).filter_map(|&i| slides::remove_in(files, sc, i).ok()).collect())
+}
+
+/// Takes out the slides the person names (`lecture tidy --drop`), as tidying does: a camera run the judge only reports,
+/// say. Outside a lecture only. Returns what went; a number not registered, or whose embed is not on a line of its own,
+/// is left.
+pub async fn drop_slides(files: &LectureFiles, store: &Store, indices: &[u32]) -> Result<Vec<SlideEntry>> {
+    let (files, indices) = (files.clone(), indices.to_vec());
+    store.update(move |sc| take_out(&files, sc, &indices)).await
 }
 
 /// Puts back `complete`, discarded by hand, in place of `partial`, kept by hand, when `partial` is an earlier state
@@ -578,6 +592,19 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn slides_named_by_the_person_go_with_their_embeds() {
+            let f = folder();
+            let steps = build(&f, 3).await;
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\n{}\n", line(&steps[0]), line(&steps[2]))).unwrap();
+            let files = f.files.clone();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 3; Ok(()) }).await.unwrap();
+            let gone = drop_slides(&f.files, &f.store, &[1, 2, 9]).await.unwrap();
+            assert_eq!(gone.iter().map(|s| s.index).collect::<Vec<_>>(), [1], "2 is used but its embed is not in the notes, 9 is not a slide");
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\n{}\n", line(&steps[2])));
+        }
+
+        #[tokio::test]
         async fn a_sweep_gives_way_to_a_running_snapshot() {
             let f = folder();
             build(&f, 2).await;
@@ -675,9 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_run_goes_and_a_lone_photograph_between_slides_stays() {
-        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, room(0)), cap(3, 2, slide(3, 3)), cap(4, 50, room(0)), cap(5, 51, room(40)), cap(6, 52, room(10))];
-        assert_eq!(judged(&caps), [(4, Redundant::Camera), (5, Redundant::Camera), (6, Redundant::Camera)]);
+    fn a_camera_run_is_reported_and_never_removed_by_the_judge() {
+        // F003: from saved pictures a camera cannot be told from a photograph slide whose caption changes.
+        let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, room(0)), cap(3, 2, slide(3, 3)), cap(4, 50, room(0)), cap(5, 51, room(40)), cap(6, 52, room(80))];
+        assert_eq!(camera_runs(&caps), [(4, 6)]);
+        assert!(judged(&caps).iter().all(|(i, _)| *i != 5 && *i != 6), "{:?}", judged(&caps));
     }
 
     #[test]
@@ -686,10 +715,10 @@ mod tests {
         let caps = [cap(1, 0, slide(0, 3)), cap(2, 1, room(0)), cap(3, 30, room(0))];
         assert_eq!(judged(&caps), [(3, Redundant::SameAs(2))]);
         let two = [cap(1, 0, room(0)), cap(2, 1, room(40))];
-        assert!(judged(&two).is_empty(), "two photographs are not enough to call a camera");
+        assert!(judged(&two).is_empty() && camera_runs(&two).is_empty(), "two photographs are not a camera");
         let series = [cap(1, 0, scan(0)), cap(2, 1, scan(1)), cap(3, 2, scan(2)), cap(4, 3, scan(3))];
         assert!(series.iter().all(|c| c.look.as_ref().unwrap().photographic()));
-        assert!(judged(&series).is_empty(), "photographs that change throughout are slides");
+        assert!(judged(&series).is_empty() && camera_runs(&series).is_empty(), "photographs that change throughout are slides");
     }
 
     #[test]

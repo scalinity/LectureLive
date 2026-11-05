@@ -69,6 +69,9 @@ pub(crate) struct LectureArgs {
     /// tidy --apply: put slide B, taken out by hand, back in place of slide A, an earlier state of it (repeatable)
     #[arg(long, value_name = "A=B", requires = "apply")]
     pub(crate) swap: Vec<String>,
+    /// tidy --apply: take out these slides, a camera run tidy reports say, with their embeds (N or A-B; repeatable)
+    #[arg(long = "drop", value_name = "A-B", requires = "apply")]
+    pub(crate) drop_slides: Vec<String>,
     /// The lecture folder (default: the current directory)
     #[arg(long)]
     pub(crate) dir: Option<PathBuf>,

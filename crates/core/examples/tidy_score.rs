@@ -57,9 +57,9 @@ fn main() -> anyhow::Result<()> {
     println!("  kept           {:>13}   {:>11}", count(true, true), count(true, false));
     let mut kinds: HashMap<&str, usize> = HashMap::new();
     for why in removed.values() {
-        *kinds.entry(match why { Redundant::EarlierStateOf(_) => "earlier state", Redundant::SameAs(_) => "same", Redundant::Camera => "camera" }).or_default() += 1;
+        *kinds.entry(match why { Redundant::EarlierStateOf(_) => "earlier state", Redundant::SameAs(_) => "same" }).or_default() += 1;
     }
-    println!("  by reason: {kinds:?}");
+    println!("  by reason: {kinds:?}; camera-like runs reported: {:?}", lecturelive_core::session::tidy::camera_runs(&caps));
 
     let rel = |a: u32, b: u32| {
         let (la, lb) = (by_index[&a].look.as_deref().unwrap(), by_index[&b].look.as_deref().unwrap());
@@ -71,7 +71,6 @@ fn main() -> anyhow::Result<()> {
         let label = if kept[&v.index] { "KEPT by hand" } else { "discarded" };
         let detail = match v.why {
             Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => format!("{}{}", rel(v.index, k), if kept.get(&k) == Some(&false) { "  (keeper discarded by hand)" } else { "" }),
-            Redundant::Camera => by_index[&v.index].look.as_deref().map(|l| format!("soft {:.2} dominant {:.2}", l.features.soft, l.features.dominant)).unwrap_or_default(),
         };
         println!("  {:>4} {:<12} {:<26} {detail}", v.index, label, v.why.to_string());
     }

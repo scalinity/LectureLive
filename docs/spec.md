@@ -811,21 +811,26 @@ hand, 131 of 236 captures were discarded for these reasons. Each is told from th
   Another slide, a new title, text a panel covers and a flat frame are not.
 - **Photographs.** A photograph's detail (§7.2's measures) is not ink. A photograph is the same only as a picture
   matching it pixel for pixel (at most 0.25 % of pixels changed by more than 32 levels), and is never an earlier state.
-- **Camera.** A camera is a run of three or more photographic captures in a row, each the same view as the one before
-  (fewer than 30 % of pixels changed), in which little moves: the typical change between neighbours is at most 2 % of the
-  frame (a classroom camera's captures changed by 0.2–13 %, typically 0.5 %). These stay:
-  - a photographic capture between slides, which is a slide with a photograph on it;
-  - two in a row;
-  - a series of photographs that change throughout;
-  - copies of one photograph, which are one slide shown again: the same-picture pass keeps one.
+- **Camera.** A run of three or more photographic captures in a row looks like a camera left on screen when:
+  - each is the same view as the one before (fewer than 30 % of pixels changed);
+  - little moves: the typical change between neighbours is at most 2 % of the frame (a classroom camera's captures
+    changed by 0.2–13 %, typically 0.5 %);
+  - not all of them are the same picture.
 
-The judge settles camera runs first. Then come groups of the same picture, each keeping its first showing or a capture
-that must stay. Then come earlier states, from the most ink down, each judged against a capture kept within 10 minutes,
+  Such a run is only reported, never removed by the judge. From saved pictures it cannot be told from a photograph slide
+  whose caption or highlight changes: grain does not tell them apart either, since a classroom camera shimmered on
+  1.2–9 % of its pixels and a re-encoded slide twin on 3.2 %. `lecture tidy --apply --drop A-B` takes it out on the
+  person's word. The scene gate's latch (§7.2) keeps a camera from being captured in the first place. Copies of one
+  photograph are one slide shown again, and the same-picture pass keeps one.
+
+The judge first forms groups of the same picture, each keeping its first showing or a capture that must stay, and each
+member goes only if it is the same as that keeper. Then come earlier states, from the most ink down, each judged against a capture kept within 10 minutes,
 preferring the one that holds it most closely. So nothing is removed together with the capture it defers to.
 
 Calibrated on the class pruned by hand (M7.6):
 
-- 119 of the 131 discards were reproduced and every camera frame was found.
+- 118 of the 131 discards were reproduced. The camera run of 23 frames, one of them discarded by hand, was reported,
+  and none of it was removed by the judge.
 - True build steps lost 0–0.12 % of their ink, and distinct slides at least 0.67 %.
 - A panel drawn over the end of a title rule, and re-encoding twins, lost 0.30–0.44 %. They stay for the person.
 
@@ -857,6 +862,7 @@ captures that are an earlier state of one taken out by hand, and what a finished
 - `--apply` does it.
 - `--swap A=B` puts slide B, taken out by hand, back in place of slide A, an earlier state of it, with B's embed taking
   A's place in the notes.
+- `--drop A-B` takes out the slides named, a camera run it reports say, with their embeds.
 - Editing the notes leaves an existing page stale; `lecture page` typesets it again.
 
 What only the person can judge stays the person's to remove: an earlier module's slides shown in review, a closing
