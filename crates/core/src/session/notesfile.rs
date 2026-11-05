@@ -236,25 +236,34 @@ fn percent_decoded(text: &str) -> String {
 /// A numeric character reference, with or without its semicolon, as HTML reads it.
 static CHARACTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?").expect("a valid pattern"));
 
-/// The notes as a reader of their links sees them: HTML character references and percent escapes undone, again and
-/// again until nothing changes (a name escaped twice is still a name), then tabs and line breaks taken out, as a browser
-/// takes them out of a URL.
-fn decoded_notes(doc: &str) -> String {
+/// The named references that spell what an escape is made of (`&`, `%`, `#`, `;`, `\\`) or what a browser drops from a
+/// URL (a tab, a line break). Digits and letters have none.
+const NAMED: [(&str, &str); 10] = [("&amp;", "&"), ("&AMP;", "&"), ("&amp", "&"), ("&AMP", "&"), ("&percnt;", "%"), ("&num;", "#"), ("&semi;", ";"), ("&bsol;", "\\"), ("&Tab;", "\t"), ("&NewLine;", "\n")];
+
+/// The notes as a reader of their links sees them. Every step between a link's text and the file it opens is applied
+/// together, again and again until nothing changes, so the steps undo in whatever order they were stacked: HTML reads its
+/// character references, Markdown drops a backslash, a browser drops tabs and line breaks from a URL and undoes its
+/// percent escapes. Each pass only shortens the text, so it settles; `None` when a name is escaped more deeply than
+/// [`DEPTH`] passes undo.
+fn decoded_notes(doc: &str) -> Option<String> {
     let mut text = doc.to_string();
-    for _ in 0..4 {
-        let entities = CHARACTER.replace_all(&text, |c: &regex::Captures| {
+    for _ in 0..DEPTH {
+        let numeric = CHARACTER.replace_all(&text, |c: &regex::Captures| {
             let n = c.get(1).map_or_else(|| c[2].parse::<u32>().ok(), |h| u32::from_str_radix(h.as_str(), 16).ok());
             n.and_then(char::from_u32).map_or(c[0].to_string(), |ch| ch.to_string())
         });
-        let named = entities.replace("&amp;", "&").replace("&Tab;", "\t").replace("&NewLine;", "\n");
-        let next = percent_decoded(&named);
+        let named = NAMED.iter().fold(numeric.into_owned(), |t, (from, to)| t.replace(from, to));
+        let bare: String = named.chars().filter(|c| !matches!(c, '\\' | '\t' | '\n' | '\r')).collect();
+        let next = percent_decoded(&bare);
         if next == text {
-            break;
+            return Some(text);
         }
         text = next;
     }
-    text.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect()
+    None
 }
+
+const DEPTH: usize = 32;
 
 /// Whether a link in the slides' folders (`slides/`, `slides/removed/`) leads to `file` under another name: the notes
 /// may name the link. A link that cannot be read counts, since it might, and so does a folder that cannot be listed; only
@@ -278,21 +287,25 @@ pub fn has_alias(slides: &std::path::Path, file: &std::path::Path) -> bool {
     false
 }
 
-/// Styles and scripts in the notes: a style spells a name with its own escapes and a script can build one, so no search
-/// of the text finds what they refer to. Notes that hold either keep every capture.
-static STYLE_OR_SCRIPT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)<\s*(?:style|script|link)\b|\bstyle\s*=").expect("a valid pattern"));
+/// Styles and scripts in the notes: a style spells a name with its own escapes (in a `<style>`, a `style` attribute, a
+/// linked sheet, or SVG, whose attributes are read as styles) and a script builds one (in a `<script>`, an `on…`
+/// handler, a `javascript:` link), so no search of the text finds what they refer to. Notes that hold any keep every
+/// capture. Looked for in the notes as written and as decoded, where an escaped `javascript:` shows itself.
+static STYLE_OR_SCRIPT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)<\s*(?:style|script|link|svg)\b|\b(?:style|on[a-z][a-z0-9]*)\s*=|\bjavascript\s*:").expect("a valid pattern"));
 
 static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
 
 pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References {
     let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let text = decoded_notes(doc);
+    let decoded = decoded_notes(doc);
+    let opaque = decoded.as_deref().is_none_or(|t| STYLE_OR_SCRIPT.is_match(doc) || STYLE_OR_SCRIPT.is_match(t));
+    let text = decoded.unwrap_or_default();
     let mentions = match SLIDE_STEM.captures(&stem) {
         Some(c) => text.matches(&c[1]).count(),
         None if stem.is_empty() => 1,
-        None => text.replace('\\', "").to_ascii_lowercase().matches(&stem.to_ascii_lowercase()).count(),
+        None => text.to_ascii_lowercase().matches(&stem.to_ascii_lowercase()).count(),
     };
-    let mentions = if STYLE_OR_SCRIPT.is_match(doc) { mentions.max(2) } else { mentions };
+    let mentions = if opaque { mentions.max(2) } else { mentions };
     let mut fenced = false;
     let mut own_line_embeds = 0;
     for line in doc.lines() {
@@ -450,11 +463,21 @@ mod tests {
             "<img src=\"slides/removed/slide_04_10&#10;0000.png\">",
             "<img src=\"slides/slide_04_10&NewLine;0000.png\">",
             "<img src=\"slides/slide_04_10\n0000.png\">",
+            "<img src=\"slides/removed/slide_04_1&percnt;300000.png\">",
+            "![detail](slides/removed/slide_04_1\\%300000.png)",
+            "<img src=\"slides/removed/slide_04_1%3&Tab;00000.png\">",
+            "<img src=\"slides/slide_04_1&amp;percnt;3&#48;0000.png\">",
         ] {
             assert_eq!(mentions(doc), 1, "{doc}");
         }
         assert_eq!(mentions(&format!("{embed}\n\n![d](slides/slide\\_04\\_100000.png)")), 2, "an escaped second reference");
         assert_eq!(mentions(&format!("{embed}\n\n<img src=\"slides/slide_04_&#49&#48&#48&#48&#48&#48.png\">")), 2, "and an unterminated one");
+        // F024: escapes stacked in any order undo together.
+        for other in ["<img src=\"slides/slide_04_1&percnt;300000.png\">", "![d](slides/slide_04_1\\%300000.png)", "<img src=\"slides/slide_04_1%3&Tab;00000.png\">"] {
+            assert_eq!(mentions(&format!("{embed}\n\n{other}")), 2, "{other}");
+        }
+        let deep = format!("<img src=\"slides/slide_04_1%{}300000.png\">", "25".repeat(40));
+        assert_eq!(mentions(&deep), 2, "escaped more deeply than the passes follow, every capture stays");
         assert_eq!(mentions("<!-- 10:00:00 -->\n\n## At 10:00:00"), 0, "times in the notes are written with colons");
         let other = std::path::Path::new("/lec/slides/Board Photo.png");
         assert_eq!(references("![b](slides/board\\ photo.png)", other, "").mentions, 1, "a name of another shape, folded");
@@ -469,10 +492,24 @@ mod tests {
         let file = std::path::Path::new("/lec/slides/removed/slide_04_100000.png");
         let embed = "![Slide 4](slides/slide_04_100000.png)";
         let figure = "<div style=\"background-image:url('slides/removed/slide_04_\\31 00000.png')\"></div>";
-        for doc in [figure.to_string(), format!("{embed}\n\n{figure}"), "<STYLE>p{}</STYLE>".into(), "<script>x()</script>".into(), "<link rel=stylesheet href=a.css>".into()] {
+        // F025: a script builds a name in a handler or a `javascript:` link as well, escaped or not.
+        let handler = "<img src=\"missing.png\" onerror=\"this.src='slides/removed/slide_04_'+'10'+'0000.png'\">";
+        let link = "<a href=\"java&#x73;cript:void(location='slides/removed/slide_04_'+'100'+'000.png')\">it</a>";
+        for doc in [
+            figure.to_string(),
+            format!("{embed}\n\n{figure}"),
+            "<STYLE>p{}</STYLE>".into(),
+            "<script>x()</script>".into(),
+            "<link rel=stylesheet href=a.css>".into(),
+            "<svg><rect mask=\"url('x.png')\"/></svg>".into(),
+            handler.into(),
+            format!("{embed}\n\n{handler}"),
+            link.into(),
+            "<a href=\"jav&Tab;ascript:go()\">it</a>".into(),
+        ] {
             assert_eq!(references(&doc, file, embed).mentions, 2, "{doc}");
         }
-        assert_eq!(references(&format!("# T\n\n{embed}\n\nIn this style, $\\beta = 1$.\n"), file, embed).mentions, 1, "prose and maths keep the common path");
+        assert_eq!(references(&format!("# T\n\n{embed}\n\nIn this style, $\\beta = 1$; merge on = id, one-hot, JavaScript.\n"), file, embed).mentions, 1, "prose, maths and code words keep the common path");
     }
 
     #[test]

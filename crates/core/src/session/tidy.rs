@@ -701,24 +701,39 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn notes_with_a_style_keep_every_capture() {
-            // F023: a style names slide 1's removed image with a CSS escape; nothing moves and nothing is cleared.
-            let f = folder();
-            let steps = build(&f, 2).await;
-            let files = f.files.clone();
-            f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
-            let name = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().into_owned();
-            let target = f.files.slides.join(REMOVED_DIR).join(&name);
-            let (head, digits) = name.split_at(name.len() - 10);
-            let figure = format!("<div style=\"background-image:url('slides/removed/{head}\\3{} {}')\"></div>", &digits[..1], &digits[1..]);
-            let sc = f.store.read().await.unwrap();
-            let embed = embed_line(sc.slides.iter().find(|s| s.index == 2).unwrap(), &f.files.dir, f.files.notes_dir());
-            std::fs::write(&f.files.notes, format!("# T\n\n{embed}\n\n{figure}\n")).unwrap();
-            assert!(drop_slides(&f.files, &f.store, &[2]).await.unwrap().is_empty(), "its embed plus a style keeps slide 2");
-            let page = f.files.dir.join("Page.html");
-            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
-            retire(&f.files, &page, Some(&f.store), false).await.unwrap();
-            assert!(target.exists(), "the image the style names stays");
+        async fn a_reference_however_escaped_keeps_its_capture() {
+            // F023, F024, F025: slide 1's removed image and slide 2 (beside its own embed) are each named once more,
+            // in a style, in stacked escapes, or by a script; nothing moves and nothing is cleared.
+            type Form = fn(&str, &str, &str, &str) -> String;
+            let forms: [(&str, Form); 6] = [
+                ("css", |dir, head, d, ext| format!("<div style=\"background-image:url('{dir}{head}\\3{} {}{ext}')\"></div>", &d[..1], &d[1..])),
+                ("percnt", |dir, head, d, ext| format!("<img src=\"{dir}{head}{}&percnt;3{}{}{ext}\">", &d[..1], &d[1..2], &d[2..])),
+                ("backslash", |dir, head, d, ext| format!("![d]({dir}{head}{}\\%3{}{}{ext})", &d[..1], &d[1..2], &d[2..])),
+                ("tab", |dir, head, d, ext| format!("<img src=\"{dir}{head}{}%3&Tab;{}{}{ext}\">", &d[..1], &d[1..2], &d[2..])),
+                ("handler", |dir, head, d, ext| format!("<img src=\"missing.png\" onerror=\"this.src='{dir}{head}{}'+'{}{ext}'\">", &d[..3], &d[3..])),
+                ("javascript", |dir, head, d, ext| format!("<a href=\"java&#x73;cript:void(location='{dir}{head}{}'+'{}{ext}')\">it</a>", &d[..3], &d[3..])),
+            ];
+            for (what, form) in forms {
+                let f = folder();
+                let steps = build(&f, 2).await;
+                let files = f.files.clone();
+                f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
+                let named = |i: usize, dir: &str| {
+                    let name = Path::new(&steps[i].file).file_name().unwrap().to_string_lossy().into_owned();
+                    let (head, rest) = name.split_at(name.len() - 10);
+                    let (d, ext) = rest.split_at(6);
+                    form(dir, head, d, ext)
+                };
+                let target = f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap());
+                let sc = f.store.read().await.unwrap();
+                let embed = embed_line(sc.slides.iter().find(|s| s.index == 2).unwrap(), &f.files.dir, f.files.notes_dir());
+                std::fs::write(&f.files.notes, format!("# T\n\n{embed}\n\n{}\n\n{}\n", named(0, "slides/removed/"), named(1, "slides/"))).unwrap();
+                assert!(drop_slides(&f.files, &f.store, &[2]).await.unwrap().is_empty(), "{what}: slide 2, named beside its embed, stays");
+                let page = f.files.dir.join("Page.html");
+                std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+                retire(&f.files, &page, Some(&f.store), false).await.unwrap();
+                assert!(target.exists(), "{what}: the removed image it names stays");
+            }
         }
 
         #[tokio::test]
