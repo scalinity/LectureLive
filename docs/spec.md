@@ -798,6 +798,12 @@ hand, 131 of 236 captures were discarded for these reasons. Each is told from th
   - B has ink of its own there in the same direction and at least as strong, as a fade does.
 
   PowerPoint's slideshow toolbar corner (the bottom-left 17 % × 6 %) counts in neither picture.
+- **Zoom's control bar.** Where the region takes in Zoom's controls, a slide that changed while the pointer was over the
+  window is captured with the bar over its bottom. The bar is found from the bottom up: a band of one dark level (at most
+  40), 5–22 of the 144 rows, with marks in it, over a slide of another level, which a slide's own dark bottom and footer
+  are not. A capture's own bar is not ink. What a capture shows under the other's bar counts as lost, since the bar hides
+  it. So a barred twin is an earlier state of its clean capture and goes, while a capture whose rows a bar covers in the
+  finished slide stays unless the hidden part is within the 0.25 %. Of copies of one picture, one without the bar stays.
 - **Earlier state.** A is an earlier state of B when B holds all of A's ink but at most 0.25 % of the frame, and A holds
   less of B's.
 - **Same picture.** Each holds the other's ink to within 0.25 %, and neither has 0.05 % more.
