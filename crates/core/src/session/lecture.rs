@@ -33,6 +33,7 @@ use crate::session::segments;
 use crate::session::sidecar::{PauseSpan, Sidecar, SlideEntry};
 use crate::session::slides::{self, SlideMeta};
 use crate::session::spend::{Spend, SpendKind};
+use crate::session::tidy::{self, Redundant, Scope};
 
 pub struct Lecture {
     pub files: LectureFiles,
@@ -117,8 +118,8 @@ pub enum Event {
     /// A piece of the model's summary of its thinking, from a snapshot or a polish: shown while it works and no word
     /// of its answer has streamed. It is not part of the answer.
     Thinking(String),
-    /// The person removed a slide no snapshot had used (spec §7.5).
-    SlideRemoved { index: u32 },
+    /// A slide was taken out: by the person (spec §7.5, no reason), or because it was redundant (§7.7).
+    SlideRemoved { index: u32, reason: Option<Redundant> },
     SlideRestored(SlideEntry),
     CapturesArchived { files: usize, bytes: u64 },
     /// A snapshot took the slides through this index into the notes: they can no longer be removed.
@@ -203,6 +204,9 @@ impl Lecture {
     /// a cancel never leaves a commit half reported.
     pub async fn snapshot_with(&self, store: &Store, hint: &str, events: &UnboundedSender<Event>, cancel: &mut Cancel) -> Result<(), OpError> {
         let text = |e: anyhow::Error| format!("{e:#}");
+        // Nothing redundant is sent: the batch is taken after the sweep, and the snapshot flag keeps capture's own
+        // sweeps out until the cursor has moved (spec §7.7).
+        sweep_slides(&self.files, store, Scope::Pending, None, events).await;
         let at = Local::now();
         let cut = store.cutoff().await.map_err(text)?;
         let sc = store.read().await.map_err(text)?;
@@ -345,7 +349,11 @@ impl Lecture {
             return Err("Polish works on a lecture LectureLive recorded, and this folder has none yet. It is left as it is, so the Python CLI can still use it.".into());
         }
         let (sc, _) = folder::open(&self.files, &self.title, false).map_err(|e| format!("{e:#}"))?;
-        if self.polish(&Store::offline(sc, self.files.sidecar()), events).await {
+        let store = Store::offline(sc, self.files.sidecar());
+        // After class the notes' own redundant slides go too, their embeds with them, before the polish reads the
+        // notes and the page sends every slide (spec §7.7).
+        sweep_slides(&self.files, &store, Scope::All, None, events).await;
+        if self.polish(&store, events).await {
             self.page_after_polish(events).await;
         }
         Ok(())
@@ -513,7 +521,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
         Some(c) => {
             let (tx, rx) = mpsc::unbounded_channel();
             let cfg = WorkerConfig { slides: lec.files.slides.clone(), interval: c.interval, thresholds: c.thresholds, record: c.record };
-            (Some(worker::spawn(c.source, c.selection, cfg, tx)), Some(tokio::spawn(capture_task(lec.clone(), store.clone(), rx, events.clone()))))
+            (Some(worker::spawn(c.source, c.selection, cfg, tx)), Some(tokio::spawn(capture_task(lec.clone(), store.clone(), rx, events.clone(), snapshotting.clone()))))
         }
         None => (None, None),
     };
@@ -637,7 +645,7 @@ pub async fn run(lec: Arc<Lecture>, cfg: SessionConfig, source: Box<dyn Source>,
                     Some(s) => {
                         match slides::remove(&lec.files, s, index, snapshotting.clone()).await {
                             Ok(_) => {
-                                let _ = events.send(Event::SlideRemoved { index });
+                                let _ = events.send(Event::SlideRemoved { index, reason: None });
                                 if let Some(r) = reply {
                                     let _ = r.send(Ok(()));
                                 }
@@ -736,9 +744,24 @@ fn slide_event(s: &SlideEntry) -> Event {
     Event::Slide { index: s.index, file: s.file.clone(), auto: s.auto, uncertain: s.uncertain, shown_at: s.shown_at }
 }
 
+/// Spec §7.7: takes out the redundant captures `scope` covers, and says which and why. Looking can fail (a file
+/// unreadable, the sidecar not saved); that is a warning, never a reason to stop what asked.
+async fn sweep_slides(files: &LectureFiles, store: &Store, scope: Scope, guard: Option<Arc<AtomicBool>>, events: &UnboundedSender<Event>) {
+    match tidy::sweep(files, store, scope, guard).await {
+        Ok(gone) => {
+            for (s, why) in gone {
+                let _ = events.send(Event::SlideRemoved { index: s.index, reason: Some(why) });
+            }
+        }
+        Err(e) => {
+            let _ = events.send(Event::Warning(format!("tidying the slides: {e:#}")));
+        }
+    }
+}
+
 /// The capture worker's results: each saved slide goes through the one registration path, and each
 /// state reaches the adapters. It ends when the worker stops, releasing its store.
-async fn capture_task(lec: Arc<Lecture>, store: Store, mut rx: UnboundedReceiver<CaptureEvent>, events: UnboundedSender<Event>) {
+async fn capture_task(lec: Arc<Lecture>, store: Store, mut rx: UnboundedReceiver<CaptureEvent>, events: UnboundedSender<Event>, snapshotting: Arc<AtomicBool>) {
     while let Some(e) = rx.recv().await {
         match e {
             CaptureEvent::Mode(mode) => { let _ = events.send(Event::CaptureMode(mode)); }
@@ -752,6 +775,10 @@ async fn capture_task(lec: Arc<Lecture>, store: Store, mut rx: UnboundedReceiver
             CaptureEvent::Captured(c) => match slides::register(&lec.files, &store, &c.path, SlideMeta { shown_at: c.shown_at, auto: c.auto, uncertain: c.uncertain }).await {
                 Ok(Some(s)) => {
                     let _ = events.send(slide_event(&s));
+                    if s.auto {
+                        // A finished slide takes its build steps with it as it arrives (spec §7.7).
+                        sweep_slides(&lec.files, &store, Scope::Pending, Some(snapshotting.clone()), &events).await;
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {

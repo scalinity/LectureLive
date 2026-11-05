@@ -15,6 +15,7 @@ use lecturelive_core::notes::embeds::embeds_in;
 use lecturelive_core::session::coordinator::SessionConfig;
 use lecturelive_core::session::files::LectureFiles;
 use lecturelive_core::session::folder;
+use lecturelive_core::session::tidy::Redundant;
 use lecturelive_core::session::lecture::{self, CaptureSetup, Command, Event, Lecture, SlideWatch};
 use lecturelive_core::session::segments;
 use lecturelive_core::session::sidecar::Sidecar;
@@ -648,6 +649,7 @@ async fn auto_slides_and_the_watcher_share_one_registration() {
     until(&mut ev, "the first auto slide", |e| matches!(e, Event::Slide { index: 1, auto: true, .. })).await;
     fake.show(42, slide(2));
     until(&mut ev, "the build", |e| matches!(e, Event::Slide { index: 2, auto: true, .. })).await;
+    until(&mut ev, "its first step taken out as it lands (spec §7.7)", |e| matches!(e, Event::SlideRemoved { index: 1, reason: Some(Redundant::EarlierStateOf(2)) })).await;
     cmd.send(Command::SetAutoCapture(false)).unwrap();
     until(&mut ev, "manual capture mode", |e| matches!(e, Event::CaptureMode(m) if !m.automatic && m.selected)).await;
     let before_audio = stt.state.frames.load(std::sync::atomic::Ordering::SeqCst);
@@ -672,15 +674,18 @@ async fn auto_slides_and_the_watcher_share_one_registration() {
 
     let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
     assert!(sc.pauses.is_empty(), "pausing automatic screenshots does not pause the lecture");
-    assert_eq!(sc.slides.iter().map(|s| (s.index, s.auto)).collect::<Vec<_>>(), vec![(1, true), (2, true), (3, false), (4, false)]);
-    let names: Vec<String> = std::fs::read_dir(&f.slides).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    assert_eq!(names.len(), 4, "{names:?}");
+    // The build's automatic steps are earlier states of the slide taken by hand, which stays: the last snapshot sends
+    // only the finished slide and the dropped image.
+    assert_eq!(sc.slides.iter().map(|s| (s.index, s.auto)).collect::<Vec<_>>(), vec![(3, false), (4, false)]);
+    assert_eq!(sc.removed_slides.iter().map(|s| s.index).collect::<Vec<_>>(), vec![1, 2]);
+    let names: Vec<String> = std::fs::read_dir(&f.slides).unwrap().flatten().filter(|e| e.path().is_file()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
     assert!(outside.exists(), "the dropped original stays");
     let notes = std::fs::read_to_string(&f.notes).unwrap();
-    for n in 1..=4 {
+    for n in 3..=4 {
         assert_eq!(notes.matches(&format!("![Slide {n}](slides/slide_{n:02}_")).count(), 1, "{notes}");
     }
-    assert_eq!(embeds_in(&notes).len(), 4);
+    assert_eq!(embeds_in(&notes).len(), 2);
 }
 
 async fn mode_until(rx: &mut mpsc::UnboundedReceiver<CaptureEvent>, automatic: bool, selected: bool) {

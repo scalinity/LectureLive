@@ -343,7 +343,8 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
             let name = Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             n("slide", &format!("slide {index}{how}"), format!("{name}, into the next snapshot"))
         }
-        Event::SlideRemoved { index } => n("slide", &format!("slide {index} removed"), "kept in slides/removed, and left out of the next snapshot".into()),
+        Event::SlideRemoved { index, reason: None } => n("slide", &format!("slide {index} removed"), "kept in slides/removed, and left out of the next snapshot".into()),
+        Event::SlideRemoved { index, reason: Some(why) } => n("slide", &format!("slide {index} removed"), format!("{why}; kept in slides/removed")),
         Event::SlideRestored(s) => n("slide", &format!("slide {} restored", s.index), "into the next snapshot".into()),
         Event::CapturesArchived { files, bytes } => n("done", "captures cleared", format!("{files} files, {:.1} MB; images are saved in the study page", *bytes as f64 / 1_000_000.0)),
         Event::Capture(s) => {
@@ -739,6 +740,7 @@ mod goldens {
     use lecturelive_core::capture::detect::Region;
     use lecturelive_core::capture::select::{Descriptor, Selection};
     use lecturelive_core::capture::worker::CaptureState;
+    use lecturelive_core::session::tidy::Redundant;
     use lecturelive_core::notes::page::PageOutcome;
     use lecturelive_core::session::folder::InitReport;
     use lecturelive_core::session::launch::LaunchReport;
@@ -1040,7 +1042,8 @@ mod goldens {
 
     #[test]
     fn a_removed_slide_is_said_with_where_it_went() {
-        assert_eq!(plain(&Event::SlideRemoved { index: 4 }), "  ▣ slide 4 removed  kept in slides/removed, and left out of the next snapshot\n");
+        assert_eq!(plain(&Event::SlideRemoved { index: 4, reason: None }), "  ▣ slide 4 removed  kept in slides/removed, and left out of the next snapshot\n");
+        assert_eq!(plain(&Event::SlideRemoved { index: 4, reason: Some(Redundant::EarlierStateOf(5)) }), "  ▣ slide 4 removed  an earlier state of slide 5; kept in slides/removed\n");
         assert_eq!(plain(&Event::SlidesNoted { through: 4 }), "", "the notes cursor is for the panes, not the log");
     }
 

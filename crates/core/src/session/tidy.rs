@@ -1,12 +1,22 @@
 //! Redundant captures (spec §7.7): a build step or a frame of a fade whose finished slide was also taken, the same
 //! slide taken again, and a camera taken for a slide. Each is judged from the pictures alone, with no request.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 
 use crate::capture::compare::{self, Look, Order, Relation};
+use crate::notes::timeline::embed_line;
+use crate::session::coordinator::Store;
+use crate::session::files::LectureFiles;
+use crate::session::notesfile;
+use crate::session::sidecar::{Sidecar, SlideEntry};
+use crate::session::slides::{self, REMOVED_DIR};
 
 /// An earlier state is looked for among captures this close in time: a build is revealed over a few minutes.
 const BUILD_MINUTES: i64 = 10;
@@ -183,6 +193,179 @@ pub fn judge(caps: &[Capture], memo: &mut Relations) -> Vec<Verdict> {
     (0..n).filter_map(|i| why[i].map(|why| Verdict { index: caps[i].index, why })).collect()
 }
 
+/// Which captures a sweep may take out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Only what no snapshot has used: during a lecture and before each snapshot.
+    Pending,
+    /// Also what the notes already embed, whose embed goes with it: after the lecture, before its polish.
+    All,
+}
+
+/// One lecture's captures as the judge saw them, kept between sweeps: decoding a capture takes longer than judging
+/// every capture of the lecture.
+#[derive(Default)]
+pub struct Tidier {
+    looks: HashMap<PathBuf, (Option<(u64, SystemTime)>, Option<Arc<Look>>)>,
+    memo: Relations,
+}
+
+/// The lecture being tidied: its capture and its snapshots share one cache, and one sweep runs at a time, so two
+/// sweeps cannot each take out one of a pair.
+static CURRENT: std::sync::Mutex<Option<(PathBuf, Arc<tokio::sync::Mutex<Tidier>>)>> = std::sync::Mutex::new(None);
+
+fn tidier(files: &LectureFiles) -> Arc<tokio::sync::Mutex<Tidier>> {
+    let mut current = CURRENT.lock().expect("the tidier");
+    if let Some((_, t)) = current.as_ref().filter(|(dir, _)| *dir == files.dir) {
+        return t.clone();
+    }
+    let t = Arc::new(tokio::sync::Mutex::new(Tidier::default()));
+    *current = Some((files.dir.clone(), t.clone()));
+    t
+}
+
+fn stamp(p: &Path) -> Option<(u64, SystemTime)> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+impl Tidier {
+    /// Looks at every capture not seen yet, or changed since, on threads of their own.
+    async fn refresh(&mut self, files: &LectureFiles, slides: &[SlideEntry]) {
+        let stale: Vec<PathBuf> = slides.iter().map(|s| files.dir.join(&s.file)).filter(|p| self.looks.get(p).is_none_or(|(st, _)| *st != stamp(p))).collect();
+        if stale.is_empty() {
+            return;
+        }
+        let decoded = tokio::task::spawn_blocking(move || {
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let chunk = stale.len().div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                let parts: Vec<_> = stale.chunks(chunk).map(|part| scope.spawn(move || part.iter().map(|p| (p.clone(), stamp(p), Look::load(p).map(Arc::new))).collect::<Vec<_>>())).collect();
+                parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect::<Vec<_>>()
+            })
+        })
+        .await
+        .unwrap_or_default();
+        for (p, st, look) in decoded {
+            self.looks.insert(p, (st, look));
+        }
+    }
+
+    fn captures(&self, files: &LectureFiles, sc: &Sidecar, scope: Scope) -> Vec<Capture> {
+        sc.slides
+            .iter()
+            .map(|s| {
+                let path = files.dir.join(&s.file);
+                let look = self.looks.get(&path).and_then(|(_, l)| l.clone());
+                let candidate = s.auto && !sc.pinned_slides.contains(&s.index) && (scope == Scope::All || s.index > sc.notes.slide_index);
+                Capture { index: s.index, shown_at: s.shown_at, candidate, look }
+            })
+            .collect()
+    }
+}
+
+/// What a sweep would take out, without taking anything: `lecture tidy` before `--apply`.
+pub async fn plan(files: &LectureFiles, sc: &Sidecar, scope: Scope) -> Vec<Verdict> {
+    let t = tidier(files);
+    let mut t = t.lock().await;
+    t.refresh(files, &sc.slides).await;
+    let caps = t.captures(files, sc, scope);
+    judge(&caps, &mut t.memo)
+}
+
+/// Takes the redundant captures `scope` covers out of the lecture (spec §7.7), through the same removal as the
+/// person's, so undo restores them; says which went and why. `guard` is a running lecture's snapshot flag: a sweep
+/// from capture gives way to a snapshot, which sweeps for itself before it takes its batch.
+pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Option<Arc<AtomicBool>>) -> Result<Vec<(SlideEntry, Redundant)>> {
+    let held = |g: &Option<Arc<AtomicBool>>| g.as_ref().is_some_and(|g| g.load(Ordering::SeqCst));
+    if held(&guard) {
+        return Ok(Vec::new());
+    }
+    let t = tidier(files);
+    let mut t = t.lock().await;
+    let sc = store.read().await?;
+    t.refresh(files, &sc.slides).await;
+    let caps = t.captures(files, &sc, scope);
+    let verdicts = judge(&caps, &mut t.memo);
+    if verdicts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let files = files.clone();
+    store
+        .update(move |sc| {
+            if held(&guard) {
+                return Ok(Vec::new());
+            }
+            // Judged from a copy: what changed since (a removal, an undo, a snapshot) is looked at again here.
+            let registered = |sc: &Sidecar, i: u32| sc.slides.iter().any(|s| s.index == i);
+            let still: Vec<Verdict> = verdicts
+                .into_iter()
+                .filter(|v| registered(sc, v.index) && !sc.pinned_slides.contains(&v.index) && (scope == Scope::All || v.index > sc.notes.slide_index))
+                .filter(|v| match v.why {
+                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k),
+                    Redundant::Camera => true,
+                })
+                .collect();
+            // The notes first: an embed must never name a file that has moved.
+            let noted: Vec<SlideEntry> = still.iter().filter(|v| v.index <= sc.notes.slide_index).filter_map(|v| sc.slides.iter().find(|s| s.index == v.index).cloned()).collect();
+            let mut stay: HashSet<u32> = HashSet::new();
+            if !noted.is_empty() {
+                let changes: Vec<(String, Option<String>)> = noted.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
+                let made = notesfile::change_embeds(&files, sc, &changes, Local::now())?;
+                stay = noted.iter().enumerate().filter(|(k, _)| !made.contains(k)).map(|(_, s)| s.index).collect();
+            }
+            let mut out = Vec::new();
+            for v in still.into_iter().filter(|v| !stay.contains(&v.index)) {
+                if let Ok(entry) = slides::remove_in(&files, sc, v.index) {
+                    out.push((entry, v.why));
+                }
+            }
+            Ok(out)
+        })
+        .await
+}
+
+/// Puts back `complete`, discarded by hand, in place of `partial`, kept by hand, when `partial` is an earlier state
+/// of it: the complete slide takes the partial's embed in the notes. Used once, to correct a folder pruned by hand
+/// before tidying existed (`lecture tidy --swap`); outside a lecture only.
+pub async fn swap(files: &LectureFiles, store: &Store, partial: u32, complete: u32) -> Result<()> {
+    let sc = store.read().await?;
+    let a = sc.slides.iter().find(|s| s.index == partial).cloned().with_context(|| format!("slide {partial} is not in this lecture"))?;
+    let b = sc.removed_slides.iter().find(|s| s.index == complete).cloned().with_context(|| format!("slide {complete} was not removed"))?;
+    let name = Path::new(&b.file).file_name().context("the removed slide has no filename")?.to_owned();
+    let (from, to) = (files.slides.join(REMOVED_DIR).join(&name), files.dir.join(&b.file));
+    let (la, lb) = (Look::load(&files.dir.join(&a.file)), Look::load(&from));
+    let earlier = la.zip(lb).is_some_and(|(la, lb)| compare::order(&compare::relate(&la, &lb)) == Order::Earlier);
+    if !earlier {
+        bail!("slide {partial} is not an earlier state of slide {complete}, so nothing was swapped");
+    }
+    if (a.index <= sc.notes.slide_index) != (b.index <= sc.notes.slide_index) {
+        bail!("slides {partial} and {complete} are on either side of what the notes hold, so nothing was swapped");
+    }
+    if to.exists() || to.parent() != Some(files.slides.as_path()) {
+        bail!("slide {complete} cannot go back to {}", to.display());
+    }
+    let files = files.clone();
+    store
+        .update(move |sc| {
+            if a.index <= sc.notes.slide_index {
+                let line = |s: &SlideEntry| embed_line(s, &files.dir, files.notes_dir());
+                let made = notesfile::change_embeds(&files, sc, &[(line(&a), Some(line(&b)))], Local::now())?;
+                if made.is_empty() {
+                    bail!("slide {partial}'s embed is not on a line of its own in the notes, so nothing was swapped");
+                }
+            }
+            std::fs::rename(&from, &to).with_context(|| format!("put back {}", to.display()))?;
+            sc.removed_slides.retain(|s| s.index != b.index);
+            sc.slides.push(b.clone());
+            sc.slides.sort_by_key(|s| s.index);
+            sc.pinned_slides.push(b.index);
+            slides::remove_in(&files, sc, a.index)?;
+            Ok(())
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +388,100 @@ mod tests {
 
     fn room(shift: u32) -> GrayImage {
         GrayImage::from_fn(W, H, |x, y| Luma([(60 + x * 90 / W + y * 70 / H + (x * 7 + y * 13) % 11 + if (100..130).contains(&x) && y > 40 { shift } else { 0 }).min(255) as u8]))
+    }
+
+    mod sweeps {
+        use super::super::*;
+        use crate::capture::compare::tests::slide;
+        use crate::session::slides::{register, undo_remove, SlideMeta};
+        use chrono::TimeZone;
+
+        struct Folder {
+            _dir: tempfile::TempDir,
+            files: LectureFiles,
+            store: Store,
+        }
+
+        fn folder() -> Folder {
+            let dir = tempfile::tempdir().unwrap();
+            let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap());
+            std::fs::create_dir_all(&files.slides).unwrap();
+            std::fs::create_dir_all(files.state_dir()).unwrap();
+            let store = Store::offline(Sidecar::default(), files.sidecar());
+            Folder { _dir: dir, files, store }
+        }
+
+        /// Registers a build of `lines` lines, one capture per line, each a minute apart.
+        async fn build(f: &Folder, lines: usize) -> Vec<SlideEntry> {
+            let mut out = Vec::new();
+            for n in 1..=lines {
+                let tmp = f.files.slides.join(format!(".capture-{n}.png.tmp"));
+                slide(0, n).save_with_format(&tmp, image::ImageFormat::Png).unwrap();
+                let at = Local.with_ymd_and_hms(2026, 11, 5, 12, n as u32, 0).unwrap();
+                out.push(register(&f.files, &f.store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap());
+            }
+            out
+        }
+
+        fn indexes(v: &[(SlideEntry, Redundant)]) -> Vec<(u32, Redundant)> {
+            v.iter().map(|(s, w)| (s.index, *w)).collect()
+        }
+
+        #[tokio::test]
+        async fn a_sweep_takes_build_steps_out_and_what_undo_puts_back_stays() {
+            let f = folder();
+            build(&f, 3).await;
+            let gone = sweep(&f.files, &f.store, Scope::Pending, None).await.unwrap();
+            assert_eq!(indexes(&gone), [(1, Redundant::EarlierStateOf(3)), (2, Redundant::EarlierStateOf(3))]);
+            assert!(f.files.slides.join(REMOVED_DIR).join(Path::new(&gone[0].0.file).file_name().unwrap()).exists());
+            let restored = undo_remove(&f.files, &f.store, Arc::new(AtomicBool::new(false))).await.unwrap();
+            assert_eq!(restored.index, 2);
+            assert!(sweep(&f.files, &f.store, Scope::Pending, None).await.unwrap().is_empty(), "a restored slide is the person's");
+            assert_eq!(f.store.read().await.unwrap().pinned_slides, [2]);
+        }
+
+        #[tokio::test]
+        async fn a_sweep_gives_way_to_a_running_snapshot() {
+            let f = folder();
+            build(&f, 2).await;
+            assert!(sweep(&f.files, &f.store, Scope::Pending, Some(Arc::new(AtomicBool::new(true)))).await.unwrap().is_empty());
+            assert_eq!(f.store.read().await.unwrap().slides.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn after_the_lecture_a_used_step_goes_with_its_embed_and_before_it_stays() {
+            let f = folder();
+            let steps = build(&f, 3).await;
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\nFirst.\n\n{}\n\n{}\n", line(&steps[0]), line(&steps[1]), line(&steps[2]))).unwrap();
+            let files = f.files.clone();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 3; Ok(()) }).await.unwrap();
+            assert!(sweep(&f.files, &f.store, Scope::Pending, None).await.unwrap().is_empty(), "the notes hold them");
+            let gone = sweep(&f.files, &f.store, Scope::All, None).await.unwrap();
+            assert_eq!(indexes(&gone), [(1, Redundant::EarlierStateOf(3)), (2, Redundant::EarlierStateOf(3))]);
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\nFirst.\n\n{}\n", line(&steps[2])));
+            assert!(std::fs::read_dir(f.files.state_dir()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".md")), "backed up");
+        }
+
+        #[tokio::test]
+        async fn a_kept_partial_swaps_for_its_discarded_complete_slide_in_place() {
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\nThe slide.\n\n{}\n", line(&steps[0]), line(&steps[1]))).unwrap();
+            let files = f.files.clone();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 2; Ok(()) }).await.unwrap();
+            // Pruned by hand the wrong way round: the complete step out, its partial kept.
+            let files = f.files.clone();
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\nThe slide.\n", line(&steps[0]))).unwrap();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; slides::remove_in(&files, sc, 2).map(|_| ()) }).await.unwrap();
+            assert!(swap(&f.files, &f.store, 2, 1).await.is_err(), "only a partial for its complete slide");
+            swap(&f.files, &f.store, 1, 2).await.unwrap();
+            let sc = f.store.read().await.unwrap();
+            assert_eq!((sc.slides.iter().map(|s| s.index).collect::<Vec<_>>(), sc.pinned_slides.clone()), (vec![2], vec![2]));
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\n{}\n\nThe slide.\n", line(&steps[1])));
+            assert!(f.files.dir.join(&steps[1].file).exists() && !f.files.dir.join(&steps[0].file).exists());
+        }
     }
 
     #[test]

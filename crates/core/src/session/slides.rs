@@ -12,7 +12,7 @@ use chrono::{DateTime, Local};
 use crate::session::coordinator::Store;
 use crate::session::files::LectureFiles;
 use crate::session::folder::{next_slide_index, relative};
-use crate::session::sidecar::SlideEntry;
+use crate::session::sidecar::{Sidecar, SlideEntry};
 
 const IMAGE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
 const SLIDE_MAX_PX: u32 = 1600;
@@ -96,34 +96,46 @@ pub async fn remove(files: &LectureFiles, store: &Store, index: u32, snapshottin
     let files = files.clone();
     store
         .update(move |sc| {
-            let Some(at) = sc.slides.iter().position(|s| s.index == index) else { bail!("Slide {index} is not in this lecture") };
+            if !sc.slides.iter().any(|s| s.index == index) {
+                bail!("Slide {index} is not in this lecture");
+            }
             if index <= sc.notes.slide_index {
                 bail!("Slide {index} is already in the notes");
             }
             if snapshotting.load(Ordering::SeqCst) {
                 bail!("A snapshot is running and may be using slide {index}: remove it once the snapshot is done");
             }
-            let from = files.dir.join(&sc.slides[at].file);
-            if let Some(name) = from.file_name().filter(|_| from.exists()) {
-                // The record's path is whatever the sidecar says, and only a file inside the slides folder is the app's
-                // to move: compared as real paths, so a `..`, an absolute path or a link pointing out is refused.
-                let inside = from.canonicalize().ok().zip(files.slides.canonicalize().ok()).is_some_and(|(file, folder)| file.starts_with(folder));
-                if !inside {
-                    bail!("Slide {index}'s file is not in the slides folder, so it is left where it is");
-                }
-                let dir = files.slides.join(REMOVED_DIR);
-                std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-                if dir.canonicalize()?.parent() != Some(files.slides.canonicalize()?.as_path()) {
-                    bail!("The removed folder is not inside the slides folder");
-                }
-                let dest = dir.join(name);
-                if dest.exists() { bail!("Slide {index}'s removed file already exists, so neither image was overwritten"); }
-                move_file(&from, &dest)?;
-                sc.removed_slides.push(sc.slides[at].clone());
-            }
-            Ok(sc.slides.remove(at))
+            remove_in(&files, sc, index)
         })
         .await
+}
+
+/// Takes a registered slide out, inside the sidecar's writer: its record goes, its file moves to `slides/removed/` and
+/// it joins the undo history. The caller has decided it may go: no snapshot is taking it, and if the notes embed it,
+/// the embed is already out of them (spec §7.7).
+pub fn remove_in(files: &LectureFiles, sc: &mut Sidecar, index: u32) -> Result<SlideEntry> {
+    let Some(at) = sc.slides.iter().position(|s| s.index == index) else { bail!("Slide {index} is not in this lecture") };
+    let from = files.dir.join(&sc.slides[at].file);
+    if let Some(name) = from.file_name().filter(|_| from.exists()) {
+        // The record's path is whatever the sidecar says, and only a file inside the slides folder is the app's
+        // to move: compared as real paths, so a `..`, an absolute path or a link pointing out is refused.
+        let inside = from.canonicalize().ok().zip(files.slides.canonicalize().ok()).is_some_and(|(file, folder)| file.starts_with(folder));
+        if !inside {
+            bail!("Slide {index}'s file is not in the slides folder, so it is left where it is");
+        }
+        let dir = files.slides.join(REMOVED_DIR);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        if dir.canonicalize()?.parent() != Some(files.slides.canonicalize()?.as_path()) {
+            bail!("The removed folder is not inside the slides folder");
+        }
+        let dest = dir.join(name);
+        if dest.exists() {
+            bail!("Slide {index}'s removed file already exists, so neither image was overwritten");
+        }
+        move_file(&from, &dest)?;
+        sc.removed_slides.push(sc.slides[at].clone());
+    }
+    Ok(sc.slides.remove(at))
 }
 
 /// Restores the most recent removal inside the same writer as capture and snapshots. If a snapshot
@@ -169,6 +181,9 @@ pub async fn undo_remove(files: &LectureFiles, store: &Store, snapshotting: Arc<
         sc.removed_slides.pop();
         sc.slides.push(slide.clone());
         sc.slides.sort_by_key(|s| s.index);
+        if !sc.pinned_slides.contains(&slide.index) {
+            sc.pinned_slides.push(slide.index);
+        }
         Ok(slide)
     }).await
 }

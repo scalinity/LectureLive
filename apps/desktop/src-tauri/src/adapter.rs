@@ -269,9 +269,13 @@ impl Pump {
                 self.emit(Stream::Status, StatusMsg::Slide(SlideView { index, file, path, at: shown_at.format("%H:%M:%S").to_string(), auto, uncertain, noted: false, embedded: None }));
                 self.notice(NoticeKind::Slide, &format!("Slide {index}"), &format!("{name}{how}, into the next snapshot"));
             }
-            Event::SlideRemoved { index } => {
+            Event::SlideRemoved { index, reason } => {
                 self.emit(Stream::Status, StatusMsg::SlideRemoved { index });
-                self.notice(NoticeKind::Slide, &format!("Slide {index} removed"), "⌘Z undoes this; kept in slides/removed, and left out of the next snapshot");
+                let why = match reason {
+                    Some(why) => format!("{why}; ⌘Z puts it back"),
+                    None => "⌘Z undoes this; kept in slides/removed, and left out of the next snapshot".into(),
+                };
+                self.notice(NoticeKind::Slide, &format!("Slide {index} removed"), &why);
             }
             Event::SlideRestored(s) => {
                 let path = self.slide_path(&s.file);
@@ -646,7 +650,7 @@ mod tests {
         let (mut p, sink) = pump();
         let at = Local::now();
         p.apply(Event::Slide { index: 1, file: "slides/slide_01_100001.png".into(), auto: true, uncertain: false, shown_at: at });
-        p.apply(Event::SlideRemoved { index: 1 });
+        p.apply(Event::SlideRemoved { index: 1, reason: None });
         p.apply(Event::SlidesNoted { through: 3 });
         let status = sink.on(Stream::Status);
         let of = |t: &str| status.iter().find(|m| m["type"] == t).unwrap_or_else(|| panic!("{t} in {status:?}"));

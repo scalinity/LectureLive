@@ -197,6 +197,59 @@ pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on:
     Ok(backup)
 }
 
+/// Takes slides' embeds out of the notes, or puts another slide's embed in one's place (spec §7.7): each change is
+/// `(embed, replacement)`, the embed as it is written on its own line. An embed is changed only where it stands once,
+/// on its own line and outside code; any other copy (inline, repeated, or the line edited by hand) leaves that one as
+/// it is. The notes are backed up and written as polish writes them. Returns which of `changes` were made.
+pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, changes: &[(String, Option<String>)], at: DateTime<Local>) -> Result<Vec<usize>> {
+    let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
+    let lines: Vec<&str> = doc.lines().collect();
+    let mut fenced = false;
+    let mut code = vec![false; lines.len()];
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fenced = !fenced;
+            code[i] = true;
+        } else {
+            code[i] = fenced;
+        }
+    }
+    let mut out: Vec<Option<String>> = lines.iter().map(|l| Some(l.to_string())).collect();
+    let mut made = Vec::new();
+    for (k, (embed, replacement)) in changes.iter().enumerate() {
+        let own: Vec<usize> = (0..lines.len()).filter(|&i| !code[i] && lines[i].trim() == embed).collect();
+        let anywhere = lines.iter().map(|l| l.matches(embed.as_str()).count()).sum::<usize>();
+        if own.len() == 1 && anywhere == 1 {
+            out[own[0]] = replacement.clone();
+            made.push(k);
+        }
+    }
+    if made.is_empty() {
+        return Ok(made);
+    }
+    // A slide's line out leaves its blank lines either side: one is kept. A "Slides not placed" heading left with
+    // nothing under it goes too.
+    let mut kept: Vec<String> = Vec::new();
+    for l in out.into_iter().flatten() {
+        if l.trim().is_empty() && kept.last().is_some_and(|p| p.trim().is_empty()) {
+            continue;
+        }
+        kept.push(l);
+    }
+    if let Some(h) = kept.iter().position(|l| l.trim() == crate::notes::embeds::NOT_PLACED) {
+        let rest_empty = kept[h + 1..].iter().take_while(|l| !l.starts_with('#')).all(|l| l.trim().is_empty());
+        if rest_empty {
+            kept.remove(h);
+            while h < kept.len() && kept[h].trim().is_empty() && (h == 0 || kept[h - 1].trim().is_empty() || h + 1 == kept.len()) {
+                kept.remove(h);
+            }
+        }
+    }
+    replace(files, sc, &kept.join("\n"), &sha256_hex(doc.as_bytes()), at)?;
+    Ok(made)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +268,41 @@ mod tests {
     }
 
     const BLOCK: &str = "\n<!-- 10:05:00 -->\n## Gradient descent\n- Steps against the gradient.\n";
+
+    #[test]
+    fn an_embed_on_its_own_line_goes_with_one_blank_line_and_the_notes_are_backed_up() {
+        let (_dir, files, mut sc) = folder();
+        let doc = "# T\n\n## Builds\n\n![Slide 1](slides/slide_01_100000.png)\n\nA partial slide.\n\n![Slide 2](slides/slide_02_100001.png)\n\n```\n![Slide 3](slides/slide_03_100002.png)\n```\nInline ![Slide 4](slides/slide_04_100003.png) here.\n";
+        std::fs::write(&files.notes, doc).unwrap();
+        let changes: Vec<(String, Option<String>)> = [1, 3, 4].iter().map(|n| (format!("![Slide {n}](slides/slide_{n:02}_10000{}.png)", n - 1), None)).collect();
+        accept_external_edit(&files, &mut sc).unwrap();
+        let before = sc.notes.revision;
+        let made = change_embeds(&files, &mut sc, &changes, chrono::Local::now()).unwrap();
+        assert_eq!(made, [0], "the fenced and the inline copies stay");
+        let after = std::fs::read_to_string(&files.notes).unwrap();
+        assert_eq!(after, "# T\n\n## Builds\n\nA partial slide.\n\n![Slide 2](slides/slide_02_100001.png)\n\n```\n![Slide 3](slides/slide_03_100002.png)\n```\nInline ![Slide 4](slides/slide_04_100003.png) here.\n");
+        assert_eq!(sc.notes.revision, before + 1);
+        assert_eq!(sc.notes.sha256, sha256_hex(after.as_bytes()));
+        let backups: Vec<_> = std::fs::read_dir(files.state_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".md")).collect();
+        assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), doc);
+    }
+
+    #[test]
+    fn a_replacement_takes_the_embeds_place_and_an_emptied_not_placed_heading_goes() {
+        let (_dir, files, mut sc) = folder();
+        std::fs::write(&files.notes, "# T\n\n![Slide 1](slides/a.png)\n\n### Slides not placed\n\n![Slide 2](slides/b.png)\n").unwrap();
+        let made = change_embeds(&files, &mut sc, &[("![Slide 1](slides/a.png)".into(), Some("![Slide 5](slides/e.png)".into())), ("![Slide 2](slides/b.png)".into(), None)], chrono::Local::now()).unwrap();
+        assert_eq!(made, [0, 1]);
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), "# T\n\n![Slide 5](slides/e.png)\n");
+    }
+
+    #[test]
+    fn nothing_to_change_writes_nothing() {
+        let (_dir, files, mut sc) = folder();
+        let before = std::fs::read_to_string(&files.notes).unwrap();
+        assert!(change_embeds(&files, &mut sc, &[("![Slide 9](slides/x.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), before);
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum Crash {

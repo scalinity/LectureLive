@@ -540,7 +540,7 @@ impl View {
             }
             Event::Slide { index, file, auto, uncertain, shown_at } => self.slide(*index, file, *auto, *uncertain, *shown_at),
             Event::SlideRestored(s) => self.slide(s.index, &s.file, s.auto, s.uncertain, s.shown_at),
-            Event::SlideRemoved { index } => {
+            Event::SlideRemoved { index, .. } => {
                 self.slides.retain(|s| s.index != *index);
                 self.removed.insert(*index);
             }
@@ -1103,7 +1103,7 @@ mod tests {
         for i in 1..=3 {
             v.reduce(&slide_event(i), at());
         }
-        v.reduce(&Event::SlideRemoved { index: 3 }, at());
+        v.reduce(&Event::SlideRemoved { index: 3, reason: None }, at());
         assert_eq!(indices(&v), [1, 2]);
         v.merge(Hydration { slides: vec![slide_entry(1), slide_entry(2), slide_entry(3)], ..Hydration::empty() });
         assert_eq!(indices(&v), [1, 2], "the stale read did not restore slide 3");
