@@ -257,19 +257,27 @@ fn decoded_notes(doc: &str) -> String {
 }
 
 /// Whether a link in the slides' folders (`slides/`, `slides/removed/`) leads to `file` under another name: the notes
-/// may name the link. A link that cannot be read counts, since it might.
+/// may name the link. A link that cannot be read counts, since it might, and so does a folder that cannot be listed; only
+/// a folder that is not there holds no link.
 pub fn has_alias(slides: &std::path::Path, file: &std::path::Path) -> bool {
     let Ok(target) = file.canonicalize() else { return true };
     for dir in [slides.to_path_buf(), slides.join("removed")] {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            if entry.file_type().map_or(true, |t| t.is_symlink()) && entry.path().canonicalize().map_or(true, |p| p == target) {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else { return true };
+            if kind.is_symlink() && entry.path().canonicalize().map_or(true, |p| p == target) {
                 return true;
             }
         }
     }
     false
 }
+
 
 static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
 
@@ -449,6 +457,29 @@ mod tests {
         assert_eq!(mentions(&format!("{embed}\n\nSee [it](slides/./slide_04_100000.png).")), 2);
         assert_eq!(mentions("![x](slides/slide_05_100001.png)"), 0);
         assert_eq!(mentions("![x](slides/slide_05_100000.png)"), 1, "a capture in the same second counts: it only keeps");
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_listed_may_hold_a_link() {
+        // F022: a traversable folder that cannot be listed hides any link in it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let slides = dir.path().join("slides");
+        std::fs::create_dir_all(slides.join("removed")).unwrap();
+        let target = slides.join("removed/slide_04_100000.png");
+        std::fs::write(&target, b"png").unwrap();
+        assert!(!has_alias(&slides, &target), "no links, nothing to keep for");
+        std::fs::remove_dir(slides.join("removed")).ok();
+        let moved = slides.join("slide_04_100000.png");
+        std::fs::write(&moved, b"png").unwrap();
+        assert!(!has_alias(&slides, &moved), "a missing removed/ holds no link");
+        std::fs::create_dir_all(slides.join("removed")).unwrap();
+        std::fs::rename(&moved, &target).unwrap();
+        std::os::unix::fs::symlink(&target, slides.join("detail.png")).unwrap();
+        std::fs::set_permissions(&slides, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let unlisted = has_alias(&slides, &target);
+        std::fs::set_permissions(&slides, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(unlisted, "a folder that cannot be listed may hold one");
     }
 
     #[test]
