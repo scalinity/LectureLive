@@ -261,9 +261,12 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         Ok(Value::Object(m)) => m.into_iter().filter_map(|(n, p)| p.as_str().map(|p| (n, p.to_string()))).collect(),
         _ => Vec::new(),
     };
-    // Reapplying a design must not discard the only surviving copies of earlier captures.
+    // Reapplying a design must not discard the only surviving copies of earlier captures, while the notes still embed
+    // them: a slide taken out of the notes has left the lecture.
+    let doc = std::fs::read_to_string(notes).unwrap_or_default();
     for (file, saved) in &archived.0 {
-        if saved.page == path && !saved.capture.slide.starts_with("removed:") && !paths.iter().any(|(n, _)| n == &saved.capture.slide) {
+        let embedded = file.strip_prefix(dir).is_ok_and(|r| doc.contains(&format!("]({})", r.to_string_lossy())));
+        if saved.page == path && embedded && !saved.capture.slide.starts_with("removed:") && !paths.iter().any(|(n, _)| n == &saved.capture.slide) {
             if let Ok(relative) = file.strip_prefix(dir) {
                 paths.push((saved.capture.slide.clone(), relative.to_string_lossy().into_owned()));
             }
@@ -306,9 +309,7 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         ("date", date),
     ]
     .into();
-    let (removed, images) = archive::removed_captures(dir, &path, &archived);
-    manifest.extend(removed);
-    let html = archive::with_removed(&archive::with_manifest(&fill(template, &values), &manifest)?, &images)?;
+    let html = archive::with_manifest(&fill(template, &values), &manifest)?;
     write_atomic(&path, html.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }

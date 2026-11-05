@@ -121,7 +121,8 @@ pub enum Event {
     /// A slide was taken out: by the person (spec §7.5, no reason), or because it was redundant (§7.7).
     SlideRemoved { index: u32, reason: Option<Redundant> },
     SlideRestored(SlideEntry),
-    CapturesArchived { files: usize, bytes: u64 },
+    /// What a finished page let go (spec §7.6): images it holds or that were taken out, and recordings.
+    CapturesArchived { files: usize, bytes: u64, recordings: usize, recording_bytes: u64 },
     /// A snapshot took the slides through this index into the notes: they can no longer be removed.
     SlidesNoted { through: u32 },
     /// The capture worker's state: watching, paused, asking, denied or failing (spec §7.1, §7.4).
@@ -354,24 +355,36 @@ impl Lecture {
         // notes and the page sends every slide (spec §7.7).
         sweep_slides(&self.files, &store, Scope::All, None, events).await;
         if self.polish(&store, events).await {
-            self.page_after_polish(events).await;
+            self.page_after_polish(&store, false, events).await;
         }
         Ok(())
     }
 
     /// Retire capture files only after both polish and its self-contained page succeeded.
-    async fn page_after_polish(&self, events: &UnboundedSender<Event>) {
+    async fn page_after_polish(&self, store: &Store, live: bool, events: &UnboundedSender<Event>) {
         if let Ok(page) = self.page(events).await {
-            if !page.missing.is_empty() {
-                let _ = events.send(Event::Warning("The study page is incomplete, so capture files were kept.".into()));
-                return;
-            }
-            match crate::notes::archive::clear(&page.path) {
-                Ok(cleaned) => {
-                    if cleaned.files > 0 { let _ = events.send(Event::CapturesArchived { files: cleaned.files, bytes: cleaned.bytes }); }
-                    if !cleaned.kept.is_empty() { let _ = events.send(Event::Warning(format!("{} capture files changed or were not safely embedded, so they were kept", cleaned.kept.len()))); }
+            self.retire(&page, Some(store), live, events).await;
+        }
+    }
+
+    /// Spec §7.6, after a page with all its parts: what it holds, what was taken out and, outside a session, the
+    /// recordings go (`tidy::retire`).
+    pub async fn retire(&self, page: &PageOutcome, store: Option<&Store>, live: bool, events: &UnboundedSender<Event>) {
+        if !page.missing.is_empty() {
+            let _ = events.send(Event::Warning("The study page is incomplete, so capture files were kept.".into()));
+            return;
+        }
+        match tidy::retire(&self.files, &page.path, store, live).await {
+            Ok(r) => {
+                if r.images.files > 0 || r.recordings > 0 {
+                    let _ = events.send(Event::CapturesArchived { files: r.images.files, bytes: r.images.bytes, recordings: r.recordings, recording_bytes: r.recording_bytes });
                 }
-                Err(e) => { let _ = events.send(Event::Warning(format!("The study page is saved; capture cleanup could not finish: {e:#}"))); }
+                if !r.images.kept.is_empty() {
+                    let _ = events.send(Event::Warning(format!("{} capture files changed or were not safely embedded, so they were kept", r.images.kept.len())));
+                }
+            }
+            Err(e) => {
+                let _ = events.send(Event::Warning(format!("The study page is saved; clearing what it replaces could not finish: {e:#}")));
             }
         }
     }
@@ -436,9 +449,9 @@ async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceive
             Op::Polish => {
                 if lec.polish_with(&store, &events, &mut cancel).await {
                     // Typesetting takes minutes and reads only the polished file: snapshots are not held up by it.
-                    let (l, ev) = (lec.clone(), events.clone());
+                    let (l, ev, st) = (lec.clone(), events.clone(), store.clone());
                     pages.lock().expect("the page list").push(tokio::spawn(async move {
-                        l.page_after_polish(&ev).await;
+                        l.page_after_polish(&st, true, &ev).await;
                     }));
                 }
             }

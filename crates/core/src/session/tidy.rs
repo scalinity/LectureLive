@@ -366,6 +366,70 @@ pub async fn swap(files: &LectureFiles, store: &Store, partial: u32, complete: u
         .await
 }
 
+/// Kept automatic captures that are an earlier state of one taken out by hand within a build's time: the partial kept
+/// and the finished slide discarded, which `swap` corrects.
+pub fn mistakes(files: &LectureFiles, sc: &Sidecar) -> Vec<(u32, u32)> {
+    let out_dir = files.slides.join(REMOVED_DIR);
+    let taken_out: Vec<(&SlideEntry, Look)> = sc.removed_slides.iter().filter_map(|s| Some((s, Look::load(&out_dir.join(Path::new(&s.file).file_name()?))?))).filter(|(_, l)| !l.photographic()).collect();
+    let mut found = Vec::new();
+    for kept in sc.slides.iter().filter(|s| s.auto) {
+        let Some(look) = Look::load(&files.dir.join(&kept.file)).filter(|l| !l.photographic()) else { continue };
+        for (gone, other) in &taken_out {
+            if (kept.shown_at - gone.shown_at).num_minutes().abs() <= BUILD_MINUTES && compare::order(&compare::relate(&look, other)) == Order::Earlier {
+                found.push((kept.index, gone.index));
+            }
+        }
+    }
+    found
+}
+
+/// What a finished page let go (spec §7.6).
+#[derive(Debug, Default)]
+pub struct Retired {
+    /// Captures the page holds, and images of slides taken out of the lecture.
+    pub images: crate::notes::archive::Cleanup,
+    pub recordings: usize,
+    pub recording_bytes: u64,
+}
+
+/// Spec §7.6: once the study page is finished it is what the lecture keeps, with the notes. The captures it holds are
+/// deleted after each is checked against it, then the images of slides taken out of the lecture and any copies of them
+/// an earlier version kept in the page, and, when no session is recording (`live` false), the recordings. `store` is
+/// the lecture's sidecar, None for a folder that has none.
+pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, live: bool) -> Result<Retired> {
+    use crate::notes::archive;
+    let html = std::fs::read_to_string(page).with_context(|| format!("read {}", page.display()))?;
+    if let Some(lighter) = archive::without_removed(&html) {
+        crate::fsutil::write_atomic(page, lighter.as_bytes()).with_context(|| format!("write {}", page.display()))?;
+    }
+    let mut out = Retired::default();
+    if archive::script(&html, "capture-files").is_some() {
+        out.images = archive::clear(page)?;
+    }
+    let removed = archive::clear_removed(&files.dir);
+    out.images.files += removed.files;
+    out.images.bytes += removed.bytes;
+    out.images.kept.extend(removed.kept);
+    if let Some(store) = store {
+        let files = files.clone();
+        let (n, bytes) = store
+            .update(move |sc| {
+                slides::forget_cleared(&files, sc);
+                if live { Ok((0, 0)) } else { crate::session::launch::retire_recordings(&files.dir, sc) }
+            })
+            .await?;
+        (out.recordings, out.recording_bytes) = (n, bytes);
+    }
+    Ok(out)
+}
+
+/// Whether a study page already on disk holds every slide the notes embed: a page `lecture tidy` may retire from.
+pub fn holds_notes(page: &Path, notes: &Path) -> bool {
+    let (Ok(html), Ok(doc)) = (std::fs::read_to_string(page), std::fs::read_to_string(notes)) else { return false };
+    let Some(gallery) = crate::notes::archive::script(&html, "slides").and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok()) else { return false };
+    crate::notes::embeds::embeds_in(&doc).iter().filter_map(|e| e.strip_prefix("![Slide ")?.split(']').next().map(str::to_string)).all(|n| gallery.get(&n).is_some_and(|u| u.starts_with("data:image/")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

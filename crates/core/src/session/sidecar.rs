@@ -40,15 +40,23 @@ pub struct Sidecar {
     /// Slides undo put back: the person wants them, so tidying never takes them out again (spec §7.7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_slides: Vec<u32>,
+    /// Numbers up to this were given to slides whose images are gone (cleared once the study page was finished, §7.6):
+    /// a later capture never takes one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reserved_index: u32,
     /// The stretches the person paused the lecture (spec §9.6): nothing was recorded in them, so the hole between
     /// the recordings either side is theirs, and the audit counts it as explained.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pauses: Vec<PauseSpan>,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 impl Default for Sidecar {
     fn default() -> Self {
-        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new(), removed_slides: Vec::new(), pinned_slides: Vec::new(), pauses: Vec::new() }
+        Self { version: SIDECAR_VERSION, recordings: Vec::new(), gaps: Vec::new(), open_utterances: Vec::new(), lecture_date: None, notes: NotesState::default(), slides: Vec::new(), removed_slides: Vec::new(), pinned_slides: Vec::new(), reserved_index: 0, pauses: Vec::new() }
     }
 }
 

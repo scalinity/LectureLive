@@ -346,7 +346,7 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
         Event::SlideRemoved { index, reason: None } => n("slide", &format!("slide {index} removed"), "kept in slides/removed, and left out of the next snapshot".into()),
         Event::SlideRemoved { index, reason: Some(why) } => n("slide", &format!("slide {index} removed"), format!("{why}; kept in slides/removed")),
         Event::SlideRestored(s) => n("slide", &format!("slide {} restored", s.index), "into the next snapshot".into()),
-        Event::CapturesArchived { files, bytes } => n("done", "captures cleared", format!("{files} files, {:.1} MB; images are saved in the study page", *bytes as f64 / 1_000_000.0)),
+        Event::CapturesArchived { files, bytes, recordings, recording_bytes } => n("done", "captures cleared", cleared(*files, *bytes, *recordings, *recording_bytes)),
         Event::Capture(s) => {
             let (kind, label, detail) = capture::state_words(s, words);
             n(kind, label, detail)
@@ -732,6 +732,16 @@ pub(crate) fn stop_after_secs(limit: u64, timer_tx: tokio::sync::mpsc::Unbounded
 
 /// Task 1's characterization goldens (M7 plan §J): the plain lines the CLI prints today, byte for
 /// byte, so the module split changes none of them.
+/// What a finished study page let go (spec §7.6).
+fn cleared(files: usize, bytes: u64, recordings: usize, recording_bytes: u64) -> String {
+    let mb = |b: u64| b as f64 / 1_000_000.0;
+    let mut out = format!("{files} files, {:.1} MB; images are saved in the study page", mb(bytes));
+    if recordings > 0 {
+        out.push_str(&format!("; {recordings} recording{}, {:.1} MB, deleted", if recordings == 1 { "" } else { "s" }, mb(recording_bytes)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod goldens {
     use super::*;

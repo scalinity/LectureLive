@@ -98,6 +98,25 @@ fn untranscribed(dir: &Path, sidecar: &Path, sc: &Sidecar, open: OpenUtterance) 
     Ok((len > from).then(|| Gap::new(open.recording_id, from, Some(len), GapKind::SttInterrupted)))
 }
 
+/// Deletes the recordings of a lecture whose study page is finished (spec §7.6): each closed recording with no
+/// unresolved gap, as retention deletes one, marked deleted in the sidecar. Returns the files and bytes deleted.
+pub fn retire_recordings(dir: &Path, sc: &mut Sidecar) -> Result<(usize, u64)> {
+    let mut out = (0, 0);
+    for id in prunable(sc, Retention::KeepDays(0), Local::now() + chrono::Duration::seconds(1)) {
+        let r = sc.recording_mut(id).expect("prunable ids come from the sidecar");
+        let wav = dir.join(&r.file);
+        let size = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&wav) {
+            Ok(()) => out = (out.0 + 1, out.1 + size),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("delete {}", wav.display())),
+        }
+        r.state = RecState::Deleted;
+    }
+    let _ = std::fs::remove_dir(dir.join("recordings")); // only when empty
+    Ok(out)
+}
+
 /// Closed recordings older than the retention window with no unresolved gap (spec §4.4).
 pub fn prunable(sc: &Sidecar, retention: Retention, now: DateTime<Local>) -> Vec<Uuid> {
     let Retention::KeepDays(days) = retention else { return Vec::new() };

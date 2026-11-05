@@ -82,7 +82,8 @@ pub fn open(files: &LectureFiles, title: &str, rebuild: bool) -> Result<(Sidecar
         captures.push(SlideEntry { index, file: relative(files, &path), shown_at: local(files.date, t), auto: false, uncertain: false });
     }
     for s in captures {
-        if !sc.slides.iter().any(|x| x.index == s.index) {
+        // A slide taken out stays out, though an older page's gallery still shows it.
+        if !sc.slides.iter().any(|x| x.index == s.index) && !sc.removed_slides.iter().any(|x| x.index == s.index) && s.index > sc.reserved_index {
             sc.slides.push(s);
             report.slides_registered += 1;
         }
@@ -183,7 +184,7 @@ pub fn slide_files(files: &LectureFiles) -> Result<Vec<SlideEntry>> {
 /// Removed slides reserve their number so undo cannot collide with a later capture.
 pub fn next_slide_index(files: &LectureFiles, sc: &Sidecar) -> Result<u32> {
     let on_disk = slide_files(files)?.iter().map(|s| s.index).max().unwrap_or(0);
-    let saved = sc.slides.iter().chain(&sc.removed_slides).map(|s| s.index).max().unwrap_or(0).max(sc.notes.slide_index).max(on_disk);
+    let saved = sc.slides.iter().chain(&sc.removed_slides).map(|s| s.index).max().unwrap_or(0).max(sc.notes.slide_index).max(sc.reserved_index).max(on_disk);
     let archived = if saved == 0 { crate::notes::archive::Archive::load(files.notes_dir()).highest_index() } else { 0 };
     saved.max(archived).checked_add(1).context("The slide numbers are exhausted")
 }

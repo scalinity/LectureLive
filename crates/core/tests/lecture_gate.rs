@@ -652,6 +652,20 @@ async fn a_failed_page_keeps_captures_and_a_successful_polish_page_retires_them(
     support::slides::png(&source);
     let slide = slides::register(&f, &store, &source, SlideMeta::manual(Local::now())).await.unwrap().unwrap();
     let image = f.dir.join(&slide.file);
+    // A slide taken out of the lecture, and the lecture's recording: both go once the page is finished (spec §7.6).
+    let out = f.slides.join("out.png");
+    support::slides::png(&out);
+    let out = slides::register(&f, &store, &out, SlideMeta::manual(Local::now())).await.unwrap().unwrap();
+    slides::remove(&f, &store, out.index, Arc::new(std::sync::atomic::AtomicBool::new(false))).await.unwrap();
+    let wav = f.dir.join("recordings/session_1.wav");
+    std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+    std::fs::write(&wav, vec![0u8; 4096]).unwrap();
+    store.update(|sc| {
+        use lecturelive_core::session::sidecar::{RecState, RecordingEntry};
+        sc.recordings.push(RecordingEntry { id: uuid::Uuid::new_v4(), file: "recordings/session_1.wav".into(), anchor: Local::now() - chrono::Duration::hours(2), source_uid: "X".into(), input_rate: 48_000, samples: Some(16_000), state: RecState::Finalized });
+        Ok(())
+    }).await.unwrap();
+    drop(store);
     let failed = fake_sse::start(|body| {
         let system = body["system"].as_str().unwrap_or_default();
         if system.starts_with("You are the note-taker") || system.starts_with("You turn raw") { respond(body) }
@@ -667,6 +681,7 @@ async fn a_failed_page_keeps_captures_and_a_successful_polish_page_retires_them(
         assert!(!matches!(event, Event::CapturesArchived { .. }));
     }
     assert!(page_failed && image.exists());
+    assert!(wav.exists() && f.slides.join("removed").exists(), "an unfinished page lets nothing go");
     let good = fake_sse::start(respond).await;
     let lec = lecture_for(&f, &good.url, &dir.path().join("spend.jsonl"));
     let (tx, mut events) = mpsc::unbounded_channel();
@@ -676,14 +691,21 @@ async fn a_failed_page_keeps_captures_and_a_successful_polish_page_retires_them(
     let mut cleared = false;
     while let Some(event) = events.recv().await {
         page_saved |= matches!(event, Event::Page { .. });
-        if let Event::CapturesArchived { files, .. } = event {
+        if let Event::CapturesArchived { files, recordings, recording_bytes, .. } = event {
             assert!(page_saved, "deletion follows the successful page event");
-            assert_eq!(files, 1);
+            assert_eq!((files, recordings, recording_bytes), (2, 1, 4096), "the capture, the removed image and the recording");
             cleared = true;
         }
     }
     assert!(cleared && !image.exists());
     assert!(lecturelive_core::notes::archive::Archive::load(&f.dir).uri(&image).is_some());
+    assert!(!wav.exists() && !f.dir.join("recordings").exists() && !f.slides.join("removed").exists());
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert_eq!(sc.recordings[0].state, lecturelive_core::session::sidecar::RecState::Deleted);
+    assert!(sc.removed_slides.is_empty() && sc.reserved_index == out.index, "the removed slide's number stays taken");
+    // Opening the folder again neither misses the recording nor brings the removed slide back.
+    let (again, _) = lecturelive_core::session::folder::open(&f, TITLE, false).unwrap();
+    assert!(again.slides.iter().all(|s| s.index != out.index));
 }
 
 /// M7 Task 3 (plan §C invariants 3 and 6): the frontend's `Event` receiver is held but not read until

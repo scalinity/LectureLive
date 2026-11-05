@@ -91,38 +91,34 @@ fn with_script(html: &str, id: &str, json: &str) -> Result<String> {
     Ok(format!("{}\n{tag}\n{}", &html[..at], &html[at..]))
 }
 
-pub fn with_removed(html: &str, images: &BTreeMap<String, String>) -> Result<String> {
-    with_script(html, "removed-captures", &serde_json::to_string(images)?.replace("</", "<\\/"))
+/// The page without the hidden copies of removed captures that earlier versions kept for undo (spec §7.6): once the
+/// page is finished, what was taken out of the lecture is gone.
+pub fn without_removed(html: &str) -> Option<String> {
+    SCRIPTS.captures_iter(html).find(|c| &c[1] == "removed-captures").map(|old| html.replacen(&old[0], "", 1))
 }
 
-/// Removed images stay out of the gallery, but their smaller HTML copy keeps deletion undo usable.
-pub fn removed_captures(dir: &Path, page: &Path, archived: &Archive) -> (Manifest, BTreeMap<String, String>) {
-    let mut manifest = Manifest::new();
-    let mut images = BTreeMap::new();
-    for (file, saved) in &archived.0 {
-        if saved.page == page && saved.capture.slide.starts_with("removed:") {
-            if let Ok(file) = file.strip_prefix(dir) {
-                manifest.insert(file.to_string_lossy().into_owned(), saved.capture.clone());
-                images.insert(saved.capture.slide.clone(), saved.uri.clone());
-            }
+/// Deletes the images of slides taken out of the lecture (`slides/removed/`) and the emptied folder: regular image
+/// files directly inside it only. Returns the files and bytes deleted, and what was left.
+pub fn clear_removed(dir: &Path) -> Cleanup {
+    let mut out = Cleanup::default();
+    let folder = dir.join("slides/removed");
+    let Ok(entries) = std::fs::read_dir(&folder) else { return out };
+    for entry in entries.flatten() {
+        let Ok(relative) = entry.path().strip_prefix(dir).map(|p| p.to_string_lossy().into_owned()) else { continue };
+        let Some(path) = capture_path(dir, &relative) else {
+            out.kept.push(relative);
+            continue;
+        };
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            out.files += 1;
+            out.bytes += size;
+        } else {
+            out.kept.push(relative);
         }
     }
-    if let Ok(files) = std::fs::read_dir(dir.join("slides/removed")) {
-        for entry in files.flatten() {
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(dir) else { continue };
-            let file = relative.to_string_lossy().into_owned();
-            if capture_path(dir, &file).is_none() { continue; }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let hash = sha256_hex(&bytes);
-            let Some(uri) = crate::notes::page::slide_uri(&path).filter(|u| image(u).is_some()) else { continue };
-            if std::fs::read(&path).ok().is_none_or(|b| sha256_hex(&b) != hash) { continue; }
-            let key = format!("removed:{file}");
-            manifest.insert(file, Capture { slide: key.clone(), sha256: hash, image_sha256: sha256_hex(uri.as_bytes()) });
-            images.insert(key, uri);
-        }
-    }
-    (manifest, images)
+    let _ = std::fs::remove_dir(&folder); // only when empty
+    out
 }
 
 fn capture_path(dir: &Path, file: &str) -> Option<PathBuf> {
@@ -185,13 +181,8 @@ pub fn adopt(page: &Path, paths: &BTreeMap<String, String>, apply: bool) -> Resu
         plan.files += 1;
         plan.bytes += bytes.len() as u64;
     }
-    let (removed, images) = removed_captures(dir, page, &Archive::load(dir));
-    for file in removed.keys() {
-        if let Ok(meta) = std::fs::metadata(dir.join(file)) { plan.files += 1; plan.bytes += meta.len(); }
-    }
-    manifest.extend(removed);
     if apply && !manifest.is_empty() {
-        let updated = with_removed(&with_manifest(&html, &manifest)?, &images)?;
+        let updated = with_manifest(&html, &manifest)?;
         write_atomic(page, updated.as_bytes())?;
         return clear(page);
     }

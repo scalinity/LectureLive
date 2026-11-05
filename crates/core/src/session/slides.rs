@@ -138,6 +138,15 @@ pub fn remove_in(files: &LectureFiles, sc: &mut Sidecar, index: u32) -> Result<S
     Ok(sc.slides.remove(at))
 }
 
+/// Once the images of removed slides are deleted with the finished study page (spec §7.6), undo has nothing to put
+/// back: their records go, and their numbers stay taken.
+pub fn forget_cleared(files: &LectureFiles, sc: &mut Sidecar) {
+    let removed = files.slides.join(REMOVED_DIR);
+    let gone: Vec<u32> = sc.removed_slides.iter().filter(|s| !removed.join(Path::new(&s.file).file_name().unwrap_or_default()).exists()).map(|s| s.index).collect();
+    sc.reserved_index = gone.iter().copied().chain([sc.reserved_index]).max().unwrap_or(0);
+    sc.removed_slides.retain(|s| !gone.contains(&s.index));
+}
+
 /// Restores the most recent removal inside the same writer as capture and snapshots. If a snapshot
 /// has passed its old number, give it a new pending number so the next snapshot can include it.
 pub async fn undo_remove(files: &LectureFiles, store: &Store, snapshotting: Arc<AtomicBool>) -> Result<SlideEntry> {
@@ -444,22 +453,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undo_still_works_when_polish_retired_the_removed_capture_file() {
+    async fn a_finished_page_lets_a_removed_image_go_and_keeps_its_number() {
         let (_d, files, store) = setup();
-        let slides = three(&files, &store).await;
+        three(&files, &store).await;
         remove(&files, &store, 2, idle()).await.unwrap();
         std::fs::write(&files.notes, "# Lecture").unwrap();
         let fills = crate::notes::page::Fills { keystone: "k".into(), summary: "s".into(), content: "c".into(), slides: "{}".into() };
         let page = crate::notes::page::render(&fills, "Test", &files.notes, "Week 01 — Test", crate::notes::page::TEMPLATE).unwrap();
-        assert_eq!(crate::notes::archive::clear(&page).unwrap().files, 1);
-        assert!(!files.slides.join(REMOVED_DIR).join("slide_02_100002.png").exists());
         let html = std::fs::read_to_string(&page).unwrap();
         assert_eq!(crate::notes::archive::script(&html, "slides").unwrap(), "{}", "a removed image stays out of the gallery");
-        let restored = undo_remove(&files, &store, idle()).await.unwrap();
-        assert_eq!((restored.index, restored.shown_at, restored.auto), (2, slides[1].shown_at, true));
-        assert!(restored.file.ends_with(".jpg"));
-        assert_eq!(crate::notes::chat::Image::read(&files.dir.join(restored.file)).unwrap().mime, "image/jpeg");
-        assert!(store.read().await.unwrap().removed_slides.is_empty());
+        assert!(crate::notes::archive::script(&html, "removed-captures").is_none(), "and the page keeps no copy of it");
+        let cleared = crate::notes::archive::clear_removed(&files.dir);
+        assert_eq!((cleared.files, cleared.kept.len()), (1, 0));
+        assert!(!files.slides.join(REMOVED_DIR).exists(), "the emptied folder goes too");
+        let files2 = files.clone();
+        store.update(move |sc| { forget_cleared(&files2, sc); Ok(()) }).await.unwrap();
+        let sc = store.read().await.unwrap();
+        assert!(sc.removed_slides.is_empty() && sc.reserved_index == 2);
+        assert!(undo_remove(&files, &store, idle()).await.is_err(), "nothing is left to put back");
+        let tmp = files.slides.join(".capture-4.png.tmp");
+        png(&tmp);
+        store.update(|sc| { sc.slides.retain(|s| s.index != 3); Ok(()) }).await.unwrap();
+        let next = register(&files, &store, &tmp, SlideMeta::manual(Local.with_ymd_and_hms(2026, 9, 25, 10, 6, 0).unwrap())).await.unwrap().unwrap();
+        assert!(next.index > 2, "a cleared slide's number is never taken again: {}", next.index);
     }
 
     #[tokio::test]
