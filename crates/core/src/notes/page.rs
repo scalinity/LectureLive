@@ -236,7 +236,22 @@ pub fn slide_uri(path: &Path) -> Option<String> {
 /// cache.
 pub fn rerender_saved(cache: &Path, course: &str, notes: &Path, lecture_name: &str) -> Option<Result<PathBuf>> {
     let v: Value = serde_json::from_slice(&std::fs::read(cache).ok()?).ok()?;
-    Some(render(&Fills::from_json(&v["fills"])?, course, notes, lecture_name, TEMPLATE))
+    let fills = Fills::from_json(&v["fills"])?;
+    // The page on disk may be the only copy of a slide's image: it is replaced only when every slide the parts name can
+    // be read again, from its file or from a verified archive copy (a page's gallery without a manifest is not one).
+    let dir = notes.parent().unwrap_or(Path::new("."));
+    let archived = Archive::load(dir);
+    let paths: Vec<String> = match serde_json::from_str::<Value>(&fills.slides) {
+        Ok(Value::Object(m)) => m.values().filter_map(|p| p.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    };
+    if let Some(lost) = paths.iter().find(|p| {
+        let file = dir.join(p);
+        slide_uri(&file).or_else(|| archived.uri(&file).map(str::to_string)).is_none_or(|u| archive::image(&u).is_none())
+    }) {
+        return Some(Err(anyhow::anyhow!("{lost} cannot be read again, so the study page was left as it was")));
+    }
+    Some(render(&fills, course, notes, lecture_name, TEMPLATE))
 }
 
 pub fn load_cache(path: &Path, key: &str) -> Option<(Fills, usize)> {
@@ -389,6 +404,22 @@ mod tests {
 
     fn words(n: usize) -> String {
         (0..n).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn rendering_again_from_saved_parts_never_replaces_a_page_holding_the_only_copy_of_an_image() {
+        // F011: a legacy page whose gallery has the image, with no manifest, and the original gone.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("lecture_notes_20261001.md");
+        std::fs::write(&notes, "# T\n\n![Slide 1](slides/slide_01_100000.png)\n").unwrap();
+        let cache = dir.path().join("cache.json");
+        std::fs::write(&cache, serde_json::json!({"source": "k", "fills": {"keystone": "k", "summary": "s", "content": "c", "slides": r#"{"1": "slides/slide_01_100000.png"}"#}, "words": 1, "budget": 1}).to_string()).unwrap();
+        let page = page_path(&notes, "Week 01 — Old");
+        let legacy = "<html><body><script type=\"application/json\" id=\"slides\">{\"1\": \"data:image/png;base64,iVBORw0KGgo=\"}</script></body></html>";
+        std::fs::write(&page, legacy).unwrap();
+        let out = rerender_saved(&cache, "Course", &notes, "Week 01 — Old").unwrap();
+        assert!(out.unwrap_err().to_string().contains("cannot be read again"));
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), legacy, "left byte for byte");
     }
 
     #[test]

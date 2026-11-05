@@ -148,9 +148,10 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -
         // request, so what it records describes it.
         if apply && !notes_changed && page.exists() && tidy::finished(&files, &page).is_err_and(|why| why.contains("does not record")) {
             let course = course_from_path(dir).unwrap_or_else(|| "Lecture".into());
-            if let Some(done) = lecturelive_core::notes::page::rerender_saved(&files.page_cache(), &course, &files.notes, &name) {
-                done?;
-                println!("  {} rendered again from its saved parts, with no request", page.file_name().unwrap_or_default().to_string_lossy());
+            match lecturelive_core::notes::page::rerender_saved(&files.page_cache(), &course, &files.notes, &name) {
+                Some(Ok(_)) => println!("  {} rendered again from its saved parts, with no request", page.file_name().unwrap_or_default().to_string_lossy()),
+                Some(Err(e)) => println!("  {e:#}"),
+                None => {}
             }
         }
         if let Err(why) = tidy::finished(&files, &page) {
