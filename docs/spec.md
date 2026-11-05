@@ -855,14 +855,17 @@ the CLI say why ("Slide 199 removed: an earlier state of slide 200"). The sweep 
    (`.live_notes/<stem>_HHMMSS.md`), and only where it stands once, on its own line, outside code; otherwise the capture
    stays. The same rule holds for every removal: a capture nothing in the notes refers to goes as it is, one whose only
    reference is its own embed goes with it, and any other reference keeps it, however it is written. A slide's file is named `slide_NN_HHMMSS`, and a reference is
-   counted wherever the notes, with percent and numeric escapes undone (with or without a semicolon) and the tabs and
-   line breaks a browser drops from a URL taken out, hold its six capture-time digits together. Digits
+   counted wherever the notes hold its six capture-time digits together once every step between a link's text and the
+   file it opens is undone: HTML character references (numeric, with or without a semicolon, and the named ones an
+   escape is made of), Markdown's backslashes, the tabs and line breaks a browser drops from a URL, and percent escapes,
+   applied together until nothing changes, so they undo in whatever order they were stacked. Digits
    have no Markdown escape, no named HTML reference and no case, so every link to the file keeps them whatever its
    syntax. The notes write times with colons, and two captures in one second only count each other, keeping both; a
    count too high only keeps a capture. A file named otherwise is found by its stem, case folded. Notes
-   that cannot be read keep every capture, and so do notes holding a style or a script (`<style>`, a `style`
-   attribute, `<script>`, `<link>`): a style spells a name with its own escapes and a script can build one, so no
-   search of the text finds them. A capture that a link in `slides/` or `slides/removed/` leads to stays, as does every
+   that cannot be read keep every capture, and so do notes escaped more deeply than 32 such passes undo, and notes
+   holding a style or a script, as written or decoded (`<style>`, a `style` attribute, `<link>`, `<svg>`, whose
+   attributes are read as styles, `<script>`, an `on…` handler, a `javascript:` link): a style spells a name with its
+   own escapes and a script builds one, so no search of the text finds them. A capture that a link in `slides/` or `slides/removed/` leads to stays, as does every
    capture while either folder cannot be listed. Clearing removed images after a finished page also keeps any the notes still
    refer to.
 
