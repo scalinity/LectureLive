@@ -233,10 +233,12 @@ fn percent_decoded(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-static CHARACTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").expect("a valid pattern"));
+/// A numeric character reference, with or without its semicolon, as HTML reads it.
+static CHARACTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?").expect("a valid pattern"));
 
 /// The notes as a reader of their links sees them: HTML character references and percent escapes undone, again and
-/// again until nothing changes (a name escaped twice is still a name).
+/// again until nothing changes (a name escaped twice is still a name), then tabs and line breaks taken out, as a browser
+/// takes them out of a URL.
 fn decoded_notes(doc: &str) -> String {
     let mut text = doc.to_string();
     for _ in 0..4 {
@@ -244,13 +246,14 @@ fn decoded_notes(doc: &str) -> String {
             let n = c.get(1).map_or_else(|| c[2].parse::<u32>().ok(), |h| u32::from_str_radix(h.as_str(), 16).ok());
             n.and_then(char::from_u32).map_or(c[0].to_string(), |ch| ch.to_string())
         });
-        let next = percent_decoded(&entities.replace("&amp;", "&"));
+        let named = entities.replace("&amp;", "&").replace("&Tab;", "\t").replace("&NewLine;", "\n");
+        let next = percent_decoded(&named);
         if next == text {
             break;
         }
         text = next;
     }
-    text
+    text.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect()
 }
 
 static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
@@ -415,10 +418,16 @@ mod tests {
             "![detail](slides/slide\\_04\\_100000.png)",
             "<img src=\"slides/slide&lowbar;04&lowbar;100000.png\">",
             "![detail](slides/removed/SLIDE_04_100000.png)",
+            "<img src=\"slides/removed/slide_04_&#49&#48&#48&#48&#48&#48.png\">",
+            "<img src=\"slides/slide_04_&#x31&#x30&#x30&#x30&#x30&#x30.png\">",
+            "<img src=\"slides/removed/slide_04_10&#10;0000.png\">",
+            "<img src=\"slides/slide_04_10&NewLine;0000.png\">",
+            "<img src=\"slides/slide_04_10\n0000.png\">",
         ] {
             assert_eq!(mentions(doc), 1, "{doc}");
         }
         assert_eq!(mentions(&format!("{embed}\n\n![d](slides/slide\\_04\\_100000.png)")), 2, "an escaped second reference");
+        assert_eq!(mentions(&format!("{embed}\n\n<img src=\"slides/slide_04_&#49&#48&#48&#48&#48&#48.png\">")), 2, "and an unterminated one");
         assert_eq!(mentions("<!-- 10:00:00 -->\n\n## At 10:00:00"), 0, "times in the notes are written with colons");
         let other = std::path::Path::new("/lec/slides/Board Photo.png");
         assert_eq!(references("![b](slides/board\\ photo.png)", other, "").mentions, 1, "a name of another shape, folded");
