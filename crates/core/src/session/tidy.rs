@@ -252,6 +252,10 @@ impl Tidier {
         if stale.is_empty() {
             return;
         }
+        // Relations are kept by slide number: once an image a relation was measured on has changed, none is trusted.
+        if stale.iter().any(|p| self.looks.contains_key(p)) {
+            self.memo = Relations::default();
+        }
         let decoded = tokio::task::spawn_blocking(move || {
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
             let chunk = stale.len().div_ceil(threads).max(1);
@@ -555,6 +559,22 @@ mod tests {
             assert_eq!(restored.index, 2);
             assert!(sweep(&f.files, &f.store, Scope::Pending, None).await.unwrap().is_empty(), "a restored slide is the person's");
             assert_eq!(f.store.read().await.unwrap().pinned_slides, [2]);
+        }
+
+        #[tokio::test]
+        async fn a_capture_whose_image_changes_is_judged_on_its_new_image() {
+            // F005: relations measured on the old image are not reused.
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let sc = f.store.read().await.unwrap();
+            let mut t = Tidier::default();
+            t.refresh(&f.files, &sc.slides).await;
+            let first = judge(&t.captures(&f.files, &sc, Scope::All), &mut t.memo);
+            assert_eq!(first, [Verdict { index: 1, why: Redundant::EarlierStateOf(2) }]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            slide(3, 1).save_with_format(f.files.dir.join(&steps[0].file), image::ImageFormat::Png).unwrap();
+            t.refresh(&f.files, &sc.slides).await;
+            assert!(judge(&t.captures(&f.files, &sc, Scope::All), &mut t.memo).is_empty(), "another title now: apart");
         }
 
         #[tokio::test]
