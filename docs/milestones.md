@@ -1222,7 +1222,10 @@ captures left in reached the notes. Captures are now judged from the pictures al
   is removed together with the capture it defers to.
 - **Where it runs.** After every automatic capture, at the start of every snapshot and after the lecture before polish.
   Removals go through the person's removal path, with the reason in the notice; undo pins what it puts back. A slide
-  the notes name anywhere (counted on the decoded notes) goes only with its own embed, taken out first and backed up.
+  the notes name anywhere goes only with its own embed, taken out first and backed up. A reference is a capture's six
+  capture-time digits in the notes once every step between a link's text and its file is undone together (HTML
+  character references, Markdown's backslashes, a URL's dropped tabs and line breaks, percent escapes). Notes holding a
+  style or a script keep every capture, as does a link to it in the slides' folders and any file named otherwise.
 - **Camera.** The scene gate stays on camera once it has seen one move, until a page or a cut (classroom camera
   captures changed by at most 0.057, cuts by 0.16–0.50). Camera-like runs among saved captures are only reported:
   grain cannot tell them from a photograph slide whose caption changes (1.2–9 % against 3.2 %), so
@@ -1251,8 +1254,8 @@ captures left in reached the notes. Captures are now judged from the pictures al
   are pixel-identical re-shows, and Biostat W08's 17 are build steps.
 - Checking those pairs is how the Zoom-bar twins were found.
 
-*Review.* An independent Codex (GPT-6.1 Sol, xhigh) read-only review of the branch, then four follow-ups on each fix
-range, found 16 issues, all fixed with regressions. Among them:
+*Review.* An independent Codex (GPT-6.1 Sol, xhigh) read-only review of the branch, then ten follow-ups on each fix
+range, found 26 issues (F001–F026), all fixed with regressions. Among them:
 
 - overpainted strokes counted as held;
 - a non-transitive same-picture group;
@@ -1264,16 +1267,48 @@ range, found 16 issues, all fixed with regressions. Among them:
 - the Zoom-bar heuristic hiding a slide's footer, twice;
 - an old page's only image overwritten by a re-render;
 - `--drop` ignoring hand-typed embeds;
-- references written with other syntaxes (encoded, by reference, unquoted, with a fragment or a query).
+- references written with other syntaxes (encoded, by reference, unquoted, with a fragment or a query);
+- references the count still missed: numeric references without a semicolon, a URL's tabs and line breaks, a symlink
+  in the slides' folders or a folder that cannot be listed, CSS escapes, escapes stacked in another order, scripts in
+  handlers and `javascript:` links, and named references such as `&colon;`.
+
+Each follow-up on the reference count found one more escape, until the ninth was asked to list every step between a
+link's text and the file it opens, and to say for each whether the count undoes it. Named references and files named
+otherwise were the only gaps left. The tenth found nothing.
 
 The NativePeers resume path refused to continue the reviewer (`PERMISSION_CAPABILITY_UNKNOWN`: unscoped tools on
 resume), so each follow-up ran in a fresh read-only worker given the previous report.
 
 *Verification* (2026-11-05):
 
-- The serial workspace suite passed 827 tests with 33 opt-in checks ignored.
+- The serial workspace suite (`--no-fail-fast`, 22 test binaries, at `85ccf55`) passed 835 tests with 33 opt-in checks
+  ignored.
 - One test failed: `the_failures_scenario_walks_the_table_and_keeps_it_inspectable`. It fails only on dates whose
   digits make the terminal's cell diff skip a character of the expected text, and is unrelated to this milestone.
 - Desktop type checking reported no errors, and the 50 frontend tests passed.
 - On a copy of Biostat W09, `lecture tidy --apply` re-rendered the page with no request. The gallery kept all 20 images,
   the page recorded itself complete, its 5 MB hidden archive of removed images went, and the recording was deleted.
+
+*Retroactive run* (2026-11-05, release CLI at `85ccf55`; each page copied first to the git-ignored
+`artifacts/m7.6/pages-before/`, each notes file and sidecar to `artifacts/m7.6/notes-before/`):
+
+| Weeks | Run | Result |
+|---|---|---|
+| Biostat W09, W10, W11; Fundamentals W10 | `lecture tidy --apply` | Pages re-rendered with no request; every gallery image identical by hash (20, 108, 77, 97); 751 MB of recordings deleted; Biostat W09's and W11's hidden archives of removed images (21 and 2) went |
+| Applied GenAI W08 | `lecture tidy --apply` | Re-rendered; the page lacks parts, so it records itself incomplete and its 401 MB recording stays until a page is typeset again (a paid request, not made) |
+| Biostat W12 | `--apply --swap 94=95 --swap 191=192 --drop 215-236` | 95 and 192 back in place of 94 and 191; the 22 camera captures and 7 redundant ones out with their embeds (105 embeds to 76; the notes otherwise unchanged); images in `slides/removed/` until the polish |
+| Applied GenAI W09, W10, W11; Fundamentals W11 | `lecture tidy --apply` | 7, 19, 8 and 15 captures out; every removed embed was the capture's own line, and nothing else in the notes changed. Applied GenAI W09's notes are 105 bytes, never written |
+| Biostat W08; Fundamentals W08 | `tidy --apply`, then `lecture page --notes` | 16 and 5 out; pages typeset ($1.28, $0.76); 96 and 219 MB of recordings deleted. Fundamentals W08's notes embed no slides, so its 27 captures stay |
+| Applied GenAI W05, W07; Fundamentals W05, W06 (Python tool) | `lecture page --notes` | Pages typeset ($0.85, $1.00, $0.83, $0.71) and their captures cleared, except two of Applied GenAI W05 |
+
+- **Space.** The week folders went from 2,956 MB to 1,910 MB (1,046 MB freed), and recordings from 2,540 MB to
+  1,524 MB. Polishing Biostat W12, Applied GenAI W09–W11 and Fundamentals W11 clears about 1.1 GB more.
+- **Spend.** $5.43 for the six pages ($20.81 to $26.24 in the ledger).
+- **Two slides missing from a page.** Applied GenAI W05's notes number their slides twice ("Slide 1" and "Slide 2"
+  each name two files), and the page keeps its slides in a map keyed by that label (`notes/page.rs`), so its page
+  shows 12 of 14. The two it lacks stay in `slides/`, since the page does not hold them. No other notes repeat a label.
+- **Old pages.** Applied GenAI W07's `visual_notes_20261006.html` from the Python tool linked two slide files, which
+  are now inside the new page instead. The other older custom pages link none.
+- **Left as they are.** The dry run also suggested `--swap 175=176` or `175=177` for Biostat W12; neither was asked
+  for.
+
