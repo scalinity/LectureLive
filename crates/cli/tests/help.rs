@@ -21,6 +21,7 @@ fn lecture_help_is_pinned() {
         "Options:\n",
         "      --apply                    tidy: do it (without this, tidy says what it would do)\n",
         "      --swap <A=B>               tidy --apply: put slide B, taken out by hand, back in place of slide A, an earlier state of it (repeatable)\n",
+        "      --drop <A-B>               tidy --apply: take out these slides, a camera run tidy reports say, with their embeds (N or A-B; repeatable)\n",
         "      --dir <DIR>                The lecture folder (default: the current directory)\n",
         "      --course <COURSE>          Course name (default: the folder above Weeks/, else LECTURE_COURSE)\n",
         "      --loopback                 Record BlackHole: Zoom through \"LectureLive Loopback\"\n",
