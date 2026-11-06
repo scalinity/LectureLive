@@ -655,10 +655,13 @@ with each count of samples multiplied by the rate, so each stays the same in sec
   screen sharing". A frame that is gentle all over with no level most of it shares (soft at least
   0.25, dominant under 0.40) and that is moving (the mean change from the sample before, over the
   last 3 samples, at least 0.0004) is a camera; the same picture held still is a slide with a
-  photograph on it. A camera once seen moving stays a camera while its frames stay gentle all over,
-  though the room holds still between someone's movements, until a page or a cut to another picture
-  (one sample's mean change of at least 0.08, after which the motion is measured afresh): a classroom
-  camera's frames minutes apart changed by at most 0.057, cuts by 0.16 to 0.50. Nothing is taken from a camera or a notice and the strip says what is showing
+  photograph on it. A camera once seen moving on every look of the window (each change at least 0.0002, as a camera's
+  grain always is: at least 0.0003) stays a camera while its frames stay gentle all over, though the
+  room holds still between someone's movements, until a page, a cut to another picture (one sample's
+  mean change of at least 0.08, after which the motion is measured afresh) or a window in which the
+  picture holds perfectly still (every change under 0.0002, as a slide held on screen does): a
+  classroom camera's frames minutes apart changed by at most 0.057, cuts by 0.16 to 0.50. One change
+  to a still photograph (a caption, a highlight) never makes it a camera. Nothing is taken from a camera or a notice and the strip says what is showing
   ("Zoom Meeting, waiting for a slide (a camera is showing)"); the first page that follows is
   the lecture's first slide. A manual capture is the person's call and is not judged.
 - **Candidate**: at least one changed tile outside the mask. Its image and first-observed time are kept.

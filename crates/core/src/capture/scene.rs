@@ -16,6 +16,9 @@ const MOTION: f32 = 0.0004;
 /// Samples averaged for the motion; fewer than this are taken as moving, so a camera is never taken for a page
 /// while it is still being looked at for the first time.
 const LOOKS: usize = 3;
+/// Below this from one sample to the next a picture holds perfectly still, which a camera never does: its grain changed
+/// the frame by at least 0.0003, a slide held on screen by 0.0001 (same recording as `MOTION`).
+const STILL: f32 = 0.0002;
 /// One sample's mean change at a cut to another picture. Measured on a classroom camera (M7.6): its frames minutes
 /// apart, people moving, differed by 0.001–0.057; a cut from a slide to it, or between slides, by 0.16–0.50.
 const CUT: f32 = 0.08;
@@ -145,10 +148,15 @@ impl Gate {
             _ => self.deltas.clear(),
         }
         self.before = Some(g.clone());
-        let measured = self.deltas.len() == LOOKS && self.deltas.iter().sum::<f32>() / LOOKS as f32 >= MOTION;
+        let full = self.deltas.len() == LOOKS;
+        let measured = full && self.deltas.iter().sum::<f32>() / LOOKS as f32 >= MOTION;
         let moving = self.deltas.len() < LOOKS || measured;
+        // A camera's grain moves every look; one change to a still photograph (a caption, a highlight) does not, and a
+        // picture that holds perfectly still for a whole window is no camera, however it was reached.
+        let sustained = measured && self.deltas.iter().all(|d| *d >= STILL);
+        let still = full && self.deltas.iter().all(|d| *d < STILL);
         let f = features(g);
-        self.camera = photographic(&f) && (self.camera && !self.deltas.is_empty() || measured);
+        self.camera = photographic(&f) && (self.camera && !self.deltas.is_empty() && !still || sustained);
         if self.camera { Scene::Camera } else { classify(&f, moving) }
     }
 }
@@ -238,16 +246,25 @@ mod tests {
         assert!(seen.iter().all(|s| *s == Scene::Camera), "{seen:?}");
     }
 
+    /// A room holding still between movements: the same view, its grain still changing a little on every look.
+    fn still_room(k: u32) -> GrayImage {
+        let mut g = camera(9);
+        let mut noise = grain(100 + k);
+        for p in g.pixels_mut() {
+            p.0[0] = (p.0[0] as i32 + noise() / 8).clamp(0, 255) as u8;
+        }
+        g
+    }
+
     #[test]
     fn a_camera_that_holds_still_after_moving_stays_a_camera_until_a_page_or_a_cut() {
         let mut gate = Gate::new();
         for k in 0..4 {
             assert_eq!(gate.look(&camera(k)), Scene::Camera);
         }
-        let still = camera(9);
-        assert!((0..8).all(|_| gate.look(&still) == Scene::Camera), "a room holding still between movements");
+        assert!((0..8).all(|k| gate.look(&still_room(k)) == Scene::Camera), "a room holding still between movements");
         assert_eq!(gate.look(&page()), Scene::Slide, "the share is back");
-        assert_eq!(gate.look(&still), Scene::Camera, "first looks are not known to be still");
+        assert_eq!(gate.look(&still_room(9)), Scene::Camera, "first looks are not known to be still");
         let mut gate = Gate::new();
         for k in 0..4 {
             gate.look(&camera(k));
@@ -257,6 +274,30 @@ mod tests {
         assert!(photographic(&features(&photo)));
         let seen: Vec<Scene> = (0..6).map(|_| gate.look(&photo)).collect();
         assert_eq!(seen[5], Scene::Slide, "{seen:?}");
+    }
+
+    #[test]
+    fn a_photograph_slide_changed_in_one_place_is_captured_once_it_settles() {
+        // R16: one change to a settled photograph armed the latch, and identical looks after it kept it for good.
+        let photo = GrayImage::from_fn(W, H, |x, y| Luma([(230 - x * 120 / W - y * 60 / H + (x * 7 + y * 13) % 21) as u8]));
+        assert!(photographic(&features(&photo)));
+        let mut gate = Gate::new();
+        assert_eq!((0..6).map(|_| gate.look(&photo)).last(), Some(Scene::Slide), "settled");
+        let mut marked = photo.clone();
+        for y in 40..56 {
+            for x in 100..116 {
+                marked.put_pixel(x, y, Luma([marked.get_pixel(x, y).0[0].saturating_sub(80)]));
+            }
+        }
+        let seen: Vec<Scene> = (0..6).map(|_| gate.look(&marked)).collect();
+        assert_eq!(seen.last(), Some(&Scene::Slide), "{seen:?}");
+        // A photographic fade that finishes and holds still is a slide too, once it has.
+        let mut gate = Gate::new();
+        for k in 0..6u8 {
+            gate.look(&GrayImage::from_fn(W, H, |x, y| Luma([(photo.get_pixel(x, y).0[0] as u32 * (10 + k as u32) / 16) as u8])));
+        }
+        let seen: Vec<Scene> = (0..6).map(|_| gate.look(&photo)).collect();
+        assert_eq!(seen.last(), Some(&Scene::Slide), "{seen:?}");
     }
 
     #[test]
