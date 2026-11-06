@@ -732,18 +732,13 @@ pub(crate) fn stop_after_secs(limit: u64, timer_tx: tokio::sync::mpsc::Unbounded
     });
 }
 
-/// Task 1's characterization goldens (M7 plan §J): the plain lines the CLI prints today, byte for
-/// byte, so the module split changes none of them.
 /// What a finished study page let go (spec §7.6).
 fn cleared(files: usize, bytes: u64, recordings: usize, recording_bytes: u64) -> String {
-    let mb = |b: u64| b as f64 / 1_000_000.0;
-    let mut out = format!("{files} files, {:.1} MB; images are saved in the study page", mb(bytes));
-    if recordings > 0 {
-        out.push_str(&format!("; {recordings} recording{}, {:.1} MB, deleted", if recordings == 1 { "" } else { "s" }, mb(recording_bytes)));
-    }
-    out
+    lecturelive_core::session::tidy::cleared_words(files, bytes, recordings, recording_bytes)
 }
 
+/// Task 1's characterization goldens (M7 plan §J): the plain lines the CLI prints today, byte for
+/// byte, so the module split changes none of them.
 #[cfg(test)]
 mod goldens {
     use super::*;

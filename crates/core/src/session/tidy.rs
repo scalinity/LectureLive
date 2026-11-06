@@ -536,6 +536,17 @@ pub struct Retired {
     pub recording_bytes: u64,
 }
 
+/// What a finished page let go, in the words the app and the CLI both use: the page holds what it shows, and what was
+/// taken out of the lecture is gone for good, so undo has nothing left to restore.
+pub fn cleared_words(files: usize, bytes: u64, recordings: usize, recording_bytes: u64) -> String {
+    let mb = |b: u64| b as f64 / 1_000_000.0;
+    let mut out = format!("{files} files, {:.1} MB; what the study page shows is saved in it, and removed slides can no longer be restored", mb(bytes));
+    if recordings > 0 {
+        out.push_str(&format!("; {recordings} recording{}, {:.1} MB, deleted", if recordings == 1 { "" } else { "s" }, mb(recording_bytes)));
+    }
+    out
+}
+
 /// Every lecture's notes in the folder, `files.notes` first: the days of a folder share `slides/`, so a removed image
 /// any of them names stays. A day's notes that cannot be read stop the clearing.
 fn folder_notes(files: &LectureFiles) -> Result<Vec<String>> {
@@ -1086,6 +1097,13 @@ mod tests {
             assert!(mistakes(&f.files, &f.store.read().await.unwrap()).is_empty());
             assert!(swap(&f.files, &f.store, 1, 2).await.unwrap_err().to_string().contains("not an earlier state"));
         }
+    }
+
+    #[test]
+    fn what_a_finished_page_let_go_is_told_as_it_is() {
+        // R25: removed images deleted for good were said to be saved in the page.
+        let said = cleared_words(3, 2_500_000, 1, 220_000_000);
+        assert_eq!(said, "3 files, 2.5 MB; what the study page shows is saved in it, and removed slides can no longer be restored; 1 recording, 220.0 MB, deleted");
     }
 
     #[test]

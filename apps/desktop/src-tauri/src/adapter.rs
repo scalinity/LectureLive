@@ -286,11 +286,7 @@ impl Pump {
             }
             Event::SlidesNoted { through } => self.emit(Stream::Status, StatusMsg::SlidesNoted { through }),
             Event::CapturesArchived { files, bytes, recordings, recording_bytes } => {
-                let mb = |b: u64| b as f64 / 1_000_000.0;
-                let mut said = format!("{files} files, {:.1} MB; images are saved in the study page", mb(bytes));
-                if recordings > 0 {
-                    said.push_str(&format!("; {recordings} recording{}, {:.1} MB, deleted", if recordings == 1 { "" } else { "s" }, mb(recording_bytes)));
-                }
+                let said = lecturelive_core::session::tidy::cleared_words(files, bytes, recordings, recording_bytes);
                 self.notice(NoticeKind::Done, "Captures cleared", &said);
                 self.emit(Stream::Status, StatusMsg::SlidesArchived);
             }
