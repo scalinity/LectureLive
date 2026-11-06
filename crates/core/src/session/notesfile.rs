@@ -350,30 +350,28 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
     // stays.
     let mentions = SLIDE_STEM.captures(&stem).map_or(2, |c| text.matches(&c[1]).count());
     let mentions = if opaque { mentions.max(2) } else { mentions };
-    let lines: Vec<&str> = doc.lines().collect();
-    let code = crate::notes::embeds::code_lines(&lines);
-    let own_line_embeds = lines.iter().zip(&code).filter(|(l, code)| !**code && l.trim() == embed).count();
+    let notes = crate::notes::embeds::read(doc);
+    let own_line_embeds = (0..notes.lines.len()).filter(|&i| notes.own_embed(i) == Some(embed)).count();
     References { mentions, own_line_embeds }
 }
 
 /// Takes slides' embeds out of the notes, or puts another slide's embed in one's place (spec §7.7): each change is
 /// `(embed, replacement)`, the embed as it is written on its own line. An embed is changed only where it stands once,
-/// on its own line and outside code; any other copy (inline, repeated, or the line edited by hand) leaves that one as
-/// it is. The notes are backed up and written as polish writes them. Returns which of `changes` were made.
+/// on its own line as an image; any other copy (inline, repeated, literal, or the line edited by hand) leaves that one
+/// as it is. The notes are backed up and written as polish writes them. Returns which of `changes` were made.
 pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, doc: &str, changes: &[(String, Option<String>)], at: DateTime<Local>) -> Result<Vec<usize>> {
     // Each line keeps its own ending, so only the lines changed differ from the notes as they were.
-    let pieces: Vec<&str> = doc.split_inclusive('\n').collect();
-    // Only the line's own ending comes off: a lone CR before it is a line break of its own.
-    let lines: Vec<&str> = pieces.iter().map(|p| p.strip_suffix('\n').map_or(*p, |l| l.strip_suffix('\r').unwrap_or(l))).collect();
-    let code = crate::notes::embeds::code_lines(&lines);
-    let mut out: Vec<Option<String>> = pieces.iter().map(|p| Some(p.to_string())).collect();
+    let notes = crate::notes::embeds::read(doc);
+    let lines: Vec<&str> = notes.lines.iter().map(|l| l.1).collect();
+    let code = &notes.literal;
+    let mut out: Vec<Option<String>> = notes.lines.iter().map(|(_, line, ending)| Some(format!("{line}{ending}"))).collect();
     let mut made = Vec::new();
     let mut removed = Vec::new();
     for (k, (embed, replacement)) in changes.iter().enumerate() {
-        let own: Vec<usize> = (0..lines.len()).filter(|&i| !code[i] && lines[i].trim() == embed).collect();
+        let own: Vec<usize> = (0..lines.len()).filter(|&i| notes.own_embed(i) == Some(embed.as_str())).collect();
         let anywhere = lines.iter().map(|l| l.matches(embed.as_str()).count()).sum::<usize>();
         if own.len() == 1 && anywhere == 1 {
-            let ending = &pieces[own[0]][lines[own[0]].len()..];
+            let ending = notes.lines[own[0]].2;
             out[own[0]] = replacement.as_ref().map(|r| format!("{r}{ending}"));
             if replacement.is_none() {
                 removed.push(own[0]);
@@ -612,6 +610,9 @@ mod tests {
             "# T\n\nParagraph\n    ```markdown\n![Slide 1](slides/a.png)\n    ```\n",
             "# T\n\n<pre>\n```markdown\n![Slide 1](slides/a.png)\n```\n</pre>\n",
             "# T\n\nParagraph\r\r\n    ~~~markdown\n    ![Slide 1](slides/a.png)\n    ~~~\n",
+            // M12: inside a code span after prose. M13: in a link reference's title.
+            "# T\n\nWrite `![Slide 1](slides/a.png)` literally.\n",
+            "# T\n\n[r]: /r \"\n![Slide 1](slides/a.png)\n\"\n\n[r]\n",
         ] {
             let (_dir, files, mut sc) = folder();
             std::fs::write(&files.notes, notes).unwrap();
@@ -620,6 +621,18 @@ mod tests {
             assert!(change_embeds(&files, &mut sc, notes, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
             assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), notes);
         }
+    }
+
+    #[test]
+    fn a_lone_carriage_return_ends_a_line_for_the_count_and_the_edit() {
+        // M14: the parser reads the heading and the embed as two lines, so the count and the edit read them so too.
+        let (_dir, files, mut sc) = folder();
+        let notes = "# T\r\n\r\n## Notes\r![Slide 1](slides/a.png)\r\n\r\nAfter.\r\n";
+        std::fs::write(&files.notes, notes).unwrap();
+        accept_external_edit(&files, &mut sc).unwrap();
+        assert_eq!(references(notes, std::path::Path::new("/lec/slides/a.png"), "![Slide 1](slides/a.png)").own_line_embeds, 1);
+        assert_eq!(change_embeds(&files, &mut sc, notes, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap(), [0]);
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), "# T\r\n\r\n## Notes\r\r\nAfter.\r\n");
     }
 
     #[test]

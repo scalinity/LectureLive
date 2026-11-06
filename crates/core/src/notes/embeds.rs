@@ -45,81 +45,134 @@ pub struct Repaired {
     pub missing: Vec<String>,
 }
 
-/// Spec §6.2: each expected embed exactly once, on its own line, outside code fences. Later and
-/// inline copies and embeds of slides outside the batch are removed; what fences hold is code and
-/// stays; expected embeds still absent are appended under their own heading, without a description.
-/// Which lines are code, as a CommonMark parser reads them: what it keeps literal rather than reading as Markdown. That
-/// is every line of a code block (fenced, with its fences, or indented) or an HTML block, in whatever list item or quote
-/// holds it, and a line that starts inside a code span or inline HTML. An unclosed fence runs to the end of its
-/// container, so what is uncertain counts as code, which keeps it. The one reading the snapshot's repair, the reference
-/// count and the embed edits share.
-pub fn code_lines(lines: &[&str]) -> Vec<bool> {
+/// The text's lines as CommonMark ends them, at an LF, a CRLF or a lone CR: where each starts, its text and its ending.
+pub fn split_lines(text: &str) -> Vec<(usize, &str, &str)> {
+    let b = text.as_bytes();
+    let (mut out, mut start, mut i) = (Vec::new(), 0, 0);
+    while i < b.len() {
+        let end = match b[i] {
+            b'\n' => i + 1,
+            b'\r' if b.get(i + 1) == Some(&b'\n') => i + 2,
+            b'\r' => i + 1,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push((start, &text[start..i], &text[i..end]));
+        (start, i) = (end, end);
+    }
+    if start < b.len() {
+        out.push((start, &text[start..], ""));
+    }
+    out
+}
+
+/// Notes as a CommonMark parser reads them: their lines, which of them a code or HTML block holds, and where a slide
+/// embed renders as an image. An embed spelled anywhere else (in code, in HTML, in a link's title, escaped) is literal
+/// text, and the snapshot's repair, the reference count and the embed edits all leave it as it is.
+pub struct Reading<'a> {
+    pub lines: Vec<(usize, &'a str, &'a str)>,
+    /// Whether a code block (fenced, with its fences, or indented) or an HTML block holds the line.
+    pub literal: Vec<bool>,
+    images: Vec<std::ops::Range<usize>>,
+}
+
+pub fn read(text: &str) -> Reading<'_> {
     use pulldown_cmark::{Event, Parser, Tag};
-    // A CR left inside a line is a line break to the parser; as an LF it stays one byte, where it was.
-    let text = lines.iter().map(|l| l.replace('\r', "\n")).collect::<Vec<_>>().join("\n");
-    let (mut blocks, mut spans) = (Vec::new(), Vec::new());
-    for (event, span) in Parser::new(&text).into_offset_iter() {
+    let (mut blocks, mut images) = (Vec::new(), Vec::new());
+    for (event, span) in Parser::new(text).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) => blocks.push(span),
-            Event::Code(_) | Event::InlineHtml(_) => spans.push(span),
+            Event::Start(Tag::Image { .. }) => images.push(span),
             _ => {}
         }
     }
-    let mut start = 0;
-    lines
-        .iter()
-        .map(|line| {
-            let end = start + line.len();
-            // A block covers whole lines; a code span or inline HTML makes a line code only where the line starts in it.
-            let first = end - line.trim_start().len();
-            let code = blocks.iter().any(|b| b.start <= end && start < b.end) || spans.iter().any(|s| s.contains(&first));
-            start = end + 1;
-            code
-        })
-        .collect()
+    let lines = split_lines(text);
+    let literal = lines.iter().map(|&(start, line, _)| blocks.iter().any(|b| b.start <= start + line.len() && start < b.end)).collect();
+    Reading { lines, literal, images }
 }
 
+impl Reading<'_> {
+    /// The slide embeds on line `i` that render as images, as ranges of the line.
+    pub fn embeds(&self, i: usize) -> Vec<std::ops::Range<usize>> {
+        let (start, line, _) = self.lines[i];
+        EMBED.find_iter(line).map(|m| m.range()).filter(|r| self.images.iter().any(|s| s.start == start + r.start && s.end == start + r.end)).collect()
+    }
+
+    /// The embed line `i` holds on its own, when it renders as an image.
+    pub fn own_embed(&self, i: usize) -> Option<&str> {
+        let line = self.lines[i].1;
+        match self.embeds(i).as_slice() {
+            [r] if line.trim() == &line[r.clone()] => Some(line.trim()),
+            _ => None,
+        }
+    }
+}
+
+/// Spec §6.2: each expected embed exactly once, on its own line, as an image. Later and inline copies and embeds of
+/// slides outside the batch are removed; what is literal text stays as written; expected embeds still absent are
+/// appended under their own heading, without a description.
 pub fn repair(text: &str, expected: &[String]) -> Repaired {
     let mut placed = vec![false; expected.len()];
     let (mut out, mut removed) = (Vec::new(), 0);
-    // The lines are joined with LF again, so a lone CR is written as the line break it is.
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = text.lines().collect();
-    let code = code_lines(&lines);
-    for (line, code) in lines.iter().zip(code) {
-        let t = line.trim();
-        if code {
+    let notes = read(text);
+    for (i, &(_, line, _)) in notes.lines.iter().enumerate() {
+        let found = notes.embeds(i);
+        if found.is_empty() {
             out.push(line.to_string());
             continue;
         }
-        if let Some(i) = expected.iter().position(|e| e == t) {
-            if placed[i] {
+        if let Some(k) = notes.own_embed(i).and_then(|own| expected.iter().position(|e| e == own)) {
+            if placed[k] {
                 removed += 1;
             } else {
-                placed[i] = true;
+                placed[k] = true;
                 out.push(line.to_string());
             }
             continue;
         }
-        let found = EMBED.find_iter(line).count();
-        if found == 0 {
-            out.push(line.to_string());
-            continue;
+        removed += found.len();
+        let mut rest = line.to_string();
+        for r in found.into_iter().rev() {
+            rest.replace_range(r, "");
         }
-        removed += found;
-        let rest = EMBED.replace_all(line, "");
         if !rest.trim().is_empty() {
             out.push(rest.trim_end().to_string());
         }
     }
     let missing: Vec<String> = expected.iter().zip(&placed).filter(|(_, p)| !**p).map(|(e, _)| e.clone()).collect();
     let body = out.join("\n");
+    let section = format!("{NOT_PLACED}\n\n{}", missing.join("\n\n"));
     let text = match (missing.is_empty(), body.trim().is_empty()) {
         (true, _) => body,
-        (false, true) => format!("{NOT_PLACED}\n\n{}", missing.join("\n\n")),
-        (false, false) => format!("{}\n\n{NOT_PLACED}\n\n{}", body.trim_end(), missing.join("\n\n")),
+        (false, true) => section,
+        (false, false) => {
+            let appended = format!("{}\n\n{section}", body.trim_end());
+            if shown(&appended, &missing) { appended } else { before_open_block(&body, &section).filter(|t| shown(t, &missing)).unwrap_or(appended) }
+        }
     };
     Repaired { text, removed, missing }
+}
+
+/// Whether every one of `embeds` stands on its own line as an image in `text`.
+fn shown(text: &str, embeds: &[String]) -> bool {
+    let notes = read(text);
+    let own: Vec<&str> = (0..notes.lines.len()).filter_map(|i| notes.own_embed(i)).collect();
+    embeds.iter().all(|e| own.contains(&e.as_str()))
+}
+
+/// `section` placed before the block that runs to the end of `body`: an answer cut off inside a fence or an HTML
+/// comment would otherwise hold it as literal text.
+fn before_open_block(body: &str, section: &str) -> Option<String> {
+    let notes = read(body);
+    let last = (0..notes.lines.len()).rev().find(|&i| !notes.lines[i].1.trim().is_empty())?;
+    if !notes.literal[last] {
+        return None;
+    }
+    let first = (0..=last).rev().take_while(|&i| notes.literal[i]).last()?;
+    let (head, tail) = body.split_at(notes.lines[first].0);
+    Some(if head.trim().is_empty() { format!("{section}\n\n{tail}") } else { format!("{}\n\n{section}\n\n{tail}", head.trim_end()) })
 }
 
 #[cfg(test)]
@@ -145,22 +198,28 @@ mod tests {
         assert_eq!((r.removed, r.missing.clone()), (3, vec![e(2)]));
     }
 
+    /// Which lines hold one slide embed on their own, as an image.
+    fn images(text: &str) -> Vec<bool> {
+        let notes = read(text);
+        (0..notes.lines.len()).map(|i| notes.own_embed(i).is_some()).collect()
+    }
+
     #[test]
     fn a_fence_closes_only_on_its_own_kind_and_length() {
         // R14: a ``` line inside a ~~~~ block is code, not the block's end.
-        let lines = ["~~~~markdown", "```", "![Slide 1](slides/a.png)", "~~~~", "after", "````", "```", "````", "out"];
-        assert_eq!(code_lines(&lines), [true, true, true, true, false, true, true, true, false]);
-        assert_eq!(code_lines(&["```rust", "x", "``` not a close", "```"]), [true, true, true, true]);
+        let text = format!("~~~~markdown\n```\n{}\n~~~~\n{}\n````\n```\n{}\n````\n{}", e(1), e(2), e(3), e(4));
+        assert_eq!(images(&text), [false, false, false, false, true, false, false, false, false, true]);
+        assert_eq!(images(&format!("```rust\n{}\n``` not a close\n{}\n```", e(1), e(2))), [false; 5]);
         // M03: a fence four spaces in from where its block opened is code; a block opened inside a list closes there.
-        assert_eq!(code_lines(&["```", "    ```", "![Slide 1](slides/slide_01_100000.png)", "```", "out"]), [true, true, true, true, false]);
-        assert_eq!(code_lines(&["- item", "    ```", "    code", "    ```", "after"]), [false, true, true, true, false]);
+        assert_eq!(images(&format!("```\n    ```\n{}\n```\n{}", e(1), e(2))), [false, false, false, false, true]);
+        assert_eq!(images(&format!("- item\n    ```\n    {}\n    ```\n{}", e(1), e(2))), [false, false, false, false, true]);
         // M05: closing is measured from the block's container, not the opener: a top-level fence closes within three
         // columns of the margin, however far in it opened; inside a list item, from the item's content.
         for opener in [" ```markdown", "  ```markdown", "   ```markdown"] {
-            assert_eq!(code_lines(&[opener, "    ```", "![Slide 1](slides/slide_01_100000.png)", "```", "out"]), [true, true, true, true, false], "{opener:?}");
+            assert_eq!(images(&format!("{opener}\n    ```\n{}\n```\n{}", e(1), e(2))), [false, false, false, false, true], "{opener:?}");
         }
-        assert_eq!(code_lines(&["1. item", "   ```", "   code", "   ```", "after"]), [false, true, true, true, false]);
-        assert_eq!(code_lines(&["- a", "  - b", "      ```", "        ```", "      ```", "after"]), [false, false, true, true, true, false]);
+        assert_eq!(images(&format!("1. item\n   ```\n   {}\n   ```\n{}", e(1), e(2))), [false, false, false, false, true]);
+        assert_eq!(images(&format!("- a\n  - b\n      ```\n        ```\n      {}\n      ```\n{}", e(1), e(2))), [false, false, false, false, false, false, true]);
     }
 
     /// M06: the first fence ends the inner list, so the second block is the outer item's and its six-space line is code.
@@ -170,15 +229,17 @@ mod tests {
 
     #[test]
     fn code_follows_list_items_tab_stops_and_indented_blocks() {
-        let lines = |t: &'static str| t.lines().collect::<Vec<_>>();
-        assert_eq!(code_lines(&lines(AFTER_A_NESTED_LIST)), [false, false, false, true, true, true, false, true, true, true, true]);
-        assert_eq!(code_lines(&lines(AFTER_A_TABBED_ITEM)), [false, true, true, true, false, true, true, true]);
+        // The literal embed stays text, and one written after the block is an image again.
+        for text in [AFTER_A_NESTED_LIST, AFTER_A_TABBED_ITEM] {
+            let seen = images(&format!("{text}\n{}", e(2)));
+            assert_eq!((seen.iter().filter(|s| **s).count(), seen.last()), (1, Some(&true)), "{text:?}");
+        }
         for marker in ["-\titem", "1.\titem"] {
-            assert_eq!(code_lines(&[marker, "\t```rust", "\t```", "", "![Slide 1](slides/slide_01_100000.png)"]), [false, true, true, false, false], "{marker:?}");
+            assert_eq!(images(&format!("{marker}\n\t```rust\n\t{}\n\t```\n\n{}", e(1), e(2))), [false, false, false, false, false, true], "{marker:?}");
         }
         // M08: fence-like lines indented four columns are an indented code block, which ends at the next line at the margin.
-        let indented = ["## Example", "", "    ```rust", "    let x = 1;", "    ```", "", "## Slides", "![Slide 1](slides/slide_01_100000.png)"];
-        assert_eq!(code_lines(&indented), [false, false, true, true, true, false, false, false]);
+        let indented = format!("## Example\n\n    ```rust\n    {}\n    ```\n\n## Slides\n{}", e(1), e(2));
+        assert_eq!(images(&indented), [false, false, false, false, false, false, false, true]);
     }
 
     /// M09: four-space backticks cannot open a fence after a paragraph, so they delimit a code span across lines.
@@ -190,12 +251,14 @@ mod tests {
 
     #[test]
     fn code_spans_html_and_lone_carriage_returns_are_read_as_the_parser_reads_them() {
-        let lines = |t: &'static str| t.lines().collect::<Vec<_>>();
-        assert_eq!(code_lines(&lines(IN_A_CODE_SPAN)), [false, true, true, true]);
-        assert_eq!(code_lines(&lines(IN_AN_HTML_BLOCK)), [true; 5]);
-        assert_eq!(code_lines(&lines(AFTER_A_LONE_CR)), [false, true, true, true]);
-        // A line that only holds a code span somewhere is still text: its inline copies are the repair's to remove.
-        assert_eq!(code_lines(&["See `x` and ![Slide 2](slides/slide_02_100000.png)"]), [false]);
+        for text in [IN_A_CODE_SPAN, IN_AN_HTML_BLOCK, AFTER_A_LONE_CR] {
+            assert!(!images(text).contains(&true), "{text:?}");
+        }
+        // M14: a lone CR ends a line, so an embed after one stands on its own line.
+        assert_eq!(images(&format!("## Notes\r{}\r\n", e(1))), [false, true]);
+        // An image beside a code span is still an image, one the repair takes out as an inline copy.
+        let notes = read("See `x` and ![Slide 2](slides/slide_02_100000.png)");
+        assert_eq!((notes.embeds(0).len(), notes.own_embed(0)), (1, None));
     }
 
     #[test]
@@ -213,6 +276,33 @@ mod tests {
         let r = repair(&clean_output(&format!("```markdown\n{AFTER_A_LONE_CR}```"), true), &[]);
         assert_eq!(r.removed, 0);
         assert!(r.text.starts_with("Paragraph\n\n    ~~~markdown"), "{:?}", r.text);
+    }
+
+    #[test]
+    fn only_what_renders_as_an_image_is_placed_or_taken_out() {
+        // M12: an image after leading inline code is an inline copy, so it goes and the slide is placed once below it.
+        let r = repair(&format!("## Weights\n`w` is the weight: {}", e(1)), &[e(1)]);
+        assert_eq!((r.text, r.removed), (format!("## Weights\n`w` is the weight:\n\n{NOT_PLACED}\n\n{}", e(1)), 1));
+        // M12: an embed spelled inside a code span is text, and stays as it is.
+        let literal = format!("Write `{}` literally.", e(9));
+        assert_eq!((repair(&literal, &[]).text, repair(&literal, &[]).removed), (literal.clone(), 0));
+        // M13: an embed spelled in a link reference's title is no image either, so the slide is still placed.
+        let titled = format!("[reference]: /reference \"\n{}\n\"\n\n[reference]", e(1));
+        let r = repair(&titled, &[e(1)]);
+        assert_eq!(r.missing, [e(1)]);
+        assert!(r.text.starts_with(&titled), "{:?}", r.text);
+    }
+
+    #[test]
+    fn a_missing_slide_is_placed_before_a_block_left_open() {
+        // M15: an answer cut off inside a fence or an HTML comment would hold the appended slides as literal text.
+        for open in ["~~~text\nexample", "<!-- unfinished\nexample"] {
+            let r = repair(&format!("## Example\n{open}"), &[e(1)]);
+            assert_eq!(r.text, format!("## Example\n\n{NOT_PLACED}\n\n{}\n\n{open}", e(1)), "{open:?}");
+        }
+        // A block that closes leaves the slides at the end, as before.
+        let closed = "## Example\n~~~text\nexample\n~~~";
+        assert_eq!(repair(closed, &[e(1)]).text, format!("{closed}\n\n{NOT_PLACED}\n\n{}", e(1)));
     }
 
     #[test]
