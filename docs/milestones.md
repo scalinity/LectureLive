@@ -1350,3 +1350,73 @@ cache key (F003). A follow-up review of the fixes found nothing further.
   earlier week in the installed app was not checked by hand.
 - Before the fix, five weeks were polished with a throwaway runner calling `Lecture::polish_after` for each folder's
   own day, not committed: Biostatistics W12 and, after their day, Applied GenAI W09–W11 and Fundamentals W11.
+
+
+## M7.8 — Review fixes for M7.6 and M7.7
+
+A full read-only review of M7.6 and M7.7 (`a7f4fc7..070a666`) used five reviewers:
+
+- two Claude (Opus) reviewers, one for bugs and one for quality and data integrity;
+- three Codex (GPT-6.1 Sol, xhigh) reviewers, one each for comparison and judging; wiring, the CLI and the app; and
+  deletion and data loss.
+
+Merged and deduplicated, they found 5 critical issues (R01–R05), 19 warnings (R06–R24) and 13 suggestions (R25–R37).
+
+None had harmed a week folder yet:
+
+- none of the twelve sidecars held an open utterance or a gap;
+- every folder holds a single day;
+- slide 188, removed under the old comparison, was an earlier state of 189: the quiz before its highlight.
+
+*Fixed.* Every fix has a regression, except R13's (R24): the app has no Tauri test harness.
+
+| Findings | What changed |
+|---|---|
+| R01, R11, R20, R23, R37 | **Retirement:** a finished day clears only the removed images its own sidecar lists and that no day's notes in the folder name. Nothing removed is cleared without a sidecar or during a live session, and hidden copies the notes still reference stay. The polish's page task holds no session store, so it never holds up Stop. Only failures are reported as kept. |
+| R02 | **Recordings:** a recording with an open utterance is never deleted. |
+| R03 | **Comparison:** holding a slide needs B to keep A's outline as well as an edge (each contrast A had stays, in the same direction), so a solid band painted over strokes no longer counts as keeping them. On the saved Week 12 set, removals went from 130 to 127, all three toward keeping (slides 29, 183 and 188). |
+| R04, R05, R22 | **Page render:** it refuses a slide image it cannot read, carries an earlier page's hidden copies with their manifest entries, and recovers archived copies by file through the notes' references. |
+| R06, R15 | **Removal:** checked before it starts (the file inside `slides/`, the destination free), and decided on the same read of the notes it edits. A failed move is an error. |
+| R07, R18 | **Swap and vetoes:** swap checks references and links, puts B back before editing the notes, and moves it back on failure. The photograph and Zoom-bar vetoes are shared by the judge, `mistakes`, swap and the calibration example. |
+| R08, R19 | **Finished pages:** a page records the sha256 of the notes it was typeset from. It counts as finished only when it is complete, was typeset from the notes as they are, and holds every embedded file by the manifest. Retirement checks this first. |
+| R09 | **Keeper rule:** the sweep's writer removes a noted slide only while its keeper is pending or still referenced. |
+| R10, R17 | **Cache:** the tidy cache is keyed by sidecar, and the writer checks that both slides' files are unchanged (path and stamp). |
+| R12, R30, R33, R35, R36 | **`lecture tidy`:** it takes `--day`, which swap and drop need in a folder of several days, and refuses reversed or huge drop ranges. It works through days in order, says why notes with styles or scripts are not tidied, and its dry run predicts with the rules `--apply` uses. |
+| R13 | **Start:** a refused start restores the folder the app had open. |
+| R14, R27 | **Notes edits:** repair, the reference count and embed edits share one reading of code. An embed edit changes only its own line and keeps line endings. |
+| R16 | **Camera latch:** a still photo slide latches Camera only on measured motion (every delta at least `STILL`, the mean at least `MOTION`) and releases after a still window. A cut clears it. |
+| R21 | **Notes revision:** a sweep that rewrites the notes publishes a notes revision (`Event::NotesEdited`), which the app and the TUI pick up. |
+| R25 | **Notices:** cleanup notices say what was cleared without promising removed images back. |
+| R29 | **Recording paths:** a recording is deleted only from inside the folder's recordings. |
+| R34 | **Tests:** they set a capture's time instead of sleeping. |
+
+*Not changed:*
+
+- R26: a reference count measured 1.4–1.9 ms on 56–73 KB notes.
+- R28: `capture_path` already refuses paths outside `slides/` and `slides/removed/`.
+- R31: CLI only, once per run.
+- R32: a module split with no change in behaviour.
+
+*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes three times.
+
+1. **First review:**
+   - M01: carried hidden-copy entries bypassed the retention guards and could lose both copies of an image. It came from the R04 and R01 fixes together; clearing now skips `slides/removed`.
+   - M02: the removal check approved a destination the removal refused.
+   - M03: a fence indented four spaces exposed literal code.
+   - M04: the dry run lacked the keeper rule.
+2. **Second review:** M05, where an opener's indent widened what could close it.
+3. **Third review:**
+   - M06: an ended nested list still served as a container.
+   - M07: tabs were counted as four columns rather than to the next tab stop.
+   - M08: an indented code block never ended.
+
+Each round found cases the hand-written fence reader missed. Code is now what pulldown-cmark reads as a code block. The TUI already used pulldown-cmark, so `Cargo.lock` gains no crate. The spec states the rule as CommonMark's. Across the 47 notes files in the class folders (29,752 lines), the old and new readers agree on every line. Those notes hold no fences; their 28 lines indented four or more are nested bullets, which both read as text.
+
+*Verification* (2026-11-05):
+
+- The workspace suite (`--no-fail-fast`, 23 test binaries, run in parallel) passed 876 tests with 33 opt-in checks
+  ignored. Two failed: the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6), and
+  `lecture_gate`'s `a_paused_lecture_streams_nothing_and_its_resume_is_a_second_recording`, the parallel-only failure
+  M7.7 recorded, which passes alone.
+- Desktop type checking reported no errors, and the 50 frontend tests passed.
+- The R16 thresholds were not measured again on a recorded class.
