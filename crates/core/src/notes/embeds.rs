@@ -47,17 +47,35 @@ pub struct Repaired {
 /// Spec §6.2: each expected embed exactly once, on its own line, outside code fences. Later and
 /// inline copies and embeds of slides outside the batch are removed; what fences hold is code and
 /// stays; expected embeds still absent are appended under their own heading, without a description.
+/// Which lines are fenced code, the fences included, as CommonMark reads them: a fence is three or more backticks or
+/// tildes, and only a fence of the same character, at least as long and with nothing after it, closes it. The one reading
+/// the snapshot's repair, the reference count and the embed edits share.
+pub fn code_lines(lines: &[&str]) -> Vec<bool> {
+    let mut open: Option<(char, usize)> = None;
+    lines
+        .iter()
+        .map(|line| {
+            let t = line.trim();
+            let fence = t.chars().next().filter(|c| matches!(c, '`' | '~')).map(|c| (c, t.chars().take_while(|x| *x == c).count())).filter(|(_, n)| *n >= 3);
+            match (open, fence) {
+                (None, Some(f)) => open = Some(f),
+                (Some((c, n)), Some((d, m))) if c == d && m >= n && t[m..].trim().is_empty() => open = None,
+                (None, None) => return false,
+                _ => {}
+            }
+            true
+        })
+        .collect()
+}
+
 pub fn repair(text: &str, expected: &[String]) -> Repaired {
     let mut placed = vec![false; expected.len()];
-    let (mut out, mut removed, mut fenced) = (Vec::new(), 0, false);
-    for line in text.lines() {
+    let (mut out, mut removed) = (Vec::new(), 0);
+    let lines: Vec<&str> = text.lines().collect();
+    let code = code_lines(&lines);
+    for (line, code) in lines.iter().zip(code) {
         let t = line.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fenced = !fenced;
-            out.push(line.to_string());
-            continue;
-        }
-        if fenced {
+        if code {
             out.push(line.to_string());
             continue;
         }
@@ -112,6 +130,14 @@ mod tests {
         let r = repair(&text, &[e(1), e(2)]);
         assert_eq!(r.text, format!("## A\n{}\n- see  here\n- also  inline\n\n{NOT_PLACED}\n\n{}", e(1), e(2)));
         assert_eq!((r.removed, r.missing.clone()), (3, vec![e(2)]));
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_kind_and_length() {
+        // R14: a ``` line inside a ~~~~ block is code, not the block's end.
+        let lines = ["~~~~markdown", "```", "![Slide 1](slides/a.png)", "~~~~", "after", "````", "```", "````", "out"];
+        assert_eq!(code_lines(&lines), [true, true, true, true, false, true, true, true, false]);
+        assert_eq!(code_lines(&["```rust", "x", "``` not a close", "```"]), [true, true, true, true]);
     }
 
     #[test]

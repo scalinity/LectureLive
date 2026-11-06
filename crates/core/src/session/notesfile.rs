@@ -180,6 +180,11 @@ pub fn recover(files: &LectureFiles, sc: &mut Sidecar) -> Result<Recovered> {
 /// Polish's replace (spec §6.3). `based_on` is the SHA-256 of the notes the polish was made from:
 /// if they have changed since, nothing is written. Returns the backup's path.
 pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on: &str, at: DateTime<Local>) -> Result<std::path::PathBuf> {
+    write_replacement(files, sc, &format!("{}\n", polished.trim_end()), based_on, at)
+}
+
+/// `replace`, writing `text` exactly as it is.
+fn write_replacement(files: &LectureFiles, sc: &mut Sidecar, text: &str, based_on: &str, at: DateTime<Local>) -> Result<std::path::PathBuf> {
     let current = std::fs::read(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
     if sha256_hex(&current) != based_on {
         bail!("the notes changed while they were being polished, so the polished version was not written; {} is as it was left", files.notes.display());
@@ -188,7 +193,7 @@ pub fn replace(files: &LectureFiles, sc: &mut Sidecar, polished: &str, based_on:
     let base = format!("{}_{}", files.stem, at.format("%H%M%S"));
     let backup = (1..).map(|n| files.state_dir().join(if n == 1 { format!("{base}.md") } else { format!("{base}_{n}.md") })).find(|p| !p.exists()).expect("an unused name");
     std::fs::write(&backup, &current).and_then(|()| std::fs::File::open(&backup)?.sync_all()).with_context(|| format!("back up the notes to {}", backup.display()))?;
-    write_atomic(&files.notes, format!("{}\n", polished.trim_end()).as_bytes()).with_context(|| format!("write {}", files.notes.display()))?;
+    write_atomic(&files.notes, text.as_bytes()).with_context(|| format!("write {}", files.notes.display()))?;
     let (len, sha) = fingerprint(files)?;
     sc.notes.revision += 1;
     sc.notes.len = len;
@@ -345,16 +350,9 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
     // stays.
     let mentions = SLIDE_STEM.captures(&stem).map_or(2, |c| text.matches(&c[1]).count());
     let mentions = if opaque { mentions.max(2) } else { mentions };
-    let mut fenced = false;
-    let mut own_line_embeds = 0;
-    for line in doc.lines() {
-        let t = line.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fenced = !fenced;
-        } else if !fenced && t == embed {
-            own_line_embeds += 1;
-        }
-    }
+    let lines: Vec<&str> = doc.lines().collect();
+    let code = crate::notes::embeds::code_lines(&lines);
+    let own_line_embeds = lines.iter().zip(&code).filter(|(l, code)| !**code && l.trim() == embed).count();
     References { mentions, own_line_embeds }
 }
 
@@ -363,26 +361,19 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
 /// on its own line and outside code; any other copy (inline, repeated, or the line edited by hand) leaves that one as
 /// it is. The notes are backed up and written as polish writes them. Returns which of `changes` were made.
 pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, doc: &str, changes: &[(String, Option<String>)], at: DateTime<Local>) -> Result<Vec<usize>> {
-    let lines: Vec<&str> = doc.lines().collect();
-    let mut fenced = false;
-    let mut code = vec![false; lines.len()];
-    for (i, l) in lines.iter().enumerate() {
-        let t = l.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fenced = !fenced;
-            code[i] = true;
-        } else {
-            code[i] = fenced;
-        }
-    }
-    let mut out: Vec<Option<String>> = lines.iter().map(|l| Some(l.to_string())).collect();
+    // Each line keeps its own ending, so only the lines changed differ from the notes as they were.
+    let pieces: Vec<&str> = doc.split_inclusive('\n').collect();
+    let lines: Vec<&str> = pieces.iter().map(|p| p.trim_end_matches(['\n', '\r'])).collect();
+    let code = crate::notes::embeds::code_lines(&lines);
+    let mut out: Vec<Option<String>> = pieces.iter().map(|p| Some(p.to_string())).collect();
     let mut made = Vec::new();
     let mut removed = Vec::new();
     for (k, (embed, replacement)) in changes.iter().enumerate() {
         let own: Vec<usize> = (0..lines.len()).filter(|&i| !code[i] && lines[i].trim() == embed).collect();
         let anywhere = lines.iter().map(|l| l.matches(embed.as_str()).count()).sum::<usize>();
         if own.len() == 1 && anywhere == 1 {
-            out[own[0]] = replacement.clone();
+            let ending = &pieces[own[0]][lines[own[0]].len()..];
+            out[own[0]] = replacement.as_ref().map(|r| format!("{r}{ending}"));
             if replacement.is_none() {
                 removed.push(own[0]);
             }
@@ -414,8 +405,10 @@ pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, doc: &str, changes:
             }
         }
     }
-    let kept: Vec<String> = out.into_iter().flatten().collect();
-    replace(files, sc, &kept.join("\n"), &sha256_hex(doc.as_bytes()), at)?;
+    // And the file ends as it did: an emptied section at the end leaves no blank line behind.
+    let kept: String = out.into_iter().flatten().collect();
+    let kept = format!("{}{}", kept.trim_end(), &doc[doc.trim_end().len()..]);
+    write_replacement(files, sc, &kept, &sha256_hex(doc.as_bytes()), at)?;
     Ok(made)
 }
 
@@ -593,6 +586,29 @@ mod tests {
         let now = std::fs::read_to_string(&files.notes).unwrap();
         assert!(change_embeds(&files, &mut sc, &decided, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).is_err());
         assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), now, "the newer notes are as the person left them");
+    }
+
+    #[test]
+    fn an_embed_edit_changes_only_its_own_line() {
+        // R27: the notes were rebuilt with \n endings and their trailing whitespace trimmed.
+        let (_dir, files, mut sc) = folder();
+        std::fs::write(&files.notes, "# T\r\n\r\nKept  \r\n\r\n![Slide 1](slides/a.png)\r\n\r\nAfter.\r\n\r\n").unwrap();
+        accept_external_edit(&files, &mut sc).unwrap();
+        let doc = std::fs::read_to_string(&files.notes).unwrap();
+        change_embeds(&files, &mut sc, &doc, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap();
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), "# T\r\n\r\nKept  \r\n\r\nAfter.\r\n\r\n");
+    }
+
+    #[test]
+    fn an_embed_inside_a_longer_fence_is_code() {
+        // R14: ``` inside a ~~~~ block did not close it; the literal embed after it is not the notes' embed.
+        let (_dir, files, mut sc) = folder();
+        let notes = "# T\n\n~~~~markdown\n```\n![Slide 1](slides/a.png)\n~~~~\n";
+        std::fs::write(&files.notes, notes).unwrap();
+        accept_external_edit(&files, &mut sc).unwrap();
+        assert_eq!(references(notes, std::path::Path::new("/lec/slides/a.png"), "![Slide 1](slides/a.png)").own_line_embeds, 0);
+        assert!(change_embeds(&files, &mut sc, notes, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), notes);
     }
 
     #[test]
