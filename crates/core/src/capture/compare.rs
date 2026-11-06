@@ -211,6 +211,19 @@ fn each_uncovered(a: &Look, b: &Look, rows: u32, mut hit: impl FnMut(usize)) {
                 hit(i);
                 continue;
             }
+            // And the stroke's own outline: a band one or two pixels high laid over separate strokes has an edge at
+            // every pixel (its border), yet the gaps between the strokes, where `a` changed across, are gone in `b`.
+            let erased = (y.saturating_sub(1)..=(y + 1).min(H - 1)).any(|ny| {
+                (x.saturating_sub(1)..=(x + 1).min(W - 1)).any(|nx| {
+                    let j = (ny * W + nx) as usize;
+                    let (da, db) = (pa[i] as i16 - pa[j] as i16, pb[i] as i16 - pb[j] as i16);
+                    da.abs() > INK && (db.signum() != da.signum() || db.abs() + SLACK < da.abs())
+                })
+            });
+            if erased {
+                hit(i);
+                continue;
+            }
             if b.busy[t] && (pb[i] as i16 - pa[i] as i16).abs() <= SLACK {
                 continue;
             }
@@ -387,6 +400,19 @@ pub(crate) mod tests {
         }
         assert_eq!(rel(&with, &s), Order::Same);
         assert_eq!(rel(&s, &with), Order::Same);
+    }
+
+    #[test]
+    fn two_pixel_panels_do_not_hold_the_strokes_they_cover() {
+        // R03: every pixel of a thin band has an edge (its border), so separate strokes under it counted as held.
+        let (mut a, mut b) = (slide(0, 1), slide(0, 1));
+        for y in [100, 108, 116] {
+            for k in 0..17 {
+                bar(&mut a, y, 60 + 6 * k, 1, 2, 30);
+            }
+            bar(&mut b, y, 58, 104, 2, 30);
+        }
+        assert_eq!(rel(&a, &b), Order::Apart);
     }
 
     /// Zoom's control bar over the bottom of `g`: its dark level with icons and labels in it.
