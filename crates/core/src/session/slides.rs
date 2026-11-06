@@ -145,6 +145,9 @@ pub fn remove_in(files: &LectureFiles, sc: &mut Sidecar, index: u32) -> Result<S
         }
         move_file(&from, &dest)?;
         sc.removed_slides.push(sc.slides[at].clone());
+    } else {
+        // No file to keep for undo, and still a number no later capture may take: its relations were measured on it.
+        sc.reserved_index = sc.reserved_index.max(index);
     }
     Ok(sc.slides.remove(at))
 }
@@ -461,6 +464,17 @@ mod tests {
         std::fs::remove_file(files.slides.join(REMOVED_DIR).join("slide_02_100002.png")).unwrap();
         assert!(undo_remove(&files, &store, idle()).await.is_err());
         assert_eq!(store.read().await.unwrap().removed_slides, vec![gone]);
+    }
+
+    #[tokio::test]
+    async fn a_slide_removed_with_its_file_gone_keeps_its_number_from_later_captures() {
+        // R10: the number was free again, and the judge's relations measured on the old image followed it.
+        let (_d, files, store) = setup();
+        three(&files, &store).await;
+        std::fs::remove_file(files.slides.join("slide_03_100003.png")).unwrap();
+        let f = files.clone();
+        let next = store.update(move |sc| { remove_in(&f, sc, 3)?; crate::session::folder::next_slide_index(&f, sc) }).await.unwrap();
+        assert_eq!(next, 4);
     }
 
     #[tokio::test]

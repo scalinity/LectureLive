@@ -231,29 +231,35 @@ pub enum Scope {
     All,
 }
 
+/// A file as it was when it was looked at: its size and modification time.
+type Stamp = Option<(u64, SystemTime)>;
+
 /// One lecture's captures as the judge saw them, kept between sweeps: decoding a capture takes longer than judging
 /// every capture of the lecture.
 #[derive(Default)]
 pub struct Tidier {
-    looks: HashMap<PathBuf, (Option<(u64, SystemTime)>, Option<Arc<Look>>)>,
+    looks: HashMap<PathBuf, (Stamp, Option<Arc<Look>>)>,
+    /// The file each number named when its relations were measured.
+    named: HashMap<u32, PathBuf>,
     memo: Relations,
 }
 
-/// The lecture being tidied: its capture and its snapshots share one cache, and one sweep runs at a time, so two
-/// sweeps cannot each take out one of a pair.
+/// The lecture being tidied, by its sidecar (the days of a folder number their slides apart): its capture and its
+/// snapshots share one cache, and one sweep runs at a time, so two sweeps cannot each take out one of a pair.
 static CURRENT: std::sync::Mutex<Option<(PathBuf, Arc<tokio::sync::Mutex<Tidier>>)>> = std::sync::Mutex::new(None);
 
 fn tidier(files: &LectureFiles) -> Arc<tokio::sync::Mutex<Tidier>> {
     let mut current = CURRENT.lock().expect("the tidier");
-    if let Some((_, t)) = current.as_ref().filter(|(dir, _)| *dir == files.dir) {
+    let lecture = files.sidecar();
+    if let Some((_, t)) = current.as_ref().filter(|(at, _)| *at == lecture) {
         return t.clone();
     }
     let t = Arc::new(tokio::sync::Mutex::new(Tidier::default()));
-    *current = Some((files.dir.clone(), t.clone()));
+    *current = Some((lecture, t.clone()));
     t
 }
 
-fn stamp(p: &Path) -> Option<(u64, SystemTime)> {
+fn stamp(p: &Path) -> Stamp {
     let m = std::fs::metadata(p).ok()?;
     Some((m.len(), m.modified().ok()?))
 }
@@ -261,11 +267,17 @@ fn stamp(p: &Path) -> Option<(u64, SystemTime)> {
 impl Tidier {
     /// Looks at every capture not seen yet, or changed since, on threads of their own.
     async fn refresh(&mut self, files: &LectureFiles, slides: &[SlideEntry]) {
+        // Relations are kept by slide number: once a number names another file, none is trusted.
+        let renamed = slides.iter().any(|s| self.named.get(&s.index).is_some_and(|p| *p != files.dir.join(&s.file)));
+        self.named = slides.iter().map(|s| (s.index, files.dir.join(&s.file))).collect();
+        if renamed {
+            self.memo = Relations::default();
+        }
         let stale: Vec<PathBuf> = slides.iter().map(|s| files.dir.join(&s.file)).filter(|p| self.looks.get(p).is_none_or(|(st, _)| *st != stamp(p))).collect();
         if stale.is_empty() {
             return;
         }
-        // Relations are kept by slide number: once an image a relation was measured on has changed, none is trusted.
+        // Nor once an image a relation was measured on has changed.
         if stale.iter().any(|p| self.looks.contains_key(p)) {
             self.memo = Relations::default();
         }
@@ -331,6 +343,8 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
     if verdicts.is_empty() {
         return Ok(Vec::new());
     }
+    // What each verdict was judged on, checked again in the writer: a file changed or gone since is judged next time.
+    let seen: HashMap<u32, (PathBuf, Stamp)> = sc.slides.iter().map(|s| { let p = files.dir.join(&s.file); let st = t.looks.get(&p).and_then(|(st, _)| *st); (s.index, (p, st)) }).collect();
     let files = files.clone();
     store
         .update(move |sc| {
@@ -347,13 +361,21 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
                 .into_iter()
                 .filter(|v| registered(sc, v.index) && !sc.pinned_slides.contains(&v.index) && (scope == Scope::All || v.index > sc.notes.slide_index))
                 .filter(|v| match v.why {
-                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k) && (v.index > sc.notes.slide_index || shown(sc, k)),
+                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k) && (v.index > sc.notes.slide_index || shown(sc, k)) && unchanged(&files, sc, &seen, &[v.index, k]),
                 })
                 .collect();
             let gone = take_out(&files, sc, &still.iter().map(|v| v.index).collect::<Vec<_>>())?;
             Ok(gone.into_iter().map(|e| { let why = still.iter().find(|v| v.index == e.index).expect("taken out from the verdicts").why; (e, why) }).collect::<Vec<_>>())
         })
         .await
+}
+
+/// Whether these slides still name the files they were judged on, unchanged since.
+fn unchanged(files: &LectureFiles, sc: &Sidecar, seen: &HashMap<u32, (PathBuf, Stamp)>, indices: &[u32]) -> bool {
+    indices.iter().all(|i| {
+        let now = sc.slides.iter().find(|s| s.index == *i).map(|s| files.dir.join(&s.file));
+        seen.get(i).is_some_and(|(p, st)| now.as_ref() == Some(p) && st.is_some() && stamp(p) == *st)
+    })
 }
 
 /// Takes these registered slides out, inside the sidecar's writer, as far as the notes allow (spec §7.7). A slide nothing
@@ -910,6 +932,37 @@ mod tests {
             assert!(drop_slides(&f.files, &f.store, &[1]).await.unwrap().is_empty());
             assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), before, "the embed stays with its slide");
             assert_eq!(f.store.read().await.unwrap().slides.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn each_day_has_its_own_judgements_and_a_number_reused_is_measured_afresh() {
+            // R10: the days of a folder number their slides apart; and a number can name another file.
+            let f = folder();
+            let other = LectureFiles::standard(&f.files.dir, chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap());
+            assert!(!Arc::ptr_eq(&tidier(&f.files), &tidier(&other)), "one cache per lecture");
+            let mut t = Tidier::default();
+            let entry = |file: &str| SlideEntry { index: 1, file: file.into(), shown_at: Local::now(), auto: true, uncertain: false };
+            t.refresh(&f.files, &[entry("slides/slide_01_100000.png")]).await;
+            t.memo.0.insert((1, 2), Relation { lost: 0.0, added: 0.5 });
+            t.refresh(&f.files, &[entry("slides/slide_01_100000.png")]).await;
+            assert!(!t.memo.0.is_empty(), "the same file: kept");
+            t.refresh(&f.files, &[entry("slides/slide_01_120000.png")]).await;
+            assert!(t.memo.0.is_empty(), "number 1 names another image now");
+        }
+
+        #[tokio::test]
+        async fn a_verdict_goes_only_while_its_images_are_as_they_were_judged() {
+            // R17: the writer checked numbers, not the images a verdict was judged on.
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let sc = f.store.read().await.unwrap();
+            let seen: HashMap<u32, (PathBuf, Stamp)> = sc.slides.iter().map(|s| { let p = f.files.dir.join(&s.file); (s.index, (p.clone(), stamp(&p))) }).collect();
+            assert!(unchanged(&f.files, &sc, &seen, &[1, 2]));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            slide(5, 1).save(f.files.dir.join(&steps[1].file)).unwrap();
+            assert!(!unchanged(&f.files, &sc, &seen, &[1, 2]), "the keeper changed");
+            std::fs::remove_file(f.files.dir.join(&steps[0].file)).unwrap();
+            assert!(!unchanged(&f.files, &sc, &seen, &[1]), "the candidate is gone");
         }
 
         #[tokio::test]
