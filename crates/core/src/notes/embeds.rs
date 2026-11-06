@@ -80,8 +80,11 @@ pub struct Reading<'a> {
 
 pub fn read(text: &str) -> Reading<'_> {
     use pulldown_cmark::{Event, Parser, Tag};
+    // The parser reads a lone CR as a line's end in some places and not in others (a fence looks only for an LF), so it
+    // reads that CR as an LF: one byte for one, so its ranges stay those of `text`.
+    let lf: String = text.char_indices().map(|(i, c)| if c == '\r' && text.as_bytes().get(i + 1) != Some(&b'\n') { '\n' } else { c }).collect();
     let (mut blocks, mut images) = (Vec::new(), Vec::new());
-    for (event, span) in Parser::new(text).into_offset_iter() {
+    for (event, span) in Parser::new(&lf).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) => blocks.push(span),
             Event::Start(Tag::Image { .. }) => images.push(span),
@@ -256,6 +259,10 @@ mod tests {
         }
         // M14: a lone CR ends a line, so an embed after one stands on its own line.
         assert_eq!(images(&format!("## Notes\r{}\r\n", e(1))), [false, true]);
+        // M16: fences end their lines at a lone CR too, so the example a fence holds stays literal, and an image after a
+        // fence that closes is an image.
+        assert_eq!(images(&format!("# T\n\n```markdown\r\r{}\r```\n", e(1))), [false, false, false, false, false, false]);
+        assert_eq!(images(&format!("~~~text\rcode\r~~~\r{}\n", e(2))), [false, false, false, true]);
         // An image beside a code span is still an image, one the repair takes out as an inline copy.
         let notes = read("See `x` and ![Slide 2](slides/slide_02_100000.png)");
         assert_eq!((notes.embeds(0).len(), notes.own_embed(0)), (1, None));

@@ -613,6 +613,8 @@ mod tests {
             // M12: inside a code span after prose. M13: in a link reference's title.
             "# T\n\nWrite `![Slide 1](slides/a.png)` literally.\n",
             "# T\n\n[r]: /r \"\n![Slide 1](slides/a.png)\n\"\n\n[r]\n",
+            // M16: a fence whose lines end at a lone CR.
+            "# T\n\n```markdown\r\r![Slide 1](slides/a.png)\r```\n",
         ] {
             let (_dir, files, mut sc) = folder();
             std::fs::write(&files.notes, notes).unwrap();
