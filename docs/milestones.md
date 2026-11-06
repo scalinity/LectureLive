@@ -24,7 +24,7 @@ kickoff prompt carries this rule.
 | M6 | Full-lecture acceptance; mixed mode; Python retired | implementation accepted as M7's baseline; the two-hour real lecture (gate lines 1–2) is deferred to a class | M5 | Removes `live_notes.py` | [m6-full-lecture](superpowers/plans/2026-09-26-m6-full-lecture.md) |
 | M7 | Ratatui CLI | done | M6 (implementation baseline) | No | [m7-ratatui-cli](superpowers/plans/2026-09-26-m7-ratatui-cli.md) |
 | M7.1 | A live lecture's findings: pause, quit, a restarted Zoom window, repeated slides | built and tested; live checks V17–V20 wait for the person | M7 | No | — |
-| M8 | Automatic Zoom capture | not yet planned; depends on M7's TUI and capture architecture | M7 | No | — |
+| M8 | Automatic Zoom capture | implemented and source-tested; real Zoom and native UI acceptance blocked | M7 | No | — |
 
 The Python CLI (`live_notes.py`) stays the in-class tool until M6 passes.
 
@@ -1458,3 +1458,65 @@ build, against 0.017 ms by hand.
 - Clippy reported nothing in the changed notes files.
 - Desktop type checking reported no errors, and the 50 frontend tests passed.
 - The R16 thresholds were not measured again on a recorded class.
+
+
+## M8 — Automatic Zoom capture
+
+The existing capture worker now discovers a recognized Zoom presentation during an explicitly
+started lecture, without requiring a saved crop. It uses the exact Zoom bundle identity, a
+conservative presentation-title list, the existing slide-layout/scene checks, and three consecutive
+observations of the same window and region. Verified recovery follows replacement windows and
+changed sizes/titles, including titleless fullscreen windows only when the last kept slide can be
+located. A saved titleless descriptor cannot authorize an unnamed window at the next startup.
+
+Strict saved-selection ambiguity still asks. Unresolved candidates, a slide whose region cannot
+be verified, and unsupported titles keep retrying with a manual window/region choice. Camera
+exclusions move only with a located copy of the previous slide. A healthy selected presentation
+stays selected; a camera/notice can give way to a separate verified share. Reused window IDs are
+checked against app identity and title before capture. Pending detection timestamps are discarded
+across interruptions, while the last saved slide is kept for duplicate suppression.
+
+Desktop capture controls distinguish lecture Pause, screenshot pause, and recovery. The compact
+controls also expose Screen Recording settings. Manual Capture remains available for a selected
+region during lecture Pause. Discovery itself starts no recording and makes no network request;
+recording, transcription, notes and screenshot persistence retain the existing session pipeline.
+
+Verification (6 November 2026): the filtered workspace suite passed 899 tests, with 33 opt-in
+checks ignored and one existing terminal assertion excluded. The unfiltered run failed
+`the_failures_scenario_walks_the_table_and_keeps_it_inspectable`: its raw-byte search expects
+`2.0–3.0` contiguously, but Ratatui emits the unchanged `0` through the existing screen state and
+cursor-position updates. Reconstructing the output shows the correct text; the exact binary
+reproduces the assertion failure. The fixture bypasses the capture worker, and its source is
+unchanged. This remains a failed check, not a passing workspace run.
+
+After the final review corrections, the focused rerun passed 386 core unit tests (8 opt-in checks
+ignored), all 18 discovery tests, and all 34 capture lifecycle/integration tests. The new integration
+case starts without a saved selection and checks the existing transcript/notes/sidecar pipeline.
+All 55 frontend tests pass; Svelte reports zero errors and warnings. The frontend production build
+passes. The final committed-source release app builds, verifies with `codesign --deep --strict`,
+and passes its packaged `--check windows` canary (exit 0, native enumeration reported success).
+The packaged executable hash is recorded in `target/m8/packaged-smoke.json`. This smoke starts
+no lecture, recording or content request. Logs and retained review reports are in `target/m8/`.
+
+Independent Claude Sonnet review and Codex desktop review were reconciled as follows. Final
+follow-up suggestions were implemented and checked locally; they were not sent through a third
+review round.
+
+| Finding | Disposition and verification |
+|---|---|
+| F001, F007 | Fixed: runtime and saved titles are separate; the course size catalog survives blank fullscreen and titled return, including a new slide; restart/manual-capture regressions pass. |
+| F002 | Fixed: background discovery preserves the bound window's status; non-flapping regression passes. |
+| F003 | Fixed: pending observations lose their old time while recent-slide history and animation masks survive a failed sample; detector regression passes. |
+| F004 | Fixed: capture-time denial is tested separately from enumeration denial, for discovery and an off-screen bound window. |
+| F005 | Fixed: repeated failure of a sole discovery candidate shows the native reason and retries; recovery regression passes. |
+| F006, F010 | Fixed: confirmation requires adjacent worker ticks; scripted resize ticks between observations cannot authorize a bind. |
+| F008 | Fixed: a differently titled share gets its own saved identity even when it shows the same slide. |
+| F009 | Fixed: changing crop geometry resets geometry-dependent detector state; fullscreen/build and duplicate-suppression tests pass. |
+| UI001, UI002 | Fixed: lecture Pause describes automatic screenshots accurately, manual Capture stays available, and settings actions are not duplicated. |
+
+The UI implementation worker was archived with checksum verification and its worktree/branch
+retired. The archive remains under `.worktrees/.archives/`; no active worker worktree remains.
+
+Real Zoom restart/fullscreen, light/dark/large-type native visual checks, and the deferred real two-hour class remain unverified.
+The computer-use service could not start and its browser host was unavailable; native window
+enumeration succeeded through both the CLI and final packaged app, but no Zoom meeting window was present.
