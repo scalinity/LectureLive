@@ -363,12 +363,15 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let chat = ChatClient::new(ChatConfig::new(claude_key), Some(spend.clone())).map_err(chain)?;
     let lec = Arc::new(Lecture { files: files.clone(), course: folder.course.clone(), name: folder.name.clone(), title: folder.title.clone(), chat, spend: spend.clone() });
     let session = uuid::Uuid::new_v4().to_string();
+    let selections = selections_path()?;
+    let capture_view = ready_view(&selections, &folder.course);
+    // The folder open before: a start refused from here on opens it again (`refused_start`).
+    let previous = app.folder();
     {
         let mut pump = app.pump.lock().await;
         *app.folder.lock().expect("the folder lock") = Some(folder.clone());
         *pump = Pump::new(session.clone(), app.sink.clone(), Some(app_ledger), kind);
         let (view, name) = (folder_view(&folder), source_name.clone());
-        let capture_view = ready_view(&selections_path()?, &folder.course);
         pump.set_status(move |s| {
             s.phase = Phase::Starting;
             s.folder = Some(view);
@@ -398,13 +401,17 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let _ = announcer.await;
     let ready = match ready {
         Ok(r) => r,
-        Err(e) => {
-            app.pump.lock().await.set_status(|s| s.phase = Phase::Idle);
-            return Err(chain(e));
-        }
+        Err(e) => return Err(refused_start(&app, previous, chain(e)).await),
     };
-    let stt = stream::spawn(stream::SttConfig::new(key.clone(), vec![])).map_err(chain)?;
-    let cfg = SessionConfig { dir: files.dir.clone(), stem: files.stem.clone(), stt: Some(stt), recovery: Some(recovery().map_err(chain)?), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
+    let stt = match stream::spawn(stream::SttConfig::new(key.clone(), vec![])) {
+        Ok(stt) => stt,
+        Err(e) => return Err(refused_start(&app, previous, chain(e)).await),
+    };
+    let link = match recovery() {
+        Ok(link) => link,
+        Err(e) => return Err(refused_start(&app, previous, chain(e)).await),
+    };
+    let cfg = SessionConfig { dir: files.dir.clone(), stem: files.stem.clone(), stt: Some(stt), recovery: Some(link), spend: Some(spend.clone()), transcript: Some(files.transcript.clone()) };
     {
         let mut pump = app.pump.lock().await;
         for (path, n) in &ready.launch.repaired {
@@ -446,12 +453,13 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
     let pump = app.pump.clone();
-    let (course, selections) = (folder.course.clone(), selections_path()?);
+    let course = folder.course.clone();
+    let saved = selections.clone();
     let forward = tauri::async_runtime::spawn(async move {
         while let Some(e) = ev_rx.recv().await {
             // A region found again after Zoom's window changed size is kept for the course.
             if let Event::CaptureMoved { selection, .. } = &e {
-                if let Err(err) = keep_selection(&selections, &course, selection) {
+                if let Err(err) = keep_selection(&saved, &course, selection) {
                     pump.lock().await.notice(NoticeKind::Warn, "Capture", &format!("the region found again could not be saved: {err:#}"));
                 }
             }
@@ -464,7 +472,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     });
     let watch = SlideWatch { screenshots: lecture::screenshot_dir(), poll: Duration::from_secs(1) };
     // Spec §7: the course's saved window, revalidated by the worker as the lecture starts.
-    let selection = Selections::load(&selections_path()?).ok().and_then(|s| s.get(&folder.course).cloned());
+    let selection = Selections::load(&selections).ok().and_then(|s| s.get(&folder.course).cloned());
     let capture = CaptureSetup { source: Box::new(SystemWindows), selection, interval: SAMPLE_INTERVAL, thresholds: Thresholds::live(), record: std::env::var_os("LECTURELIVE_RECORD").map(PathBuf::from) };
     let (source, fallback): (Box<dyn Source>, Option<Fallback>) = match kind {
         SourceKind::Mixed => (Box::new(MixedSource::new(loopback::BLACKHOLE_UID, &uid)), None),
@@ -607,6 +615,18 @@ fn open_in_browser(path: &Path) -> Res<()> {
         std::process::Command::new("open").arg(path).status().map_err(text)?;
     }
     Ok(())
+}
+
+/// A start refused after it showed today's lecture (spec §3.6): the folder open before it, an earlier day's lecture
+/// perhaps, is open again with its view, and the error is passed on.
+async fn refused_start(app: &App, previous: Option<OpenFolder>, error: String) -> String {
+    let view = previous.as_ref().map(folder_view);
+    *app.folder.lock().expect("the folder lock") = previous;
+    app.pump.lock().await.set_status(move |s| {
+        s.phase = Phase::Idle;
+        s.folder = view;
+    });
+    error
 }
 
 /// The chosen folder's lecture while none runs, with the folder lock held for as long as it is kept.
