@@ -74,10 +74,9 @@ fn recover_one(dir: &Path, path: &Path, retention: Retention, now: DateTime<Loca
     for id in prunable(&sc, retention, now) {
         let r = sc.recording_mut(id).expect("prunable ids come from the sidecar");
         let wav = dir.join(&r.file);
-        match std::fs::remove_file(&wav) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("delete {}", wav.display())),
+        let Some(owned) = recording_path(dir, &r.file) else { continue };
+        if let Some(path) = owned {
+            std::fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
         }
         r.state = RecState::Deleted;
         report.pruned.push(wav);
@@ -98,18 +97,32 @@ fn untranscribed(dir: &Path, sidecar: &Path, sc: &Sidecar, open: OpenUtterance) 
     Ok((len > from).then(|| Gap::new(open.recording_id, from, Some(len), GapKind::SttInterrupted)))
 }
 
+/// A recording's file, as only the app's own may be deleted: a plain file directly inside the folder's `recordings/`,
+/// compared as real paths, so the sidecar's path cannot lead out. Some(None) when it is gone already; None when it is
+/// there but not the app's to delete, which keeps it.
+fn recording_path(dir: &Path, file: &str) -> Option<Option<PathBuf>> {
+    let path = dir.join(file);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Ok(m) if m.file_type().is_file() => {
+            let inside = path.canonicalize().ok()?.parent()? == dir.join("recordings").canonicalize().ok()?;
+            inside.then_some(Some(path))
+        }
+        _ => None,
+    }
+}
+
 /// Deletes the recordings of a lecture whose study page is finished (spec §7.6): each closed recording with no
 /// unresolved gap, as retention deletes one, marked deleted in the sidecar. Returns the files and bytes deleted.
 pub fn retire_recordings(dir: &Path, sc: &mut Sidecar) -> Result<(usize, u64)> {
     let mut out = (0, 0);
     for id in prunable(sc, Retention::KeepDays(0), Local::now() + chrono::Duration::seconds(1)) {
         let r = sc.recording_mut(id).expect("prunable ids come from the sidecar");
-        let wav = dir.join(&r.file);
-        let size = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
-        match std::fs::remove_file(&wav) {
-            Ok(()) => out = (out.0 + 1, out.1 + size),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("delete {}", wav.display())),
+        let Some(owned) = recording_path(dir, &r.file) else { continue };
+        if let Some(path) = owned {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            std::fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+            out = (out.0 + 1, out.1 + size);
         }
         r.state = RecState::Deleted;
     }
@@ -338,6 +351,25 @@ mod tests {
         assert_eq!(sc.gaps, vec![Gap::new(id, len, None, GapKind::Interrupted), gap]);
         assert!(sc.open_utterances.is_empty());
         assert!(recover(dir.path(), Retention::KeepAll, now()).unwrap().untranscribed.is_empty(), "a second launch adds nothing");
+    }
+
+    #[test]
+    fn only_a_plain_file_in_recordings_is_deleted() {
+        // R29: the sidecar's path was joined and deleted as it stood.
+        let dir = tempfile::tempdir().unwrap();
+        let lecture = dir.path().join("lecture");
+        std::fs::create_dir_all(lecture.join("recordings")).unwrap();
+        std::fs::write(dir.path().join("elsewhere.wav"), b"not the app's").unwrap();
+        std::fs::write(lecture.join("recordings/own.wav"), b"own").unwrap();
+        let (out, own, gone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut sc = Sidecar::default();
+        sc.recordings.push(entry(out, "recordings/../../elsewhere.wav", 0, RecState::Finalized));
+        sc.recordings.push(entry(own, "recordings/own.wav", 0, RecState::Finalized));
+        sc.recordings.push(entry(gone, "recordings/gone.wav", 0, RecState::Finalized));
+        assert_eq!(retire_recordings(&lecture, &mut sc).unwrap(), (1, 3));
+        assert!(dir.path().join("elsewhere.wav").exists());
+        let state = |id| sc.recordings.iter().find(|r| r.id == id).unwrap().state;
+        assert_eq!((state(out), state(own), state(gone)), (RecState::Finalized, RecState::Deleted, RecState::Deleted));
     }
 
     #[test]
