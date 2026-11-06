@@ -894,8 +894,9 @@ captures that are an earlier state of one taken out by hand, and what a finished
   this is first rendered again from its saved parts (no request). A page typeset before a part was asked for then
   records itself incomplete, and keeps its files until it is typeset again.
 - `--apply` does it.
-- `--swap A=B` puts slide B, taken out by hand, back in place of slide A, an earlier state of it, with B's embed taking
-  A's place in the notes.
+- `--swap A=B` puts slide B, taken out by hand, back in place of slide A, an earlier state of it as the judge says
+  (Zoom's bar included), with B's embed taking A's place in the notes. It changes nothing when the notes or a link refer
+  to either slide other than by A's own embed.
 - `--drop A-B` takes out the slides named, a camera run it reports say, with their embeds.
 - Editing the notes leaves an existing page stale; `lecture page` typesets it again.
 
