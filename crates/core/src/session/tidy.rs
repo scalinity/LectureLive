@@ -357,7 +357,8 @@ fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<V
     let mut stay: HashSet<u32> = HashSet::new();
     for s in indices.iter().filter_map(|&i| sc.slides.iter().find(|s| s.index == i)) {
         let embed = embed_line(s, &files.dir, files.notes_dir());
-        if notesfile::has_alias(&files.slides, &files.dir.join(&s.file)) {
+        // A file that cannot be moved keeps its slide, and its embed, before anything is edited.
+        if slides::removable(files, s).is_err() || notesfile::has_alias(&files.slides, &files.dir.join(&s.file)) {
             stay.insert(s.index);
             continue;
         }
@@ -371,10 +372,17 @@ fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<V
     }
     if !with_embed.is_empty() {
         let changes: Vec<(String, Option<String>)> = with_embed.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
-        let made = notesfile::change_embeds(files, sc, &changes, Local::now())?;
+        // Edited on the reading the decision was made on: notes saved since are refused, not edited over.
+        let made = notesfile::change_embeds(files, sc, &doc, &changes, Local::now())?;
         stay.extend(with_embed.iter().enumerate().filter(|(k, _)| !made.contains(k)).map(|(_, s)| s.index));
     }
-    Ok(indices.iter().filter(|i| !stay.contains(i)).filter_map(|&i| slides::remove_in(files, sc, i).ok()).collect())
+    let mut gone = Vec::new();
+    for &i in indices.iter().filter(|i| !stay.contains(i)) {
+        if sc.slides.iter().any(|s| s.index == i) {
+            gone.push(slides::remove_in(files, sc, i).with_context(|| format!("take slide {i} out"))?);
+        }
+    }
+    Ok(gone)
 }
 
 /// Takes out the slides the person names (`lecture tidy --drop`), as tidying does: a camera run the judge only reports,
@@ -410,7 +418,8 @@ pub async fn swap(files: &LectureFiles, store: &Store, partial: u32, complete: u
         .update(move |sc| {
             if a.index <= sc.notes.slide_index {
                 let line = |s: &SlideEntry| embed_line(s, &files.dir, files.notes_dir());
-                let made = notesfile::change_embeds(&files, sc, &[(line(&a), Some(line(&b)))], Local::now())?;
+                let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
+                let made = notesfile::change_embeds(&files, sc, &doc, &[(line(&a), Some(line(&b)))], Local::now())?;
                 if made.is_empty() {
                     bail!("slide {partial}'s embed is not on a line of its own in the notes, so nothing was swapped");
                 }
@@ -851,6 +860,22 @@ mod tests {
                 retire(&f.files, &page, Some(&f.store), false).await.unwrap();
                 assert!(target.exists(), "{what}: the removed image it names stays");
             }
+        }
+
+        #[tokio::test]
+        async fn a_slide_that_cannot_be_moved_keeps_its_embed() {
+            // R06: the embed went first and the failed move was dropped, leaving a noted slide with no embed.
+            let f = folder();
+            let steps = build(&f, 1).await;
+            let sc = f.store.read().await.unwrap();
+            let embed = embed_line(&sc.slides[0], &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{embed}\n")).unwrap();
+            std::fs::create_dir_all(f.files.slides.join(REMOVED_DIR)).unwrap();
+            std::fs::write(f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap()), b"an older removal").unwrap();
+            let before = std::fs::read_to_string(&f.files.notes).unwrap();
+            assert!(drop_slides(&f.files, &f.store, &[1]).await.unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), before, "the embed stays with its slide");
+            assert_eq!(f.store.read().await.unwrap().slides.len(), 1);
         }
 
         #[tokio::test]

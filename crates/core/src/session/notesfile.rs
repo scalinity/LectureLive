@@ -352,8 +352,7 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
 /// `(embed, replacement)`, the embed as it is written on its own line. An embed is changed only where it stands once,
 /// on its own line and outside code; any other copy (inline, repeated, or the line edited by hand) leaves that one as
 /// it is. The notes are backed up and written as polish writes them. Returns which of `changes` were made.
-pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, changes: &[(String, Option<String>)], at: DateTime<Local>) -> Result<Vec<usize>> {
-    let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
+pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, doc: &str, changes: &[(String, Option<String>)], at: DateTime<Local>) -> Result<Vec<usize>> {
     let lines: Vec<&str> = doc.lines().collect();
     let mut fenced = false;
     let mut code = vec![false; lines.len()];
@@ -437,7 +436,7 @@ mod tests {
         let changes: Vec<(String, Option<String>)> = [1, 3, 4].iter().map(|n| (format!("![Slide {n}](slides/slide_{n:02}_10000{}.png)", n - 1), None)).collect();
         accept_external_edit(&files, &mut sc).unwrap();
         let before = sc.notes.revision;
-        let made = change_embeds(&files, &mut sc, &changes, chrono::Local::now()).unwrap();
+        let made = change_embeds(&files, &mut sc, &std::fs::read_to_string(&files.notes).unwrap(), &changes, chrono::Local::now()).unwrap();
         assert_eq!(made, [0], "the fenced and the inline copies stay");
         let after = std::fs::read_to_string(&files.notes).unwrap();
         assert_eq!(after, "# T\n\n## Builds\n\nA partial slide.\n\n![Slide 2](slides/slide_02_100001.png)\n\n```\n![Slide 3](slides/slide_03_100002.png)\n```\nInline ![Slide 4](slides/slide_04_100003.png) here.\n");
@@ -451,7 +450,7 @@ mod tests {
     fn a_replacement_takes_the_embeds_place_and_an_emptied_not_placed_heading_goes() {
         let (_dir, files, mut sc) = folder();
         std::fs::write(&files.notes, "# T\n\n![Slide 1](slides/a.png)\n\n### Slides not placed\n\n![Slide 2](slides/b.png)\n").unwrap();
-        let made = change_embeds(&files, &mut sc, &[("![Slide 1](slides/a.png)".into(), Some("![Slide 5](slides/e.png)".into())), ("![Slide 2](slides/b.png)".into(), None)], chrono::Local::now()).unwrap();
+        let made = change_embeds(&files, &mut sc, &std::fs::read_to_string(&files.notes).unwrap(), &[("![Slide 1](slides/a.png)".into(), Some("![Slide 5](slides/e.png)".into())), ("![Slide 2](slides/b.png)".into(), None)], chrono::Local::now()).unwrap();
         assert_eq!(made, [0, 1]);
         assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), "# T\n\n![Slide 5](slides/e.png)\n");
     }
@@ -463,7 +462,7 @@ mod tests {
         let code = "```markdown\nfirst\n\n\nsecond\n### Slides not placed\n## Next\n```";
         let doc = format!("# T\n\nText.\n\n\nMore.\n\n{code}\n\n![Slide 1](slides/a.png)\n\nAfter.\n");
         std::fs::write(&files.notes, &doc).unwrap();
-        change_embeds(&files, &mut sc, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap();
+        change_embeds(&files, &mut sc, &std::fs::read_to_string(&files.notes).unwrap(), &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap();
         assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), format!("# T\n\nText.\n\n\nMore.\n\n{code}\n\nAfter.\n"));
     }
 
@@ -574,10 +573,23 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_decided_on_notes_since_changed_is_refused() {
+        // R15: the caller decided what to take out on one reading; the person saved another link since.
+        let (_dir, files, mut sc) = folder();
+        std::fs::write(&files.notes, "# T\n\n![Slide 1](slides/a.png)\n").unwrap();
+        accept_external_edit(&files, &mut sc).unwrap();
+        let decided = std::fs::read_to_string(&files.notes).unwrap();
+        std::fs::write(&files.notes, format!("{decided}\n[detail](slides/a.png)\n")).unwrap();
+        let now = std::fs::read_to_string(&files.notes).unwrap();
+        assert!(change_embeds(&files, &mut sc, &decided, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).is_err());
+        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), now, "the newer notes are as the person left them");
+    }
+
+    #[test]
     fn nothing_to_change_writes_nothing() {
         let (_dir, files, mut sc) = folder();
         let before = std::fs::read_to_string(&files.notes).unwrap();
-        assert!(change_embeds(&files, &mut sc, &[("![Slide 9](slides/x.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
+        assert!(change_embeds(&files, &mut sc, &std::fs::read_to_string(&files.notes).unwrap(), &[("![Slide 9](slides/x.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), before);
     }
 

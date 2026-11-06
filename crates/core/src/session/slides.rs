@@ -113,16 +113,27 @@ pub async fn remove(files: &LectureFiles, store: &Store, index: u32, snapshottin
 /// Takes a registered slide out, inside the sidecar's writer: its record goes, its file moves to `slides/removed/` and
 /// it joins the undo history. The caller has decided it may go: no snapshot is taking it, and if the notes embed it,
 /// the embed is already out of them (spec §7.7).
+/// Whether `remove_in` can move this slide's file: only a file inside the slides folder is the app's to move (compared
+/// as real paths, so a `..`, an absolute path or a link pointing out is refused), and never over a removed file of its
+/// name. A slide whose file is gone already has nothing to move. Checked before its embed leaves the notes.
+pub fn removable(files: &LectureFiles, slide: &SlideEntry) -> Result<()> {
+    let from = files.dir.join(&slide.file);
+    let Some(name) = from.file_name().filter(|_| from.exists()) else { return Ok(()) };
+    let inside = from.canonicalize().ok().zip(files.slides.canonicalize().ok()).is_some_and(|(file, folder)| file.starts_with(folder));
+    if !inside {
+        bail!("Slide {}'s file is not in the slides folder, so it is left where it is", slide.index);
+    }
+    if files.slides.join(REMOVED_DIR).join(name).exists() {
+        bail!("Slide {}'s removed file already exists, so neither image was overwritten", slide.index);
+    }
+    Ok(())
+}
+
 pub fn remove_in(files: &LectureFiles, sc: &mut Sidecar, index: u32) -> Result<SlideEntry> {
     let Some(at) = sc.slides.iter().position(|s| s.index == index) else { bail!("Slide {index} is not in this lecture") };
+    removable(files, &sc.slides[at])?;
     let from = files.dir.join(&sc.slides[at].file);
     if let Some(name) = from.file_name().filter(|_| from.exists()) {
-        // The record's path is whatever the sidecar says, and only a file inside the slides folder is the app's
-        // to move: compared as real paths, so a `..`, an absolute path or a link pointing out is refused.
-        let inside = from.canonicalize().ok().zip(files.slides.canonicalize().ok()).is_some_and(|(file, folder)| file.starts_with(folder));
-        if !inside {
-            bail!("Slide {index}'s file is not in the slides folder, so it is left where it is");
-        }
         let dir = files.slides.join(REMOVED_DIR);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         if dir.canonicalize()?.parent() != Some(files.slides.canonicalize()?.as_path()) {
