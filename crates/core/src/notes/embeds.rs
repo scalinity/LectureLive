@@ -47,26 +47,42 @@ pub struct Repaired {
 /// Spec §6.2: each expected embed exactly once, on its own line, outside code fences. Later and
 /// inline copies and embeds of slides outside the batch are removed; what fences hold is code and
 /// stays; expected embeds still absent are appended under their own heading, without a description.
+/// A list item's marker and the spaces after it: where the item's content starts.
+static LIST_ITEM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(?:[-*+]|\d{1,9}[.)])(?:\s+|$)").expect("a valid pattern"));
+
 /// Which lines are fenced code, the fences included, as CommonMark reads them: a fence is three or more backticks or
-/// tildes, and only a fence of the same character, at least as long, with nothing after it and indented at most three
-/// columns past where the block opened, closes it. A fence opens at any indent, as one inside a list item does: what
-/// is uncertain counts as code, which keeps it. The one reading the snapshot's repair, the reference count and the
-/// embed edits share.
+/// tildes, and only a fence of the same character, at least as long, with nothing after it, indented at most three
+/// columns past the start of its container (the margin, or the content of the list item it is in) closes it. A fence
+/// opens at any indent, as an over-indented one is code too: what is uncertain counts as code, which keeps it. The one
+/// reading the snapshot's repair, the reference count and the embed edits share.
 pub fn code_lines(lines: &[&str]) -> Vec<bool> {
-    let indent = |line: &str| line.chars().take_while(|c| c.is_whitespace()).map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>();
+    let columns = |s: &str| s.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>();
+    let indent = |line: &str| columns(&line[..line.len() - line.trim_start().len()]);
+    // The content columns of the list items still open, outermost first.
+    let mut items: Vec<usize> = Vec::new();
     let mut open: Option<(char, usize, usize)> = None;
     lines
         .iter()
         .map(|line| {
-            let t = line.trim();
+            let (t, at) = (line.trim(), indent(line));
             let fence = t.chars().next().filter(|c| matches!(c, '`' | '~')).map(|c| (c, t.chars().take_while(|x| *x == c).count())).filter(|(_, n)| *n >= 3);
-            match (open, fence) {
-                (None, Some((c, n))) => open = Some((c, n, indent(line))),
-                (Some((c, n, at)), Some((d, m))) if c == d && m >= n && t[m..].trim().is_empty() && indent(line) <= at + 3 => open = None,
-                (None, None) => return false,
-                _ => {}
+            if let Some((c, n, container)) = open {
+                if fence.is_some_and(|(d, m)| c == d && m >= n && t[m..].trim().is_empty() && (container..=container + 3).contains(&at)) {
+                    open = None;
+                }
+                return true;
             }
-            true
+            if let Some((c, n)) = fence {
+                open = Some((c, n, items.iter().copied().filter(|&o| o <= at).max().unwrap_or(0)));
+                return true;
+            }
+            if !t.is_empty() {
+                items.retain(|&o| o <= at);
+                if let Some(marker) = LIST_ITEM.find(line) {
+                    items.push(columns(marker.as_str()));
+                }
+            }
+            false
         })
         .collect()
 }
@@ -144,6 +160,20 @@ mod tests {
         // M03: a fence four spaces in from where its block opened is code; a block opened inside a list closes there.
         assert_eq!(code_lines(&["```", "    ```", "![Slide 1](slides/slide_01_100000.png)", "```", "out"]), [true, true, true, true, false]);
         assert_eq!(code_lines(&["- item", "    ```", "    code", "    ```", "after"]), [false, true, true, true, false]);
+        // M05: closing is measured from the block's container, not the opener: a top-level fence closes within three
+        // columns of the margin, however far in it opened; inside a list item, from the item's content.
+        for opener in [" ```markdown", "  ```markdown", "   ```markdown"] {
+            assert_eq!(code_lines(&[opener, "    ```", "![Slide 1](slides/slide_01_100000.png)", "```", "out"]), [true, true, true, true, false], "{opener:?}");
+        }
+        assert_eq!(code_lines(&["1. item", "   ```", "   code", "   ```", "after"]), [false, true, true, true, false]);
+        assert_eq!(code_lines(&["- a", "  - b", "      ```", "        ```", "      ```", "after"]), [false, false, true, true, true, false]);
+    }
+
+    #[test]
+    fn a_literal_embed_in_a_shifted_fence_is_left_alone_by_the_repair() {
+        // M05 through repair: the line is code, so it is no embed of the batch to place or drop.
+        let text = " ```markdown\n    ```\n![Slide 1](slides/slide_01_100000.png)\n```\n";
+        assert_eq!(repair(text, &[]).text.lines().filter(|l| l.starts_with("![Slide 1]")).count(), 1);
     }
 
     #[test]
