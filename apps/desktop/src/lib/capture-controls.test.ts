@@ -38,3 +38,41 @@ test("capture controls wait for the acknowledged mode and keep Capture available
   await Promise.resolve();
   expect(transport.calls).toContainEqual(["capture_now", undefined]);
 });
+
+test.each([
+  { automatic: true, paused: false, expected: "Looking for a shared slide", absent: "Recording and transcription continue" },
+  { automatic: false, paused: false, expected: "Automatic screenshots are paused", absent: "will keep checking" },
+  { automatic: true, paused: true, expected: "Lecture paused", absent: "Recording and transcription continue" },
+])("discovery respects screenshot and lecture pause: $automatic/$paused", async ({ automatic, paused, expected, absent }) => {
+  const state = emptyState("discovery");
+  state.status = { ...state.status, phase: "running", paused, capture_mode: { automatic, selected: false, shortcut: { state: "inactive" } }, capture: { state: "asking", window: "Zoom presentation", detail: "Looking for a shared slide", candidates: [], captured: false } };
+  await session.init(new FixtureTransport(state));
+  view = mount(CaptureControls, { target: document.body, props: { onChoose: () => {}, showWindow: true } });
+  flushSync();
+  expect(document.querySelector('[role="status"]')?.textContent).toContain(expected);
+  expect(document.querySelector('[role="status"]')?.textContent).not.toContain(absent);
+  expect([...document.querySelectorAll("button")].find((b) => b.textContent === "Capture")?.disabled).toBe(true);
+});
+
+test("compact controls expose permission recovery without starting recording", async () => {
+  const state = emptyState("denial");
+  state.status = { ...state.status, phase: "running", capture: { ...state.status.capture, state: "denied" } };
+  const transport = new FixtureTransport(state);
+  await session.init(transport);
+  view = mount(CaptureControls, { target: document.body, props: { onChoose: () => {}, showWindow: true } });
+  flushSync();
+  [...document.querySelectorAll("button")].find((b) => b.textContent === "Open Screen Recording settings")!.click();
+  await Promise.resolve();
+  expect(transport.calls.some(([name]) => name === "open_screen_settings")).toBe(true);
+  expect(transport.calls.some(([name]) => name === "start_lecture")).toBe(false);
+});
+
+test("lecture Pause still permits a deliberate screenshot of a selected region", async () => {
+  const state = emptyState("paused-selected");
+  state.status = { ...state.status, phase: "running", paused: true, capture_mode: { automatic: true, selected: true, shortcut: { state: "inactive" } }, capture: { ...state.status.capture, state: "paused", window: "Zoom Meeting" } };
+  await session.init(new FixtureTransport(state));
+  view = mount(CaptureControls, { target: document.body, props: { onChoose: () => {} } });
+  flushSync();
+  expect(document.querySelector('[role="status"]')?.textContent).toContain("automatic screenshots wait");
+  expect([...document.querySelectorAll("button")].find((b) => b.textContent === "Capture")?.disabled).toBe(false);
+});

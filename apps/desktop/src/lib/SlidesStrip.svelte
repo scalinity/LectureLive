@@ -44,16 +44,16 @@
     {:else if c.state === "paused"}
       <p class="state">Window unavailable</p>
       <p class="window">{c.window}</p>
-      <p class="note">{sentence(c.detail)}.</p>
+      {#if !running}<p class="note">{sentence(c.detail)}.</p>{/if}
     {:else if c.state === "asking"}
-      <p class="ask">{sentence(c.detail)}. {single ? "Watch it?" : "Choose the window to watch."}</p>
+      {#if single}<p class="ask">{sentence(c.detail)}. Watch it?</p>{/if}
       {#if single && running}<div class="actions"><button class="primary" onclick={() => session.captureWatch(single.id)}>Watch it</button></div>{/if}
     {:else if c.state === "denied"}
       <p class="ask">Screen Recording is off for LectureLive.</p>
-      <div class="actions"><button class="outline" onclick={() => session.openScreenSettings()}>Open Settings</button></div>
+      {#if !running}<div class="actions"><button class="outline" onclick={() => session.openScreenSettings()}>Open Settings</button></div>{/if}
       <p class="note">Allow LectureLive there, then quit and reopen LectureLive.</p>
     {:else if c.state === "failing"}
-      <p class="ask">{c.window} could not be captured: {c.detail}.</p>
+      <p class="window">{c.window}</p>
     {:else}
       <p class="window">No window chosen</p>
       <p class="note">Choose Zoom's window and the part that shows the slide.</p>
