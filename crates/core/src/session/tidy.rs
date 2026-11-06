@@ -751,6 +751,12 @@ mod tests {
             out
         }
 
+        /// A file rewritten, its time set a minute on: a change the stamp sees however fast the test runs.
+        fn touched(p: &Path) {
+            let at = std::fs::metadata(p).unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+            std::fs::File::options().write(true).open(p).unwrap().set_modified(at).unwrap();
+        }
+
         fn indexes(v: &[(SlideEntry, Redundant)]) -> Vec<(u32, Redundant)> {
             v.iter().map(|(s, w)| (s.index, *w)).collect()
         }
@@ -778,8 +784,8 @@ mod tests {
             t.refresh(&f.files, &sc.slides).await;
             let first = judge(&t.captures(&f.files, &sc, Scope::All), &mut t.memo);
             assert_eq!(first, [Verdict { index: 1, why: Redundant::EarlierStateOf(2) }]);
-            std::thread::sleep(std::time::Duration::from_millis(20));
             slide(3, 1).save_with_format(f.files.dir.join(&steps[0].file), image::ImageFormat::Png).unwrap();
+            touched(&f.files.dir.join(&steps[0].file));
             t.refresh(&f.files, &sc.slides).await;
             assert!(judge(&t.captures(&f.files, &sc, Scope::All), &mut t.memo).is_empty(), "another title now: apart");
         }
@@ -988,8 +994,8 @@ mod tests {
             let sc = f.store.read().await.unwrap();
             let seen: HashMap<u32, (PathBuf, Stamp)> = sc.slides.iter().map(|s| { let p = f.files.dir.join(&s.file); (s.index, (p.clone(), stamp(&p))) }).collect();
             assert!(unchanged(&f.files, &sc, &seen, &[1, 2]));
-            std::thread::sleep(std::time::Duration::from_millis(20));
             slide(5, 1).save(f.files.dir.join(&steps[1].file)).unwrap();
+            touched(&f.files.dir.join(&steps[1].file));
             assert!(!unchanged(&f.files, &sc, &seen, &[1, 2]), "the keeper changed");
             std::fs::remove_file(f.files.dir.join(&steps[0].file)).unwrap();
             assert!(!unchanged(&f.files, &sc, &seen, &[1]), "the candidate is gone");
