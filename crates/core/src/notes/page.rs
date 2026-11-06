@@ -1,7 +1,7 @@
 //! The study page (spec §6.4): one distillation request over the whole notes and slides within a
 //! word budget, one revision on overshoot, re-cut at every <h2>, cached against the prompt and the
 //! notes in the Python CLI's own file, and filled into notes_template.html in one pass.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -291,7 +291,9 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
     let doc = std::fs::read_to_string(notes).unwrap_or_default();
     for (file, saved) in &archived.0 {
         let embedded = file.strip_prefix(dir).is_ok_and(|r| doc.contains(&format!("]({})", r.to_string_lossy())));
-        if saved.page == path && embedded && !saved.capture.slide.starts_with("removed:") && !paths.iter().any(|(n, _)| n == &saved.capture.slide) {
+        // Already there by its number or by its file: a renumbered slide is still the same slide.
+        let present = paths.iter().any(|(n, p)| n == &saved.capture.slide || dir.join(p) == *file);
+        if saved.page == path && embedded && !saved.capture.slide.starts_with("removed:") && !present {
             if let Ok(relative) = file.strip_prefix(dir) {
                 paths.push((saved.capture.slide.clone(), relative.to_string_lossy().into_owned()));
             }
@@ -361,22 +363,24 @@ pub struct PageOutcome {
 }
 
 /// Each embed's number on the page, which its gallery, its redraws' `data-slide` and the request go by: its label's,
-/// unless an earlier embed of another file took it (notes from the Python tool numbered their slides again partway, and
-/// the page kept one slide of each pair), then its file's capture index, then the next number free. One file embedded
-/// twice keeps one number.
+/// unless another file's embed took it first (notes from the Python tool numbered their slides again partway, and the
+/// page kept one slide of each pair). Then the file keeps a number it was given already, else takes its capture index,
+/// else the next number free. Labels that never name two files are kept as they are.
 fn numbered(embeds: &[(String, String)]) -> Vec<(String, String)> {
-    let mut by_path: HashMap<&str, String> = HashMap::new();
-    let mut used: HashSet<String> = HashSet::new();
+    let mut taken: HashMap<String, &str> = HashMap::new();
+    let mut given: HashMap<&str, String> = HashMap::new();
     embeds
         .iter()
         .map(|(label, path)| {
-            if let Some(n) = by_path.get(path.as_str()) {
-                return (n.clone(), path.clone());
-            }
-            let index = CAPTURE_INDEX.captures(path).map(|c| c[1].to_string());
-            let n = [Some(label.clone()), index].into_iter().flatten().find(|n| !used.contains(n)).unwrap_or_else(|| (1u32..).map(|i| i.to_string()).find(|n| !used.contains(n)).expect("a number is free"));
-            used.insert(n.clone());
-            by_path.insert(path, n.clone());
+            let n = match taken.get(label) {
+                Some(owner) if *owner != path.as_str() => given.get(path.as_str()).cloned().unwrap_or_else(|| {
+                    let index = CAPTURE_INDEX.captures(path).map(|c| c[1].to_string()).filter(|i| !taken.contains_key(i));
+                    index.unwrap_or_else(|| (1u32..).map(|i| i.to_string()).find(|n| !taken.contains_key(n)).expect("a number is free"))
+                }),
+                _ => label.clone(),
+            };
+            taken.entry(n.clone()).or_insert(path);
+            given.entry(path).or_insert_with(|| n.clone());
             (n, path.clone())
         })
         .collect()
@@ -546,15 +550,44 @@ mod tests {
         assert_eq!(numbered(&app), app, "the app's embeds carry their capture index already");
         let twice = embeds(&[("5", "slides/slide_05_100000.png"), ("5", "slides/slide_05_100000.png")]);
         assert_eq!(numbered(&twice), twice, "one slide embedded twice is one slide");
+        // F003: labels that never name two files are kept as they are, even where two name one file.
+        let shared = embeds(&[("1", "slides/a.png"), ("2", "slides/a.png")]);
+        assert_eq!(numbered(&shared), shared);
+        let again = embeds(&[("1", "slides/slide_01_100000.png"), ("1", "slides/slide_02_100100.png"), ("1", "slides/slide_02_100100.png")]);
+        assert_eq!(numbered(&again), embeds(&[("1", "slides/slide_01_100000.png"), ("2", "slides/slide_02_100100.png"), ("2", "slides/slide_02_100100.png")]), "a file renumbered once keeps its number");
         let other = embeds(&[("1", "slides/a.png"), ("1", "slides/b.png"), ("2", "slides/c.png")]);
         assert_eq!(numbered(&other), embeds(&[("1", "slides/a.png"), ("2", "slides/b.png"), ("3", "slides/c.png")]), "else the next number free");
     }
 
     #[test]
+    fn a_renumbered_slide_is_not_recovered_twice_from_the_archive() {
+        // F002: the page archived slide_02 as slide 2; once the first embed is gone it is slide 1, and stays one slide.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("lecture_notes_20260922.md");
+        for name in ["slide_01_100000.png", "slide_02_100100.png"] {
+            let file = dir.path().join("slides").join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            image::RgbImage::new(4, 4).save(&file).unwrap();
+        }
+        let both = "# T\n\n![Slide 1](slides/slide_01_100000.png)\n\n![Slide 1](slides/slide_02_100100.png)\n";
+        let page_of = |doc: &str| {
+            std::fs::write(&notes, doc).unwrap();
+            let labelled: Vec<(String, String)> = SLIDE_EMBED.captures_iter(doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
+            let path = render(&cut("<h2>A</h2><p>x</p>", &numbered(&labelled)), "Course", &notes, "Week 05 — Old", TEMPLATE).unwrap();
+            let html = std::fs::read_to_string(path).unwrap();
+            let slides = html.split("<script type=\"application/json\" id=\"slides\">").nth(1).unwrap().split("</script>").next().unwrap().to_string();
+            serde_json::from_str::<Value>(&slides).unwrap().as_object().unwrap().len()
+        };
+        assert_eq!(page_of(both), 2);
+        assert_eq!(page_of("# T\n\n![Slide 1](slides/slide_02_100100.png)\n"), 1);
+    }
+
+    #[test]
     fn a_page_is_typeset_again_only_where_its_numbers_changed() {
         let (system, doc, extra) = ("sys", "# T\n", "");
-        let app = embeds(&[("3", "slides/slide_03_100000.png")]);
-        assert_eq!(page_key(system, doc, extra, &app, &numbered(&app)), sha256_hex(format!("{system}{doc}{extra}").as_bytes()), "every page typeset so far stays cached");
+        for unchanged in [embeds(&[("3", "slides/slide_03_100000.png")]), embeds(&[("1", "slides/a.png"), ("2", "slides/a.png")])] {
+            assert_eq!(page_key(system, doc, extra, &unchanged, &numbered(&unchanged)), sha256_hex(format!("{system}{doc}{extra}").as_bytes()), "every page typeset so far stays cached");
+        }
         let restarted = embeds(&[("1", "slides/slide_01_100000.png"), ("1", "slides/slide_02_100500.png")]);
         assert_ne!(page_key(system, doc, extra, &restarted, &numbered(&restarted)), sha256_hex(format!("{system}{doc}{extra}").as_bytes()));
     }

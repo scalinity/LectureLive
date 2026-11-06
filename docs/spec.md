@@ -511,8 +511,9 @@ character for character, and the final count is reported with the page. At most 
 (3–10) are redrawn, only where a figure, table, diagram or formula block teaches faster than words; a
 redraw whose numbers can move is better as a widget; every slide stays reachable in a collapsed All
 slides gallery. Each embedded slide has its own number there, in the request and in a redraw's `data-slide`: its
-label's, unless an earlier embed of another file took it (the Python tool's notes number their slides again partway),
-then its file's capture index, then the next number free; one file embedded twice is one slide. The notes and polish prompts are `live_notes.py`'s, carried over with golden tests; the
+label's, unless another file's embed took it first (the Python tool's notes number their slides again partway); then
+the number that file was given already, else its capture index, else the next number free. Labels that never name two
+files stay as they are. The notes and polish prompts are `live_notes.py`'s, carried over with golden tests; the
 page's prompts are this project's own.
 
 The output runs lede (two sentences), keystone, 5–8 topic sections each headed by its claim, a
