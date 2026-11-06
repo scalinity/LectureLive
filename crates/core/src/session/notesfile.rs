@@ -326,10 +326,20 @@ static STYLE_OR_SCRIPT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
 
 static SLIDE_STEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^slide_\d+_(\d{6})$").expect("a valid pattern"));
 
+fn opaque_in(doc: &str, decoded: Option<&str>) -> bool {
+    decoded.is_none_or(|t| STYLE_OR_SCRIPT.is_match(doc) || STYLE_OR_SCRIPT.is_match(t))
+}
+
+/// Whether these notes hold a style or a script, or escapes deeper than the count follows: then every capture counts as
+/// referred to, and tidying keeps them all (spec §7.7).
+pub fn opaque(doc: &str) -> bool {
+    opaque_in(doc, decoded_notes(doc).as_deref())
+}
+
 pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References {
     let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let decoded = decoded_notes(doc);
-    let opaque = decoded.as_deref().is_none_or(|t| STYLE_OR_SCRIPT.is_match(doc) || STYLE_OR_SCRIPT.is_match(t));
+    let opaque = opaque_in(doc, decoded.as_deref());
     let text = decoded.unwrap_or_default();
     // Every capture is named slide_NN_HHMMSS; a file named otherwise could be spelled in ways the digits are not, so it
     // stays.

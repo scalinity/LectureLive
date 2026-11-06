@@ -385,28 +385,8 @@ fn unchanged(files: &LectureFiles, sc: &Sidecar, seen: &HashMap<u32, (PathBuf, S
 /// moved file. A reference is counted wherever the decoded notes name the file (`notesfile::references`). Returns what
 /// went.
 fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<Vec<SlideEntry>> {
-    // No notes yet refer to nothing; notes that cannot be read keep every slide.
-    let doc = match std::fs::read_to_string(&files.notes) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        read => read.with_context(|| format!("read {}", files.notes.display()))?,
-    };
-    let mut with_embed: Vec<SlideEntry> = Vec::new();
-    let mut stay: HashSet<u32> = HashSet::new();
-    for s in indices.iter().filter_map(|&i| sc.slides.iter().find(|s| s.index == i)) {
-        let embed = embed_line(s, &files.dir, files.notes_dir());
-        // A file that cannot be moved keeps its slide, and its embed, before anything is edited.
-        if slides::removable(files, s).is_err() || notesfile::has_alias(&files.slides, &files.dir.join(&s.file)) {
-            stay.insert(s.index);
-            continue;
-        }
-        match notesfile::references(&doc, &files.dir.join(&s.file), &embed) {
-            notesfile::References { mentions: 0, .. } => {}
-            notesfile::References { mentions: 1, own_line_embeds: 1 } => with_embed.push(s.clone()),
-            _ => {
-                stay.insert(s.index);
-            }
-        }
-    }
+    let doc = notes_or_none(files)?;
+    let (with_embed, mut stay) = decide(files, sc, &doc, indices);
     if !with_embed.is_empty() {
         let changes: Vec<(String, Option<String>)> = with_embed.iter().map(|s| (embed_line(s, &files.dir, files.notes_dir()), None)).collect();
         // Edited on the reading the decision was made on: notes saved since are refused, not edited over.
@@ -420,6 +400,45 @@ fn take_out(files: &LectureFiles, sc: &mut Sidecar, indices: &[u32]) -> Result<V
         }
     }
     Ok(gone)
+}
+
+/// The notes as they are, or none yet; notes that cannot be read stop the removal, which keeps every slide.
+fn notes_or_none(files: &LectureFiles) -> Result<String> {
+    match std::fs::read_to_string(&files.notes) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        read => read.with_context(|| format!("read {}", files.notes.display())),
+    }
+}
+
+/// Which of these slides `take_out` would take with their own embed, and which it keeps: the one decision a removal and
+/// a dry run share.
+fn decide(files: &LectureFiles, sc: &Sidecar, doc: &str, indices: &[u32]) -> (Vec<SlideEntry>, HashSet<u32>) {
+    let mut with_embed: Vec<SlideEntry> = Vec::new();
+    let mut stay: HashSet<u32> = HashSet::new();
+    for s in indices.iter().filter_map(|&i| sc.slides.iter().find(|s| s.index == i)) {
+        let embed = embed_line(s, &files.dir, files.notes_dir());
+        // A file that cannot be moved keeps its slide, and its embed, before anything is edited.
+        if slides::removable(files, s).is_err() || notesfile::has_alias(&files.slides, &files.dir.join(&s.file)) {
+            stay.insert(s.index);
+            continue;
+        }
+        match notesfile::references(doc, &files.dir.join(&s.file), &embed) {
+            notesfile::References { mentions: 0, .. } => {}
+            notesfile::References { mentions: 1, own_line_embeds: 1 } => with_embed.push(s.clone()),
+            _ => {
+                stay.insert(s.index);
+            }
+        }
+    }
+    (with_embed, stay)
+}
+
+/// What `take_out` would do with these verdicts, writing nothing: for each slide that would go, whether its embed goes
+/// with it. A verdict missing here is one the notes keep.
+pub fn would_take_out(files: &LectureFiles, sc: &Sidecar, verdicts: &[Verdict]) -> Result<Vec<(u32, bool)>> {
+    let indices: Vec<u32> = verdicts.iter().map(|v| v.index).collect();
+    let (with_embed, stay) = decide(files, sc, &notes_or_none(files)?, &indices);
+    Ok(indices.into_iter().filter(|i| !stay.contains(i)).map(|i| (i, with_embed.iter().any(|s| s.index == i))).collect())
 }
 
 /// Takes out the slides the person names (`lecture tidy --drop`), as tidying does: a camera run the judge only reports,
@@ -963,6 +982,20 @@ mod tests {
             assert!(!unchanged(&f.files, &sc, &seen, &[1, 2]), "the keeper changed");
             std::fs::remove_file(f.files.dir.join(&steps[0].file)).unwrap();
             assert!(!unchanged(&f.files, &sc, &seen, &[1]), "the candidate is gone");
+        }
+
+        #[tokio::test]
+        async fn a_dry_run_says_what_the_removal_would_keep() {
+            // R36: the dry run listed every verdict, though take_out keeps a slide the notes name another way.
+            let f = folder();
+            let steps = build(&f, 3).await;
+            let sc = f.store.read().await.unwrap();
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\nAs on {}.\n", line(&steps[0]), steps[1].file)).unwrap();
+            let verdicts = [1, 2].map(|index| Verdict { index, why: Redundant::EarlierStateOf(3) });
+            assert_eq!(would_take_out(&f.files, &sc, &verdicts).unwrap(), [(1, true)], "1 goes with its embed, 2 is named in the text");
+            drop_slides(&f.files, &f.store, &[1, 2]).await.unwrap();
+            assert_eq!(f.store.read().await.unwrap().slides.iter().map(|s| s.index).collect::<Vec<_>>(), [2, 3], "and the removal agrees");
         }
 
         #[tokio::test]

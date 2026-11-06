@@ -72,6 +72,9 @@ pub(crate) struct LectureArgs {
     /// tidy --apply: take out these slides, a camera run tidy reports say, with their embeds (N or A-B; repeatable)
     #[arg(long = "drop", value_name = "A-B", requires = "apply")]
     pub(crate) drop_slides: Vec<String>,
+    /// tidy: only this lecture day of the folder (needed with --swap or --drop when it holds more than one)
+    #[arg(long, value_name = "YYYYMMDD")]
+    pub(crate) day: Option<String>,
     /// The lecture folder (default: the current directory)
     #[arg(long)]
     pub(crate) dir: Option<PathBuf>,

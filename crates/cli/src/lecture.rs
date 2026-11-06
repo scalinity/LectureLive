@@ -83,22 +83,32 @@ fn audit_cmd(dir: &Path) -> Result<()> {
 
 /// `lecture tidy` (spec §7.7): each day's redundant captures, and with `--apply` takes them out, the notes' embeds of
 /// them first, then clears what a finished study page replaces (§7.6). No request is made, so no key is needed.
-async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -> Result<()> {
-    let days: Vec<(String, chrono::NaiveDate)> = std::fs::read_dir(dir.join(".live_notes"))
+async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String], day: Option<&str>) -> Result<()> {
+    let mut days: Vec<(String, chrono::NaiveDate)> = std::fs::read_dir(dir.join(".live_notes"))
         .map(|e| e.flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".v2.json").map(str::to_string)).collect::<Vec<_>>())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|stem| Some((stem.clone(), chrono::NaiveDate::parse_from_str(stem.strip_prefix("lecture_notes_")?, "%Y%m%d").ok()?)))
         .collect();
+    days.sort_by_key(|(_, date)| *date);
     anyhow::ensure!(!days.is_empty(), "no LectureLive lecture state in {} (.live_notes/*.v2.json); a folder from the Python tool gets its page with `lecture page --notes <file>`", dir.display());
+    if let Some(day) = day {
+        days.retain(|(stem, _)| stem.ends_with(day));
+        anyhow::ensure!(!days.is_empty(), "no lecture day {day} in {}", dir.display());
+    }
+    // Slide numbers belong to one day: --swap and --drop name the day they mean.
+    anyhow::ensure!(swaps.is_empty() && drops.is_empty() || days.len() == 1, "this folder holds {} lecture days ({}); name one with --day YYYYMMDD for --swap or --drop, since slide numbers belong to one day", days.len(), days.iter().map(|(_, d)| d.format("%Y%m%d").to_string()).collect::<Vec<_>>().join(", "));
     let drops: Vec<u32> = drops
         .iter()
         .map(|d| match d.split_once('-') {
-            Some((a, b)) => Some((a.trim().parse::<u32>().ok()?..=b.trim().parse::<u32>().ok()?).collect::<Vec<_>>()),
+            Some((a, b)) => {
+                let (a, b) = (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?);
+                (a <= b && b - a < 10_000).then(|| (a..=b).collect::<Vec<_>>())
+            }
             None => Some(vec![d.trim().parse().ok()?]),
         })
         .collect::<Option<Vec<_>>>()
-        .with_context(|| format!("--drop wants slide numbers, N or A-B: {drops:?}"))?
+        .with_context(|| format!("--drop wants slide numbers, N or A-B with A at most B (fewer than 10,000 slides): {drops:?}"))?
         .concat();
     let swaps: Vec<(u32, u32)> = swaps.iter().map(|s| s.split_once('=').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))).with_context(|| format!("--swap wants A=B, slide numbers: {s:?}"))).collect::<Result<_>>()?;
     // Only a change needs the folder to itself: what a dry run reads, a lecture open in the app does not touch.
@@ -111,7 +121,7 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -
         anyhow::ensure!(!files.journal().exists(), "a snapshot's commit was interrupted in {stem}; open the lecture once to finish it, then tidy");
         let sc = Sidecar::load(&files.sidecar())?.with_context(|| format!("no sidecar for {stem}"))?;
         let store = Store::offline(sc.clone(), files.sidecar());
-        let mut notes_changed = false;
+        let notes_changed;
         if apply {
             let revision = sc.notes.revision;
             for (a, b) in &swaps {
@@ -129,16 +139,27 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -
             notes_changed = store.read().await?.notes.revision != revision;
         } else {
             let mut bytes = 0;
-            let going = tidy::plan(&files, &sc, tidy::Scope::All).await;
-            for v in &going {
-                bytes += sc.slides.iter().find(|s| s.index == v.index).and_then(|s| std::fs::metadata(files.dir.join(&s.file)).ok()).map_or(0, |m| m.len());
-                println!("  slide {} would go: {}", v.index, v.why);
+            let judged = tidy::plan(&files, &sc, tidy::Scope::All).await;
+            // What --apply would do: the same rule, so a slide the notes keep is said to stay.
+            let going = tidy::would_take_out(&files, &sc, &judged)?;
+            for v in &judged {
+                match going.iter().find(|(i, _)| *i == v.index) {
+                    Some((_, embed)) => {
+                        bytes += sc.slides.iter().find(|s| s.index == v.index).and_then(|s| std::fs::metadata(files.dir.join(&s.file)).ok()).map_or(0, |m| m.len());
+                        println!("  slide {} would go: {}{}", v.index, v.why, if *embed { ", its embed with it" } else { "" });
+                    }
+                    None => println!("  slide {} would stay, though {}: the notes refer to it another way, or its file cannot move", v.index, v.why),
+                }
             }
             println!("  {:.1} MB of redundant captures", mb(bytes));
+            if std::fs::read_to_string(&files.notes).is_ok_and(|d| lecturelive_core::session::notesfile::opaque(&d)) {
+                println!("  the notes hold styles or scripts, which may name any capture: every capture stays");
+            }
+            notes_changed = going.iter().any(|(_, embed)| *embed);
             for (first, last) in tidy::camera_report(&files, &sc).await {
                 println!("  slides {first}-{last} look like a camera left on screen (a fixed view in which someone moves); tidy never removes them on its own: --drop {first}-{last} takes them out");
             }
-            for (a, b) in tidy::mistakes(&files, &sc).into_iter().filter(|(a, _)| !going.iter().any(|v| v.index == *a)) {
+            for (a, b) in tidy::mistakes(&files, &sc).into_iter().filter(|(a, _)| !going.iter().any(|(i, _)| i == a)) {
                 println!("  slide {a}, kept, is an earlier state of slide {b}, taken out by hand: --swap {a}={b} puts {b} back in its place");
             }
         }
@@ -156,7 +177,8 @@ async fn tidy_cmd(dir: &Path, apply: bool, swaps: &[String], drops: &[String]) -
         if let Err(why) = tidy::finished(&files, &page) {
             println!("  the study page is not finished ({why}): its captures and recordings stay until a complete page is made");
         } else if notes_changed {
-            println!("  the notes changed, so {} is stale: `lecture page` typesets it again, then clears what it replaces", page.file_name().unwrap_or_default().to_string_lossy());
+            let (did, will) = if apply { ("changed", "is") } else { ("would change", "would be") };
+            println!("  the notes {did}, so {} {will} stale: `lecture page` typesets it again, then clears what it replaces", page.file_name().unwrap_or_default().to_string_lossy());
         } else if apply {
             let r = tidy::retire(&files, &page, Some(&store), false).await?;
             println!("  finished page: {} images ({:.1} MB) and {} recordings ({:.1} MB) cleared", r.images.files, mb(r.images.bytes), r.recordings, mb(r.recording_bytes));
@@ -266,7 +288,7 @@ pub(crate) async fn lecture_cmd(a: LectureArgs) -> Result<()> {
     let p = out.paint;
     // Tidying reads no ledger and needs no key: it goes before the ledger is taken over, so a dry run writes nothing.
     if a.command.as_deref() == Some("tidy") {
-        return tidy_cmd(&lecture_dir(a.dir.clone())?, a.apply, &a.swap, &a.drop_slides).await;
+        return tidy_cmd(&lecture_dir(a.dir.clone())?, a.apply, &a.swap, &a.drop_slides, a.day.as_deref()).await;
     }
     let app_ledger = if fixture.is_some() {
         // A name in the scripted lecture's own folder, never written: the scripted session spends nothing.

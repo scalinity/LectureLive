@@ -886,12 +886,14 @@ the CLI say why ("Slide 199 removed: an earlier state of slide 200"). The sweep 
    capture that a link in `slides/` or `slides/removed/` leads to stays, as does every capture while either folder
    cannot be listed. Clearing removed images after a finished page also keeps any the notes still refer to.
 
-`lecture tidy` makes no request and needs no key. It reports each day's redundant captures and their size, kept
-captures that are an earlier state of one taken out by hand, and what a finished page would let go.
+`lecture tidy` makes no request and needs no key. It reports each day's redundant captures, in date order, and their
+size, by the same rule `--apply` takes them out by (one the notes refer to another way is said to stay; notes holding a
+style or a script keep every capture, and it says so), kept captures that are an earlier state of one taken out by hand,
+and what a finished page would let go. `--day YYYYMMDD` takes one day of the folder.
 
-- A page counts as finished when the page itself records that it was typeset with every part, the same rule as after a
-  polish, and it holds every slide the notes embed. The record is a `page-status` script written in the page's own
-  atomic write, so it describes the page on disk and not the cache saved before it. A page from before pages recorded
+- A page counts as finished by the rule of §7.6, the same after a polish: every part, typeset from the notes as they are,
+  holding every file the notes embed. The record is a `page-status` script written in the page's own atomic write, so it
+  describes the page on disk and not the cache saved before it. A page from before pages recorded
   this is first rendered again from its saved parts (no request). A page typeset before a part was asked for then
   records itself incomplete, and keeps its files until it is typeset again.
 - `--apply` does it.
@@ -899,6 +901,7 @@ captures that are an earlier state of one taken out by hand, and what a finished
   (Zoom's bar included), with B's embed taking A's place in the notes. It changes nothing when the notes or a link refer
   to either slide other than by A's own embed.
 - `--drop A-B` takes out the slides named, a camera run it reports say, with their embeds.
+- Slide numbers belong to one day, so `--swap` and `--drop` need `--day` in a folder of more than one.
 - Editing the notes leaves an existing page stale; `lecture page` typesets it again.
 
 What only the person can judge stays the person's to remove: an earlier module's slides shown in review, a closing
