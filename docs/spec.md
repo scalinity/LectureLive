@@ -788,8 +788,11 @@ This runs after a polish's page and after `lecture page`; the app's Open study p
 and app report the images, recordings and bytes cleared, and the app rehydrates image sources afterwards.
 
 LectureLive loads archived images for the notes, thumbnails and later page requests or free template rebuilds.
-Rendering a new page preserves its previous archived images while the notes still embed them, so a slide taken out of
-the notes leaves the gallery, and opening the folder never registers a removed slide again from an older page. The
+Rendering a new page preserves its previous archived images while the notes still refer to them, however written, so a
+slide taken out of the notes leaves the gallery, and opening the folder never registers a removed slide again from an
+older page. An earlier page's hidden copies of removed captures, which undo restores from, are carried as they are
+until a finished page lets them go, and a slide whose image cannot be read again, from its file or a verified copy,
+leaves the page on disk as it was. The
 Markdown text and its fingerprint stay unchanged; standalone Markdown viewers need the original files, while LectureLive
 and the self-contained HTML can show the archived copies.
 

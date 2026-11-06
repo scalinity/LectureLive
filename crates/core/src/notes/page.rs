@@ -286,26 +286,38 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         Ok(Value::Object(m)) => m.into_iter().filter_map(|(n, p)| p.as_str().map(|p| (n, p.to_string()))).collect(),
         _ => Vec::new(),
     };
-    // Reapplying a design must not discard the only surviving copies of earlier captures, while the notes still embed
-    // them: a slide taken out of the notes has left the lecture.
+    // Reapplying a design must not discard the only surviving copies of earlier captures while the notes still refer to
+    // them, however written: a slide taken out of the notes has left the lecture. A copy is the same slide by its file;
+    // when a renumbered slide took its old number, it takes the next one free.
     let doc = std::fs::read_to_string(notes).unwrap_or_default();
-    for (file, saved) in &archived.0 {
-        let embedded = file.strip_prefix(dir).is_ok_and(|r| doc.contains(&format!("]({})", r.to_string_lossy())));
-        // Already there by its number or by its file: a renumbered slide is still the same slide.
-        let present = paths.iter().any(|(n, p)| n == &saved.capture.slide || dir.join(p) == *file);
-        if saved.page == path && embedded && !saved.capture.slide.starts_with("removed:") && !present {
-            if let Ok(relative) = file.strip_prefix(dir) {
-                paths.push((saved.capture.slide.clone(), relative.to_string_lossy().into_owned()));
-            }
+    let mut archived_here: Vec<(&PathBuf, &archive::Saved)> = archived.0.iter().filter(|(_, s)| s.page == path && !s.capture.slide.starts_with("removed:")).collect();
+    archived_here.sort_by(|a, b| a.0.cmp(b.0));
+    for (file, saved) in archived_here {
+        let present = paths.iter().any(|(_, p)| dir.join(p) == *file);
+        let Ok(relative) = file.strip_prefix(dir) else { continue };
+        if present || crate::session::notesfile::references(&doc, file, "").mentions == 0 {
+            continue;
         }
+        let taken = |n: &str| paths.iter().any(|(m, _)| m == n);
+        let n = if taken(&saved.capture.slide) { (1u32..).map(|i| i.to_string()).find(|n| !taken(n)).expect("a number is free") } else { saved.capture.slide.clone() };
+        paths.push((n, relative.to_string_lossy().into_owned()));
     }
+    // An earlier page's hidden copies of removed captures, which undo restores from, go only once a finished page lets
+    // them (`tidy::retire`): a page rendered in between, complete or not, carries them as they are.
+    let carried = std::fs::read_to_string(&path).ok().and_then(|old| {
+        let copies = archive::script(&old, "removed-captures")?;
+        let manifest: Manifest = archive::script(&old, "capture-files").and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
+        Some((copies, manifest.into_iter().filter(|(_, c)| c.slide.starts_with("removed:")).collect::<Manifest>()))
+    });
     let mut uris: HashMap<String, String> = HashMap::new();
     let mut manifest = Manifest::new();
     for (n, p) in &paths {
         if !uris.contains_key(p) {
             let file = dir.join(p);
             let before = std::fs::read(&file).ok().map(|b| sha256_hex(&b));
-            let uri = slide_uri(&file).or_else(|| archived.uri(&file).map(str::to_string)).unwrap_or_else(|| p.clone());
+            // A slide whose image cannot be read again, from its file or a verified copy, leaves the page as it was: the
+            // page on disk may hold its only copy.
+            let uri = slide_uri(&file).or_else(|| archived.uri(&file).map(str::to_string)).filter(|u| archive::image(u).is_some()).with_context(|| format!("{p} cannot be read again, so the study page was left as it was"))?;
             let hash = match before {
                 Some(hash) => {
                     if sha256_hex(&std::fs::read(&file)?) != hash { bail!("A capture changed while the page was being saved; its file was kept"); }
@@ -336,7 +348,14 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
         ("date", date),
     ]
     .into();
-    let html = archive::with_status(&archive::with_manifest(&fill(template, &values), &manifest)?, fills.missing().is_empty())?;
+    if let Some((_, removed)) = &carried {
+        manifest.extend(removed.clone());
+    }
+    let mut html = archive::with_manifest(&fill(template, &values), &manifest)?;
+    if let Some((copies, _)) = &carried {
+        html = archive::with_removed(&html, copies)?;
+    }
+    let html = archive::with_status(&html, fills.missing().is_empty())?;
     write_atomic(&path, html.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
@@ -580,6 +599,60 @@ mod tests {
         };
         assert_eq!(page_of(both), 2);
         assert_eq!(page_of("# T\n\n![Slide 1](slides/slide_02_100100.png)\n"), 1);
+    }
+
+    fn png(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(8, 6, image::Rgb([20, 120, 220])).save(path).unwrap();
+    }
+
+    #[test]
+    fn a_page_is_never_written_over_an_image_it_cannot_read_again() {
+        // R05: the cached path renders with no request, so nothing read the images first.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("lecture_notes_20261001.md");
+        std::fs::write(&notes, "# T\n\n![Slide 1](slides/slide_01_100000.png)\n").unwrap();
+        let page = page_path(&notes, "Week 01 — Old");
+        std::fs::write(&page, "the only copy").unwrap();
+        let fills = cut("<h2>A</h2><p>x</p>", &[("1".into(), "slides/slide_01_100000.png".into())]);
+        assert!(render(&fills, "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap_err().to_string().contains("cannot be read again"));
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "the only copy");
+    }
+
+    #[test]
+    fn an_earlier_pages_copies_of_removed_slides_last_until_a_finished_page_lets_them_go() {
+        // R04: undo restores from them; a page rendered in between, complete or not, carries them as they are.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("lecture_notes_20261001.md");
+        std::fs::write(&notes, "# T\n").unwrap();
+        let removed = dir.path().join("slides/removed/slide_03_100000.png");
+        png(&removed);
+        let uri = slide_uri(&removed).unwrap();
+        std::fs::remove_file(&removed).unwrap();
+        let manifest = format!(r#"{{"slides/removed/slide_03_100000.png":{{"slide":"removed:3","sha256":"a","image_sha256":"{}"}}}}"#, sha256_hex(uri.as_bytes()));
+        let page = page_path(&notes, "Week 01 — Old");
+        std::fs::write(&page, format!("<html><body><script type=\"application/json\" id=\"slides\">{{}}</script><script type=\"application/json\" id=\"capture-files\">{manifest}</script><script type=\"application/json\" id=\"removed-captures\">{{\"removed:3\": \"{uri}\"}}</script></body></html>")).unwrap();
+        assert!(Archive::load(dir.path()).uri(&removed).is_some(), "the fixture is a copy undo can use");
+        let incomplete = Fills { keystone: String::new(), summary: "s".into(), content: "c".into(), slides: "{}".into() };
+        render(&incomplete, "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap();
+        assert!(Archive::load(dir.path()).uri(&removed).is_some(), "still there for undo");
+    }
+
+    #[test]
+    fn an_archived_slide_the_notes_still_name_another_way_stays_in_the_gallery() {
+        // R22: the only copy once its file was cleared, named in an <img> rather than an embed.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("lecture_notes_20261001.md");
+        let file = dir.path().join("slides/slide_05_100000.png");
+        png(&file);
+        std::fs::write(&notes, "# T\n\n![Slide 5](slides/slide_05_100000.png)\n").unwrap();
+        render(&cut("<h2>A</h2><p>x</p>", &[("5".into(), "slides/slide_05_100000.png".into())]), "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&notes, "# T\n\n<img src=\"slides/slide_05_100000.png\">\n").unwrap();
+        let path = render(&cut("<h2>A</h2><p>x</p>", &[]), "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap();
+        let html = std::fs::read_to_string(path).unwrap();
+        let gallery: HashMap<String, String> = serde_json::from_str(&archive::script(&html, "slides").unwrap()).unwrap();
+        assert!(gallery.values().any(|u| u.starts_with("data:image/")), "{gallery:?}");
     }
 
     #[test]

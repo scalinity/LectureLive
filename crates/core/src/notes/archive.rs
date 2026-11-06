@@ -89,6 +89,11 @@ pub fn complete(html: &str) -> Option<bool> {
     serde_json::from_str::<serde_json::Value>(&script(html, "page-status")?).ok()?["complete"].as_bool()
 }
 
+/// The page with an earlier page's hidden copies of removed captures, carried over as they were (`json`).
+pub fn with_removed(html: &str, json: &str) -> Result<String> {
+    with_script(html, "removed-captures", json)
+}
+
 pub fn with_manifest(html: &str, manifest: &Manifest) -> Result<String> {
     with_script(html, "capture-files", &manifest_json(manifest)?)
 }
