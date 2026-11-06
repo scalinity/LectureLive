@@ -1397,7 +1397,7 @@ None had harmed a week folder yet:
 - R31: CLI only, once per run.
 - R32: a module split with no change in behaviour.
 
-*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes five times.
+*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes seven times.
 
 1. **First review:**
    - M01: carried hidden-copy entries bypassed the retention guards and could lose both copies of an image. It came from the R04 and R01 fixes together; clearing now skips `slides/removed`.
@@ -1423,8 +1423,24 @@ already used pulldown-cmark, so `Cargo.lock` gains no crate. The spec states the
 5. **Fifth review:** M09 resolved, M10 partly.
    - M11: a snapshot's and a polish's answer is unwrapped before repair, and the unwrapping rejoined lines with LF, so a
      lone CR's break was gone before repair saw it. Line endings are now made LF when the answer is unwrapped. The fix
-     is the review's own proposed patch, tested through `repair(clean_output(…))` and `polish::validate`, so it was not
-     sent for a sixth review.
+     is the review's own proposed patch, tested through `repair(clean_output(…))` and `polish::validate`.
+6. **Sixth review** (of the whole notes reading as merged, `bb4c4dc..5b68763`):
+   - M12: deciding code once per line let one flag stand for every embed on the line. An image after leading inline
+     code was kept and placed again, so it showed twice, and an embed spelled inside a code span after prose was
+     deleted.
+   - M13: an embed spelled in a link reference's title counted as placed.
+   - M14: the reference count and the embed edit split lines only at LF, while the parser also ends one at a lone CR.
+   - M15: an answer cut off inside a fence or an HTML comment took the appended slides as literal text.
+
+   An embed is now what pulldown-cmark reads as an image, matched by its source range, in repair, the reference count
+   and the embed edit alike. A spelling anywhere else is literal and left alone. All three split lines where CommonMark
+   does. When an answer ends inside a block left open, the missing slides go before it. Across the 47 notes files, all
+   2,376 embeds are images on their own line under the new reading, so nothing in them changes.
+7. **Seventh review:** M12, M13 and M15 resolved, M14 partly.
+   - M16: pulldown-cmark ends a fence's line only at an LF, so in notes whose lines end at a lone CR, a fence could fail
+     to open and the example it held read as an image, which the embed edit could then delete. The parser now reads a
+     copy in which each lone CR is an LF, one byte for one, so its ranges still fit the notes as written. The fix is the
+     review's own proposed patch, reproduced by failing tests first, so it was not sent for an eighth review.
 
 Across the 47 notes files in the class folders (29,752 lines), the hand-written and parser readers differ on 88 lines,
 every one read as code by the parser and none an embed: 32 are the notes' `<!-- HH:MM:SS -->` timestamps, and 56 start
@@ -1434,9 +1450,11 @@ build, against 0.017 ms by hand.
 
 *Verification* (2026-11-05):
 
-- The workspace suite (`--no-fail-fast`, 23 test binaries, run in parallel) passed 878 tests with 33 opt-in checks
+- The workspace suite (`--no-fail-fast`, 23 test binaries, run in parallel) passed 881 tests with 33 opt-in checks
   ignored. Two failed: the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6),
-  and one of the parallel-only `lecture_gate` failures M7.7 recorded; run serially, `lecture_gate` passed 25 of 25.
+  and one of the parallel-only `lecture_gate` failures M7.7 recorded; run serially, `lecture_gate` passed 25 of 25. In
+  an earlier run `coordinator::a_stuck_stt_worker_loses_frames_not_control_messages` also failed in parallel; it passed
+  alone three times out of three.
 - Clippy reported nothing in the changed notes files.
 - Desktop type checking reported no errors, and the 50 frontend tests passed.
 - The R16 thresholds were not measured again on a recorded class.
