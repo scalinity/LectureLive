@@ -1397,7 +1397,7 @@ None had harmed a week folder yet:
 - R31: CLI only, once per run.
 - R32: a module split with no change in behaviour.
 
-*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes three times.
+*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes four times.
 
 1. **First review:**
    - M01: carried hidden-copy entries bypassed the retention guards and could lose both copies of an image. It came from the R04 and R01 fixes together; clearing now skips `slides/removed`.
@@ -1410,13 +1410,28 @@ None had harmed a week folder yet:
    - M07: tabs were counted as four columns rather than to the next tab stop.
    - M08: an indented code block never ended.
 
-Each round found cases the hand-written fence reader missed. Code is now what pulldown-cmark reads as a code block. The TUI already used pulldown-cmark, so `Cargo.lock` gains no crate. The spec states the rule as CommonMark's. Across the 47 notes files in the class folders (29,752 lines), the old and new readers agree on every line. Those notes hold no fences; their 28 lines indented four or more are nested bullets, which both read as text.
+Each round found cases the hand-written fence reader missed, so code is now what pulldown-cmark keeps literal. The TUI
+already used pulldown-cmark, so `Cargo.lock` gains no crate. The spec states the rule as CommonMark's.
+
+4. **Fourth review** (of the parser change): M06–M08 resolved.
+   - M09: a code span across lines, or an HTML block, still exposed the literal embed it held. Every line of an HTML
+     block is now code, and so is a line that starts inside a code span or inline HTML. A line that merely holds a code
+     span stays text, so repair still removes an inline copy of an embed on it.
+   - M10: a lone CR before a CRLF is two line breaks, and joining the lines made it one, so an indented block after it
+     lost its blank line and read as text. The reader and the embed edit keep a lone CR as a break, and repair writes it
+     as one.
+
+Across the 47 notes files in the class folders (29,752 lines), the hand-written and parser readers differ on 88 lines,
+every one read as code by the parser and none an embed: 32 are the notes' `<!-- HH:MM:SS -->` timestamps, and 56 start
+with inline code, none of them holding an embed. The notes hold no fences, and their 28 lines indented four or more are
+nested bullets, which both read as text. On the largest notes (72.9 KB), the parser reading takes 0.127 ms in a release
+build, against 0.017 ms by hand.
 
 *Verification* (2026-11-05):
 
 - The workspace suite (`--no-fail-fast`, 23 test binaries, run in parallel) passed 876 tests with 33 opt-in checks
-  ignored. Two failed: the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6), and
-  `lecture_gate`'s `a_paused_lecture_streams_nothing_and_its_resume_is_a_second_recording`, the parallel-only failure
-  M7.7 recorded, which passes alone.
+  ignored. Three failed: the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6),
+  and the two parallel-only `lecture_gate` failures M7.7 recorded; run serially, `lecture_gate` passed 25 of 25.
+- Clippy reported nothing in the changed notes files.
 - Desktop type checking reported no errors, and the 50 frontend tests passed.
 - The R16 thresholds were not measured again on a recorded class.
