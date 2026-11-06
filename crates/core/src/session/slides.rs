@@ -42,7 +42,7 @@ pub fn file_time(p: &Path) -> Result<DateTime<Local>> {
 }
 
 /// Moves a file, copying when it crosses file systems.
-fn move_file(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn move_file(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }

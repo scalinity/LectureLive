@@ -76,9 +76,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\ndiscarded by hand, kept by the judge (neighbours within 6):");
+    // The judge's own order, Zoom's bar and photographs included.
     let order_of = |i: usize, j: usize| match (caps[i].look.as_deref(), caps[j].look.as_deref()) {
-        (Some(a), Some(b)) if a.photographic() || b.photographic() => compare::order_photographs(a, b),
-        (Some(a), Some(b)) => compare::order(&compare::relate(a, b)),
+        (Some(a), Some(b)) => lecturelive_core::session::tidy::order_of(a, b),
         _ => Order::Apart,
     };
     for (i, (s, k)) in entries.iter().enumerate() {

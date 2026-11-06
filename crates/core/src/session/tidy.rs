@@ -74,28 +74,39 @@ impl Relations {
         Some(*self.0.entry((a.index, b.index)).or_insert_with(|| compare::relate(la, lb)))
     }
 
-    /// What `b` is to `a`. A photograph's detail is not ink, so it is never the earlier state of anything and is only
-    /// ever the same as an identical picture; a slide can still be an earlier state of one that adds a photograph.
     fn order(&mut self, a: &Capture, b: &Capture) -> Order {
         let (Some(la), Some(lb)) = (a.look.as_deref(), b.look.as_deref()) else { return Order::Apart };
-        if la.photographic() && lb.photographic() {
-            return compare::order_photographs(la, lb);
-        }
-        match self.get(a, b).map_or(Order::Apart, |r| compare::order(&r)) {
-            Order::Earlier if la.photographic() => Order::Apart,
-            Order::Later if lb.photographic() => Order::Apart,
-            // All the later one adds is a band like Zoom's bar: it may be the bar over the same slide, or a footer; either
-            // way the earlier one is no step of it, and both stay.
-            Order::Earlier if lb.bar.is_some() && compare::adds_above_band(la, lb) <= compare::NOISE => Order::Apart,
-            Order::Later if la.bar.is_some() && compare::adds_above_band(lb, la) <= compare::NOISE => Order::Apart,
-            Order::Same if la.photographic() || lb.photographic() => compare::order_photographs(la, lb),
-            o => o,
-        }
+        guarded(la, lb, || self.get(a, b))
     }
 
     fn lost(&mut self, a: &Capture, b: &Capture) -> f32 {
         self.get(a, b).map_or(1.0, |r| r.lost)
     }
+}
+
+/// What `b` is to `a`, by every rule the judge goes by beyond the ink: the one order the judge, `mistakes` and `swap` all
+/// use. A photograph's detail is not ink, so it is never the earlier state of anything and is only ever the same as an
+/// identical picture; a slide can still be an earlier state of one that adds a photograph. `relation` measures `a`
+/// against `b` when needed.
+fn guarded(la: &Look, lb: &Look, relation: impl FnOnce() -> Option<Relation>) -> Order {
+    if la.photographic() && lb.photographic() {
+        return compare::order_photographs(la, lb);
+    }
+    match relation().map_or(Order::Apart, |r| compare::order(&r)) {
+        Order::Earlier if la.photographic() => Order::Apart,
+        Order::Later if lb.photographic() => Order::Apart,
+        // All the later one adds is a band like Zoom's bar: it may be the bar over the same slide, or a footer; either
+        // way the earlier one is no step of it, and both stay.
+        Order::Earlier if lb.bar.is_some() && compare::adds_above_band(la, lb) <= compare::NOISE => Order::Apart,
+        Order::Later if la.bar.is_some() && compare::adds_above_band(lb, la) <= compare::NOISE => Order::Apart,
+        Order::Same if la.photographic() || lb.photographic() => compare::order_photographs(la, lb),
+        o => o,
+    }
+}
+
+/// What `b` is to `a`, as the judge would say, for two pictures measured afresh.
+pub fn order_of(la: &Look, lb: &Look) -> Order {
+    guarded(la, lb, || Some(compare::relate(la, lb)))
 }
 
 /// Runs that look like a camera left on screen: at least three photographs of one fixed view in which little moves,
@@ -394,42 +405,61 @@ pub async fn drop_slides(files: &LectureFiles, store: &Store, indices: &[u32]) -
 }
 
 /// Puts back `complete`, discarded by hand, in place of `partial`, kept by hand, when `partial` is an earlier state
-/// of it: the complete slide takes the partial's embed in the notes. Used once, to correct a folder pruned by hand
-/// before tidying existed (`lecture tidy --swap`); outside a lecture only.
+/// of it (as the judge says, Zoom's bar included): the complete slide takes the partial's embed in the notes. Used once,
+/// to correct a folder pruned by hand before tidying existed (`lecture tidy --swap`); outside a lecture only. Refused,
+/// changing nothing, when the notes or a link refer to either slide other than by the partial's own embed, as
+/// `take_out` refuses to leave a link naming a moved file.
 pub async fn swap(files: &LectureFiles, store: &Store, partial: u32, complete: u32) -> Result<()> {
     let sc = store.read().await?;
     let a = sc.slides.iter().find(|s| s.index == partial).cloned().with_context(|| format!("slide {partial} is not in this lecture"))?;
     let b = sc.removed_slides.iter().find(|s| s.index == complete).cloned().with_context(|| format!("slide {complete} was not removed"))?;
     let name = Path::new(&b.file).file_name().context("the removed slide has no filename")?.to_owned();
     let (from, to) = (files.slides.join(REMOVED_DIR).join(&name), files.dir.join(&b.file));
+    let plain = std::fs::symlink_metadata(&from).is_ok_and(|m| m.file_type().is_file()) && from.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) == files.slides.join(REMOVED_DIR).canonicalize().ok();
+    if !plain {
+        bail!("slide {complete}'s removed file is not a plain image in slides/removed, so nothing was swapped");
+    }
     let (la, lb) = (Look::load(&files.dir.join(&a.file)), Look::load(&from));
-    let earlier = la.zip(lb).is_some_and(|(la, lb)| compare::order(&compare::relate(&la, &lb)) == Order::Earlier);
-    if !earlier {
+    if !la.zip(lb).is_some_and(|(la, lb)| order_of(&la, &lb) == Order::Earlier) {
         bail!("slide {partial} is not an earlier state of slide {complete}, so nothing was swapped");
     }
-    if (a.index <= sc.notes.slide_index) != (b.index <= sc.notes.slide_index) {
+    let noted = a.index <= sc.notes.slide_index;
+    if noted != (b.index <= sc.notes.slide_index) {
         bail!("slides {partial} and {complete} are on either side of what the notes hold, so nothing was swapped");
     }
     if to.exists() || to.parent() != Some(files.slides.as_path()) {
         bail!("slide {complete} cannot go back to {}", to.display());
     }
-    let files = files.clone();
+    slides::removable(files, &a).with_context(|| format!("slide {partial} cannot be taken out, so nothing was swapped"))?;
+    let doc = match std::fs::read_to_string(&files.notes) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.with_context(|| format!("read {}", files.notes.display()))?,
+    };
+    let line = |s: &SlideEntry| embed_line(s, &files.dir, files.notes_dir());
+    let partial_refs = notesfile::references(&doc, &files.dir.join(&a.file), &line(&a));
+    let only_its_embed = if noted { partial_refs == notesfile::References { mentions: 1, own_line_embeds: 1 } } else { partial_refs.mentions == 0 };
+    let linked = notesfile::has_alias(&files.slides, &files.dir.join(&a.file)) || notesfile::has_alias(&files.slides, &from);
+    if !only_its_embed || notesfile::references(&doc, &from, "").mentions > 0 || linked {
+        bail!("the notes or a link refer to slide {partial} or {complete} other than by the partial's own embed, so nothing was swapped");
+    }
+    let (edit, files) = ((line(&a), line(&b)), files.clone());
     store
         .update(move |sc| {
-            if a.index <= sc.notes.slide_index {
-                let line = |s: &SlideEntry| embed_line(s, &files.dir, files.notes_dir());
-                let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
-                let made = notesfile::change_embeds(&files, sc, &doc, &[(line(&a), Some(line(&b)))], Local::now())?;
-                if made.is_empty() {
+            // The complete slide comes back first; if the notes cannot take it, it goes back where it was.
+            slides::move_file(&from, &to).with_context(|| format!("put back {}", to.display()))?;
+            if noted {
+                let made = notesfile::change_embeds(&files, sc, &doc, &[(edit.0, Some(edit.1))], Local::now());
+                if !made.as_ref().is_ok_and(|m| !m.is_empty()) {
+                    let _ = slides::move_file(&to, &from);
+                    made?;
                     bail!("slide {partial}'s embed is not on a line of its own in the notes, so nothing was swapped");
                 }
             }
-            std::fs::rename(&from, &to).with_context(|| format!("put back {}", to.display()))?;
             sc.removed_slides.retain(|s| s.index != b.index);
             sc.slides.push(b.clone());
             sc.slides.sort_by_key(|s| s.index);
             sc.pinned_slides.push(b.index);
-            slides::remove_in(&files, sc, a.index)?;
+            slides::remove_in(&files, sc, a.index).with_context(|| format!("take slide {partial} out"))?;
             Ok(())
         })
         .await
@@ -444,7 +474,7 @@ pub fn mistakes(files: &LectureFiles, sc: &Sidecar) -> Vec<(u32, u32)> {
     for kept in sc.slides.iter().filter(|s| s.auto) {
         let Some(look) = Look::load(&files.dir.join(&kept.file)).filter(|l| !l.photographic()) else { continue };
         for (gone, other) in &taken_out {
-            if (kept.shown_at - gone.shown_at).num_minutes().abs() <= BUILD_MINUTES && compare::order(&compare::relate(&look, other)) == Order::Earlier {
+            if (kept.shown_at - gone.shown_at).num_minutes().abs() <= BUILD_MINUTES && order_of(&look, other) == Order::Earlier {
                 found.push((kept.index, gone.index));
             }
         }
@@ -919,6 +949,39 @@ mod tests {
             assert_eq!((sc.slides.iter().map(|s| s.index).collect::<Vec<_>>(), sc.pinned_slides.clone()), (vec![2], vec![2]));
             assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\n{}\n\nThe slide.\n", line(&steps[1])));
             assert!(f.files.dir.join(&steps[1].file).exists() && !f.files.dir.join(&steps[0].file).exists());
+        }
+
+        #[tokio::test]
+        async fn a_swap_is_refused_when_the_notes_name_a_slide_another_way() {
+            // R07: swap moved the partial with no reference check, leaving a second link naming a moved file.
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            let detail = format!("[detail]({})", line(&steps[0]).split('(').nth(1).unwrap().trim_end_matches(')'));
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n\nSee {detail}.\n", line(&steps[0]))).unwrap();
+            let files = f.files.clone();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 2; slides::remove_in(&files, sc, 2).map(|_| ()) }).await.unwrap();
+            let before = std::fs::read_to_string(&f.files.notes).unwrap();
+            assert!(swap(&f.files, &f.store, 1, 2).await.unwrap_err().to_string().contains("other than by the partial's own embed"));
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), before);
+            let sc = f.store.read().await.unwrap();
+            assert_eq!((sc.slides.len(), sc.removed_slides.len()), (1, 1), "nothing moved");
+        }
+
+        #[tokio::test]
+        async fn a_clean_capture_kept_against_its_barred_twin_is_no_mistake() {
+            // R18: the judge's Zoom-bar rule says both stay; mistakes and swap went by the ink alone.
+            let f = folder();
+            for (n, g) in [(1u32, slide(0, 3)), (2, crate::capture::compare::tests::with_bar(&slide(0, 3)))] {
+                let tmp = f.files.slides.join(format!(".capture-{n}.png.tmp"));
+                g.save_with_format(&tmp, image::ImageFormat::Png).unwrap();
+                let at = Local.with_ymd_and_hms(2026, 11, 5, 12, n, 0).unwrap();
+                register(&f.files, &f.store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap();
+            }
+            let files = f.files.clone();
+            f.store.update(move |sc| slides::remove_in(&files, sc, 2).map(|_| ())).await.unwrap();
+            assert!(mistakes(&f.files, &f.store.read().await.unwrap()).is_empty());
+            assert!(swap(&f.files, &f.store, 1, 2).await.unwrap_err().to_string().contains("not an earlier state"));
         }
     }
 
