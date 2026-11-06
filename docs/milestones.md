@@ -1312,3 +1312,41 @@ resume), so each follow-up ran in a fresh read-only worker given the previous re
 - **Left as they are.** The dry run also suggested `--swap 175=176` or `175=177` for Biostat W12; neither was asked
   for.
 
+
+## M7.7 — A past lecture's polish, and every slide on its page
+
+Two faults met during M7.6's retroactive run:
+
+- **The app could polish only today's lecture.** It opened every folder at today's date, so a week whose lecture was on
+  an earlier day showed no notes, and Polish refused it ("this folder has none yet"). A folder now opens at today's
+  lecture, or, when it holds only earlier days' notes or state, at the latest of them (`files::lecture_day`).
+  Polish, the study page and undo follow that day. Recording is always today's: Start switches a folder opened at an
+  earlier day to today, only once the session's setup has succeeded, so a refused start leaves the folder as it was.
+  An after-class request is entered in the ledger on the day it is spent.
+- **A page could lose slides whose labels repeat.** The page keyed its slides by the number in each embed's label, and
+  the Python tool's notes number their slides again partway, so Applied GenAI W05's page showed 12 of its 14. A label
+  now gives way only when another file's embed took it first: that file keeps a number it was given already, else
+  takes its capture index, else the next number free. Notes whose labels never name two files come out exactly as
+  before, and so does their cache key, so no page typeset so far is typeset again. Archive recovery finds a slide by
+  its file as well as its number, so a renumbered slide never comes back twice.
+
+*Review.* A Codex (GPT-6.1 Sol, xhigh) read-only review of `main..m7.7-past-days-and-slide-labels` found no critical
+issues and three warnings, all fixed with regressions: today's folder published before a start could still fail
+(F001), archive recovery duplicating a renumbered slide (F002), and one file under two unique labels changing its
+cache key (F003). A follow-up review of the fixes found nothing further.
+
+*Verification* (2026-11-05):
+
+- The serial workspace suite (`--no-fail-fast`, 22 test binaries, at `d66196b`) passed 839 tests with 33 opt-in checks
+  ignored. The one failure is the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6).
+- Desktop type checking reported no errors, and the 50 frontend tests passed.
+- `lecture_gate` run in parallel failed now and then in two synthetic-transcript tests,
+  `a_paused_lecture_streams_nothing_and_its_resume_is_a_second_recording` and the race M7.2 recorded in
+  `frontend_boundary::every_segment_is_in_the_log_whatever_the_frontend_read`; each passes alone and in the serial
+  suite.
+- Applied GenAI W05's page was typeset again ($1.16): its gallery holds slides 1–14, the page records itself complete,
+  and its last two captures were cleared.
+- The release app and CLI were built at `d66196b` and installed; the installed binaries match the builds. Opening an
+  earlier week in the installed app was not checked by hand.
+- Before the fix, five weeks were polished with a throwaway runner calling `Lecture::polish_after` for each folder's
+  own day, not committed: Biostatistics W12 and, after their day, Applied GenAI W09–W11 and Fundamentals W11.
