@@ -811,7 +811,10 @@ hand, 131 of 236 captures were discarded for these reasons. Each is told from th
 
 - **Ink** is an edge (something within one pixel differs by more than 32 levels) that stands more than 32 levels off its
   16×16 tile's page level (the tile's median).
-- **Holding ink.** Capture B holds A's ink at a pixel in either of two ways:
+- **Holding ink.** Capture B holds A's ink at a pixel only where B has an edge there too and keeps A's outline: every
+  change of more than 32 levels from the pixel to a neighbour in A is still there in B, in the same direction and at
+  least as strong (a band one or two pixels high laid over separate strokes has an edge everywhere, yet erases the gaps
+  between them). Then in either of two ways:
   - B's tile shows something and B has the same level there within 32;
   - B has ink of its own there in the same direction and at least as strong, as a fade does.
 
