@@ -355,8 +355,8 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     spend::take_over(&app_ledger, Path::new(CLI_LEDGER)).map_err(chain)?;
     // A lecture is always today's: a folder opened at an earlier day's lecture records today's beside it.
     let today = Local::now().date_naive();
+    // It becomes the open folder only with the session's status below, so a start refused before then leaves it as it was.
     let folder = if folder.files.date == today { folder } else { OpenFolder { files: LectureFiles::standard(&folder.files.dir, today), title: prompts::title(&folder.course, &folder.name, today), ..folder } };
-    *app.folder.lock().expect("the folder lock") = Some(folder.clone());
     let files = folder.files.clone();
     let lock = FolderLock::acquire(&files.dir).map_err(chain)?;
     let spend = Spend::open(&app_ledger, &folder.course, &folder.name, files.date).map_err(chain)?;
@@ -365,6 +365,7 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let session = uuid::Uuid::new_v4().to_string();
     {
         let mut pump = app.pump.lock().await;
+        *app.folder.lock().expect("the folder lock") = Some(folder.clone());
         *pump = Pump::new(session.clone(), app.sink.clone(), Some(app_ledger), kind);
         let (view, name) = (folder_view(&folder), source_name.clone());
         let capture_view = ready_view(&selections_path()?, &folder.course);
