@@ -510,7 +510,9 @@ revision request, without images, that cuts the lowest-yield prose and keeps eve
 character for character, and the final count is reported with the page. At most 40% of the slides
 (3–10) are redrawn, only where a figure, table, diagram or formula block teaches faster than words; a
 redraw whose numbers can move is better as a widget; every slide stays reachable in a collapsed All
-slides gallery. The notes and polish prompts are `live_notes.py`'s, carried over with golden tests; the
+slides gallery. Each embedded slide has its own number there, in the request and in a redraw's `data-slide`: its
+label's, unless an earlier embed of another file took it (the Python tool's notes number their slides again partway),
+then its file's capture index, then the next number free; one file embedded twice is one slide. The notes and polish prompts are `live_notes.py`'s, carried over with golden tests; the
 page's prompts are this project's own.
 
 The output runs lede (two sentences), keystone, 5–8 topic sections each headed by its claim, a
@@ -546,7 +548,8 @@ page without widgets, or without either plain-language block, is reported as mis
 
 Each request gets one retry (a refusal gets none); if it still fails, no page is written and
 the notes are untouched. The typeset page is stored in `.live_notes/<stem>.page.json` keyed by
-the SHA-256 of the prompt and the notes: a change to either typesets again, while a change to
+the SHA-256 of the prompt and the notes, and of the slides' numbers where they differ from the notes' labels: a change
+to either typesets again, while a change to
 the template alone re-renders every lecture without requests. The file is the Python CLI's
 own, `{"source": <key>, "fills": {"keystone", "summary", "content", "slides"}, "words", "budget"}`
 written as Python's `json.dumps` writes it, so a page either tool typeset re-renders in the

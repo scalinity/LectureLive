@@ -1,7 +1,7 @@
 //! The study page (spec §6.4): one distillation request over the whole notes and slides within a
 //! word budget, one revision on overshoot, re-cut at every <h2>, cached against the prompt and the
 //! notes in the Python CLI's own file, and filled into notes_template.html in one pass.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -33,6 +33,8 @@ fn re(p: &str) -> Regex {
 }
 
 static SLIDE_EMBED: LazyLock<Regex> = LazyLock::new(|| re(r"!\[Slide (\d+)\]\(([^)]+)\)"));
+/// A capture's index in its file name, `slide_NN_HHMMSS`.
+static CAPTURE_INDEX: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|/)slide_0*(\d+)_\d{6}\.[A-Za-z]+$"));
 static TAGS: LazyLock<Regex> = LazyLock::new(|| re(r"(?is)<svg\b.*?</svg>|<script\b.*?</script\s*>|<[^>]+>"));
 /// A widget's script: the one kind of script the page keeps (spec §6.4).
 static WIDGET_SCRIPT: LazyLock<Regex> = LazyLock::new(|| re(r#"(?is)<script\s+type="text/widget"\s*>.*?</script\s*>"#));
@@ -358,17 +360,47 @@ pub struct PageOutcome {
     pub missing: Vec<&'static str>,
 }
 
+/// Each embed's number on the page, which its gallery, its redraws' `data-slide` and the request go by: its label's,
+/// unless an earlier embed of another file took it (notes from the Python tool numbered their slides again partway, and
+/// the page kept one slide of each pair), then its file's capture index, then the next number free. One file embedded
+/// twice keeps one number.
+fn numbered(embeds: &[(String, String)]) -> Vec<(String, String)> {
+    let mut by_path: HashMap<&str, String> = HashMap::new();
+    let mut used: HashSet<String> = HashSet::new();
+    embeds
+        .iter()
+        .map(|(label, path)| {
+            if let Some(n) = by_path.get(path.as_str()) {
+                return (n.clone(), path.clone());
+            }
+            let index = CAPTURE_INDEX.captures(path).map(|c| c[1].to_string());
+            let n = [Some(label.clone()), index].into_iter().flatten().find(|n| !used.contains(n)).unwrap_or_else(|| (1u32..).map(|i| i.to_string()).find(|n| !used.contains(n)).expect("a number is free"));
+            used.insert(n.clone());
+            by_path.insert(path, n.clone());
+            (n, path.clone())
+        })
+        .collect()
+}
+
+/// The cache's key: what the request is made of. The page's numbers are part of it only where they differ from the
+/// notes' own labels, so every page typeset while they could not differ stays cached.
+fn page_key(system: &str, doc: &str, extra: &str, labelled: &[(String, String)], embeds: &[(String, String)]) -> String {
+    let numbers = if embeds == labelled { String::new() } else { format!("{:?}", embeds.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()) };
+    sha256_hex(format!("{system}{doc}{extra}{numbers}").as_bytes())
+}
+
 /// The CLI's `render_html`: typeset (or take the cached parts), then fill the template.
 pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Path, lecture_name: &str, template: &str, progress: &(dyn Fn(String) + Send + Sync)) -> Result<PageOutcome> {
     let doc = std::fs::read_to_string(notes).with_context(|| format!("read {}", notes.display()))?;
     let budget = page_budget(&doc);
-    let embeds: Vec<(String, String)> = SLIDE_EMBED.captures_iter(&doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
+    let labelled: Vec<(String, String)> = SLIDE_EMBED.captures_iter(&doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
+    let embeds = numbered(&labelled);
     let system = page_system(course, budget, max_slides(embeds.len()));
     let dir = notes.parent().unwrap_or(Path::new("."));
     // the notebook and datasets beside the notes: read fresh, and part of the key only when there are some
     let materials = Materials::gather(dir);
     let extra = if materials.is_empty() { String::new() } else { materials.digest() };
-    let key = sha256_hex(format!("{system}{doc}{extra}").as_bytes());
+    let key = page_key(&system, &doc, &extra, &labelled, &embeds);
     let (fills, words, cached) = match load_cache(cache, &key) {
         Some((fills, words)) => (fills, words, true),
         None => {
@@ -496,6 +528,35 @@ mod tests {
         let fills: HashMap<&str, String> = [("title", "T &amp; U".to_string()), ("content", "<p>{{title}} stays</p>".to_string())].into();
         assert_eq!(fill("<t>{{title}}</t>{{content}}{{unknown}}", &fills), "<t>T &amp; U</t><p>{{title}} stays</p>{{unknown}}");
         assert!(TEMPLATE.contains("{{content}}") && TEMPLATE.contains("{{slides}}") && TEMPLATE.contains("{{data}}"), "the repository's template is embedded");
+    }
+
+    fn embeds(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(n, p)| (n.to_string(), p.to_string())).collect()
+    }
+
+    #[test]
+    fn every_embed_keeps_a_number_of_its_own() {
+        // Notes from the Python tool numbered their slides again partway, so two embeds said "Slide 1" and the page kept
+        // one of them: a label taken already gives way to its file's capture index.
+        let restarted = embeds(&[("1", "slides/slide_01_125954.png"), ("2", "slides/slide_02_130317.png"), ("1", "slides/slide_03_130828.png"), ("2", "slides/slide_04_131207.png"), ("3", "slides/slide_05_131448.png"), ("6", "slides/slide_06_132246.png")]);
+        assert_eq!(numbered(&restarted).iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["1", "2", "3", "4", "5", "6"]);
+        let fills = cut("<h2>A</h2><p>x</p>", &numbered(&restarted));
+        assert_eq!(serde_json::from_str::<Value>(&fills.slides).unwrap().as_object().unwrap().len(), 6, "the page holds every slide");
+        let app = embeds(&[("3", "slides/slide_03_100000.png"), ("7", "slides/slide_07_100500.png")]);
+        assert_eq!(numbered(&app), app, "the app's embeds carry their capture index already");
+        let twice = embeds(&[("5", "slides/slide_05_100000.png"), ("5", "slides/slide_05_100000.png")]);
+        assert_eq!(numbered(&twice), twice, "one slide embedded twice is one slide");
+        let other = embeds(&[("1", "slides/a.png"), ("1", "slides/b.png"), ("2", "slides/c.png")]);
+        assert_eq!(numbered(&other), embeds(&[("1", "slides/a.png"), ("2", "slides/b.png"), ("3", "slides/c.png")]), "else the next number free");
+    }
+
+    #[test]
+    fn a_page_is_typeset_again_only_where_its_numbers_changed() {
+        let (system, doc, extra) = ("sys", "# T\n", "");
+        let app = embeds(&[("3", "slides/slide_03_100000.png")]);
+        assert_eq!(page_key(system, doc, extra, &app, &numbered(&app)), sha256_hex(format!("{system}{doc}{extra}").as_bytes()), "every page typeset so far stays cached");
+        let restarted = embeds(&[("1", "slides/slide_01_100000.png"), ("1", "slides/slide_02_100500.png")]);
+        assert_ne!(page_key(system, doc, extra, &restarted, &numbered(&restarted)), sha256_hex(format!("{system}{doc}{extra}").as_bytes()));
     }
 
     #[test]
