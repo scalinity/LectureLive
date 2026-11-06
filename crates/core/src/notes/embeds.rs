@@ -10,7 +10,8 @@ pub const NOT_PLACED: &str = "### Slides not placed";
 
 /// The Python CLI's `clean_output`: a wrapping code fence removed, and with `strip_title` every leading `# ` title line.
 pub fn clean_output(text: &str, strip_title: bool) -> String {
-    let mut text = text.trim().to_string();
+    // Lines are rejoined with LF below, so every line break is made one first, a lone CR included.
+    let mut text = text.replace("\r\n", "\n").replace('\r', "\n").trim().to_string();
     if text.starts_with("```") {
         let mut lines: Vec<&str> = text.lines().skip(1).collect();
         if lines.last().is_some_and(|l| l.trim().starts_with("```")) {
@@ -208,6 +209,10 @@ mod tests {
             assert_eq!(repair(text, &[e(1)]).missing, [e(1)], "{text:?}");
         }
         assert!(repair(AFTER_A_LONE_CR, &[]).text.starts_with("Paragraph\n\n    ~~~markdown"));
+        // M11: a snapshot's answer is unwrapped first, and the break survives that as well.
+        let r = repair(&clean_output(&format!("```markdown\n{AFTER_A_LONE_CR}```"), true), &[]);
+        assert_eq!(r.removed, 0);
+        assert!(r.text.starts_with("Paragraph\n\n    ~~~markdown"), "{:?}", r.text);
     }
 
     #[test]

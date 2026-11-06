@@ -30,6 +30,15 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_answer_keeps_the_blank_line_a_lone_carriage_return_made() {
+        // M11: the answer is unwrapped before it is repaired, so the break has to survive the unwrapping too.
+        let out = "```markdown\nParagraph\r\r\n    ~~~markdown\n    ![Slide 9](slides/slide_09_100900.png)\n    ~~~\n```";
+        let r = validate(out, "# T\n");
+        assert_eq!(r.removed, 0);
+        assert!(r.text.starts_with("Paragraph\n\n    ~~~markdown\n    ![Slide 9]"), "{:?}", r.text);
+    }
+
+    #[test]
     fn a_polish_request_is_the_clis() {
         let r = request("Machine Learning", "# ML — W — 2026-09-25", "doc", "tr");
         assert_eq!(r.what, SpendKind::Polish);
