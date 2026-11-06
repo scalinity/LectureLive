@@ -778,7 +778,7 @@ snapshot. Otherwise:
 - **Images of slides taken out of the lecture** (`slides/removed/`) are deleted with their folder, and so is any copy of
   them an earlier page kept. Undo has nothing left to restore: their records leave the sidecar, and their numbers stay
   reserved (`reserved_index`).
-- **Recordings**, outside a session: each closed recording with no unresolved gap is deleted as retention deletes one
+- **Recordings**, outside a session: each closed recording with no unresolved gap, and no transcript still open on it, is deleted as retention deletes one
   (§4.4) and marked deleted in the sidecar, and the emptied `recordings/` goes. `lecture audit` reports it as deleted.
 
 This runs after a polish's page and after `lecture page`; the app's Open study page typesets without clearing. The CLI

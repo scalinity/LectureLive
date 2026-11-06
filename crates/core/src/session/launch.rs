@@ -117,7 +117,8 @@ pub fn retire_recordings(dir: &Path, sc: &mut Sidecar) -> Result<(usize, u64)> {
     Ok(out)
 }
 
-/// Closed recordings older than the retention window with no unresolved gap (spec §4.4).
+/// Closed recordings older than the retention window with no unresolved gap (spec §4.4). A transcript still open on
+/// a recording is a gap launch recovery has not written down yet, so that recording stays too.
 pub fn prunable(sc: &Sidecar, retention: Retention, now: DateTime<Local>) -> Vec<Uuid> {
     let Retention::KeepDays(days) = retention else { return Vec::new() };
     let cutoff = now - chrono::Duration::days(days as i64);
@@ -126,6 +127,7 @@ pub fn prunable(sc: &Sidecar, retention: Retention, now: DateTime<Local>) -> Vec
         .filter(|r| matches!(r.state, RecState::Finalized | RecState::Repaired))
         .filter(|r| r.anchor < cutoff)
         .filter(|r| !sc.gaps.iter().any(|g| g.recording_id == r.id && !g.resolved))
+        .filter(|r| !sc.open_utterances.iter().any(|o| o.recording_id == r.id))
         .map(|r| r.id)
         .collect()
 }
@@ -336,6 +338,24 @@ mod tests {
         assert_eq!(sc.gaps, vec![Gap::new(id, len, None, GapKind::Interrupted), gap]);
         assert!(sc.open_utterances.is_empty());
         assert!(recover(dir.path(), Retention::KeepAll, now()).unwrap().untranscribed.is_empty(), "a second launch adds nothing");
+    }
+
+    #[test]
+    fn a_recording_whose_transcript_is_still_open_is_never_retired() {
+        // R02: a stop flushing the transcript, cut short after the recording was finalized, leaves the open mark that
+        // launch recovery turns into a gap; until then the tail is untranscribed audio.
+        let dir = tempfile::tempdir().unwrap();
+        let (open, closed) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut sc = Sidecar::default();
+        sc.recordings.push(entry(open, "recordings/a.wav", 0, RecState::Finalized));
+        sc.recordings.push(entry(closed, "recordings/b.wav", 0, RecState::Finalized));
+        sc.open_utterances = vec![OpenUtterance { recording_id: open, from_sample: 96_000 }];
+        std::fs::create_dir_all(dir.path().join("recordings")).unwrap();
+        std::fs::write(dir.path().join("recordings/a.wav"), b"a").unwrap();
+        std::fs::write(dir.path().join("recordings/b.wav"), b"b").unwrap();
+        assert_eq!(retire_recordings(dir.path(), &mut sc).unwrap(), (1, 1));
+        assert!(dir.path().join("recordings/a.wav").exists(), "its tail is still to be transcribed");
+        assert!(!dir.path().join("recordings/b.wav").exists());
     }
 
     #[test]
