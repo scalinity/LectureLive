@@ -623,6 +623,15 @@ async fn until(events: &mut mpsc::UnboundedReceiver<Event>, what: &str, want: im
 
 #[tokio::test]
 async fn auto_slides_and_the_watcher_share_one_registration() {
+    registration(false).await;
+}
+
+#[tokio::test]
+async fn discovered_slides_preserve_transcript_notes_timestamps_and_registration() {
+    registration(true).await;
+}
+
+async fn registration(discover: bool) {
     let dir = tempfile::tempdir().unwrap();
     let f = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap());
     let ledger = dir.path().join("spend.jsonl");
@@ -639,22 +648,23 @@ async fn auto_slides_and_the_watcher_share_one_registration() {
     let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), stt: Some(stream::spawn(stt_cfg).unwrap()), recovery: Some(spawn_recovery(RestClient::new(rest_cfg).unwrap())), spend: Some(spend), ..Default::default() };
 
     let fake = FakeWindows::default();
-    fake.add(42, "Zoom Meeting", 1600, 900, slide(1));
-    let capture = CaptureSetup { source: Box::new(fake.clone()), selection: Some(selection(&fake, 42)), interval: ms(20), thresholds: Thresholds::default(), record: None };
+    let image = |n| if discover { zoom_window(800, 600, (40, 100, 640, 360), n) } else { slide(n) };
+    fake.add(42, "Zoom Meeting", 800, 600, image(1));
+    let capture = CaptureSetup { source: Box::new(fake.clone()), selection: if discover { None } else { Some(selection(&fake, 42)) }, interval: ms(20), thresholds: Thresholds::default(), record: None };
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev) = mpsc::unbounded_channel();
     let source = Talking { pace: ms(2), fake: stt.state.clone() };
     let run = tokio::spawn(lecture::run(lec, session, Box::new(source), SlideWatch { screenshots: None, poll: ms(20) }, Some(capture), cmd_rx, ev_tx));
 
     until(&mut ev, "the first auto slide", |e| matches!(e, Event::Slide { index: 1, auto: true, .. })).await;
-    fake.show(42, slide(2));
+    fake.show(42, image(2));
     until(&mut ev, "the build", |e| matches!(e, Event::Slide { index: 2, auto: true, .. })).await;
     until(&mut ev, "its first step taken out as it lands (spec §7.7)", |e| matches!(e, Event::SlideRemoved { index: 1, reason: Some(Redundant::EarlierStateOf(2)) })).await;
     cmd.send(Command::SetAutoCapture(false)).unwrap();
     until(&mut ev, "manual capture mode", |e| matches!(e, Event::CaptureMode(m) if !m.automatic && m.selected)).await;
     let before_audio = stt.state.frames.load(std::sync::atomic::Ordering::SeqCst);
     let before_images = fake.0.lock().unwrap().captures;
-    fake.show(42, slide(3));
+    fake.show(42, image(3));
     stt.state.wait_frames(before_audio + 5).await;
     until(&mut ev, "transcription while automatic screenshots are paused", |e| matches!(e, Event::Session(lecturelive_core::session::coordinator::Notification::Segment(_)))).await;
     assert_eq!(fake.0.lock().unwrap().captures, before_images, "manual mode takes no periodic window images while audio reaches STT");

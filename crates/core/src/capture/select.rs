@@ -135,6 +135,15 @@ pub fn revalidate(sel: &Selection, windows: &[WindowInfo]) -> Revalidation {
     Revalidation::Ask { reason, candidates: vec![] }
 }
 
+/// Automatic discovery never uses an application-name fallback or arbitrary Zoom dialogs.
+/// Empty titles occur during Zoom fullscreen transitions; only recovery may consider them.
+pub fn zoom_presentation(w: &WindowInfo, recovering: bool) -> bool {
+    w.bundle_id.as_deref() == Some("us.zoom.xos")
+        && w.width >= 480 && w.height >= 270
+        && (matches!(w.title.trim(), "Zoom Meeting" | "Zoom Webinar" | "Screen Sharing" | "Zoom Screen Sharing")
+            || (recovering && w.title.trim().is_empty()))
+}
+
 /// The saved selections by course, in the app's data folder (`capture.json`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Selections(pub BTreeMap<String, Selection>);

@@ -246,6 +246,13 @@ impl<T: Clone> Detector<T> {
         self.masked = [false; TILES];
     }
 
+    /// Discard an interrupted observation and its time without forgetting saved-slide history
+    /// or the animated regions already learned for the current slide.
+    pub fn drop_pending(&mut self) {
+        self.candidate = None;
+        self.prev = self.reference.clone();
+    }
+
     pub fn observe(&mut self, at: T, frame: GrayImage) -> Option<Decision<T>> {
         self.samples += 1;
         let (Some(reference), Some(prev)) = (&self.reference, &self.prev) else {
@@ -326,6 +333,32 @@ mod tests {
 
     fn run(d: &mut Detector<u32>, frames: &[GrayImage]) -> Vec<(u32, Decision<u32>)> {
         frames.iter().enumerate().filter_map(|(i, f)| d.observe(i as u32, f.clone()).map(|x| (i as u32, x))).collect()
+    }
+
+    #[test]
+    fn interruption_discards_the_old_candidate_time_but_keeps_recent_slides_and_masks() {
+        let a = page();
+        let b = with_bar(a.clone(), 16, 32, 120, 8, 40);
+        let c = with_bar(b.clone(), 16, 64, 120, 8, 40);
+        let mut d = Detector::new(Thresholds::default());
+        assert!(d.observe(0, a.clone()).is_some());
+        assert!(d.observe(1, b.clone()).is_none());
+        assert!(d.observe(2, b.clone()).is_some());
+        assert!(d.observe(3, c.clone()).is_none());
+        d.drop_pending();
+        assert!(d.observe(100, c.clone()).is_none());
+        assert_eq!(d.observe(101, c).unwrap().shown_at, 100);
+        d.drop_pending();
+        assert!(d.observe(102, b.clone()).is_none());
+        assert!(d.observe(103, b).is_none(), "a recent saved slide remains a duplicate after interruption");
+        // Moving a tile for the calibrated number of samples teaches an animation mask.
+        for at in 104..110 {
+            d.observe(at, with_bar(a.clone(), 0, 0, 16, 16, if at % 2 == 0 { 0 } else { 200 }));
+        }
+        let masks = d.masked();
+        assert!(masks > 0);
+        d.drop_pending();
+        assert_eq!(d.masked(), masks, "a single failed sample must not relearn animations");
     }
 
     #[test]

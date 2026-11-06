@@ -594,12 +594,31 @@ is redrawn, and choosing the same window again keeps the parts it has. The selec
 the region, and the region at each other size the window has had, is saved per course in the app's
 data folder (`capture.json`).
 
+During a lecture started with Start, automatic screenshots can find a Zoom presentation without
+an existing selection. Discovery accepts only the `us.zoom.xos` bundle and recognized presentation
+titles (`Zoom Meeting`, `Zoom Webinar`, `Screen Sharing`, `Zoom Screen Sharing`). A window must have
+a slide-shaped region found by the existing content-edge and scene checks, with the same identity,
+size and region on three consecutive observations. Home, chat, settings and other titles are never
+sampled for discovery. An empty title is eligible only during recovery with a saved Zoom selection
+and a match to the last kept slide. An unrecognized title or content without clear edges requires
+Choose window or region; no whole-window guess is made.
+
+The same discovery runs when the selected Zoom window closes, changes title, cannot be captured
+off screen, or shows a camera/notice while a separate presentation window opens. A healthy selected
+slide stays selected. A unique verified presentation can replace it; multiple verified or unresolved
+windows wait and retry, and multiple strict saved-selection matches keep their explicit choice.
+Known crops are never inferred from discovery alone: the verified region and current descriptor
+are saved through the existing per-course selection path. Exclusions move to a replacement only
+when its image matches the last kept slide. Discovery does not start a recording or send content;
+it runs only in an already started lecture, and both screenshot pause and lecture Pause stop it.
+Interrupted samples lose their pending detection timestamp while retaining the last saved slide.
+
 When a lecture starts, exactly one window matching the descriptor (at a size it has had, within 2%)
 is watched. Anything else asks, in the slides strip. "Watch it" is offered only for a window the
 selection matches, whose region at its size someone has chosen or found; any other window is chosen
 in the picker, where its region is drawn. A saved window that is not there at the start is watched
-once exactly one window matches it. Once a window is watched, no other window is watched in its place
-without the person:
+once exactly one window matches it. Saved selections retain the following recovery rules, with verified Zoom discovery above as
+an additional recovery path:
 
 - it cannot be captured while off screen (minimised) for three samples in a row: capture pauses and
   resumes by itself when it is back. A moment off screen, as full screen animates, is not a pause;
@@ -1353,7 +1372,7 @@ and a second signal exits at once. The CLI handles SIGTERM and SIGHUP in both fr
 | Spend ledger write fails | Warning in the status; the request's result is kept and recording continues |
 | App crash | Recording valid to last checkpoint and repaired at launch; system output untouched; journal recovery; unclosed utterance becomes a gap |
 | App quit (Cmd-Q, window closed, SIGTERM, SIGHUP) | The lecture is quit (§9.6): files saved and finalized, no last snapshot, no repair at the next launch; what the snapshot would have taken is pending |
-| Zoom quit and opened again | Capture pauses, then watches the new window through the saved region once exactly one window matches; several, or a new size, ask (§7.1) |
+| Zoom quit and opened again | Capture pauses, then watches a strict saved match or a uniquely verified Zoom presentation; ambiguous or unverified regions wait (§7.1) |
 | Break, quiz, absence | Pause (§9.6): no recording, no transcription, no automatic slides; the hole between the recordings is explained by the sidecar's `pauses` |
 | External edit of notes | Accepted as new revision |
 

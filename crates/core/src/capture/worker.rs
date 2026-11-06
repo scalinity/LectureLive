@@ -1,10 +1,8 @@
 //! The capture worker (spec §3.2, §7): on its own thread, because its native calls and image work
 //! block. Once a second it finds the bound window, captures it, and feeds the slide region to the
-//! detector; a kept frame becomes a PNG temp file in `slides/` for the lecture to register. Once bound,
-//! it binds no other window by itself, except the saved one back: when the window closes and exactly one
-//! window matches the selection as at a lecture's start (an app quit and opened again), that is watched
-//! and said. Anything else, several matches, a size not seen before, another app, pauses capture and asks
-//! (spec §7.1).
+//! detector; a kept frame becomes a PNG temp file in `slides/` for the lecture to register. Saved
+//! selections retain strict matching. Zoom presentations can also be discovered by trusted app/title
+//! identity and a stable, verified slide region; ambiguous windows wait for a choice (spec §7.1).
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
@@ -21,7 +19,7 @@ use crate::capture::layout;
 use crate::capture::locate::locate;
 use crate::capture::scene::{classify, features, Gate, Scene};
 use crate::capture::shortcut::Listener;
-use crate::capture::select::{revalidate, Revalidation, Selection};
+use crate::capture::select::{revalidate, zoom_presentation, Descriptor, Revalidation, Selection};
 use crate::capture::window::{fit_within, is_blank, CaptureError, WindowInfo, WindowSource, MAX_PX};
 
 /// Failed captures in a row before the strip says so: a minimise animation or one bad frame is not worth a word.
@@ -158,7 +156,7 @@ pub fn spawn(source: Box<dyn WindowSource>, selection: Option<Selection>, cfg: W
         .name("capture".into())
         .spawn(move || {
             let recorder = cfg.record.as_ref().and_then(|d| Recorder::new(d.clone()).ok());
-            let mut w = Worker { detector: Detector::new(cfg.thresholds), gate: Gate::new(), source, cfg, events, bound: None, waiting: None, sent: None, failures: 0, tried: None, new_size: None, settling: 0, held: false, since_audit: AUDIT_EVERY, suspect: 0, recorder, mode: CaptureMode::default(), sent_mode: None, listener: None, generation: 0, tx: worker_tx, manual_selection: None };
+            let mut w = Worker { detector: Detector::new(cfg.thresholds), gate: Gate::new(), source, cfg, events, bound: None, waiting: None, sent: None, failures: 0, tried: None, new_size: None, settling: 0, held: false, since_audit: AUDIT_EVERY, suspect: 0, recorder, mode: CaptureMode::default(), sent_mode: None, listener: None, generation: 0, tx: worker_tx, manual_selection: None, discovery: None, tick_serial: 0 };
             w.start(selection);
             w.publish_mode();
             w.run(rx);
@@ -201,6 +199,9 @@ struct Worker {
     /// Regions chosen or verified at exact sizes. Startup's tolerant identity match must not
     /// turn a size never checked into a known manual crop before the automatic layout audit.
     manual_selection: Option<Selection>,
+    /// A discovered identity and crop must agree across consecutive observations.
+    discovery: Option<(u32, Selection, u32, u64)>,
+    tick_serial: u64,
 }
 
 impl Worker {
@@ -226,6 +227,7 @@ impl Worker {
                 }
                 Ok(CaptureCmd::Hold(held)) => {
                     self.held = held;
+                    self.interrupted();
                     self.failures = 0;
                     next = Instant::now();
                 }
@@ -253,6 +255,7 @@ impl Worker {
         if self.mode.automatic != enabled {
             self.mode.automatic = enabled;
             self.generation = self.generation.wrapping_add(1);
+            self.discovery = None;
             // Keep only the last saved frame. A candidate and its timestamp cannot cross a pause.
             let kept = self.detector.kept().cloned();
             self.detector = Detector::new(self.cfg.thresholds);
@@ -290,6 +293,10 @@ impl Worker {
         let Some(sel) = selection else { return self.set(CaptureState::Unbound) };
         match self.source.windows() {
             Ok(ws) => match revalidate(&sel, &ws) {
+                Revalidation::Match(w) if w.bundle_id.as_deref() == Some("us.zoom.xos") && w.title.trim().is_empty() => {
+                    self.waiting = Some(sel);
+                    self.set(CaptureState::Asking { window: "Zoom presentation".into(), reason: "An unnamed Zoom window needs its presentation region checked; choose the window or open its meeting view".into(), candidates: vec![] });
+                }
                 Revalidation::Match(w) => self.bound = Some((w.id, sel.at_size(w.width, w.height).unwrap_or(sel))),
                 Revalidation::Ask { reason, candidates } => {
                     let window = sel.descriptor.label();
@@ -306,6 +313,7 @@ impl Worker {
     }
 
     fn bind(&mut self, window: u32, selection: Selection) {
+        self.discovery = None;
         self.manual_selection = Some(selection.clone());
         let seen = |s: &Selection| (s.region, s.leave_out.clone());
         let before = self.bound.as_ref().map(|(_, s)| seen(s)).or(self.waiting.as_ref().map(seen));
@@ -327,6 +335,7 @@ impl Worker {
     }
 
     fn failed(&mut self, window: &str, e: CaptureError) {
+        self.interrupted();
         if let Some(r) = self.recorder.as_mut() {
             r.error(&e.to_string());
         }
@@ -341,18 +350,133 @@ impl Worker {
         }
     }
 
-    /// While asking: the candidates as they are now. Exactly one window matching the selection is the saved window
-    /// back, as at a lecture's start: it is watched, with no one to choose.
+    /// Drop observations whose timestamps precede an interruption, retaining only a saved slide.
+    fn interrupted(&mut self) {
+        self.discovery = None;
+        self.gate = Gate::new();
+        self.interrupted_observation();
+    }
+
+    fn interrupted_observation(&mut self) {
+        self.detector.drop_pending();
+    }
+
     fn wait(&mut self) {
-        let Some(sel) = self.waiting.clone() else { return };
-        let window = sel.descriptor.label();
+        let sel = self.waiting.clone();
+        let window = sel.as_ref().map_or_else(|| "Zoom presentation".into(), |s| s.descriptor.label());
         match self.source.windows() {
-            Ok(ws) => match revalidate(&sel, &ws) {
-                Revalidation::Match(w) => self.follow(&w, &sel),
-                Revalidation::Ask { reason, candidates } => self.set(CaptureState::Asking { window, reason, candidates }),
-            },
+            Ok(ws) => {
+                if let Some(sel) = &sel {
+                    match revalidate(sel, &ws) {
+                        Revalidation::Match(w) if w.bundle_id.as_deref() != Some("us.zoom.xos") || !w.title.trim().is_empty() => return self.follow(&w, sel),
+                        Revalidation::Ask { reason, candidates } if candidates.len() > 1 => {
+                            self.discovery = None;
+                            return self.set(CaptureState::Asking { window, reason, candidates });
+                        }
+                        _ => {}
+                    }
+                }
+                if self.discover(&ws, sel.as_ref(), None) { return; }
+                if let Some(sel) = sel {
+                    if let Revalidation::Ask { reason, candidates } = revalidate(&sel, &ws) {
+                        self.set(CaptureState::Asking { window, reason, candidates });
+                    }
+                }
+            }
             Err(e) => self.failed(&window, e),
         }
+    }
+
+    /// Discovery inspects only recognized Zoom presentation windows. A title is a hint, never a crop:
+    /// pixels must identify a slide and the same identity/region must survive three observations.
+    /// Returns true when it owns the recovery message (including ambiguity), not just on success.
+    fn discover(&mut self, windows: &[WindowInfo], saved: Option<&Selection>, exclude: Option<u32>) -> bool {
+        let recovering = saved.is_some_and(|s| s.descriptor.bundle_id.as_deref() == Some("us.zoom.xos"));
+        if saved.is_some() && !recovering { return false; }
+        let candidates: Vec<_> = windows.iter().filter(|w| Some(w.id) != exclude && zoom_presentation(w, recovering)).collect();
+        if candidates.is_empty() {
+            self.discovery = None;
+            self.failures = 0;
+            if saved.is_none() {
+                self.set(CaptureState::Asking { window: "Zoom presentation".into(), reason: "Looking for a Zoom meeting; open its shared slides or choose a window. Retrying automatically".into(), candidates: vec![] });
+                return true;
+            }
+            return false;
+        }
+        let mut verified = Vec::new();
+        let mut unresolved = false;
+        let mut failure = None;
+        for w in &candidates {
+            let img = match self.source.capture(w.id) {
+                Ok(img) if !is_blank(&img) => img,
+                Err(CaptureError::Denied) => { self.discovery = None; self.set(CaptureState::Denied); return true; }
+                result => {
+                    let reason = match result { Err(e) => e.to_string(), Ok(_) => "the capture was blank".into() };
+                    if let Some(r) = self.recorder.as_mut() { r.error(&reason); }
+                    failure = Some(reason);
+                    unresolved = true;
+                    continue;
+                }
+            };
+            let located = saved.and_then(|s| self.detector.kept().and_then(|kept| {
+                let aspect = s.region.w * s.descriptor.width as f64 / (s.region.h * s.descriptor.height as f64);
+                locate(&img, kept, aspect, &s.leave_out)
+            }));
+            // Exclusions describe the old slide. Move them only with a recognized copy of that slide.
+            let masked = saved.is_some_and(|s| !s.leave_out.is_empty());
+            let region = located.or_else(|| (!masked && !w.title.trim().is_empty()).then(|| Self::edges(&img)).flatten());
+            if let Some(region) = region {
+                let selection = Selection { descriptor: Descriptor::of(w), region,
+                    leave_out: saved.map_or_else(Vec::new, |s| s.leave_out.clone()), sizes: vec![] };
+                verified.push((w.id, selection));
+            }
+        }
+        if verified.len() == 1 && !unresolved {
+            self.failures = 0;
+            let (id, selection) = verified.pop().unwrap();
+            let count = match &self.discovery {
+                Some((old_id, old, n, tick)) if *old_id == id && *old == selection && tick.wrapping_add(1) == self.tick_serial => n + 1,
+                _ => 1,
+            };
+            self.discovery = Some((id, selection.clone(), count, self.tick_serial));
+            if count >= NEW_SIZE_HELD {
+                self.interrupted();
+                // The runtime title can disappear in fullscreen. Preserve the useful course identity
+                // and verified crops when this is the same presentation, while binding its live title.
+                let checked = self.manual_selection.as_ref().filter(|known| {
+                    known.descriptor.title == selection.descriptor.title
+                        || selection.descriptor.title.trim().is_empty()
+                }).map(|known| known.with_size(selection.descriptor.width, selection.descriptor.height, selection.region))
+                    .unwrap_or_else(|| selection.clone());
+                self.manual_selection = Some(checked);
+                self.waiting = None;
+                self.new_size = None;
+                self.failures = 0;
+                self.rebind(id, selection.clone(), format!("{} found; watching its verified slide region", selection.descriptor.label()));
+                self.publish_mode();
+            } else if exclude.is_none() {
+                self.set(CaptureState::Asking { window: "Zoom presentation".into(), reason: "Checking the presentation region; capture resumes when it settles".into(), candidates: vec![] });
+            }
+        } else {
+            self.discovery = None;
+            let reason = if verified.len() > 1 || unresolved && candidates.len() > 1 {
+                "More than one Zoom window may contain the presentation; choose its window and region. Retrying automatically"
+            } else {
+                "Waiting for a clear shared slide in Zoom; choose its region if it is already visible. Retrying automatically"
+            };
+            if exclude.is_none() {
+                if candidates.len() == 1 && failure.is_some() {
+                    self.failures += 1;
+                    if self.failures >= FAILURES_SHOWN {
+                        self.set(CaptureState::Failing { window: "Zoom presentation".into(), reason: failure.unwrap() });
+                    }
+                } else {
+                    self.failures = 0;
+                    self.set(CaptureState::Asking { window: "Zoom presentation".into(), reason: reason.into(), candidates: vec![] });
+                }
+            }
+        }
+        true
     }
 
     /// The window this selection watched is gone and exactly one window matches it as one does at a lecture's
@@ -361,6 +485,7 @@ impl Worker {
     /// judge against the last kept one, so the slide that was up is not taken again.
     fn follow(&mut self, window: &WindowInfo, sel: &Selection) {
         let Some(at) = sel.at_size(window.width, window.height) else { return };
+        self.interrupted();
         let label = sel.descriptor.label();
         self.bound = Some((window.id, at.clone()));
         self.waiting = None;
@@ -373,6 +498,7 @@ impl Worker {
     }
 
     fn tick(&mut self) {
+        self.tick_serial = self.tick_serial.wrapping_add(1);
         if !self.mode.automatic { return; }
         if self.held {
             if let Some((_, sel)) = &self.bound {
@@ -387,11 +513,17 @@ impl Worker {
             Ok(ws) => ws,
             Err(e) => return self.failed(&window, e),
         };
-        let Some(w) = windows.iter().find(|w| w.id == id).cloned() else {
-            let others: Vec<WindowInfo> = windows.into_iter().filter(|w| sel.matches(w)).collect();
+        let Some(w) = windows.iter().find(|w| w.id == id && sel.descriptor.same_app(w) && (sel.descriptor.bundle_id.is_none() || w.bundle_id == sel.descriptor.bundle_id) && w.title == sel.descriptor.title).cloned() else {
+            self.interrupted_observation();
+            let others: Vec<WindowInfo> = windows.iter().cloned().filter(|w| sel.matches(w)).collect();
             if let [only] = others.as_slice() {
-                return self.follow(only, &sel);
+                if only.bundle_id.as_deref() != Some("us.zoom.xos") || !only.title.trim().is_empty() { return self.follow(only, &sel); }
             }
+            if others.len() > 1 {
+                self.discovery = None;
+                return self.set(CaptureState::Asking { window, reason: "Several windows match; choose the presentation".into(), candidates: others });
+            }
+            if self.discover(&windows, Some(&sel), None) { return; }
             return self.set(if others.is_empty() {
                 CaptureState::Paused { window, reason: "the window closed; a new one is offered here when it opens".into() }
             } else {
@@ -404,6 +536,7 @@ impl Worker {
             self.new_size = None;
             sel
         } else {
+            self.interrupted_observation();
             // Full screen animates, and a size can be reported before the content is laid out for it: act
             // once the new size has held for a sample.
             let seen = match self.new_size {
@@ -432,6 +565,7 @@ impl Worker {
                     return;
                 }
                 if self.suspect > 0 {
+                    self.interrupted_observation();
                     return; // looking somewhere else than the slide, perhaps: nothing is taken until it is checked again
                 }
                 let scene = self.gate.look(&t);
@@ -443,18 +577,24 @@ impl Worker {
                 // is showing, and nothing is taken from it. A manual capture is the person's call and still works.
                 self.set(CaptureState::Watching { window: scene.waiting_for().map_or_else(|| window.clone(), |why| format!("{window}, waiting for a slide ({why})")) });
                 if scene != Scene::Slide {
+                    self.interrupted_observation();
+                    self.discover(&windows, Some(&sel), Some(id));
                     None
                 } else if self.settling > 0 && self.detector.shows_kept(&t) {
+                    self.discovery = None;
                     // Just after a new region: a frame still showing the kept slide settles into it.
                     self.settling -= 1;
                     self.detector.keep(t);
                     None
                 } else {
+                    self.discovery = None;
                     self.settling = 0;
                     self.detector.observe(Local::now(), t).map(|d| (img, d))
                 }
             }
+            Err(CaptureError::Denied) => return self.failed(&window, CaptureError::Denied),
             Err(e) if !w.on_screen => {
+                self.interrupted_observation();
                 // A closed window's id can stay listed off screen while its app runs, so another window
                 // matching on screen is a replacement to ask about, not a reason to wait.
                 let others: Vec<WindowInfo> = windows.iter().filter(|o| o.id != id && o.on_screen && sel.matches(o)).cloned().collect();
@@ -467,8 +607,14 @@ impl Worker {
                     return;
                 }
                 if let [only] = others.as_slice() {
-                    return self.follow(only, &sel);
+                    if only.bundle_id.as_deref() != Some("us.zoom.xos") || !only.title.trim().is_empty() { return self.follow(only, &sel); }
                 }
+                if others.len() > 1 {
+                    self.discovery = None;
+                    return self.set(CaptureState::Asking { window, reason: "Several windows match; choose the presentation".into(), candidates: others });
+                }
+                let replacements: Vec<_> = windows.iter().filter(|o| o.id != id).cloned().collect();
+                if self.discover(&replacements, Some(&sel), None) { return; }
                 return self.set(if others.is_empty() {
                     CaptureState::Paused { window, reason: "not on screen and cannot be captured (minimised?); capture resumes when it is back".into() }
                 } else {
@@ -579,6 +725,12 @@ impl Worker {
     }
 
     fn use_region(&mut self, id: u32, sel: &Selection) {
+        self.interrupted();
+        // Tile masks and recent frames belong to the previous crop's geometry.
+        let kept = self.detector.kept().cloned();
+        self.detector = Detector::new(self.cfg.thresholds);
+        if let Some(kept) = kept { self.detector.keep(kept); }
+        self.settling = 0;
         if let Ok((_, t)) = self.frame(id, &sel) {
             if self.detector.shows_kept(&t) {
                 self.detector.keep(t);
@@ -610,7 +762,7 @@ impl Worker {
             }
             e.to_string()
         })?;
-        let chosen = self.bound.as_ref().and_then(|(id, _)| windows.iter().find(|w| w.id == *id && sel.descriptor.same_app(w) && sel.descriptor.title == w.title)).cloned();
+        let chosen = self.bound.as_ref().and_then(|(id, runtime)| windows.iter().find(|w| w.id == *id && runtime.descriptor.same_app(w) && runtime.descriptor.title == w.title)).cloned();
         let w = match chosen {
             Some(w) => w,
             None => match revalidate(&sel, &windows) {
@@ -623,13 +775,15 @@ impl Worker {
         };
         let known_size = |w: &WindowInfo| (sel.descriptor.width, sel.descriptor.height) == (w.width, w.height)
             || sel.sizes.iter().any(|s| (s.width, s.height) == (w.width, w.height));
-        let Some(at_size) = known_size(&w).then(|| sel.at_size(w.width, w.height)).flatten() else {
+        let Some(mut at_size) = known_size(&w).then(|| sel.at_size(w.width, w.height)).flatten() else {
             let reason = format!("the window is {} × {} now; choose its region in LectureLive", w.width, w.height);
             self.set(CaptureState::Asking { window: sel.descriptor.label(), reason: reason.clone(), candidates: vec![] });
             return Err(reason);
         };
+        at_size.descriptor = Descriptor::of(&w);
         if self.bound.as_ref() != Some(&(w.id, at_size.clone())) {
-            self.follow(&w, &sel);
+            self.use_region(w.id, &at_size);
+            self.waiting = None;
         }
         let (id, at_size) = self.bound.clone().ok_or("No window is selected.")?;
         let mut frame = self.frame(id, &at_size);

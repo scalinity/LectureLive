@@ -8,6 +8,7 @@ use lecturelive_core::capture::window::{CaptureError, WindowInfo, WindowSource};
 pub struct Screen {
     pub windows: Vec<(WindowInfo, RgbaImage)>,
     pub denied: bool,
+    pub deny_capture: bool,
     pub fail_next: u32,
     pub blank_next: u32,
     pub captures: u32,
@@ -61,6 +62,7 @@ impl WindowSource for FakeWindows {
     fn capture(&mut self, id: u32) -> Result<RgbaImage, CaptureError> {
         let mut s = self.0.lock().unwrap();
         s.captures += 1;
+        if s.deny_capture { return Err(CaptureError::Denied); }
         if s.fail_next > 0 {
             s.fail_next -= 1;
             return Err(CaptureError::Failed("the window server said no".into()));
