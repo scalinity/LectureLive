@@ -123,7 +123,11 @@ pub fn removable(files: &LectureFiles, slide: &SlideEntry) -> Result<()> {
     if !inside {
         bail!("Slide {}'s file is not in the slides folder, so it is left where it is", slide.index);
     }
-    if files.slides.join(REMOVED_DIR).join(name).exists() {
+    let removed = files.slides.join(REMOVED_DIR);
+    if removed.exists() && removed.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) != files.slides.canonicalize().ok() {
+        bail!("The removed folder is not inside the slides folder");
+    }
+    if removed.join(name).exists() {
         bail!("Slide {}'s removed file already exists, so neither image was overwritten", slide.index);
     }
     Ok(())

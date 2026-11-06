@@ -190,6 +190,9 @@ pub fn clear(page: &Path) -> Result<Cleanup> {
     let dir = page.parent().context("The study page has no folder")?;
     let mut out = Cleanup::default();
     for (file, capture) in manifest {
+        // A removed slide's image goes only by the rules for what was taken out (`tidy::retire`): whose it is, and
+        // whether any notes or link still lead to it. A page's carried copy is no reason on its own.
+        if Path::new(&file).starts_with("slides/removed") { continue; }
         if !dir.join(&file).exists() { continue; }
         let Some(path) = capture_path(dir, &file) else { out.kept.push(file); continue };
         let Ok(bytes) = std::fs::read(&path) else { out.kept.push(file); continue };

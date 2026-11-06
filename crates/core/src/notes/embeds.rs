@@ -48,18 +48,21 @@ pub struct Repaired {
 /// inline copies and embeds of slides outside the batch are removed; what fences hold is code and
 /// stays; expected embeds still absent are appended under their own heading, without a description.
 /// Which lines are fenced code, the fences included, as CommonMark reads them: a fence is three or more backticks or
-/// tildes, and only a fence of the same character, at least as long and with nothing after it, closes it. The one reading
-/// the snapshot's repair, the reference count and the embed edits share.
+/// tildes, and only a fence of the same character, at least as long, with nothing after it and indented at most three
+/// columns past where the block opened, closes it. A fence opens at any indent, as one inside a list item does: what
+/// is uncertain counts as code, which keeps it. The one reading the snapshot's repair, the reference count and the
+/// embed edits share.
 pub fn code_lines(lines: &[&str]) -> Vec<bool> {
-    let mut open: Option<(char, usize)> = None;
+    let indent = |line: &str| line.chars().take_while(|c| c.is_whitespace()).map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>();
+    let mut open: Option<(char, usize, usize)> = None;
     lines
         .iter()
         .map(|line| {
             let t = line.trim();
             let fence = t.chars().next().filter(|c| matches!(c, '`' | '~')).map(|c| (c, t.chars().take_while(|x| *x == c).count())).filter(|(_, n)| *n >= 3);
             match (open, fence) {
-                (None, Some(f)) => open = Some(f),
-                (Some((c, n)), Some((d, m))) if c == d && m >= n && t[m..].trim().is_empty() => open = None,
+                (None, Some((c, n))) => open = Some((c, n, indent(line))),
+                (Some((c, n, at)), Some((d, m))) if c == d && m >= n && t[m..].trim().is_empty() && indent(line) <= at + 3 => open = None,
                 (None, None) => return false,
                 _ => {}
             }
@@ -138,6 +141,9 @@ mod tests {
         let lines = ["~~~~markdown", "```", "![Slide 1](slides/a.png)", "~~~~", "after", "````", "```", "````", "out"];
         assert_eq!(code_lines(&lines), [true, true, true, true, false, true, true, true, false]);
         assert_eq!(code_lines(&["```rust", "x", "``` not a close", "```"]), [true, true, true, true]);
+        // M03: a fence four spaces in from where its block opened is code; a block opened inside a list closes there.
+        assert_eq!(code_lines(&["```", "    ```", "![Slide 1](slides/slide_01_100000.png)", "```", "out"]), [true, true, true, true, false]);
+        assert_eq!(code_lines(&["- item", "    ```", "    code", "    ```", "after"]), [false, true, true, true, false]);
     }
 
     #[test]

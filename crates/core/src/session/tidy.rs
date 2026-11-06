@@ -353,21 +353,26 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
             }
             // Judged from a copy: what changed since (a removal, an undo, a snapshot) is looked at again here.
             let registered = |sc: &Sidecar, i: u32| sc.slides.iter().any(|s| s.index == i);
-            // A slide the notes already hold goes only for a keeper that will show what it showed: one still pending,
-            // which the next snapshot adds, or one the notes still refer to (the person may have taken its embed out).
             let doc = std::fs::read_to_string(&files.notes).unwrap_or_default();
-            let shown = |sc: &Sidecar, k: u32| k > sc.notes.slide_index || sc.slides.iter().find(|s| s.index == k).is_some_and(|s| notesfile::references(&doc, &files.dir.join(&s.file), "").mentions > 0);
             let still: Vec<Verdict> = verdicts
                 .into_iter()
                 .filter(|v| registered(sc, v.index) && !sc.pinned_slides.contains(&v.index) && (scope == Scope::All || v.index > sc.notes.slide_index))
                 .filter(|v| match v.why {
-                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k) && (v.index > sc.notes.slide_index || shown(sc, k)) && unchanged(&files, sc, &seen, &[v.index, k]),
+                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k) && keeper_shows(&files, sc, &doc, v) && unchanged(&files, sc, &seen, &[v.index, k]),
                 })
                 .collect();
             let gone = take_out(&files, sc, &still.iter().map(|v| v.index).collect::<Vec<_>>())?;
             Ok(gone.into_iter().map(|e| { let why = still.iter().find(|v| v.index == e.index).expect("taken out from the verdicts").why; (e, why) }).collect::<Vec<_>>())
         })
         .await
+}
+
+/// Whether a verdict's keeper will show what its slide showed: always for a pending slide; for one the notes already
+/// hold, only a keeper still pending, which the next snapshot adds, or one the notes still refer to (the person may
+/// have taken its embed out). The rule a sweep and the dry run share.
+fn keeper_shows(files: &LectureFiles, sc: &Sidecar, doc: &str, v: &Verdict) -> bool {
+    let (Redundant::EarlierStateOf(k) | Redundant::SameAs(k)) = v.why;
+    v.index > sc.notes.slide_index || k > sc.notes.slide_index || sc.slides.iter().find(|s| s.index == k).is_some_and(|s| notesfile::references(doc, &files.dir.join(&s.file), "").mentions > 0)
 }
 
 /// Whether these slides still name the files they were judged on, unchanged since.
@@ -436,8 +441,9 @@ fn decide(files: &LectureFiles, sc: &Sidecar, doc: &str, indices: &[u32]) -> (Ve
 /// What `take_out` would do with these verdicts, writing nothing: for each slide that would go, whether its embed goes
 /// with it. A verdict missing here is one the notes keep.
 pub fn would_take_out(files: &LectureFiles, sc: &Sidecar, verdicts: &[Verdict]) -> Result<Vec<(u32, bool)>> {
-    let indices: Vec<u32> = verdicts.iter().map(|v| v.index).collect();
-    let (with_embed, stay) = decide(files, sc, &notes_or_none(files)?, &indices);
+    let doc = notes_or_none(files)?;
+    let indices: Vec<u32> = verdicts.iter().filter(|v| keeper_shows(files, sc, &doc, v)).map(|v| v.index).collect();
+    let (with_embed, stay) = decide(files, sc, &doc, &indices);
     Ok(indices.into_iter().filter(|i| !stay.contains(i)).map(|i| (i, with_embed.iter().any(|s| s.index == i))).collect())
 }
 
@@ -1016,6 +1022,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_removed_image_an_earlier_page_kept_a_copy_of_goes_only_by_the_removed_rules() {
+            // M01: the page's manifest carried the removed image, and the page's own clearing deleted it past every
+            // guard (here a link in slides/ that the notes name).
+            let f = folder();
+            let steps = build(&f, 1).await;
+            let files = f.files.clone();
+            f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
+            let name = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().into_owned();
+            let target = f.files.slides.join(REMOVED_DIR).join(&name);
+            std::os::unix::fs::symlink(&target, f.files.slides.join("detail.png")).unwrap();
+            std::fs::write(&f.files.notes, "# T\n\n![detail](slides/detail.png)\n").unwrap();
+            let page = finished_page(&f);
+            let uri = crate::notes::page::slide_uri(&target).unwrap();
+            let bytes = std::fs::read(&target).unwrap();
+            let manifest = format!(r#"{{"slides/removed/{name}":{{"slide":"removed:1","sha256":"{}","image_sha256":"{}"}}}}"#, notesfile::sha256_hex(&bytes), notesfile::sha256_hex(uri.as_bytes()));
+            let html = std::fs::read_to_string(&page).unwrap();
+            let html = crate::notes::archive::with_manifest(&html, &serde_json::from_str(&manifest).unwrap()).unwrap();
+            let html = crate::notes::archive::with_removed(&html, &format!("{{\"removed:1\": \"{uri}\"}}")).unwrap();
+            std::fs::write(&page, html).unwrap();
+            retire(&f.files, &page, Some(&f.store), false).await.unwrap();
+            assert!(target.exists() && f.files.slides.join("detail.png").canonicalize().is_ok(), "the link still leads to it");
+        }
+
+        #[tokio::test]
+        async fn a_removed_folder_outside_the_slides_keeps_the_embed() {
+            // M02: the preflight let a removed folder that leads out of slides/ pass, and the move refused only after
+            // the embed had left the notes.
+            let f = folder();
+            build(&f, 1).await;
+            let sc = f.store.read().await.unwrap();
+            let embed = embed_line(&sc.slides[0], &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{embed}\n")).unwrap();
+            let outside = f.files.dir.join("elsewhere");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, f.files.slides.join(REMOVED_DIR)).unwrap();
+            let before = std::fs::read_to_string(&f.files.notes).unwrap();
+            assert!(drop_slides(&f.files, &f.store, &[1]).await.unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), before);
+        }
+
+        #[tokio::test]
         async fn a_sweep_gives_way_to_a_running_snapshot() {
             let f = folder();
             build(&f, 2).await;
@@ -1047,6 +1094,9 @@ mod tests {
             std::fs::write(&f.files.notes, format!("# T\n\n{}\n", line(&steps[0]))).unwrap();
             let files = f.files.clone();
             f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 2; Ok(()) }).await.unwrap();
+            // M04: and the dry run says so too.
+            let sc = f.store.read().await.unwrap();
+            assert!(would_take_out(&f.files, &sc, &[Verdict { index: 1, why: Redundant::EarlierStateOf(2) }]).unwrap().is_empty());
             assert!(sweep(&f.files, &f.store, Scope::All, None).await.unwrap().is_empty());
             assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\n{}\n", line(&steps[0])));
         }
