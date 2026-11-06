@@ -1397,7 +1397,7 @@ None had harmed a week folder yet:
 - R31: CLI only, once per run.
 - R32: a module split with no change in behaviour.
 
-*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes four times.
+*Follow-up reviews.* Codex (GPT-6.1 Sol, xhigh) reviewed the fixes five times.
 
 1. **First review:**
    - M01: carried hidden-copy entries bypassed the retention guards and could lose both copies of an image. It came from the R04 and R01 fixes together; clearing now skips `slides/removed`.
@@ -1420,6 +1420,11 @@ already used pulldown-cmark, so `Cargo.lock` gains no crate. The spec states the
    - M10: a lone CR before a CRLF is two line breaks, and joining the lines made it one, so an indented block after it
      lost its blank line and read as text. The reader and the embed edit keep a lone CR as a break, and repair writes it
      as one.
+5. **Fifth review:** M09 resolved, M10 partly.
+   - M11: a snapshot's and a polish's answer is unwrapped before repair, and the unwrapping rejoined lines with LF, so a
+     lone CR's break was gone before repair saw it. Line endings are now made LF when the answer is unwrapped. The fix
+     is the review's own proposed patch, tested through `repair(clean_output(…))` and `polish::validate`, so it was not
+     sent for a sixth review.
 
 Across the 47 notes files in the class folders (29,752 lines), the hand-written and parser readers differ on 88 lines,
 every one read as code by the parser and none an embed: 32 are the notes' `<!-- HH:MM:SS -->` timestamps, and 56 start
@@ -1429,9 +1434,9 @@ build, against 0.017 ms by hand.
 
 *Verification* (2026-11-05):
 
-- The workspace suite (`--no-fail-fast`, 23 test binaries, run in parallel) passed 876 tests with 33 opt-in checks
-  ignored. Three failed: the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6),
-  and the two parallel-only `lecture_gate` failures M7.7 recorded; run serially, `lecture_gate` passed 25 of 25.
+- The workspace suite (`--no-fail-fast`, 23 test binaries, run in parallel) passed 878 tests with 33 opt-in checks
+  ignored. Two failed: the date-dependent `the_failures_scenario_walks_the_table_and_keeps_it_inspectable` (M7.6),
+  and one of the parallel-only `lecture_gate` failures M7.7 recorded; run serially, `lecture_gate` passed 25 of 25.
 - Clippy reported nothing in the changed notes files.
 - Desktop type checking reported no errors, and the 50 frontend tests passed.
 - The R16 thresholds were not measured again on a recorded class.
