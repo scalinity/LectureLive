@@ -866,7 +866,8 @@ the CLI say why ("Slide 199 removed: an earlier state of slide 200"). The sweep 
 2. **At the start of every snapshot** (manual, polish's own, and the last one at stop), over the pending captures, before
    the batch is taken.
 3. **After the lecture, before its polish** (§6.3), over every capture. A capture the notes already embed goes with its
-   embed. The line comes out of the notes first, backed up and written as a polish writes them
+   embed. It goes only for a keeper that will show what it showed: one still pending, which the next snapshot adds, or one
+   the notes still refer to. The line comes out of the notes first, backed up and written as a polish writes them
    (`.live_notes/<stem>_HHMMSS.md`), and only where it stands once, on its own line, outside code; otherwise the capture
    stays. The same rule holds for every removal: a capture nothing in the notes refers to goes as it is, one whose only
    reference is its own embed goes with it, and any other reference keeps it, however it is written. A slide's file is

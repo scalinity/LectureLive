@@ -339,11 +339,15 @@ pub async fn sweep(files: &LectureFiles, store: &Store, scope: Scope, guard: Opt
             }
             // Judged from a copy: what changed since (a removal, an undo, a snapshot) is looked at again here.
             let registered = |sc: &Sidecar, i: u32| sc.slides.iter().any(|s| s.index == i);
+            // A slide the notes already hold goes only for a keeper that will show what it showed: one still pending,
+            // which the next snapshot adds, or one the notes still refer to (the person may have taken its embed out).
+            let doc = std::fs::read_to_string(&files.notes).unwrap_or_default();
+            let shown = |sc: &Sidecar, k: u32| k > sc.notes.slide_index || sc.slides.iter().find(|s| s.index == k).is_some_and(|s| notesfile::references(&doc, &files.dir.join(&s.file), "").mentions > 0);
             let still: Vec<Verdict> = verdicts
                 .into_iter()
                 .filter(|v| registered(sc, v.index) && !sc.pinned_slides.contains(&v.index) && (scope == Scope::All || v.index > sc.notes.slide_index))
                 .filter(|v| match v.why {
-                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k),
+                    Redundant::EarlierStateOf(k) | Redundant::SameAs(k) => registered(sc, k) && (v.index > sc.notes.slide_index || shown(sc, k)),
                 })
                 .collect();
             let gone = take_out(&files, sc, &still.iter().map(|v| v.index).collect::<Vec<_>>())?;
@@ -929,6 +933,19 @@ mod tests {
             assert_eq!(indexes(&gone), [(1, Redundant::EarlierStateOf(3)), (2, Redundant::EarlierStateOf(3))]);
             assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\nFirst.\n\n{}\n", line(&steps[2])));
             assert!(std::fs::read_dir(f.files.state_dir()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".md")), "backed up");
+        }
+
+        #[tokio::test]
+        async fn a_used_slide_stays_when_the_notes_no_longer_show_its_keeper() {
+            // R09: the person took the finished slide's embed out by hand and kept the partial's.
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let line = |s: &SlideEntry| embed_line(s, &f.files.dir, f.files.notes_dir());
+            std::fs::write(&f.files.notes, format!("# T\n\n{}\n", line(&steps[0]))).unwrap();
+            let files = f.files.clone();
+            f.store.update(move |sc| { notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 2; Ok(()) }).await.unwrap();
+            assert!(sweep(&f.files, &f.store, Scope::All, None).await.unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&f.files.notes).unwrap(), format!("# T\n\n{}\n", line(&steps[0])));
         }
 
         #[tokio::test]
