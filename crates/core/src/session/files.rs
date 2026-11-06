@@ -69,6 +69,21 @@ impl LectureFiles {
     }
 }
 
+/// The day a lecture folder opens at (spec §9.1): today when today has notes or lecture state there, or when no earlier
+/// day does; otherwise the latest earlier day that has them, so a week's lecture can be polished, typeset and undone
+/// after its day. Recording is always today's.
+pub fn lecture_day(dir: &Path, today: NaiveDate) -> NaiveDate {
+    let day = |name: &str, suffixes: &[&str]| {
+        let rest = name.strip_prefix("lecture_notes_")?;
+        let stamp = suffixes.iter().find_map(|s| rest.strip_suffix(s))?;
+        NaiveDate::parse_from_str(stamp, "%Y%m%d").ok().filter(|_| stamp.len() == 8)
+    };
+    let names = |d: &Path| std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let notes = names(dir).into_iter().filter_map(|n| day(&n, &[".md"]));
+    let state = names(&dir.join(".live_notes")).into_iter().filter_map(|n| day(&n, &[".v2.json", ".json"]));
+    notes.chain(state).filter(|d| *d <= today).max().unwrap_or(today)
+}
+
 /// The folder above `Weeks/` in `<course>/Weeks/<lecture>`, so each course names itself.
 pub fn course_from_path(dir: &Path) -> Option<String> {
     let parts: Vec<String> = dir.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
@@ -78,6 +93,25 @@ pub fn course_from_path(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_opens_at_today_unless_only_an_earlier_lecture_is_there() {
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let today = day(2026, 11, 5);
+        let dir = tempfile::tempdir().unwrap();
+        let (d, state) = (dir.path(), dir.path().join(".live_notes"));
+        std::fs::create_dir_all(&state).unwrap();
+        assert_eq!(lecture_day(d, today), today, "an empty folder records today");
+        std::fs::write(state.join("lecture_notes_20261020_185916.md"), "").unwrap();
+        std::fs::write(state.join("lecture_notes_20261020.page.json"), "").unwrap();
+        assert_eq!(lecture_day(d, today), today, "backups and caches are no lecture");
+        std::fs::write(state.join("lecture_notes_20261013.v2.json"), "{}").unwrap();
+        std::fs::write(d.join("lecture_notes_20261020.md"), "# T\n").unwrap();
+        std::fs::write(d.join("lecture_notes_20261201.md"), "# T\n").unwrap();
+        assert_eq!(lecture_day(d, today), day(2026, 10, 20), "the latest earlier day, by its notes or its state; none ahead of today");
+        std::fs::write(state.join("lecture_notes_20261105.v2.json"), "{}").unwrap();
+        assert_eq!(lecture_day(d, today), today, "today, once it has begun");
+    }
 
     #[test]
     fn the_standard_files_take_the_clis_names() {

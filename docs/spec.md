@@ -152,7 +152,9 @@ fn list_inputs()  -> Result<Vec<InputInfo>, AudioError>;
 
 The desktop adapter runs one lecture per window: at most one `session::lecture::run`, spawned on
 Tauri's runtime, drives the session; a lecture folder can be open without one, and its notes and
-transcript are then shown from the files. A `Pump` turns each lecture event into one message on one
+transcript are then shown from the files. A folder opens at today's lecture, or, when it holds only earlier days'
+notes or state, at the latest of them, so a lecture can be polished, typeset and undone after its day; a recording is
+always today's, beside it. A `Pump` turns each lecture event into one message on one
 of three streams:
 
 - **status**, a Tauri event: the whole status (phase, folder, source, input level once a second, STT

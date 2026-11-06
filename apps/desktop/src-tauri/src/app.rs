@@ -16,7 +16,7 @@ use lecturelive_core::capture::window::{self, SystemWindows, WindowInfo, WindowS
 use lecturelive_core::notes::chat::{ChatClient, ChatConfig};
 use lecturelive_core::notes::{page, prompts};
 use lecturelive_core::session::coordinator::SessionConfig;
-use lecturelive_core::session::files::{course_from_path, LectureFiles};
+use lecturelive_core::session::files::{course_from_path, lecture_day, LectureFiles};
 use lecturelive_core::session::folder::How;
 use lecturelive_core::session::launch::{self, Retention};
 use lecturelive_core::session::lecture::{self, CaptureSetup, Command, Event, Lecture, Op, SlideWatch};
@@ -271,11 +271,12 @@ pub async fn select_folder(dir: String, app: State<'_, App>, handle: AppHandle) 
     let dir = PathBuf::from(dir).canonicalize().map_err(text)?;
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let course = course_from_path(&dir).or_else(|| std::env::var("LECTURE_COURSE").ok().filter(|c| !c.is_empty())).unwrap_or_else(|| "Lecture".into());
-    let today = Local::now().date_naive();
-    let files = LectureFiles::standard(&dir, today);
+    // The folder's own lecture: today's, or an earlier day's when only that one is there, for its polish and page.
+    let day = lecture_day(&dir, Local::now().date_naive());
+    let files = LectureFiles::standard(&dir, day);
     // Images resolve only inside this lecture's slides/ (spec §9.3).
     handle.asset_protocol_scope().allow_directory(&files.slides, false).map_err(text)?;
-    let folder = OpenFolder { title: prompts::title(&course, &name, today), files, course, name };
+    let folder = OpenFolder { title: prompts::title(&course, &name, day), files, course, name };
     let view = folder_view(&folder);
     let capture = ready_view(&selections_path()?, &folder.course);
     *app.folder.lock().expect("the folder lock") = Some(folder);
@@ -352,6 +353,10 @@ pub async fn start_lecture(source: String, app: State<'_, App>, handle: AppHandl
     let data = data_dir()?;
     let app_ledger = data.join("spend.jsonl");
     spend::take_over(&app_ledger, Path::new(CLI_LEDGER)).map_err(chain)?;
+    // A lecture is always today's: a folder opened at an earlier day's lecture records today's beside it.
+    let today = Local::now().date_naive();
+    let folder = if folder.files.date == today { folder } else { OpenFolder { files: LectureFiles::standard(&folder.files.dir, today), title: prompts::title(&folder.course, &folder.name, today), ..folder } };
+    *app.folder.lock().expect("the folder lock") = Some(folder.clone());
     let files = folder.files.clone();
     let lock = FolderLock::acquire(&files.dir).map_err(chain)?;
     let spend = Spend::open(&app_ledger, &folder.course, &folder.name, files.date).map_err(chain)?;
@@ -607,7 +612,8 @@ fn open_in_browser(path: &Path) -> Res<()> {
 fn idle_lecture(folder: &OpenFolder) -> Res<(Arc<Lecture>, FolderLock)> {
     let key = claude_key()?;
     let lock = FolderLock::acquire(&folder.files.dir).map_err(chain)?;
-    let spend = Spend::open(&data_dir()?.join("spend.jsonl"), &folder.course, &folder.name, folder.files.date).map_err(chain)?;
+    // The ledger's day is the day of the spending, whichever lecture's it is.
+    let spend = Spend::open(&data_dir()?.join("spend.jsonl"), &folder.course, &folder.name, Local::now().date_naive()).map_err(chain)?;
     let chat = ChatClient::new(ChatConfig::new(key), Some(spend.clone())).map_err(chain)?;
     Ok((Arc::new(Lecture { files: folder.files.clone(), course: folder.course.clone(), name: folder.name.clone(), title: folder.title.clone(), chat, spend }), lock))
 }
