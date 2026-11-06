@@ -381,6 +381,27 @@ async fn the_page_a_polish_started_is_cancelled_with_it_and_the_next_typeset_is_
     tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
 }
 
+/// R20: a polish's page still typesetting when the lecture stops holds nothing of the session, so the stop does not
+/// wait for its request to give up.
+#[tokio::test]
+async fn a_stop_is_not_held_up_by_the_page_a_polish_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = files(dir.path());
+    let ledger = dir.path().join("spend.jsonl");
+    folder::open(&f, TITLE, false).unwrap();
+    let sse = fake_sse::start(|b| if b["system"].as_str().unwrap_or_default().starts_with("You build the study page") { Reply::Stall } else { respond(b) }).await;
+    let lec = Arc::new(lecture_for(&f, &sse.url, &ledger));
+    let session = SessionConfig { dir: f.dir.clone(), stem: f.stem.clone(), ..Default::default() };
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    let run = tokio::spawn(lecture::run(lec.clone(), session, Box::new(Idle), SlideWatch { screenshots: None, poll: ms(20) }, None, cmd_rx, ev_tx));
+    cmd.send(Command::Op(Op::Polish)).unwrap();
+    until(&mut ev, "the page being typeset", |e| matches!(e, Event::Busy(m) if m.starts_with("distilling"))).await;
+    cmd.send(Command::Stop).unwrap();
+    // The page's request stalls for its idle timeout (5 s) and once more on its retry.
+    tokio::time::timeout(Duration::from_secs(4), run).await.expect("the stop waits for no page").unwrap().unwrap();
+}
+
 /// A removal the lecture refuses is told to the caller that waits for an answer (the desktop's command), and as a
 /// warning to one that has no reply channel (a typed `remove`, which hears nothing else).
 #[tokio::test]

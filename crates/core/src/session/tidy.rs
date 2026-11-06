@@ -452,36 +452,53 @@ pub struct Retired {
     pub recording_bytes: u64,
 }
 
+/// Every lecture's notes in the folder, `files.notes` first: the days of a folder share `slides/`, so a removed image
+/// any of them names stays. A day's notes that cannot be read stop the clearing.
+fn folder_notes(files: &LectureFiles) -> Result<Vec<String>> {
+    let read = |p: &Path| std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()));
+    let mut docs = vec![read(&files.notes)?];
+    for entry in std::fs::read_dir(&files.dir).with_context(|| format!("list {}", files.dir.display()))? {
+        let path = entry?.path();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if name.starts_with("lecture_notes_") && name.ends_with(".md") && path != files.notes {
+            docs.push(read(&path)?);
+        }
+    }
+    Ok(docs)
+}
+
 /// Spec §7.6: once the study page is finished it is what the lecture keeps, with the notes. The captures it holds are
-/// deleted after each is checked against it, then the images of slides taken out of the lecture and any copies of them
-/// an earlier version kept in the page, and, when no session is recording (`live` false), the recordings. `store` is
-/// the lecture's sidecar, None for a folder that has none.
+/// deleted after each is checked against it. Then, when no session is recording (`live` false) and the lecture has its
+/// sidecar (`store`), the images of slides this lecture took out and any copies of them an earlier version kept in the
+/// page, and the recordings. A removed image any day's notes in the folder still refer to stays, and so does one another
+/// day took out: the days of a folder share `slides/removed/`. During a session a removal can still be undone.
 pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, live: bool) -> Result<Retired> {
     use crate::notes::archive;
     let html = std::fs::read_to_string(page).with_context(|| format!("read {}", page.display()))?;
-    if let Some(lighter) = archive::without_removed(&html) {
-        crate::fsutil::write_atomic(page, lighter.as_bytes()).with_context(|| format!("write {}", page.display()))?;
-    }
     let mut out = Retired::default();
     if archive::script(&html, "capture-files").is_some() {
         out.images = archive::clear(page)?;
     }
-    // A removed image the notes still refer to, however written, stays.
-    let doc = std::fs::read_to_string(&files.notes).with_context(|| format!("read {}", files.notes.display()))?;
-    let removed = archive::clear_removed(&files.dir, |p| notesfile::references(&doc, p, "").mentions > 0 || notesfile::has_alias(&files.slides, p));
+    let Some(store) = store.filter(|_| !live) else { return Ok(out) };
+    let docs = folder_notes(files)?;
+    let named = move |docs: &[String], p: &Path| docs.iter().any(|d| notesfile::references(d, p, "").mentions > 0);
+    if let Some(lighter) = archive::without_removed(&html, files.notes_dir(), |p| named(&docs, p)) {
+        crate::fsutil::write_atomic(page, lighter.as_bytes()).with_context(|| format!("write {}", page.display()))?;
+    }
+    let files = files.clone();
+    let (removed, n, bytes) = store
+        .update(move |sc| {
+            let mine: HashSet<std::ffi::OsString> = sc.removed_slides.iter().filter_map(|s| Path::new(&s.file).file_name().map(|n| n.to_owned())).collect();
+            let removed = archive::clear_removed(&files.dir, |p| !p.file_name().is_some_and(|n| mine.contains(n)) || named(&docs, p) || notesfile::has_alias(&files.slides, p));
+            slides::forget_cleared(&files, sc);
+            let (n, bytes) = crate::session::launch::retire_recordings(&files.dir, sc)?;
+            Ok((removed, n, bytes))
+        })
+        .await?;
     out.images.files += removed.files;
     out.images.bytes += removed.bytes;
     out.images.kept.extend(removed.kept);
-    if let Some(store) = store {
-        let files = files.clone();
-        let (n, bytes) = store
-            .update(move |sc| {
-                slides::forget_cleared(&files, sc);
-                if live { Ok((0, 0)) } else { crate::session::launch::retire_recordings(&files.dir, sc) }
-            })
-            .await?;
-        (out.recordings, out.recording_bytes) = (n, bytes);
-    }
+    (out.recordings, out.recording_bytes) = (n, bytes);
     Ok(out)
 }
 
@@ -678,8 +695,55 @@ mod tests {
             let page = f.files.dir.join("Page.html");
             std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
             let r = retire(&f.files, &page, Some(&f.store), false).await.unwrap();
-            assert_eq!((r.images.files, r.images.kept.len()), (0, 1));
+            assert_eq!((r.images.files, r.images.kept.len()), (0, 0), "kept because it is named: no failure to report");
             assert!(f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap()).exists());
+        }
+
+        /// A page that records itself complete, for the folder's notes as they are now.
+        fn finished_page(f: &Folder) -> PathBuf {
+            let page = f.files.dir.join("Page.html");
+            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+            page
+        }
+
+        #[tokio::test]
+        async fn a_finished_day_clears_only_what_it_took_out_and_no_day_still_names() {
+            // R01: every day of a folder shares slides/removed; retiring one day judged them all by its own notes.
+            let f = folder();
+            let steps = build(&f, 2).await;
+            let files = f.files.clone();
+            f.store.update(move |sc| { slides::remove_in(&files, sc, 1)?; slides::remove_in(&files, sc, 2).map(|_| ()) }).await.unwrap();
+            let removed = |s: &SlideEntry| f.files.slides.join(REMOVED_DIR).join(Path::new(&s.file).file_name().unwrap());
+            // Another day in the folder: one removal of its own, and notes naming this day's second removed image.
+            let other = LectureFiles::standard(&f.files.dir, chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap());
+            let theirs = SlideEntry { index: 7, file: "slides/slide_07_090000.png".into(), shown_at: Local::now(), auto: true, uncertain: false };
+            slide(0, 4).save(f.files.slides.join(REMOVED_DIR).join("slide_07_090000.png")).unwrap();
+            Sidecar { removed_slides: vec![theirs], ..Sidecar::default() }.save(&other.sidecar()).unwrap();
+            let digits = &Path::new(&steps[1].file).file_stem().unwrap().to_string_lossy()[9..];
+            std::fs::write(&other.notes, format!("# Monday\n\nAs on slide_02_{digits} today.\n")).unwrap();
+            std::fs::write(&f.files.notes, "# T\n").unwrap();
+            let page = finished_page(&f);
+            retire(&f.files, &page, Some(&f.store), false).await.unwrap();
+            assert!(!removed(&steps[0]).exists(), "this day's own, which no notes name, goes");
+            assert!(removed(&steps[1]).exists(), "another day's notes still name it");
+            assert!(f.files.slides.join(REMOVED_DIR).join("slide_07_090000.png").exists(), "another day's removal is that day's");
+            assert_eq!(f.store.read().await.unwrap().removed_slides.iter().map(|s| s.index).collect::<Vec<_>>(), [2], "undo keeps what stays");
+        }
+
+        #[tokio::test]
+        async fn during_a_session_or_without_a_sidecar_removed_images_stay() {
+            // R11: a page typeset during the lecture must not end its undo, nor race the capture's removals.
+            let f = folder();
+            let steps = build(&f, 1).await;
+            let files = f.files.clone();
+            f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
+            std::fs::write(&f.files.notes, "# T\n").unwrap();
+            let page = finished_page(&f);
+            let gone = f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap());
+            retire(&f.files, &page, Some(&f.store), true).await.unwrap();
+            retire(&f.files, &page, None, false).await.unwrap();
+            assert!(gone.exists());
+            assert_eq!(f.store.read().await.unwrap().removed_slides.len(), 1);
         }
 
         #[tokio::test]

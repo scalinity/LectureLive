@@ -775,9 +775,12 @@ snapshot. Otherwise:
 - **Captures the page holds** are deleted, each after a check. The page contains a small manifest mapping capture paths
   and source hashes to its embedded gallery images, and cleanup checks both the source and the saved image before
   deleting a file. A changed file, unreadable file, external path or symlink stays.
-- **Images of slides taken out of the lecture** (`slides/removed/`) are deleted with their folder, and so is any copy of
-  them an earlier page kept. Undo has nothing left to restore: their records leave the sidecar, and their numbers stay
-  reserved (`reserved_index`).
+- **Images of slides taken out of the lecture** (`slides/removed/`) are deleted, outside a session and only for a
+  lecture with its sidecar, and so is any copy of them an earlier page kept. Only the images this lecture's sidecar took
+  out go: the days of a folder share `slides/removed/`, so another day's stay, and so does any image, or earlier copy,
+  that any day's notes in the folder still refer to. Undo has nothing left to restore: their records leave the sidecar,
+  and their numbers stay reserved (`reserved_index`). During a session a polish's page clears only the captures it
+  holds, so every removal of the lecture can still be undone.
 - **Recordings**, outside a session: each closed recording with no unresolved gap, and no transcript still open on it, is deleted as retention deletes one
   (§4.4) and marked deleted in the sidecar, and the emptied `recordings/` goes. `lecture audit` reports it as deleted.
 

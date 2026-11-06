@@ -355,15 +355,17 @@ impl Lecture {
         // notes and the page sends every slide (spec §7.7).
         sweep_slides(&self.files, &store, Scope::All, None, events).await;
         if self.polish(&store, events).await {
-            self.page_after_polish(&store, false, events).await;
+            self.page_after_polish(Some(&store), false, events).await;
         }
         Ok(())
     }
 
-    /// Retire capture files only after both polish and its self-contained page succeeded.
-    async fn page_after_polish(&self, store: &Store, live: bool, events: &UnboundedSender<Event>) {
+    /// Retire capture files only after both polish and its self-contained page succeeded. During a session (`live`)
+    /// only the captures the page holds go, which needs no sidecar: the page's task holds no store, so it never keeps
+    /// the session's writer open past a stop.
+    async fn page_after_polish(&self, store: Option<&Store>, live: bool, events: &UnboundedSender<Event>) {
         if let Ok(page) = self.page(events).await {
-            self.retire(&page, Some(store), live, events).await;
+            self.retire(&page, store, live, events).await;
         }
     }
 
@@ -449,9 +451,9 @@ async fn notes_worker(lec: Arc<Lecture>, store: Store, mut ops: UnboundedReceive
             Op::Polish => {
                 if lec.polish_with(&store, &events, &mut cancel).await {
                     // Typesetting takes minutes and reads only the polished file: snapshots are not held up by it.
-                    let (l, ev, st) = (lec.clone(), events.clone(), store.clone());
+                    let (l, ev) = (lec.clone(), events.clone());
                     pages.lock().expect("the page list").push(tokio::spawn(async move {
-                        l.page_after_polish(&st, true, &ev).await;
+                        l.page_after_polish(None, true, &ev).await;
                     }));
                 }
             }

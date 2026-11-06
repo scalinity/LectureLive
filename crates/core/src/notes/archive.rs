@@ -103,21 +103,37 @@ fn with_script(html: &str, id: &str, json: &str) -> Result<String> {
 }
 
 /// The page without the hidden copies of removed captures that earlier versions kept for undo (spec §7.6): once the
-/// page is finished, what was taken out of the lecture is gone.
-pub fn without_removed(html: &str) -> Option<String> {
-    SCRIPTS.captures_iter(html).find(|c| &c[1] == "removed-captures").map(|old| html.replacen(&old[0], "", 1))
+/// page is finished, what was taken out of the lecture is gone, except the copy of a file `keep` says is still referred
+/// to (once its file was cleared, the copy is the only one). None when there is nothing to drop, or the copies cannot
+/// be read, which keeps them.
+pub fn without_removed(html: &str, dir: &Path, keep: impl Fn(&Path) -> bool) -> Option<String> {
+    let old = SCRIPTS.captures_iter(html).find(|c| &c[1] == "removed-captures")?;
+    let copies: BTreeMap<String, String> = serde_json::from_str(&old[2]).ok()?;
+    let manifest: Manifest = script(html, "capture-files").map(|s| serde_json::from_str(&s)).transpose().ok()?.unwrap_or_default();
+    let file_of = |key: &str| manifest.iter().find(|(_, c)| c.slide == key).map(|(f, _)| dir.join(f));
+    let kept: BTreeMap<&String, &String> = copies.iter().filter(|(key, _)| file_of(key).is_some_and(|f| keep(&f))).collect();
+    if kept.len() == copies.len() {
+        return None;
+    }
+    if kept.is_empty() {
+        return Some(html.replacen(&old[0], "", 1));
+    }
+    with_script(html, "removed-captures", &serde_json::to_string(&kept).ok()?.replace("</", "<\\/")).ok()
 }
 
 /// Deletes the images of slides taken out of the lecture (`slides/removed/`) and the emptied folder: regular image
-/// files directly inside it only, and none that `keep` says is still referred to. Returns the files and bytes deleted,
-/// and what was left.
+/// files directly inside it only, and none that `keep` says stays. Returns the files and bytes deleted, and what could
+/// not be: an entry that is no plain image there, or a delete that failed (what `keep` keeps is no failure).
 pub fn clear_removed(dir: &Path, keep: impl Fn(&Path) -> bool) -> Cleanup {
     let mut out = Cleanup::default();
     let folder = dir.join("slides/removed");
     let Ok(entries) = std::fs::read_dir(&folder) else { return out };
     for entry in entries.flatten() {
         let Ok(relative) = entry.path().strip_prefix(dir).map(|p| p.to_string_lossy().into_owned()) else { continue };
-        let Some(path) = capture_path(dir, &relative).filter(|p| !keep(p)) else {
+        if keep(&entry.path()) {
+            continue;
+        }
+        let Some(path) = capture_path(dir, &relative) else {
             out.kept.push(relative);
             continue;
         };
@@ -215,6 +231,19 @@ mod tests {
         image::RgbImage::from_pixel(32, 18, image::Rgb([70, 90, 110])).save(&image).unwrap();
         std::fs::write(&files.notes, "# Lecture\n![Slide 7](slides/slide_07_100000.png)\n").unwrap();
         (dir, files, image)
+    }
+
+    #[test]
+    fn a_hidden_copy_the_notes_still_name_is_kept_when_the_others_go() {
+        // R23: an earlier page's copies of removed captures, the only ones once their files were cleared.
+        let dir = Path::new("/lec");
+        let manifest = r#"{"slides/removed/slide_03_100000.png":{"slide":"removed:3","sha256":"a","image_sha256":"b"},"slides/removed/slide_04_100100.png":{"slide":"removed:4","sha256":"c","image_sha256":"d"}}"#;
+        let html = format!("<html><body><script type=\"application/json\" id=\"capture-files\">{manifest}</script><script type=\"application/json\" id=\"removed-captures\">{{\"removed:3\": \"data:image/png;base64,AAA\", \"removed:4\": \"data:image/png;base64,BBB\"}}</script></body></html>");
+        let named = |p: &Path| p.ends_with("slide_04_100100.png");
+        let lighter = without_removed(&html, dir, named).unwrap();
+        assert!(!lighter.contains("removed:3\": ") && lighter.contains("BBB"), "{lighter}");
+        assert_eq!(without_removed(&lighter, dir, named), None, "nothing more to drop");
+        assert!(!without_removed(&html, dir, |_| false).unwrap().contains("removed-captures"));
     }
 
     fn render(files: &LectureFiles) -> PathBuf {
