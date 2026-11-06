@@ -78,10 +78,20 @@ fn parts(html: &str) -> Result<(Manifest, BTreeMap<String, String>)> {
 
 pub fn manifest_json(manifest: &Manifest) -> Result<String> { Ok(serde_json::to_string(manifest)?.replace("</", "<\\/")) }
 
-/// The page with what it records of itself (spec §7.6): whether it was typeset with every part §6.4 promises. Written in
-/// the same atomic write as the page, so it describes the page on disk and not a cache saved before it.
-pub fn with_status(html: &str, complete: bool) -> Result<String> {
-    with_script(html, "page-status", &serde_json::json!({ "complete": complete }).to_string())
+/// The page with what it records of itself (spec §7.6): whether it was typeset with every part §6.4 promises, and the
+/// fingerprint of the notes it was typeset from (`typeset_from`, when known). Written in the same atomic write as the
+/// page, so it describes the page on disk and not a cache saved before it.
+pub fn with_status(html: &str, complete: bool, typeset_from: Option<&str>) -> Result<String> {
+    let mut status = serde_json::json!({ "complete": complete });
+    if let Some(doc) = typeset_from {
+        status["notes"] = sha256_hex(doc.as_bytes()).into();
+    }
+    with_script(html, "page-status", &status.to_string())
+}
+
+/// The fingerprint of the notes the page was typeset from; None when it records none.
+pub fn typeset_from(html: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&script(html, "page-status")?).ok()?["notes"].as_str().map(str::to_string)
 }
 
 /// Whether the page records that it is complete; None when it records nothing, as pages typeset before M7.6 do.
@@ -253,7 +263,7 @@ mod tests {
 
     fn render(files: &LectureFiles) -> PathBuf {
         let fills = Fills { keystone: "k".into(), summary: "s".into(), content: "<img src=\"slides/slide_07_100000.png\">".into(), slides: r#"{"7":"slides/slide_07_100000.png"}"#.into() };
-        page::render(&fills, "Test course", &files.notes, "Week 01 — Test", page::TEMPLATE).unwrap()
+        page::render(&fills, "Test course", &files.notes, "Week 01 — Test", page::TEMPLATE, None).unwrap()
     }
 
     #[test]

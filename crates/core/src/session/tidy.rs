@@ -474,6 +474,8 @@ fn folder_notes(files: &LectureFiles) -> Result<Vec<String>> {
 /// day took out: the days of a folder share `slides/removed/`. During a session a removal can still be undone.
 pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, live: bool) -> Result<Retired> {
     use crate::notes::archive;
+    // One rule for every caller (a polish, `lecture page`, `lecture tidy`): only a finished page lets anything go.
+    finished(files, page).map_err(|why| anyhow::anyhow!("the study page is not finished ({why}), so nothing was cleared"))?;
     let html = std::fs::read_to_string(page).with_context(|| format!("read {}", page.display()))?;
     let mut out = Retired::default();
     if archive::script(&html, "capture-files").is_some() {
@@ -502,19 +504,26 @@ pub async fn retire(files: &LectureFiles, page: &Path, store: Option<&Store>, li
     Ok(out)
 }
 
-/// Whether a study page already on disk is finished, so `lecture tidy` may let go of what it replaces (spec §7.6): the
-/// page records, in the HTML itself, that it was typeset with every part §6.4 promises (the same rule as after a
-/// polish), and it holds every slide the notes embed. Says why not otherwise.
+/// Whether a study page already on disk is finished, so what it replaces may go (spec §7.6): the page records, in the
+/// HTML itself, that it was typeset with every part §6.4 promises, from the notes as they are now, and it holds every
+/// file the notes embed, by its manifest and a verified gallery image (labels can repeat). Says why not otherwise.
 pub fn finished(files: &LectureFiles, page: &Path) -> Result<(), String> {
+    use crate::notes::archive;
     let (Ok(html), Ok(doc)) = (std::fs::read_to_string(page), std::fs::read_to_string(&files.notes)) else { return Err("no study page yet".into()) };
-    match crate::notes::archive::complete(&html) {
+    match archive::complete(&html) {
         None => return Err("it does not record whether it is complete".into()),
         Some(false) => return Err("it lacks parts a study page has".into()),
         Some(true) => {}
     }
-    let Some(gallery) = crate::notes::archive::script(&html, "slides").and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok()) else { return Err("it has no slide gallery".into()) };
-    let held = crate::notes::embeds::embeds_in(&doc).iter().filter_map(|e| e.strip_prefix("![Slide ")?.split(']').next().map(str::to_string)).all(|n| gallery.get(&n).is_some_and(|u| u.starts_with("data:image/")));
-    if held { Ok(()) } else { Err("it lacks slides the notes embed".into()) }
+    match archive::typeset_from(&html) {
+        None => return Err("it was typeset before pages recorded their notes; `lecture page` typesets it again".into()),
+        Some(sha) if sha != notesfile::sha256_hex(doc.as_bytes()) => return Err("the notes changed since it was typeset; `lecture page` typesets it again".into()),
+        Some(_) => {}
+    }
+    let Some(gallery) = archive::script(&html, "slides").and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok()) else { return Err("it has no slide gallery".into()) };
+    let manifest: archive::Manifest = archive::script(&html, "capture-files").and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
+    let held = |p: &str| manifest.get(p).is_some_and(|c| gallery.get(&c.slide).is_some_and(|u| archive::image(u).is_some() && notesfile::sha256_hex(u.as_bytes()) == c.image_sha256));
+    if crate::notes::page::slide_embeds(&doc).iter().all(|(_, p)| held(p)) { Ok(()) } else { Err("it lacks slides the notes embed".into()) }
 }
 
 #[cfg(test)]
@@ -564,12 +573,56 @@ mod tests {
             let all = ["widget", "eli5", "everyday", "glossary", "takeaways", "quiz"].iter().map(|c| format!("<p class=\"{c}\"></p>")).collect::<String>();
             std::fs::write(files.page_cache(), serde_json::json!({"source": "k", "fills": {"keystone": "k", "summary": "s", "content": format!("<section class=\"part\">{all}</section>"), "slides": "{}"}, "words": 1, "budget": 1}).to_string()).unwrap();
             assert!(finished(&files, &page).unwrap_err().contains("does not record"), "even with no slides to hold");
-            std::fs::write(&page, crate::notes::archive::with_status(&html(""), false).unwrap()).unwrap();
+            let notes = "# T\n\nNo slides.\n";
+            std::fs::write(&page, crate::notes::archive::with_status(&html(""), false, Some(notes)).unwrap()).unwrap();
             assert!(finished(&files, &page).unwrap_err().contains("lacks parts"));
-            std::fs::write(&page, crate::notes::archive::with_status(&html(""), true).unwrap()).unwrap();
+            std::fs::write(&page, crate::notes::archive::with_status(&html(""), true, None).unwrap()).unwrap();
+            assert!(finished(&files, &page).unwrap_err().contains("before pages recorded their notes"));
+            std::fs::write(&page, crate::notes::archive::with_status(&html(""), true, Some(notes)).unwrap()).unwrap();
             assert_eq!(finished(&files, &page), Ok(()));
-            std::fs::write(&files.notes, "# T\n\n![Slide 3](slides/slide_03_100000.png)\n").unwrap();
+            // R19: a page typeset from earlier notes is not the page of these, whatever ran since.
+            let embedding = "# T\n\n![Slide 3](slides/slide_03_100000.png)\n";
+            std::fs::write(&files.notes, embedding).unwrap();
+            assert!(finished(&files, &page).unwrap_err().contains("notes changed"));
+            std::fs::write(&page, crate::notes::archive::with_status(&html(""), true, Some(embedding)).unwrap()).unwrap();
             assert!(finished(&files, &page).unwrap_err().contains("slides the notes embed"));
+        }
+
+        #[test]
+        fn a_page_holds_a_slide_by_its_file_not_its_label() {
+            // R08: two files labelled Slide 1, and a page from before M7.7 whose gallery kept only the first.
+            let dir = tempfile::tempdir().unwrap();
+            let files = LectureFiles::standard(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 9, 22).unwrap());
+            let notes = "# T\n\n![Slide 1](slides/slide_01_100000.png)\n\n![Slide 1](slides/slide_03_100200.png)\n";
+            std::fs::write(&files.notes, notes).unwrap();
+            let shot = dir.path().join("shot.png");
+            image::RgbImage::from_pixel(8, 6, image::Rgb([20, 120, 220])).save(&shot).unwrap();
+            let uri = crate::notes::page::slide_uri(&shot).unwrap();
+            let entry = |slide: &str| format!(r#"{{"slide":"{slide}","sha256":"a","image_sha256":"{}"}}"#, notesfile::sha256_hex(uri.as_bytes()));
+            let page_with = |manifest: String, gallery: String| {
+                let html = format!("<html><body><script type=\"application/json\" id=\"slides\">{gallery}</script><script type=\"application/json\" id=\"capture-files\">{manifest}</script></body></html>");
+                let page = dir.path().join("Page.html");
+                std::fs::write(&page, crate::notes::archive::with_status(&html, true, Some(notes)).unwrap()).unwrap();
+                page
+            };
+            let old = page_with(format!(r#"{{"slides/slide_01_100000.png":{}}}"#, entry("1")), format!(r#"{{"1":"{uri}"}}"#));
+            assert!(finished(&files, &old).unwrap_err().contains("slides the notes embed"), "the second file is in no gallery");
+            let both = page_with(format!(r#"{{"slides/slide_01_100000.png":{},"slides/slide_03_100200.png":{}}}"#, entry("1"), entry("3")), format!(r#"{{"1":"{uri}","3":"{uri}"}}"#));
+            assert_eq!(finished(&files, &both), Ok(()));
+        }
+
+        #[tokio::test]
+        async fn nothing_goes_after_a_page_that_is_not_finished() {
+            // The same rule for every caller: a polish, `lecture page` and `lecture tidy`.
+            let f = folder();
+            let steps = build(&f, 1).await;
+            let files = f.files.clone();
+            f.store.update(move |sc| slides::remove_in(&files, sc, 1).map(|_| ())).await.unwrap();
+            std::fs::write(&f.files.notes, "# T\n").unwrap();
+            let page = finished_page(&f);
+            std::fs::write(&f.files.notes, "# T\n\nEdited after the page.\n").unwrap();
+            assert!(retire(&f.files, &page, Some(&f.store), false).await.unwrap_err().to_string().contains("not finished"));
+            assert!(f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap()).exists());
         }
 
         use crate::capture::compare::tests::slide;
@@ -692,18 +745,20 @@ mod tests {
             let name = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().replacen("slide_", "%73lide_", 1);
             let shouted = Path::new(&steps[0].file).file_name().unwrap().to_string_lossy().to_uppercase().replace('_', "\\_");
             std::fs::write(&f.files.notes, format!("# T\n\n![detail][s]\n\n[s]: slides/removed/{name}#detail\n\n<img src=\"slides/removed/{shouted}\">\n")).unwrap();
-            let page = f.files.dir.join("Page.html");
-            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+            let page = finished_page(&f);
             let r = retire(&f.files, &page, Some(&f.store), false).await.unwrap();
             assert_eq!((r.images.files, r.images.kept.len()), (0, 0), "kept because it is named: no failure to report");
             assert!(f.files.slides.join(REMOVED_DIR).join(Path::new(&steps[0].file).file_name().unwrap()).exists());
         }
 
-        /// A page that records itself complete, for the folder's notes as they are now.
+        /// A finished page for the folder's notes as they are now: every part, and every slide the notes embed.
         fn finished_page(f: &Folder) -> PathBuf {
-            let page = f.files.dir.join("Page.html");
-            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
-            page
+            use crate::notes::page;
+            let notes = std::fs::read_to_string(&f.files.notes).unwrap();
+            let parts: String = ["widget", "eli5", "everyday", "glossary", "takeaways", "quiz"].iter().map(|c| format!("<p class=\"{c}\"></p>")).collect();
+            let slides: serde_json::Map<String, serde_json::Value> = page::slide_embeds(&notes).into_iter().map(|(n, p)| (n, p.into())).collect();
+            let fills = page::Fills { keystone: "k".into(), summary: "s".into(), content: format!("<section class=\"part\">{parts}</section>"), slides: serde_json::Value::Object(slides).to_string() };
+            page::render(&fills, "Course", &f.files.notes, "Week 01 — Test", page::TEMPLATE, Some(&notes)).unwrap()
         }
 
         #[tokio::test]
@@ -758,8 +813,7 @@ mod tests {
             std::os::unix::fs::symlink(f.files.dir.join(&steps[1].file), f.files.slides.join("other.png")).unwrap();
             std::fs::write(&f.files.notes, "# T\n\n![detail](slides/detail.png)\n\n![other](slides/other.png)\n").unwrap();
             assert!(drop_slides(&f.files, &f.store, &[2]).await.unwrap().is_empty(), "a registered slide with a link to it stays");
-            let page = f.files.dir.join("Page.html");
-            std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+            let page = finished_page(&f);
             retire(&f.files, &page, Some(&f.store), false).await.unwrap();
             assert!(target.exists() && f.files.slides.join("detail.png").canonicalize().is_ok(), "the link still leads to it");
         }
@@ -793,8 +847,7 @@ mod tests {
                 let embed = embed_line(sc.slides.iter().find(|s| s.index == 2).unwrap(), &f.files.dir, f.files.notes_dir());
                 std::fs::write(&f.files.notes, format!("# T\n\n{embed}\n\n{}\n\n{}\n", named(0, "slides/removed/"), named(1, "slides/"))).unwrap();
                 assert!(drop_slides(&f.files, &f.store, &[2]).await.unwrap().is_empty(), "{what}: slide 2, named beside its embed, stays");
-                let page = f.files.dir.join("Page.html");
-                std::fs::write(&page, crate::notes::archive::with_status("<html><body><script type=\"application/json\" id=\"slides\">{}</script></body></html>", true).unwrap()).unwrap();
+                let page = finished_page(&f);
                 retire(&f.files, &page, Some(&f.store), false).await.unwrap();
                 assert!(target.exists(), "{what}: the removed image it names stays");
             }

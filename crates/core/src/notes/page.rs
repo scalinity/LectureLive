@@ -253,7 +253,8 @@ pub fn rerender_saved(cache: &Path, course: &str, notes: &Path, lecture_name: &s
     }) {
         return Some(Err(anyhow::anyhow!("{lost} cannot be read again, so the study page was left as it was")));
     }
-    Some(render(&fills, course, notes, lecture_name, TEMPLATE))
+    // Parts typeset from notes it cannot name: the page records none, so it never counts as made from these.
+    Some(render(&fills, course, notes, lecture_name, TEMPLATE, None))
 }
 
 pub fn load_cache(path: &Path, key: &str) -> Option<(Fills, usize)> {
@@ -271,8 +272,14 @@ pub fn save_cache(path: &Path, key: &str, fills: &Fills, words: usize, budget: u
     write_atomic(path, dumps(&json!({"source": key, "fills": fills.to_json(), "words": words, "budget": budget})).as_bytes())
 }
 
-/// The page's HTML, written atomically beside the notes; slides are read fresh and embedded.
-pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, template: &str) -> Result<PathBuf> {
+/// Each `![Slide N](path)` embed in the notes, as (label, path), in order.
+pub fn slide_embeds(doc: &str) -> Vec<(String, String)> {
+    SLIDE_EMBED.captures_iter(doc).map(|c| (c[1].to_string(), c[2].to_string())).collect()
+}
+
+/// The page's HTML, written atomically beside the notes; slides are read fresh and embedded. `typeset_from` is the
+/// notes the parts were typeset from, recorded in the page when known.
+pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, template: &str, typeset_from: Option<&str>) -> Result<PathBuf> {
     let (week, title) = match lecture_name.split_once(" — ") {
         Some((w, t)) if !t.is_empty() => (w, t),
         _ => ("", lecture_name),
@@ -355,7 +362,7 @@ pub fn render(fills: &Fills, course: &str, notes: &Path, lecture_name: &str, tem
     if let Some((copies, _)) = &carried {
         html = archive::with_removed(&html, copies)?;
     }
-    let html = archive::with_status(&html, fills.missing().is_empty())?;
+    let html = archive::with_status(&html, fills.missing().is_empty(), typeset_from)?;
     write_atomic(&path, html.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
@@ -416,7 +423,7 @@ fn page_key(system: &str, doc: &str, extra: &str, labelled: &[(String, String)],
 pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Path, lecture_name: &str, template: &str, progress: &(dyn Fn(String) + Send + Sync)) -> Result<PageOutcome> {
     let doc = std::fs::read_to_string(notes).with_context(|| format!("read {}", notes.display()))?;
     let budget = page_budget(&doc);
-    let labelled: Vec<(String, String)> = SLIDE_EMBED.captures_iter(&doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
+    let labelled = slide_embeds(&doc);
     let embeds = numbered(&labelled);
     let system = page_system(course, budget, max_slides(embeds.len()));
     let dir = notes.parent().unwrap_or(Path::new("."));
@@ -449,7 +456,7 @@ pub async fn make_page(chat: &ChatClient, course: &str, notes: &Path, cache: &Pa
             (fills, words, false)
         }
     };
-    let path = render(&fills, course, notes, lecture_name, template)?;
+    let path = render(&fills, course, notes, lecture_name, template, Some(&doc))?;
     Ok(PageOutcome { path, words, budget, cached, missing: fills.missing() })
 }
 
@@ -592,7 +599,7 @@ mod tests {
         let page_of = |doc: &str| {
             std::fs::write(&notes, doc).unwrap();
             let labelled: Vec<(String, String)> = SLIDE_EMBED.captures_iter(doc).map(|c| (c[1].to_string(), c[2].to_string())).collect();
-            let path = render(&cut("<h2>A</h2><p>x</p>", &numbered(&labelled)), "Course", &notes, "Week 05 — Old", TEMPLATE).unwrap();
+            let path = render(&cut("<h2>A</h2><p>x</p>", &numbered(&labelled)), "Course", &notes, "Week 05 — Old", TEMPLATE, None).unwrap();
             let html = std::fs::read_to_string(path).unwrap();
             let slides = html.split("<script type=\"application/json\" id=\"slides\">").nth(1).unwrap().split("</script>").next().unwrap().to_string();
             serde_json::from_str::<Value>(&slides).unwrap().as_object().unwrap().len()
@@ -615,7 +622,7 @@ mod tests {
         let page = page_path(&notes, "Week 01 — Old");
         std::fs::write(&page, "the only copy").unwrap();
         let fills = cut("<h2>A</h2><p>x</p>", &[("1".into(), "slides/slide_01_100000.png".into())]);
-        assert!(render(&fills, "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap_err().to_string().contains("cannot be read again"));
+        assert!(render(&fills, "Course", &notes, "Week 01 — Old", TEMPLATE, None).unwrap_err().to_string().contains("cannot be read again"));
         assert_eq!(std::fs::read_to_string(&page).unwrap(), "the only copy");
     }
 
@@ -634,7 +641,7 @@ mod tests {
         std::fs::write(&page, format!("<html><body><script type=\"application/json\" id=\"slides\">{{}}</script><script type=\"application/json\" id=\"capture-files\">{manifest}</script><script type=\"application/json\" id=\"removed-captures\">{{\"removed:3\": \"{uri}\"}}</script></body></html>")).unwrap();
         assert!(Archive::load(dir.path()).uri(&removed).is_some(), "the fixture is a copy undo can use");
         let incomplete = Fills { keystone: String::new(), summary: "s".into(), content: "c".into(), slides: "{}".into() };
-        render(&incomplete, "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap();
+        render(&incomplete, "Course", &notes, "Week 01 — Old", TEMPLATE, None).unwrap();
         assert!(Archive::load(dir.path()).uri(&removed).is_some(), "still there for undo");
     }
 
@@ -646,10 +653,10 @@ mod tests {
         let file = dir.path().join("slides/slide_05_100000.png");
         png(&file);
         std::fs::write(&notes, "# T\n\n![Slide 5](slides/slide_05_100000.png)\n").unwrap();
-        render(&cut("<h2>A</h2><p>x</p>", &[("5".into(), "slides/slide_05_100000.png".into())]), "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap();
+        render(&cut("<h2>A</h2><p>x</p>", &[("5".into(), "slides/slide_05_100000.png".into())]), "Course", &notes, "Week 01 — Old", TEMPLATE, None).unwrap();
         std::fs::remove_file(&file).unwrap();
         std::fs::write(&notes, "# T\n\n<img src=\"slides/slide_05_100000.png\">\n").unwrap();
-        let path = render(&cut("<h2>A</h2><p>x</p>", &[]), "Course", &notes, "Week 01 — Old", TEMPLATE).unwrap();
+        let path = render(&cut("<h2>A</h2><p>x</p>", &[]), "Course", &notes, "Week 01 — Old", TEMPLATE, None).unwrap();
         let html = std::fs::read_to_string(path).unwrap();
         let gallery: HashMap<String, String> = serde_json::from_str(&archive::script(&html, "slides").unwrap()).unwrap();
         assert!(gallery.values().any(|u| u.starts_with("data:image/")), "{gallery:?}");

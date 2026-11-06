@@ -768,9 +768,12 @@ used slides lose the removal control.
 
 ### 7.6 Clearing after the finished page
 
-Once the study page is complete (every part §6.4 asks for), it is what the lecture keeps, with the notes and the
-transcript. A failed or incomplete page keeps everything, and pending images absent from the page stay for the next
-snapshot. Otherwise:
+Once the study page is finished, it is what the lecture keeps, with the notes and the transcript. Finished means the
+page records, in the same atomic write as itself, that it has every part §6.4 asks for and the fingerprint of the notes
+it was typeset from, those notes are the notes as they are now, and its manifest and gallery hold every file the notes
+embed (by file: labels can repeat). The same rule gates a polish's page, `lecture page` and `lecture tidy`. A failed,
+incomplete or out-of-date page keeps everything, and pending images absent from the page stay for the next snapshot.
+Otherwise:
 
 - **Captures the page holds** are deleted, each after a check. The page contains a small manifest mapping capture paths
   and source hashes to its embedded gallery images, and cleanup checks both the source and the saved image before

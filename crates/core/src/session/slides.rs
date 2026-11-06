@@ -459,7 +459,7 @@ mod tests {
         remove(&files, &store, 2, idle()).await.unwrap();
         std::fs::write(&files.notes, "# Lecture").unwrap();
         let fills = crate::notes::page::Fills { keystone: "k".into(), summary: "s".into(), content: "c".into(), slides: "{}".into() };
-        let page = crate::notes::page::render(&fills, "Test", &files.notes, "Week 01 — Test", crate::notes::page::TEMPLATE).unwrap();
+        let page = crate::notes::page::render(&fills, "Test", &files.notes, "Week 01 — Test", crate::notes::page::TEMPLATE, None).unwrap();
         let html = std::fs::read_to_string(&page).unwrap();
         assert_eq!(crate::notes::archive::script(&html, "slides").unwrap(), "{}", "a removed image stays out of the gallery");
         assert!(crate::notes::archive::script(&html, "removed-captures").is_none(), "and the page keeps no copy of it");
