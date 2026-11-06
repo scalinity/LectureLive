@@ -240,6 +240,8 @@ impl Pump {
                 let name = backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.notice(NoticeKind::Done, "Polished", &format!("previous version in .live_notes/{name}, {}", money(usd)));
             }
+            // The document changed under the notes pane: it reads it again, as after a polish.
+            Event::NotesEdited { revision } => self.emit(Stream::Notes, NotesMsg::Polished { revision }),
             Event::PolishStopped(m) => self.failed("Polish stopped", &m),
             Event::PolishFailed(m) => self.failed("Polish failed", &m),
             Event::Page { outcome, usd } => {
@@ -745,6 +747,15 @@ mod tests {
         assert_eq!(n[2]["revision"].as_u64(), Some(4));
         assert_eq!([n[4]["outcome"].as_str(), n[5]["outcome"].as_str(), n[6]["outcome"].as_str()], [Some("failed"), Some("nothing_new"), Some("cancelled")]);
         assert_eq!(n[7]["revision"].as_u64(), Some(5));
+    }
+
+    #[test]
+    fn notes_a_sweep_edited_are_read_again() {
+        // R21: the sweep before a polish takes embeds out; the notes pane reads the file even when the polish fails.
+        let (mut p, sink) = pump();
+        p.apply(Event::NotesEdited { revision: 7 });
+        let n = sink.on(Stream::Notes);
+        assert_eq!((n[0]["type"].as_str(), n[0]["revision"].as_u64()), (Some("polished"), Some(7)));
     }
 
     #[test]

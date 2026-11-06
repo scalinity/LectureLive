@@ -120,6 +120,9 @@ pub enum Event {
     Thinking(String),
     /// A slide was taken out: by the person (spec §7.5, no reason), or because it was redundant (§7.7).
     SlideRemoved { index: u32, reason: Option<Redundant> },
+    /// The notes were edited outside a snapshot or a polish (a sweep took embeds out with their slides), now at this
+    /// revision: what shows them reads them again.
+    NotesEdited { revision: u64 },
     SlideRestored(SlideEntry),
     /// What a finished page let go (spec §7.6): images it holds or that were taken out, and recordings.
     CapturesArchived { files: usize, bytes: u64, recordings: usize, recording_bytes: u64 },
@@ -762,10 +765,17 @@ fn slide_event(s: &SlideEntry) -> Event {
 /// Spec §7.7: takes out the redundant captures `scope` covers, and says which and why. Looking can fail (a file
 /// unreadable, the sidecar not saved); that is a warning, never a reason to stop what asked.
 async fn sweep_slides(files: &LectureFiles, store: &Store, scope: Scope, guard: Option<Arc<AtomicBool>>, events: &UnboundedSender<Event>) {
+    let before = store.read().await.map(|sc| sc.notes.revision).ok();
     match tidy::sweep(files, store, scope, guard).await {
         Ok(gone) => {
             for (s, why) in gone {
                 let _ = events.send(Event::SlideRemoved { index: s.index, reason: Some(why) });
+            }
+            // A removal that took an embed out changed the notes, whatever the polish after it does.
+            if let Ok(after) = store.read().await.map(|sc| sc.notes.revision) {
+                if before.is_some_and(|b| b != after) {
+                    let _ = events.send(Event::NotesEdited { revision: after });
+                }
             }
         }
         Err(e) => {

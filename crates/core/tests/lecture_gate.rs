@@ -381,6 +381,44 @@ async fn the_page_a_polish_started_is_cancelled_with_it_and_the_next_typeset_is_
     tokio::time::timeout(Duration::from_secs(30), run).await.expect("the lecture stops").unwrap().unwrap();
 }
 
+/// R21: the sweep before an after-class polish takes a repeated slide out with its embed; what shows the notes hears
+/// so even when the polish then fails.
+#[tokio::test]
+async fn the_sweep_before_a_polish_says_the_notes_changed_whatever_the_polish_does() {
+    use lecturelive_core::notes::timeline::embed_line;
+    use lecturelive_core::session::slides::{self, SlideMeta};
+    let dir = tempfile::tempdir().unwrap();
+    let (f, _) = offline_folder(dir.path());
+    let store = Store::offline(Sidecar::load(&f.sidecar()).unwrap().unwrap(), f.sidecar());
+    let mut lines = Vec::new();
+    for k in 1..=2u32 {
+        let tmp = f.slides.join(format!(".capture-{k}.png"));
+        support::slides::png(&tmp);
+        let at = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 9, 25, 10, 0, k).unwrap();
+        let s = slides::register(&f, &store, &tmp, SlideMeta { shown_at: at, auto: true, uncertain: false }).await.unwrap().unwrap();
+        lines.push(embed_line(&s, &f.dir, f.notes_dir()));
+    }
+    std::fs::write(&f.notes, format!("{TITLE}\n\n{}\n\nAgain.\n\n{}\n", lines[0], lines[1])).unwrap();
+    let files = f.clone();
+    store.update(move |sc| { lecturelive_core::session::notesfile::accept_external_edit(&files, sc)?; sc.notes.slide_index = 2; Ok(()) }).await.unwrap();
+    drop(store);
+    let sse = fake_sse::start(|b| if b["system"].as_str().unwrap_or_default().starts_with("You turn raw") { Reply::Status(503, "{\"code\":\"unavailable\",\"error\":\"overloaded\"}".into()) } else { respond(b) }).await;
+    let lec = lecture_for(&f, &sse.url, &dir.path().join("spend.jsonl"));
+    let (ev_tx, mut ev) = mpsc::unbounded_channel();
+    lec.polish_after(&ev_tx).await.unwrap();
+    drop(ev_tx);
+    let mut edited = None;
+    while let Some(e) = ev.recv().await {
+        if let Event::NotesEdited { revision } = e {
+            edited = Some(revision);
+        }
+    }
+    // The sweep's own revision: the polish's snapshot then commits the lines still pending on top of it.
+    let sc = Sidecar::load(&f.sidecar()).unwrap().unwrap();
+    assert!(edited.is_some_and(|r| r < sc.notes.revision), "the notes pane reads the swept notes: {edited:?}");
+    assert!(!std::fs::read_to_string(&f.notes).unwrap().contains(&lines[1]));
+}
+
 /// R20: a polish's page still typesetting when the lecture stops holds nothing of the session, so the stop does not
 /// wait for its request to give up.
 #[tokio::test]

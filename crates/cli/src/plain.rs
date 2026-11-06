@@ -343,6 +343,8 @@ pub(crate) fn notice(e: &Event, d: Display, words: &capture::Words, mixed: bool)
             let name = Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             n("slide", &format!("slide {index}{how}"), format!("{name}, into the next snapshot"))
         }
+        // Each removal that edited the notes has said so already.
+        Event::NotesEdited { .. } => None,
         Event::SlideRemoved { index, reason: None } => n("slide", &format!("slide {index} removed"), "kept in slides/removed, and left out of the next snapshot".into()),
         Event::SlideRemoved { index, reason: Some(why) } => n("slide", &format!("slide {index} removed"), format!("{why}; kept in slides/removed")),
         Event::SlideRestored(s) => n("slide", &format!("slide {} restored", s.index), "into the next snapshot".into()),

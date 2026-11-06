@@ -533,6 +533,8 @@ impl View {
             Event::Preview(d) => self.preview(d, at),
             Event::NothingNew | Event::SnapshotFailed(_) | Event::Cancelled(_) => self.notes.end_preview(),
             Event::Committed { block, revision, .. } => self.committed(block, *revision, &mut effect),
+            // So is a document a sweep edited.
+            Event::NotesEdited { .. } => effect.hydrate = true,
             // The polished document is canonical only in the file; the event cannot rebuild it.
             Event::Polished { .. } => {
                 self.notes.end_preview();
