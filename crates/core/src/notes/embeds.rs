@@ -47,42 +47,23 @@ pub struct Repaired {
 /// Spec §6.2: each expected embed exactly once, on its own line, outside code fences. Later and
 /// inline copies and embeds of slides outside the batch are removed; what fences hold is code and
 /// stays; expected embeds still absent are appended under their own heading, without a description.
-/// A list item's marker and the spaces after it: where the item's content starts.
-static LIST_ITEM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(?:[-*+]|\d{1,9}[.)])(?:\s+|$)").expect("a valid pattern"));
-
-/// Which lines are fenced code, the fences included, as CommonMark reads them: a fence is three or more backticks or
-/// tildes, and only a fence of the same character, at least as long, with nothing after it, indented at most three
-/// columns past the start of its container (the margin, or the content of the list item it is in) closes it. A fence
-/// opens at any indent, as an over-indented one is code too: what is uncertain counts as code, which keeps it. The one
-/// reading the snapshot's repair, the reference count and the embed edits share.
+/// Which lines are code, as a CommonMark parser reads them: fenced blocks with their fences, and indented blocks, in
+/// whatever list item or quote holds them. An unclosed fence runs to the end of its container, so what is uncertain
+/// counts as code, which keeps it. The one reading the snapshot's repair, the reference count and the embed edits share.
 pub fn code_lines(lines: &[&str]) -> Vec<bool> {
-    let columns = |s: &str| s.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>();
-    let indent = |line: &str| columns(&line[..line.len() - line.trim_start().len()]);
-    // The content columns of the list items still open, outermost first.
-    let mut items: Vec<usize> = Vec::new();
-    let mut open: Option<(char, usize, usize)> = None;
+    let text = lines.join("\n");
+    let blocks: Vec<std::ops::Range<usize>> = pulldown_cmark::Parser::new(&text)
+        .into_offset_iter()
+        .filter_map(|(event, span)| matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))).then_some(span))
+        .collect();
+    let mut start = 0;
     lines
         .iter()
         .map(|line| {
-            let (t, at) = (line.trim(), indent(line));
-            let fence = t.chars().next().filter(|c| matches!(c, '`' | '~')).map(|c| (c, t.chars().take_while(|x| *x == c).count())).filter(|(_, n)| *n >= 3);
-            if let Some((c, n, container)) = open {
-                if fence.is_some_and(|(d, m)| c == d && m >= n && t[m..].trim().is_empty() && (container..=container + 3).contains(&at)) {
-                    open = None;
-                }
-                return true;
-            }
-            if let Some((c, n)) = fence {
-                open = Some((c, n, items.iter().copied().filter(|&o| o <= at).max().unwrap_or(0)));
-                return true;
-            }
-            if !t.is_empty() {
-                items.retain(|&o| o <= at);
-                if let Some(marker) = LIST_ITEM.find(line) {
-                    items.push(columns(marker.as_str()));
-                }
-            }
-            false
+            let end = start + line.len();
+            let code = blocks.iter().any(|b| b.start <= end && start < b.end);
+            start = end + 1;
+            code
         })
         .collect()
 }
@@ -169,11 +150,38 @@ mod tests {
         assert_eq!(code_lines(&["- a", "  - b", "      ```", "        ```", "      ```", "after"]), [false, false, true, true, true, false]);
     }
 
+    /// M06: the first fence ends the inner list, so the second block is the outer item's and its six-space line is code.
+    const AFTER_A_NESTED_LIST: &str = "- outer\n  - inner\n\n  ```text\n  first example\n  ```\n\n    ```markdown\n      ```\n    ![Slide 1](slides/slide_01_100000.png)\n  ```\n";
+    /// M07: a tab after a list marker runs to the next four-column stop, so the item's fence closes on the tabbed line.
+    const AFTER_A_TABBED_ITEM: &str = "-\titem\n\t```rust\n\tlet x = 1;\n\t```\n\n```markdown\n![Slide 1](slides/slide_01_100000.png)\n```\n";
+
+    #[test]
+    fn code_follows_list_items_tab_stops_and_indented_blocks() {
+        let lines = |t: &'static str| t.lines().collect::<Vec<_>>();
+        assert_eq!(code_lines(&lines(AFTER_A_NESTED_LIST)), [false, false, false, true, true, true, false, true, true, true, true]);
+        assert_eq!(code_lines(&lines(AFTER_A_TABBED_ITEM)), [false, true, true, true, false, true, true, true]);
+        for marker in ["-\titem", "1.\titem"] {
+            assert_eq!(code_lines(&[marker, "\t```rust", "\t```", "", "![Slide 1](slides/slide_01_100000.png)"]), [false, true, true, false, false], "{marker:?}");
+        }
+        // M08: fence-like lines indented four columns are an indented code block, which ends at the next line at the margin.
+        let indented = ["## Example", "", "    ```rust", "    let x = 1;", "    ```", "", "## Slides", "![Slide 1](slides/slide_01_100000.png)"];
+        assert_eq!(code_lines(&indented), [false, false, true, true, true, false, false, false]);
+    }
+
     #[test]
     fn a_literal_embed_in_a_shifted_fence_is_left_alone_by_the_repair() {
-        // M05 through repair: the line is code, so it is no embed of the batch to place or drop.
-        let text = " ```markdown\n    ```\n![Slide 1](slides/slide_01_100000.png)\n```\n";
-        assert_eq!(repair(text, &[]).text.lines().filter(|l| l.starts_with("![Slide 1]")).count(), 1);
+        // M05-M07 through repair: the line is code, so it is no embed of the batch to place or drop.
+        for text in [" ```markdown\n    ```\n![Slide 1](slides/slide_01_100000.png)\n```\n", AFTER_A_NESTED_LIST, AFTER_A_TABBED_ITEM] {
+            assert_eq!(repair(text, &[]).text.lines().filter(|l| l.trim().starts_with("![Slide 1]")).count(), 1, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_placed_embed_after_an_indented_example_is_not_placed_again() {
+        // M08 through repair.
+        let text = format!("## Example\n\n    ```rust\n    let x = 1;\n    ```\n\n## Slides\n{}", e(1));
+        let r = repair(&text, &[e(1)]);
+        assert_eq!((r.text.as_str(), r.missing.len()), (text.as_str(), 0));
     }
 
     #[test]

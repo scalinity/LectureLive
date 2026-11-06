@@ -2758,6 +2758,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-av-foundation",
+ "pulldown-cmark",
  "regex",
  "reqwest",
  "rtrb",

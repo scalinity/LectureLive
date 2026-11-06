@@ -600,15 +600,21 @@ mod tests {
     }
 
     #[test]
-    fn an_embed_inside_a_longer_fence_is_code() {
-        // R14: ``` inside a ~~~~ block did not close it; the literal embed after it is not the notes' embed.
-        let (_dir, files, mut sc) = folder();
-        let notes = "# T\n\n~~~~markdown\n```\n![Slide 1](slides/a.png)\n~~~~\n";
-        std::fs::write(&files.notes, notes).unwrap();
-        accept_external_edit(&files, &mut sc).unwrap();
-        assert_eq!(references(notes, std::path::Path::new("/lec/slides/a.png"), "![Slide 1](slides/a.png)").own_line_embeds, 0);
-        assert!(change_embeds(&files, &mut sc, notes, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
-        assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), notes);
+    fn a_literal_embed_in_code_is_not_the_notes_embed() {
+        // R14: ``` inside a ~~~~ block did not close it. M06: a fence after a nested list is the outer item's, so a line
+        // four columns past it does not close it. M07: a tab after a list marker runs to the next four-column stop.
+        for notes in [
+            "# T\n\n~~~~markdown\n```\n![Slide 1](slides/a.png)\n~~~~\n",
+            "# T\n\n- outer\n  - inner\n\n  ```text\n  first\n  ```\n\n    ```markdown\n      ```\n    ![Slide 1](slides/a.png)\n  ```\n",
+            "# T\n\n-\titem\n\t```rust\n\tlet x = 1;\n\t```\n\n```markdown\n![Slide 1](slides/a.png)\n```\n",
+        ] {
+            let (_dir, files, mut sc) = folder();
+            std::fs::write(&files.notes, notes).unwrap();
+            accept_external_edit(&files, &mut sc).unwrap();
+            assert_eq!(references(notes, std::path::Path::new("/lec/slides/a.png"), "![Slide 1](slides/a.png)").own_line_embeds, 0, "{notes:?}");
+            assert!(change_embeds(&files, &mut sc, notes, &[("![Slide 1](slides/a.png)".into(), None)], chrono::Local::now()).unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&files.notes).unwrap(), notes);
+        }
     }
 
     #[test]
