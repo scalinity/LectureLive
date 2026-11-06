@@ -363,7 +363,8 @@ pub fn references(doc: &str, file: &std::path::Path, embed: &str) -> References 
 pub fn change_embeds(files: &LectureFiles, sc: &mut Sidecar, doc: &str, changes: &[(String, Option<String>)], at: DateTime<Local>) -> Result<Vec<usize>> {
     // Each line keeps its own ending, so only the lines changed differ from the notes as they were.
     let pieces: Vec<&str> = doc.split_inclusive('\n').collect();
-    let lines: Vec<&str> = pieces.iter().map(|p| p.trim_end_matches(['\n', '\r'])).collect();
+    // Only the line's own ending comes off: a lone CR before it is a line break of its own.
+    let lines: Vec<&str> = pieces.iter().map(|p| p.strip_suffix('\n').map_or(*p, |l| l.strip_suffix('\r').unwrap_or(l))).collect();
     let code = crate::notes::embeds::code_lines(&lines);
     let mut out: Vec<Option<String>> = pieces.iter().map(|p| Some(p.to_string())).collect();
     let mut made = Vec::new();
@@ -607,6 +608,10 @@ mod tests {
             "# T\n\n~~~~markdown\n```\n![Slide 1](slides/a.png)\n~~~~\n",
             "# T\n\n- outer\n  - inner\n\n  ```text\n  first\n  ```\n\n    ```markdown\n      ```\n    ![Slide 1](slides/a.png)\n  ```\n",
             "# T\n\n-\titem\n\t```rust\n\tlet x = 1;\n\t```\n\n```markdown\n![Slide 1](slides/a.png)\n```\n",
+            // M09: a code span across lines, and an HTML block. M10: a lone CR then a CRLF leave a blank line.
+            "# T\n\nParagraph\n    ```markdown\n![Slide 1](slides/a.png)\n    ```\n",
+            "# T\n\n<pre>\n```markdown\n![Slide 1](slides/a.png)\n```\n</pre>\n",
+            "# T\n\nParagraph\r\r\n    ~~~markdown\n    ![Slide 1](slides/a.png)\n    ~~~\n",
         ] {
             let (_dir, files, mut sc) = folder();
             std::fs::write(&files.notes, notes).unwrap();

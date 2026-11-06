@@ -47,21 +47,31 @@ pub struct Repaired {
 /// Spec §6.2: each expected embed exactly once, on its own line, outside code fences. Later and
 /// inline copies and embeds of slides outside the batch are removed; what fences hold is code and
 /// stays; expected embeds still absent are appended under their own heading, without a description.
-/// Which lines are code, as a CommonMark parser reads them: fenced blocks with their fences, and indented blocks, in
-/// whatever list item or quote holds them. An unclosed fence runs to the end of its container, so what is uncertain
-/// counts as code, which keeps it. The one reading the snapshot's repair, the reference count and the embed edits share.
+/// Which lines are code, as a CommonMark parser reads them: what it keeps literal rather than reading as Markdown. That
+/// is every line of a code block (fenced, with its fences, or indented) or an HTML block, in whatever list item or quote
+/// holds it, and a line that starts inside a code span or inline HTML. An unclosed fence runs to the end of its
+/// container, so what is uncertain counts as code, which keeps it. The one reading the snapshot's repair, the reference
+/// count and the embed edits share.
 pub fn code_lines(lines: &[&str]) -> Vec<bool> {
-    let text = lines.join("\n");
-    let blocks: Vec<std::ops::Range<usize>> = pulldown_cmark::Parser::new(&text)
-        .into_offset_iter()
-        .filter_map(|(event, span)| matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))).then_some(span))
-        .collect();
+    use pulldown_cmark::{Event, Parser, Tag};
+    // A CR left inside a line is a line break to the parser; as an LF it stays one byte, where it was.
+    let text = lines.iter().map(|l| l.replace('\r', "\n")).collect::<Vec<_>>().join("\n");
+    let (mut blocks, mut spans) = (Vec::new(), Vec::new());
+    for (event, span) in Parser::new(&text).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) => blocks.push(span),
+            Event::Code(_) | Event::InlineHtml(_) => spans.push(span),
+            _ => {}
+        }
+    }
     let mut start = 0;
     lines
         .iter()
         .map(|line| {
             let end = start + line.len();
-            let code = blocks.iter().any(|b| b.start <= end && start < b.end);
+            // A block covers whole lines; a code span or inline HTML makes a line code only where the line starts in it.
+            let first = end - line.trim_start().len();
+            let code = blocks.iter().any(|b| b.start <= end && start < b.end) || spans.iter().any(|s| s.contains(&first));
             start = end + 1;
             code
         })
@@ -71,6 +81,8 @@ pub fn code_lines(lines: &[&str]) -> Vec<bool> {
 pub fn repair(text: &str, expected: &[String]) -> Repaired {
     let mut placed = vec![false; expected.len()];
     let (mut out, mut removed) = (Vec::new(), 0);
+    // The lines are joined with LF again, so a lone CR is written as the line break it is.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<&str> = text.lines().collect();
     let code = code_lines(&lines);
     for (line, code) in lines.iter().zip(code) {
@@ -168,12 +180,34 @@ mod tests {
         assert_eq!(code_lines(&indented), [false, false, true, true, true, false, false, false]);
     }
 
+    /// M09: four-space backticks cannot open a fence after a paragraph, so they delimit a code span across lines.
+    const IN_A_CODE_SPAN: &str = "Paragraph\n    ```markdown\n![Slide 1](slides/slide_01_100000.png)\n    ```\n";
+    /// M09: what an HTML block holds is not read as Markdown.
+    const IN_AN_HTML_BLOCK: &str = "<pre>\n```markdown\n![Slide 1](slides/slide_01_100000.png)\n```\n</pre>\n";
+    /// M10: a lone CR then a CRLF is two line breaks, so the indented lines after the blank line are code.
+    const AFTER_A_LONE_CR: &str = "Paragraph\r\r\n    ~~~markdown\n    ![Slide 1](slides/slide_01_100000.png)\n    ~~~\n";
+
+    #[test]
+    fn code_spans_html_and_lone_carriage_returns_are_read_as_the_parser_reads_them() {
+        let lines = |t: &'static str| t.lines().collect::<Vec<_>>();
+        assert_eq!(code_lines(&lines(IN_A_CODE_SPAN)), [false, true, true, true]);
+        assert_eq!(code_lines(&lines(IN_AN_HTML_BLOCK)), [true; 5]);
+        assert_eq!(code_lines(&lines(AFTER_A_LONE_CR)), [false, true, true, true]);
+        // A line that only holds a code span somewhere is still text: its inline copies are the repair's to remove.
+        assert_eq!(code_lines(&["See `x` and ![Slide 2](slides/slide_02_100000.png)"]), [false]);
+    }
+
     #[test]
     fn a_literal_embed_in_a_shifted_fence_is_left_alone_by_the_repair() {
-        // M05-M07 through repair: the line is code, so it is no embed of the batch to place or drop.
-        for text in [" ```markdown\n    ```\n![Slide 1](slides/slide_01_100000.png)\n```\n", AFTER_A_NESTED_LIST, AFTER_A_TABBED_ITEM] {
+        // M05-M10 through repair: the line is code, so it is no embed of the batch to place or drop.
+        for text in [" ```markdown\n    ```\n![Slide 1](slides/slide_01_100000.png)\n```\n", AFTER_A_NESTED_LIST, AFTER_A_TABBED_ITEM, IN_A_CODE_SPAN, IN_AN_HTML_BLOCK, AFTER_A_LONE_CR] {
             assert_eq!(repair(text, &[]).text.lines().filter(|l| l.trim().starts_with("![Slide 1]")).count(), 1, "{text:?}");
         }
+        // A literal copy is not a placement, so the slide is placed after it; and the blank line the lone CR made stays.
+        for text in [IN_A_CODE_SPAN, IN_AN_HTML_BLOCK, AFTER_A_LONE_CR] {
+            assert_eq!(repair(text, &[e(1)]).missing, [e(1)], "{text:?}");
+        }
+        assert!(repair(AFTER_A_LONE_CR, &[]).text.starts_with("Paragraph\n\n    ~~~markdown"));
     }
 
     #[test]

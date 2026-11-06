@@ -430,8 +430,9 @@ finish, an error event, an empty answer or a stream that ends before its finish 
 before the stream is a refusal (the key or a parameter), reported with the server's message.
 
 Validation, after stripping a wrapping code fence and any `#` title: each expected embed line
-appears exactly once, on its own line, outside code. Code is what a CommonMark parser reads as a
-code block: fenced or indented, in whatever list item or quote holds it, and an unclosed fence
+appears exactly once, on its own line, outside code. Code is what a CommonMark parser keeps
+literal: every line of a code block (fenced or indented) or an HTML block, in whatever list item
+or quote holds it, and a line that starts inside a code span or inline HTML. An unclosed fence
 runs to the end of its container. A later own-line copy is removed; inline copies are removed,
 since an image in the middle of a bullet is not placed; embeds of slides not in the batch are
 removed; what code blocks hold stays as written. Expected
